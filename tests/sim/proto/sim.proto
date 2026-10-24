@@ -1,4 +1,4 @@
-// B-23a spike: the smallest gRPC surface B-03 needs, request/response plus a server stream.
+// The smallest gRPC surface B-03 needs, request/response plus a server stream (B-23a spike, B-03 acceptance).
 syntax = "proto3";
 package sim;
 

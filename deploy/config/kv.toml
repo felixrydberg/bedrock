@@ -1,5 +1,6 @@
 node_id = "eu-1a-m1"
 listen = "0.0.0.0:7100"
+admin_listen = "0.0.0.0:7101"
 data_dir = "/data"
 roles = ["l1", "l2"]
 datasets = ["quicksilver", "kv", "auth"]

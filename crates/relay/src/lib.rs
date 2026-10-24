@@ -11,7 +11,10 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
         upstreams = ?config.upstreams,
         "starting bedrock-relay"
     );
+    let admin = node::start_admin(&config.node).await?;
+    admin.set_ready(true);
     node::shutdown_signal().await;
+    admin.set_ready(false);
     tracing::info!("shutting down");
     Ok(())
 }

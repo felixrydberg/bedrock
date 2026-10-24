@@ -3,6 +3,7 @@
 //! The real `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` entry points boot as simulated nodes and stop
 //! on a simulated Ctrl-C. Alongside them, two nodes talk over tonic (unary and server stream), the server writes every
 //! message to the simulated S3, and an Axum router answers HTTP over simulated TCP. Run with `RUSTFLAGS="--cfg madsim" cargo test -p bedrock-sim`.
+//! The proto is shared with `tests/transport.rs`, which also runs in normal builds, so `build.rs` compiles it in both.
 #![cfg(madsim)]
 
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -72,6 +73,7 @@ fn node_config(name: &str, ip: &str) -> NodeConfig {
             cell: "eu-1a".into(),
         },
         listen: format!("{ip}:7000").parse().unwrap(),
+        admin_listen: format!("{ip}:7001").parse().unwrap(),
         data_dir: format!("/data/{name}").into(),
         budget: Budget::default(),
     }

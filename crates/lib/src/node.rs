@@ -7,11 +7,14 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+
+use crate::transport::admin::Admin;
 
 /// Settings every binary has.
 #[derive(Debug, Clone, Deserialize)]
@@ -19,6 +22,8 @@ pub struct NodeConfig {
     pub node_id: String,
     pub location: Location,
     pub listen: SocketAddr,
+    /// Serves `/metrics`, `/health` and `/ready`.
+    pub admin_listen: SocketAddr,
     pub data_dir: PathBuf,
     #[serde(default)]
     pub budget: Budget,
@@ -173,6 +178,16 @@ pub fn init_tracing() {
         .init();
 }
 
+/// Binds `admin_listen` and serves the admin endpoint in the background; the node is not ready until it says so.
+pub async fn start_admin(node: &NodeConfig) -> Result<Arc<Admin>, ConfigError> {
+    let listener = tokio::net::TcpListener::bind(node.admin_listen)
+        .await
+        .map_err(|e| ConfigError(format!("admin_listen {}: {e}", node.admin_listen)))?;
+    let admin = Admin::new();
+    tokio::spawn(admin.clone().serve(listener));
+    Ok(admin)
+}
+
 /// Resolves on Ctrl-C or SIGTERM (what `docker stop` sends).
 pub async fn shutdown_signal() {
     // madsim simulates only Ctrl-C.
@@ -199,6 +214,7 @@ mod tests {
     const KV_TOML: &str = r#"
         node_id = "kv-1"
         listen = "0.0.0.0:7100"
+        admin_listen = "0.0.0.0:7101"
         data_dir = "data"
         roles = ["l1"]
         datasets = ["quicksilver", "kv"]
@@ -250,6 +266,7 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.set_env("BEDROCK_NODE_ID", "relay-1");
             jail.set_env("BEDROCK_LISTEN", "0.0.0.0:7300");
+            jail.set_env("BEDROCK_ADMIN_LISTEN", "0.0.0.0:7301");
             jail.set_env("BEDROCK_DATA_DIR", "data");
             jail.set_env("BEDROCK_LOCATION__REGION", "eu");
             jail.set_env("BEDROCK_LOCATION__DC", "eu-1");
