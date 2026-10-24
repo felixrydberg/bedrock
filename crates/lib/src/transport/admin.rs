@@ -5,15 +5,17 @@
 //! - `/ready`: 200 once the node has validated its state and serves traffic, 503 otherwise.
 
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::CONTENT_TYPE;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::rt::TokioIo;
 use prometheus_client::registry::{Metric, Registry};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
@@ -72,7 +74,7 @@ impl Admin {
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(e) = hyper::server::conn::http1::Builder::new()
-                    .timer(TokioTimer::new())
+                    .timer(RuntimeTimer)
                     .serve_connection(TokioIo::new(stream), svc)
                     .await
                 {
@@ -102,6 +104,36 @@ impl Admin {
             .expect("static status and header are valid")
     }
 }
+
+/// hyper's timer (for its header read timeout) on the runtime clock. hyper-util's `TokioTimer` calls the real tokio,
+/// which has no reactor under madsim.
+#[derive(Clone)]
+struct RuntimeTimer;
+
+impl hyper::rt::Timer for RuntimeTimer {
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(RuntimeSleep(Box::pin(tokio::time::sleep(duration))))
+    }
+
+    #[allow(clippy::useless_conversion)] // madsim's `Instant` is std's
+    fn sleep_until(&self, deadline: std::time::Instant) -> Pin<Box<dyn hyper::rt::Sleep>> {
+        Box::pin(RuntimeSleep(Box::pin(tokio::time::sleep_until(
+            deadline.into(),
+        ))))
+    }
+}
+
+struct RuntimeSleep(Pin<Box<tokio::time::Sleep>>);
+
+impl Future for RuntimeSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+impl hyper::rt::Sleep for RuntimeSleep {}
 
 #[cfg(test)]
 mod tests {
@@ -165,6 +197,7 @@ mod tests {
             .write_all(b"GET /health HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n")
             .await
             .unwrap();
+        excess.flush().await.unwrap();
         let mut response = [0; 1];
         assert!(
             tokio::time::timeout(Duration::from_millis(50), excess.read(&mut response))
@@ -179,5 +212,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(response.starts_with(b"HTTP/1.1 200"));
+    }
+
+    // Virtual time makes hyper's 30 s header read timeout instant.
+    #[cfg(madsim)]
+    #[tokio::test]
+    async fn stalled_request_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(Admin::new().serve(listener));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(b"GET /health HTTP/1.1\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), stream.read_to_end(&mut response))
+            .await
+            .expect("server closes a stalled connection")
+            .unwrap();
     }
 }

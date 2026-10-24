@@ -7,6 +7,8 @@
 //! [`WriteBatch`] as the data they describe, so after a crash both are either there or not.
 
 pub mod memory;
+#[cfg(not(madsim))]
+pub mod rocksdb;
 
 #[cfg(test)]
 mod contract;

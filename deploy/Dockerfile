@@ -1,6 +1,8 @@
 # One image per binary: docker build -f deploy/Dockerfile --build-arg BIN=bedrock-kv -t bedrock-kv .
 FROM rust:1.92-bookworm AS build
 ARG BIN
+# librocksdb-sys generates its bindings with bindgen, which needs libclang.
+RUN apt-get update && apt-get install -y --no-install-recommends libclang-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

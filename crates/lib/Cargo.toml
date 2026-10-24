@@ -16,8 +16,13 @@ tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# RocksDB runs real threads and files, so simulation builds use the in-memory engine (B-23a).
+[target.'cfg(not(madsim))'.dependencies]
+rocksdb.workspace = true
+
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util"] }
 
 [lints]
