@@ -4,11 +4,8 @@ mod namespaces {}
 mod operations {}
 pub mod storage;
 
-use std::sync::Arc;
-
-use bedrock_lib::datasets::{CachePolicy, Dataset, Policy, Registry, ReplicationPolicy};
+use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, ReplicationPolicy};
 use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
-use bedrock_lib::storage::memory::MemoryEngine;
 
 pub const DATASETS: &[Dataset] = &[
     // Routing and deployment metadata, complete in every datacenter (`kv.md` §4).
@@ -45,9 +42,8 @@ const fn dataset(
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-kv");
-    // ponytail: in-memory until the RocksDB adapter (B-05) lands.
     let _datasets = Registry::open(DATASETS, &config.datasets, |d| {
-        Ok(Arc::new(MemoryEngine::new(d.name)))
+        datasets::open_engine(&config.node.data_dir, d)
     })?;
     // ponytail: role subsystems don't exist yet; each starts here as its issue lands.
     for role in &config.roles {
@@ -64,6 +60,8 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bedrock_lib::storage::memory::MemoryEngine;
+    use std::sync::Arc;
 
     #[test]
     fn opens_only_kv_datasets() {

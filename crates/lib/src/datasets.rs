@@ -4,6 +4,7 @@
 //! `bedrock-kv` hosts `quicksilver`, `kv` and `auth`, `bedrock-cdn` hosts `cdn`, and neither opens the other's.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::node::{Budget, ConfigError};
@@ -162,6 +163,24 @@ impl Registry {
     }
 }
 
+/// The node's engine for `dataset`: RocksDB in `data_dir/{dataset}`, or in memory in simulation builds, which compile
+/// RocksDB out (B-23a).
+pub fn open_engine(data_dir: &Path, dataset: &Dataset) -> StorageResult<Arc<dyn StorageEngine>> {
+    // ponytail: RocksDB defaults; map the resolved dataset budget onto `RocksDbOptions` when budgets are enforced.
+    #[cfg(not(madsim))]
+    let engine = crate::storage::rocksdb::RocksDbAdapter::open(
+        &data_dir.join(dataset.name),
+        dataset.name,
+        &Default::default(),
+    )?;
+    #[cfg(madsim)]
+    let engine = {
+        let _ = data_dir;
+        crate::storage::memory::MemoryEngine::new(dataset.name)
+    };
+    Ok(Arc::new(engine))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +317,24 @@ mod tests {
         });
         assert!(err.is_err());
         assert_eq!(opened, 0);
+    }
+
+    #[test]
+    #[cfg(not(madsim))]
+    fn engines_persist_in_separate_dataset_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kv, qs) = (dataset("kv"), dataset("quicksilver"));
+        open_engine(dir.path(), &kv)
+            .unwrap()
+            .put(b"k", b"v")
+            .unwrap();
+        assert_eq!(
+            open_engine(dir.path(), &kv).unwrap().get(b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
+        assert_eq!(
+            open_engine(dir.path(), &qs).unwrap().get(b"k").unwrap(),
+            None
+        );
     }
 }

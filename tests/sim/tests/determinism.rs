@@ -46,6 +46,8 @@ const BUCKET: &str = "bedrock";
 struct Trace(Arc<Mutex<Vec<(u128, String)>>>, Instant);
 
 impl Trace {
+    // `tokio::time::Instant` is std's under madsim, which simulates its `now`.
+    #[allow(clippy::disallowed_methods)]
     fn new() -> Self {
         Trace(Arc::default(), Instant::now())
     }
