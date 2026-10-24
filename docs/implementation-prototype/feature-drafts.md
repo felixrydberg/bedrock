@@ -35,9 +35,9 @@ are out of scope for this plan.
 
 ```text
 crates/
-├── lib/          # bedrock/lib — shared distributed core (library only)
-│   ├── membership  health  buckets  placement  replication  relays  reconciliation   (documented)
-│   └── storage  datasets  s3  transport                                              (proposed additions, see §4)
+├── lib/          # bedrock-lib — shared distributed core (library only)
+│   ├── membership  health  buckets  placement  replication  relays  reconciliation
+│   └── storage  datasets  s3  transport                                              (decided in B-01, see §4)
 ├── api/          # bedrock/api — write API (B-09)                                         → binary `bedrock-api`
 ├── relay/        # bedrock/relay — relay process: tiers, fan-out, replay, membership      → binary `bedrock-relay`
 ├── kv/           # bedrock/kv  — storage (keyspaces/eviction), namespaces, operations  → binary `bedrock-kv`
@@ -1242,13 +1242,11 @@ Labels: enhancement
      as a histogram, so write-to-anywhere latency needs no tracing infrastructure.
    - **Every draft names its metrics** in its solution or acceptance criteria, on top of the B-03 baseline (logging, metrics endpoint, health).
    - Relays expose per-namespace state through the B-18b introspection API.
+9. **`lib/` holds `storage`, `datasets`, `s3` and `transport`** alongside the seven documented modules, since every binary
+   needs them. `code-structure.md` reflects this, including `storage` moving out of `kv/` (B-01).
+10. **Crate naming.** The shared crate is the package `bedrock-lib` (`use bedrock_lib::…`) in `crates/lib`; the binary
+    crates are `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` (B-01).
 
 ### Still open
 
-These need a decision before or during B-01. The drafts above assume the recommendation.
-
-1. **Additions to `lib/` beyond the documented seven modules.** `storage`, `datasets`, `s3` and `transport`
-   are needed by both binaries. *Recommendation:* add them to `lib/` and update `code-structure.md`
-   (including the two-binary split and `storage` moving out of `kv/`).
-2. **Crate naming.** `lib` is a confusing crate name in `use` paths. Consider `bedrock-lib` (directory unchanged).
-3. **Auth dataset scope (B-42).** It is only mentioned in `notes.md`, so it needs a short design before it becomes an issue.
+1. **Auth dataset scope (B-42).** It is only mentioned in `notes.md`, so it needs a short design before it becomes an issue.

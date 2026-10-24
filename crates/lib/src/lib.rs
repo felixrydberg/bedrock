@@ -1,14 +1,13 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Shared distributed core linked by every Bedrock binary.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod buckets {}
+pub mod datasets {}
+pub mod health {}
+pub mod membership {}
+pub mod placement {}
+pub mod reconciliation {}
+pub mod relays {}
+pub mod replication {}
+pub mod s3 {}
+pub mod storage {}
+pub mod transport {}
