@@ -1,6 +1,7 @@
 [package]
-name = "kv"
+name = "bedrock-kv"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bedrock-lib = { path = "../lib" }
