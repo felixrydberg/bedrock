@@ -1,13 +1,7 @@
-//! `bedrock-api`: authoritative writes and revision ordering (B-09).
-
-use bedrock_lib::node::{self, ApiConfig, ConfigError};
+//! Thin entry point: `bedrock_api::run` holds the node so `bedrock-sim` runs the same code (B-23a).
 
 #[tokio::main]
-async fn main() -> Result<(), ConfigError> {
-    node::init_tracing();
-    let config: ApiConfig = node::load()?;
-    tracing::info!(node_id = %config.node.node_id, "starting bedrock-api");
-    node::shutdown_signal().await;
-    tracing::info!("shutting down");
-    Ok(())
+async fn main() -> Result<(), bedrock_lib::node::ConfigError> {
+    bedrock_lib::node::init_tracing();
+    bedrock_api::run(bedrock_lib::node::load()?).await
 }
