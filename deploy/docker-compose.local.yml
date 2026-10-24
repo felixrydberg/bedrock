@@ -1,0 +1,273 @@
+# Local multi-node cluster: 2 regions x 3 machines x (kv + cdn), 2 relays per region, one api, SeaweedFS (S3 on :8333).
+#   docker compose -f deploy/docker-compose.local.yml up -d --build
+# Uses a bridge network (service names as addresses) instead of host networking so every node can share ports.
+# Data lives in deploy/local-data/<service>.
+x-node: &node
+  restart: unless-stopped
+  stop_grace_period: 30s
+  cpus: 0.5
+  mem_limit: 256m
+x-kv: &kv
+  <<: *node
+  image: bedrock-kv
+  pull_policy: never # built by the first service of each kind
+x-cdn: &cdn
+  <<: *node
+  image: bedrock-cdn
+  pull_policy: never # built by the first service of each kind
+x-relay: &relay
+  <<: *node
+  image: bedrock-relay
+  pull_policy: never # built by the first service of each kind
+
+services:
+  s3:
+    image: chrislusf/seaweedfs:4.01
+    command: server -s3 -dir=/data
+    restart: unless-stopped
+    volumes: [./local-data/s3:/data]
+    ports: ["8333:8333"]
+
+  api:
+    <<: *node
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-api } }
+    image: bedrock-api
+    volumes: [./local-data/api:/data]
+    environment:
+      BEDROCK_NODE_ID: api
+      BEDROCK_LISTEN: 0.0.0.0:7000
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  relay-eu-1:
+    <<: *relay
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-relay } } # built once, shared by every relay service
+    volumes: [./local-data/relay-eu-1:/data]
+    environment:
+      BEDROCK_NODE_ID: relay-eu-1
+      BEDROCK_LISTEN: 0.0.0.0:7300
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_TIER: region
+      BEDROCK_UPSTREAMS: "[api:7000]"
+
+  relay-eu-2:
+    <<: *relay
+    volumes: [./local-data/relay-eu-2:/data]
+    environment:
+      BEDROCK_NODE_ID: relay-eu-2
+      BEDROCK_LISTEN: 0.0.0.0:7300
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_TIER: region
+      BEDROCK_UPSTREAMS: "[api:7000]"
+
+  kv-eu-1:
+    <<: *kv
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-kv } } # built once, shared by every kv service
+    volumes: [./local-data/kv-eu-1:/data]
+    environment:
+      BEDROCK_NODE_ID: kv-eu-1
+      BEDROCK_LISTEN: 0.0.0.0:7100
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  cdn-eu-1:
+    <<: *cdn
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-cdn } } # built once, shared by every cdn service
+    volumes: [./local-data/cdn-eu-1:/data]
+    environment:
+      BEDROCK_NODE_ID: cdn-eu-1
+      BEDROCK_LISTEN: 0.0.0.0:7200
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[cdn]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  kv-eu-2:
+    <<: *kv
+    volumes: [./local-data/kv-eu-2:/data]
+    environment:
+      BEDROCK_NODE_ID: kv-eu-2
+      BEDROCK_LISTEN: 0.0.0.0:7100
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  cdn-eu-2:
+    <<: *cdn
+    volumes: [./local-data/cdn-eu-2:/data]
+    environment:
+      BEDROCK_NODE_ID: cdn-eu-2
+      BEDROCK_LISTEN: 0.0.0.0:7200
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[cdn]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  kv-eu-3:
+    <<: *kv
+    volumes: [./local-data/kv-eu-3:/data]
+    environment:
+      BEDROCK_NODE_ID: kv-eu-3
+      BEDROCK_LISTEN: 0.0.0.0:7100
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  cdn-eu-3:
+    <<: *cdn
+    volumes: [./local-data/cdn-eu-3:/data]
+    environment:
+      BEDROCK_NODE_ID: cdn-eu-3
+      BEDROCK_LISTEN: 0.0.0.0:7200
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[cdn]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  relay-us-1:
+    <<: *relay
+    volumes: [./local-data/relay-us-1:/data]
+    environment:
+      BEDROCK_NODE_ID: relay-us-1
+      BEDROCK_LISTEN: 0.0.0.0:7300
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_TIER: region
+      BEDROCK_UPSTREAMS: "[api:7000]"
+
+  relay-us-2:
+    <<: *relay
+    volumes: [./local-data/relay-us-2:/data]
+    environment:
+      BEDROCK_NODE_ID: relay-us-2
+      BEDROCK_LISTEN: 0.0.0.0:7300
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_TIER: region
+      BEDROCK_UPSTREAMS: "[api:7000]"
+
+  kv-us-1:
+    <<: *kv
+    volumes: [./local-data/kv-us-1:/data]
+    environment:
+      BEDROCK_NODE_ID: kv-us-1
+      BEDROCK_LISTEN: 0.0.0.0:7100
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  cdn-us-1:
+    <<: *cdn
+    volumes: [./local-data/cdn-us-1:/data]
+    environment:
+      BEDROCK_NODE_ID: cdn-us-1
+      BEDROCK_LISTEN: 0.0.0.0:7200
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[cdn]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  kv-us-2:
+    <<: *kv
+    volumes: [./local-data/kv-us-2:/data]
+    environment:
+      BEDROCK_NODE_ID: kv-us-2
+      BEDROCK_LISTEN: 0.0.0.0:7100
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  cdn-us-2:
+    <<: *cdn
+    volumes: [./local-data/cdn-us-2:/data]
+    environment:
+      BEDROCK_NODE_ID: cdn-us-2
+      BEDROCK_LISTEN: 0.0.0.0:7200
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[cdn]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  kv-us-3:
+    <<: *kv
+    volumes: [./local-data/kv-us-3:/data]
+    environment:
+      BEDROCK_NODE_ID: kv-us-3
+      BEDROCK_LISTEN: 0.0.0.0:7100
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  cdn-us-3:
+    <<: *cdn
+    volumes: [./local-data/cdn-us-3:/data]
+    environment:
+      BEDROCK_NODE_ID: cdn-us-3
+      BEDROCK_LISTEN: 0.0.0.0:7200
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[cdn]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7000
+      BEDROCK_S3_ENDPOINT: http://s3:8333

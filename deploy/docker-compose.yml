@@ -1,0 +1,41 @@
+# One machine. Every machine runs kv + cdn; relay machines add `--profile relay`, the core region adds `--profile api`.
+# Copy deploy/config/*.toml next to this file (or edit them) and set node_id/location per machine.
+x-service: &service
+  network_mode: host
+  restart: unless-stopped
+  stop_grace_period: 30s
+
+services:
+  kv:
+    <<: *service
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-kv } }
+    image: bedrock-kv
+    volumes: [/var/lib/bedrock/kv:/data, ./config/kv.toml:/etc/bedrock/config.toml:ro]
+    cpus: 2
+    mem_limit: 4g
+
+  cdn:
+    <<: *service
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-cdn } }
+    image: bedrock-cdn
+    volumes: [/var/lib/bedrock/cdn:/data, ./config/cdn.toml:/etc/bedrock/config.toml:ro]
+    cpus: 2
+    mem_limit: 4g
+
+  relay:
+    <<: *service
+    profiles: [relay]
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-relay } }
+    image: bedrock-relay
+    volumes: [/var/lib/bedrock/relay:/data, ./config/relay.toml:/etc/bedrock/config.toml:ro]
+    cpus: 1
+    mem_limit: 2g
+
+  api:
+    <<: *service
+    profiles: [api]
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-api } }
+    image: bedrock-api
+    volumes: [/var/lib/bedrock/api:/data, ./config/api.toml:/etc/bedrock/config.toml:ro]
+    cpus: 1
+    mem_limit: 2g

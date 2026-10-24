@@ -1,0 +1,18 @@
+node_id = "eu-1a-m1"
+listen = "0.0.0.0:7100"
+data_dir = "/data"
+roles = ["l1", "l2"]
+datasets = ["quicksilver", "kv", "auth"]
+relays = ["relay-eu-1a-1:7300", "relay-eu-1a-2:7300"]
+api = "api.core:7000"
+s3_endpoint = "https://s3.example.internal"
+
+[location]
+region = "eu"
+dc = "eu-1"
+cell = "eu-1a"
+
+[budget]
+cpus = 2.0
+memory_mb = 4096
+disk_mb = 102400
