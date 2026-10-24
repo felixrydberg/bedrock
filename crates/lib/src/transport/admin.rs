@@ -111,6 +111,11 @@ impl Admin {
 struct RuntimeTimer;
 
 impl hyper::rt::Timer for RuntimeTimer {
+    #[allow(clippy::useless_conversion)] // madsim's `Instant` is std's
+    fn now(&self) -> std::time::Instant {
+        tokio::time::Instant::now().into()
+    }
+
     fn sleep(&self, duration: Duration) -> Pin<Box<dyn hyper::rt::Sleep>> {
         Box::pin(RuntimeSleep(Box::pin(tokio::time::sleep(duration))))
     }
@@ -212,6 +217,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(response.starts_with(b"HTTP/1.1 200"));
+    }
+
+    #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+    #[cfg_attr(madsim, tokio::test)]
+    async fn timer_deadline_uses_runtime_clock() {
+        use hyper::rt::Timer;
+
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        let delay = Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let mut sleep = RuntimeTimer.sleep_until(RuntimeTimer.now() + delay);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut sleep)
+                .await
+                .is_err(),
+            "deadline must not expire early"
+        );
+        tokio::time::timeout(delay, sleep)
+            .await
+            .expect("deadline must expire on the runtime clock");
+        assert!(started.elapsed() >= delay);
     }
 
     // Virtual time makes hyper's 30 s header read timeout instant.

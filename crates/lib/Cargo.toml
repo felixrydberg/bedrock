@@ -23,7 +23,7 @@ rocksdb.workspace = true
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 
 [lints]
 workspace = true

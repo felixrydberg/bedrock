@@ -476,7 +476,7 @@ mod tests {
         };
         let engine = RocksDbAdapter::open(Path::new(&dir), "crash", &RocksDbOptions::default());
         let engine = engine.unwrap();
-        for revision in 1u64.. {
+        for revision in 1u64..=u64::MAX {
             let mut batch = WriteBatch::default();
             batch
                 .put(format!("ns/{revision}"), revision.to_string())
