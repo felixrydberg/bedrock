@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# AGENTS.md is picked up as code guidelines by default; this file only adds review routing.
+language: en-US
+tone_instructions: "Terse. Report correctness, durability, determinism and boundary violations first. Skip style nits that rustfmt or clippy already enforce."
+
+reviews:
+  profile: chill
+  high_level_summary: true
+  sequence_diagrams: false
+  poem: false
+  auto_review:
+    drafts: false
+    ignore_title_keywords: ["wip", "do not review"]
+
+  # Speed: never feed generated or vendored content to the reviewer.
+  path_filters:
+    - "!target/**"
+    - "!**/Cargo.lock"
+    - "!deploy/local-data/**"
+
+  path_instructions:
+    - path: "crates/lib/**"
+      instructions: |
+        Shared distributed core. Check against AGENTS.md "Correctness and validation":
+        - No direct OS time, threads, filesystem or unseeded randomness outside adapters; use runtime time/tasks so madsim builds stay deterministic.
+        - No HashMap/HashSet iteration that affects messages, ordering or output.
+        - Data and applied revisions persist atomically; application is ordered and duplicate-safe; tombstones and checksums preserved.
+        - Missing key is Ok(None); corruption/unavailability/unsupported are explicit errors.
+        - No heartbeat/gossip protocol or membership/placement epochs.
+        - Metrics labels stay low-cardinality (no namespace/key/hash/subscriber labels). committed_at is preserved through every hop.
+        - StorageEngine and adapters live in lib/storage.
+    - path: "crates/{kv,cdn,relay,api}/**"
+      instructions: |
+        Binaries depend only on bedrock-lib, never on each other — flag any cross-binary dependency or import.
+        kv hosts quicksilver/kv/auth datasets; cdn hosts cdn retention metadata and artifact bytes; each subscribes only to its own datasets.
+        KV keyspaces and eviction belong in kv/storage. CDN artifact caching stays behind CacheStorage.
+        Retention is ordinary SET/DELETE replication interpreted only by CDN apply hooks. Workers/Pages/deploy logic does not belong here.
+    - path: "crates/*/Cargo.toml"
+      instructions: "Binary crates must not depend on other binary crates. New dependencies need a justification; prefer workspace.dependencies. RocksDB must be excluded under cfg(madsim)."
+    - path: "tests/sim/**"
+      instructions: "Deterministic simulation tests. A seed must reproduce the same trace. Failing seeds should be kept as regressions. Flag nondeterminism (wall clock, unseeded RNG, unordered iteration)."
+    - path: "docs/implementation-prototype/**"
+      instructions: "Design docs. Check consistency with AGENTS.md and between kv.md, cdn.md, code-structure.md and feature-drafts.md. Flag contradictions rather than style."
+
+  tools:
+    clippy:
+      enabled: false # CI runs clippy with -D warnings on the real workspace
+    github-checks:
+      enabled: true
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    issue_assessment:
+      mode: warning
+    custom_checks:
+      - name: Crate boundaries
+        mode: error
+        instructions: "Fail if any of crates/kv, crates/cdn, crates/relay or crates/api depends on or imports another of those crates. They may depend only on bedrock-lib."
+      - name: Protocol spec first
+        mode: warning
+        instructions: "If the PR changes the replication/write/relay protocol or its message types, warn unless the TLA+ specification is updated in the same PR or the description links where it was updated."
+
+knowledge_base:
+  learnings:
+    scope: local
