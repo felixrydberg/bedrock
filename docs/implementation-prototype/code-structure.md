@@ -32,10 +32,13 @@ Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-kv`, `bedrock-cdn`) runs a
 (service-specific code) plus a `main.rs` that only initialises logging, loads config and calls `run`.
 
 `bedrock/tests/sim` (`bedrock-sim`, B-23a) holds the deterministic simulation tests. It boots those same `run`
-functions as simulated nodes, so tests and production execute the same code. They only compile under
+functions as simulated nodes, so tests and production execute the same code. Most only compile under
 `RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim"`, where `tokio`, `tonic` and `aws-sdk-s3` resolve to their madsim
 simulators, and only on Linux or macOS (on Windows, use WSL). A normal `cargo test` lists them as one ignored test.
-CI does not run them; run them locally before merging shared-core changes:
+The exception is `tests/transport.rs` (B-03), which runs in both builds: over real HTTP/2 normally, where it also proves
+bulk/control isolation, and simulated under madsim, where tonic has no flow control. Its `build.rs` compiles
+`proto/sim.proto` with the vendored `protoc` in every build.
+CI does not run the madsim builds; run them locally before merging shared-core changes:
 `RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo test --workspace`, and lint the sim code with
 `cargo clippy --workspace --all-targets -- -D warnings -A clippy::disallowed_methods -A clippy::disallowed_types`
 under the same flags (madsim re-exports std's `Instant`, so the I/O rules only hold in the normal build).

@@ -17,7 +17,10 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
+    let admin = node::start_admin(&config.node).await?;
+    admin.set_ready(true);
     node::shutdown_signal().await;
+    admin.set_ready(false);
     tracing::info!("shutting down");
     Ok(())
 }

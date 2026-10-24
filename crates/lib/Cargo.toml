@@ -6,12 +6,19 @@ rust-version.workspace = true
 
 [dependencies]
 figment.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+prometheus-client.workspace = true
 serde.workspace = true
 tokio.workspace = true
+tonic.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 figment = { workspace = true, features = ["test"] }
+tokio = { workspace = true, features = ["io-util"] }
 
 [lints]
 workspace = true

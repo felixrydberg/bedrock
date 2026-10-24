@@ -11,4 +11,4 @@ pub mod relays {}
 pub mod replication {}
 pub mod s3 {}
 pub mod storage {}
-pub mod transport {}
+pub mod transport;
