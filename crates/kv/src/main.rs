@@ -1,24 +1,7 @@
-//! `bedrock-kv`: hosts the `quicksilver`, `kv` and `auth` datasets.
-
-mod namespaces {}
-mod operations {}
-mod storage {}
-
-use bedrock_lib::node::{self, ConfigError, ServiceConfig};
-
-const DATASETS: &[&str] = &["quicksilver", "kv", "auth"];
+//! Thin entry point: `bedrock_kv::run` holds the node so `bedrock-sim` runs the same code (B-23a).
 
 #[tokio::main]
-async fn main() -> Result<(), ConfigError> {
-    node::init_tracing();
-    let config: ServiceConfig = node::load()?;
-    config.validate(DATASETS)?;
-    tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-kv");
-    // ponytail: role subsystems don't exist yet; each starts here as its issue lands.
-    for role in &config.roles {
-        tracing::info!(?role, "role enabled");
-    }
-    node::shutdown_signal().await;
-    tracing::info!("shutting down");
-    Ok(())
+async fn main() -> Result<(), bedrock_lib::node::ConfigError> {
+    bedrock_lib::node::init_tracing();
+    bedrock_kv::run(bedrock_lib::node::load()?).await
 }

@@ -28,7 +28,18 @@ bedrock/crates/
     └── retention
 
 Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-kv`, `bedrock-cdn`) runs as its own process, depends on
-`bedrock-lib` and never on another binary crate.
+`bedrock-lib` and never on another binary crate. Each binary crate is a library with a `run(config)` entry point
+(service-specific code) plus a `main.rs` that only initialises logging, loads config and calls `run`.
+
+`bedrock/tests/sim` (`bedrock-sim`, B-23a) holds the deterministic simulation tests. It boots those same `run`
+functions as simulated nodes, so tests and production execute the same code. They only compile under
+`RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim"`, where `tokio`, `tonic` and `aws-sdk-s3` resolve to their madsim
+simulators, and only on Linux or macOS (on Windows, use WSL). A normal `cargo test` lists them as one ignored test.
+CI does not run them; run them locally before merging shared-core changes:
+`RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo test --workspace`, and lint the sim code with
+`cargo clippy --workspace --all-targets -- -D warnings -A clippy::disallowed_methods -A clippy::disallowed_types`
+under the same flags (madsim re-exports std's `Instant`, so the I/O rules only hold in the normal build).
+The I/O rules in `clippy.toml` apply to every crate; adapters opt out with an explicit `#[allow]`.
 
 | Module           | Responsibility                                                        |
 | ---------------- | --------------------------------------------------------------------- |

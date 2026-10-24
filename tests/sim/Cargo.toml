@@ -1,0 +1,34 @@
+[package]
+name = "bedrock-sim"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "Deterministic simulation tests for the shared core (B-23a); only `--cfg madsim` builds compile them."
+
+[target.'cfg(madsim)'.dev-dependencies]
+bedrock-api = { path = "../../crates/api" }
+bedrock-cdn = { path = "../../crates/cdn" }
+bedrock-kv = { path = "../../crates/kv" }
+bedrock-lib.workspace = true
+bedrock-relay = { path = "../../crates/relay" }
+aws-sdk-s3.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
+madsim.workspace = true
+prost.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+tokio-stream = "0.1"
+http-body-util = "0.1"
+
+[target.'cfg(madsim)'.build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = { package = "madsim-tonic-build", version = "0.6" }
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

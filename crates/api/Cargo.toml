@@ -2,8 +2,12 @@
 name = "bedrock-api"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 
 [dependencies]
 bedrock-lib.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

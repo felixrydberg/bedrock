@@ -149,7 +149,8 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 
 /// Loads config from `BEDROCK_CONFIG` plus `BEDROCK_*` overrides and creates the data directory.
-// ponytail: startup-only file/env access; B-23a's disallowed-methods lint should allow this function explicitly.
+// Startup adapter: reads the environment and creates the data directory before any simulated I/O runs.
+#[allow(clippy::disallowed_methods)]
 pub fn load<T: DeserializeOwned + AsRef<NodeConfig>>() -> Result<T, ConfigError> {
     let path = std::env::var("BEDROCK_CONFIG").unwrap_or_else(|_| "bedrock.toml".into());
     let config: T = Figment::new()
@@ -174,7 +175,8 @@ pub fn init_tracing() {
 
 /// Resolves on Ctrl-C or SIGTERM (what `docker stop` sends).
 pub async fn shutdown_signal() {
-    #[cfg(unix)]
+    // madsim simulates only Ctrl-C.
+    #[cfg(all(unix, not(madsim)))]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
@@ -183,7 +185,7 @@ pub async fn shutdown_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(any(not(unix), madsim))]
     let _ = tokio::signal::ctrl_c().await;
 }
 
@@ -211,6 +213,7 @@ mod tests {
     "#;
 
     #[test]
+    #[allow(clippy::disallowed_methods)] // checks that `load` created the data directory
     fn file_then_env_overrides() {
         Jail::expect_with(|jail| {
             jail.create_file("kv.toml", KV_TOML)?;

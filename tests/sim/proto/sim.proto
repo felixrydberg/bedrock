@@ -1,0 +1,13 @@
+// B-23a spike: the smallest gRPC surface B-03 needs, request/response plus a server stream.
+syntax = "proto3";
+package sim;
+
+message Msg {
+  uint32 id = 1;
+  string body = 2;
+}
+
+service Echo {
+  rpc Send(Msg) returns (Msg);
+  rpc Watch(Msg) returns (stream Msg);
+}
