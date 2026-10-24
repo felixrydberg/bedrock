@@ -188,6 +188,8 @@ pub async fn shutdown_signal() {
 }
 
 #[cfg(test)]
+// `Jail::expect_with` closures must return `figment::Result`; newer clippy flags `figment::Error` as large.
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use figment::Jail;
