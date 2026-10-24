@@ -9,6 +9,7 @@ bedrock/crates/
 │   ├── reconciliation
 │   ├── storage
 │   ├── datasets
+│   ├── node
 │   ├── s3
 │   └── transport
 │
@@ -40,6 +41,7 @@ Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-kv`, `bedrock-cdn`) runs a
 | `reconciliation` | Compare desired state with actual state and schedule repair           |
 | `storage`        | `StorageEngine` contract and adapters (RocksDB), shared by all binaries |
 | `datasets`       | Dataset → namespace model and policy resolution                       |
+| `node`           | Node config (file + `BEDROCK_*` env), roles, logging and graceful shutdown |
 | `s3`             | L3 S3 client with checksums and versioned manifests                   |
 | `transport`      | Node-to-node transport and observability baseline                     |
 | `kv/storage`     | KV keyspaces and eviction only, on top of `lib/storage`               |

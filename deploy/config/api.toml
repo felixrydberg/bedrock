@@ -1,0 +1,9 @@
+node_id = "api-1"
+listen = "0.0.0.0:7000"
+data_dir = "/data"
+s3_endpoint = "https://s3.example.internal"
+
+[location]
+region = "core"
+dc = "core-1"
+cell = "core-1a"

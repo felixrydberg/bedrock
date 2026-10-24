@@ -1,3 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+
+[workspace.dependencies]
+bedrock-lib = { path = "crates/lib" }
+figment = { version = "0.10.19", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
