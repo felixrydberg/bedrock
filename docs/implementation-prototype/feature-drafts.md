@@ -611,7 +611,8 @@ This must not swamp relay traffic and must not duplicate fetches when many reque
 **Describe the solution you'd like**
 - Streaming transfers between nodes over the B-03 bulk channel.
 - Fetch from S3 when no peer has the artifact.
-- Coalesce concurrent requests for the same hash.
+- Coalesce concurrent requests for the same hash on each node, including local prewarming and incoming peer requests.
+  A peer request can start a missing artifact's fetch or join an existing fetch, even before local prewarming starts.
 - Retries, timeouts and backpressure.
 - Checksum verified before an artifact is stored or served.
 
@@ -620,7 +621,9 @@ This must not swamp relay traffic and must not duplicate fetches when many reque
 - **Module:** `cdn/artifact_transfer`.
 - **Doc reference:** `cdn.md` §3 Artifact Transfer, Core Principle 6.
 - **Depends on:** B-30.
-- **Acceptance criteria:** 100 concurrent requests for one missing hash cause exactly one upstream fetch. Bulk transfers do not push relay or control latency past its SLO. Truncated transfers are rejected.
+- **Acceptance criteria:** 100 concurrent requests for one missing hash on one node, mixing local prewarming and peer requests,
+  cause exactly one upstream fetch. A peer request arriving before local prewarming starts also shares that fetch.
+  Bulk transfers do not push relay or control latency past its SLO. Truncated transfers are rejected.
 
 ---
 
@@ -714,11 +717,17 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Retained artifacts must be held by two verified nodes per region, chosen with the shared bucket and placement system.
+Retained artifacts must be held by two verified nodes per cell, chosen with the shared bucket and placement system.
 Local availability must be tracked separately from bucket ownership.
+Applying `RETAIN_MANIFEST` must not make both cold holders independently download the same artifact from S3.
 
 **Describe the solution you'd like**
-- Map artifact hash → bucket (B-16). Pick 2 holders with B-15.
+- Map artifact hash → bucket (B-16). Pick 2 holders within the cell in deterministic placement order with B-15.
+- Only the selected holders initiate prewarming for their artifacts when retention is applied.
+- Reuse verified local or peer copies first. On a completely cold miss, the first holder fetches from S3.
+  The second requests the artifact from the first through B-31, starting or joining its coalesced fetch.
+- If the first holder fails or times out, the second falls back to S3 using B-31's retries and timeouts.
+  Artifact bytes use the existing bulk channel; relays continue carrying metadata.
 - A reconciler (B-20):
   - desired = retained artifacts in my buckets
   - actual = local inventory
@@ -731,7 +740,13 @@ Local availability must be tracked separately from bucket ownership.
 - **Module:** `cdn/retention`, `cdn/artifact_storage`.
 - **Doc reference:** `cdn.md` §3 Regional L2, §4 Phase 2, Core Principle 3.
 - **Depends on:** B-31, B-32.
-- **Acceptance criteria:** After `RETAIN_MANIFEST`, every artifact has two verified holders in each region. Availability lookups return only holders that really have the bytes.
+- **Known limits:** Download suppression is per cell and best-effort. Separate cells fetch independently; failover or
+  differing membership views can cause duplicate S3 downloads.
+- **Acceptance criteria:**
+  - After `RETAIN_MANIFEST`, every artifact has two verified holders in each cell. Availability lookups return only holders that really have the bytes.
+  - With stable placement and healthy nodes, concurrent prewarming on both cold holders causes one S3 download and produces two verified copies.
+  - The second holder can request the first before it starts prewarming; concurrent requests on the first share one fetch.
+  - Failure or timeout of the first holder lets the second complete from S3 without waiting indefinitely.
 
 ---
 
