@@ -1,9 +1,10 @@
 //! Contract suite every [`StorageEngine`] adapter must pass (B-04; used by B-05 and B-39).
 //!
 //! An adapter implements [`Harness`] in its test module and calls `storage_contract!(harness_expr)`, which defines
-//! one `#[test]` per case with a fresh harness each.
+//! one test per case with a fresh harness each.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::{Entry, KeyRange, Scan, StorageEngine, StorageError, StorageResult, WriteBatch};
 
@@ -24,7 +25,6 @@ macro_rules! storage_contract {
             missing_key_is_none_not_error,
             put_overwrite_delete,
             batch_applies_in_order,
-            data_and_revision_commit_together,
             revisions_are_per_name_and_outside_key_space,
             scans_in_key_order,
             snapshot_is_consistent,
@@ -33,6 +33,10 @@ macro_rules! storage_contract {
             corruption_is_an_error_not_a_miss,
             stats_disk_usage_and_health,
         );
+        #[tokio::test]
+        async fn data_and_revision_commit_together() {
+            $crate::storage::contract::data_and_revision_commit_together(&mut $harness).await;
+        }
     };
     ($harness:expr; $($case:ident),* $(,)?) => {
         $(
@@ -106,13 +110,16 @@ pub fn batch_applies_in_order(h: &mut impl Harness) {
     );
 }
 
-pub fn data_and_revision_commit_together(h: &mut impl Harness) {
-    let engine = h.open();
+pub async fn data_and_revision_commit_together<H: Harness>(h: &mut H)
+where
+    H::Engine: 'static,
+{
+    let engine = Arc::new(h.open());
     let before = engine.snapshot().unwrap();
     let mut batch = WriteBatch::default();
     batch.put(*b"ns/k", *b"1").set_revision("ns", 1);
     engine.write(batch).unwrap();
-    assert_eq!(get(&engine, b"ns/k"), Some(b"1".to_vec()));
+    assert_eq!(get(&*engine, b"ns/k"), Some(b"1".to_vec()));
     assert_eq!(engine.revision("ns"), Ok(Some(1)));
     assert_eq!(before.get(b"ns/k"), Ok(None));
     assert_eq!(before.revision("ns"), Ok(None));
@@ -120,26 +127,33 @@ pub fn data_and_revision_commit_together(h: &mut impl Harness) {
 
     // A reader must never see a revision without its data, or the reverse.
     const WRITES: u64 = 200;
-    std::thread::scope(|s| {
-        s.spawn(|| {
+    let writer = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        async move {
             for revision in 2..=WRITES {
                 let mut batch = WriteBatch::default();
                 batch
                     .put(*b"ns/k", revision.to_string())
                     .set_revision("ns", revision);
                 engine.write(batch).unwrap();
-            }
-        });
-        loop {
-            let snapshot = engine.snapshot().unwrap();
-            let revision = snapshot.revision("ns").unwrap().unwrap();
-            let value = snapshot.get(b"ns/k").unwrap().unwrap();
-            assert_eq!(value, revision.to_string().into_bytes());
-            if revision == WRITES {
-                break;
+                tokio::task::yield_now().await;
             }
         }
     });
+    while !writer.is_finished() {
+        let snapshot = engine.snapshot().unwrap();
+        let revision = snapshot.revision("ns").unwrap().unwrap();
+        let value = snapshot.get(b"ns/k").unwrap().unwrap();
+        assert_eq!(value, revision.to_string().into_bytes());
+        drop(snapshot);
+        tokio::task::yield_now().await;
+    }
+    writer.await.unwrap();
+    assert_eq!(engine.revision("ns"), Ok(Some(WRITES)));
+    assert_eq!(
+        get(&*engine, b"ns/k"),
+        Some(WRITES.to_string().into_bytes())
+    );
 }
 
 pub fn revisions_are_per_name_and_outside_key_space(h: &mut impl Harness) {
