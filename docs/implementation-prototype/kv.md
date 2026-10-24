@@ -121,10 +121,10 @@ Example:
 {
   "dataset": "quicksilver",
   "namespace": "infrastructure",
-  "replication": "global",
+  "replication": "full_replica",
   "cache": {
     "l1_recent_window_seconds": 60,
-    "l2_eviction": true,
+    "l2_eviction": false,
     "pinned_prefixes": [
       "critical/ownership/",
       "critical/routing/"
@@ -133,7 +133,8 @@ Example:
 }
 ```
 
-Pinned records are protected against normal cache eviction.
+Pinned records are protected against normal cache eviction. Under `full_replica` nothing is evicted from L2, so pins keep
+critical records in each node's L1.
 
 ## 5. Docker Deployment
 
@@ -438,7 +439,7 @@ The writer sends each event once per region; each cell receives it over a short 
 - Every node and every CDN process holds one long-lived connection to a relay in its cell, with one logical stream per channel.
 - Failover walks the upstream list and resumes from the cursor. Duplicates and gaps are handled by the ordered applier.
 - Subscriptions propagate up the tree with counts, so a tier only receives namespaces that someone below it wants.
-- Fan-out is routed by `(namespace, bucket)`: L2 events go to the bucket's owners, not to every node. This includes `global` and
+- Fan-out is routed by `(namespace, bucket)`: L2 events go to the bucket's owners, not to every node. This includes `global` data and
   `full_replica` data such as Quicksilver, which is spread across each cell's L2 buckets (§3), never held whole on one node.
 - Each event is encoded once and shared by all subscribers. A subscriber whose bounded queue fills is disconnected and catches up from replay.
 
@@ -516,7 +517,8 @@ Example: a D1 database changes ownership.
 8. Applied revisions are committed atomically.
 9. Leaves acknowledge progress.
 
-Older unpinned values may eventually be evicted under `global`.
+Quicksilver is `full_replica`: every datacenter keeps the complete namespace across its L2 nodes, so a lookup that misses
+L1 is one hop inside the cell and never falls through to the home region or L3.
 
 Critical ownership transitions use fencing epochs.
 

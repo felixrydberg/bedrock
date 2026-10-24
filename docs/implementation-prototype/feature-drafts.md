@@ -403,13 +403,14 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Infrastructure metadata needs a globally replicated, pinned store: routing, ownership (D1/DO/KV), system configuration,
+Infrastructure metadata needs a store that is complete in every datacenter: routing, ownership (D1/DO/KV), system configuration,
 and later deployment records written by the deploy control plane (B-50). The KV namespace directory (B-25) reads from it.
 Quicksilver is a KV dataset only: the CDN never reads it.
 
 **Describe the solution you'd like**
-- A `quicksilver` dataset with an `infrastructure` namespace and the `global` policy.
-- Pinned prefixes (`critical/ownership/`, `critical/routing/`) protected from eviction.
+- A `quicksilver` dataset with an `infrastructure` namespace and the `full_replica` policy: L2 never evicts it.
+  Coverage tracking and rebuild after node loss come with B-40.
+- Pinned prefixes (`critical/ownership/`, `critical/routing/`) kept in L1.
 - Generic metadata keys and values. Typed schemas for specific consumers (for example Worker deployment config) belong to
   those consumers, not to this dataset.
 - Ownership transitions use fencing epochs (B-09).
@@ -419,7 +420,7 @@ Quicksilver is a KV dataset only: the CDN never reads it.
 - **Module:** `kv/namespaces`.
 - **Doc reference:** `kv.md` §1, §4, §11; `notes.md` (Quicksilver).
 - **Depends on:** B-23.
-- **Acceptance criteria:** A metadata write in one region is visible in every region. Pinned keys survive eviction pressure. Stale-epoch ownership changes are rejected.
+- **Acceptance criteria:** A metadata write in one region is visible in every region. No Quicksilver key is evicted from L2, and pinned keys stay in L1, under eviction pressure. Stale-epoch ownership changes are rejected.
 
 ---
 
@@ -527,7 +528,7 @@ Namespaces need their configured policy to take effect. Caches also need a bound
 - `home_only`: forward remote reads to the home region.
 - Basic eviction based on storage pressure and access recency, respecting pinned prefixes.
 - Unsubscribe idle `on_demand` namespaces.
-- `full_replica` is out of scope here (B-40).
+- `full_replica` namespaces (Quicksilver) are never evicted from L2; their placement and completeness are B-40.
 
 **Additional context**
 - **Implementation:** KV.
@@ -630,17 +631,19 @@ This must not swamp relay traffic and must not duplicate fetches when many reque
 #### B-32 — `cdn` dataset and retention operations
 
 ```
-Title:  Feature 🚀: cdn dataset with regional retention namespaces and RETAIN/RELEASE operations
+Title:  Feature 🚀: cdn dataset with global retention namespaces and RETAIN/RELEASE operations
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Which artifacts each region keeps is declared through replicated retention state, not by tracking artifact locations globally.
+Which artifacts the CDN keeps is declared through replicated retention state, not by tracking artifact locations globally.
 This reuses the shared replication and sequencing infrastructure (`bedrock-api`, `bedrock-relay`), not KV itself.
 The `cdn` dataset belongs to the CDN: `bedrock-kv` never hosts or subscribes to it, just as `bedrock-cdn` never subscribes to a KV dataset.
 
 **Describe the solution you'd like**
-- A `cdn` dataset (B-06), with one retention namespace per region. It holds metadata only, never artifact bytes.
+- A `cdn` dataset (B-06) with global retention namespaces, replicated to every region. The deploy control plane (B-50) uses
+  `workers` and `pages`; the CDN treats namespace names as opaque. It holds metadata only, never artifact bytes, and its
+  records are never evicted.
 - The four retention operations are plain writes through `bedrock-api` (B-09). The write API and relays are generic over datasets
   and need no CDN code:
 
@@ -652,7 +655,7 @@ The `cdn` dataset belongs to the CDN: `bedrock-kv` never hosts or subscribes to 
   | `RELEASE_ARTIFACT` | `DELETE artifact/{sha256}` |
 
 - A client in `cdn/retention` with typed `retain_manifest(...)` etc. that turns calls into those writes.
-- `bedrock-cdn` subscribes to its region's retention namespace through the relays (B-10/B-17). Its apply hook (B-08):
+- `bedrock-cdn` subscribes to every retention namespace through the relays (B-10/B-17). Its apply hook (B-08):
   - expands manifests into artifact retention requirements
   - keeps reference counts shared across manifests
   - stores this derived state in a local `lib/storage` instance
@@ -689,7 +692,8 @@ The CDN is a backing service: it knows manifests and artifacts, never deployment
 - A publish client in `cdn/manifests`:
   1. Upload the artifacts.
   2. Upload the manifest.
-  3. `RETAIN_MANIFEST` (a write to the `cdn` dataset through `bedrock-api`, see B-32), so caching starts.
+  3. `RETAIN_MANIFEST` in the caller's retention namespace (a write to the `cdn` dataset through `bedrock-api`, see B-32),
+     so caching starts in every region.
   4. Return `manifest_hash` only once steps 1-3 have succeeded.
 - **Contract for callers:** a returned `manifest_hash` is stored and retained until the caller sends `RELEASE_MANIFEST`.
   Callers must write their own references to it (for example in Quicksilver) only after publishing, and remove them before
@@ -729,7 +733,7 @@ Applying `RETAIN_MANIFEST` must not make both cold holders independently downloa
 - If the first holder fails or times out, the second falls back to S3 using B-31's retries and timeouts.
   Artifact bytes use the existing bulk channel; relays continue carrying metadata.
 - A reconciler (B-20):
-  - desired = retained artifacts in my buckets
+  - desired = retained artifacts in my buckets, retained or read within the idle window (B-44)
   - actual = local inventory
   - repair = fetch via B-31
 - Publish local artifact availability to the regional directory (B-19), separate from ownership.
@@ -894,7 +898,8 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Some namespaces must be retained in full in every eligible datacenter. The working-set behaviour of `global` does not guarantee that.
+Some namespaces, starting with Quicksilver (B-24), must be retained in full in every eligible datacenter. Disabling L2 eviction
+keeps what arrived, but nothing yet guarantees coverage or rebuilds it after a node is lost.
 
 **Describe the solution you'd like**
 - `full_replica` placement so that every key of the namespace is held across the L2 nodes in each DC.
@@ -999,6 +1004,8 @@ Retention state must also recover cleanly after node and relay failures, without
 
 **Describe the solution you'd like**
 - Coordinated eviction when a refcount reaches zero, across both replicas.
+- Idle eviction: both L2 holders evict a retained artifact that has not been read within a configurable idle window, and
+  under storage pressure the least recently read first. S3 keeps it, it stays retained, and the next miss fetches it again.
 - S3 garbage collection with a grace period. GC deletes an S3 object only when:
   - it was released (its refcount reached zero), not merely never retained. Objects uploaded by a publish that has not reached
     `RETAIN_MANIFEST` yet (B-33 steps 1-2) are never candidates, and
@@ -1013,7 +1020,8 @@ Retention state must also recover cleanly after node and relay failures, without
 - **Module:** `cdn/retention`.
 - **Doc reference:** `cdn.md` §3 Declarative Retention, §4 Phase 3.
 - **Depends on:** B-43.
-- **Acceptance criteria:** An artifact that is still referenced is never deleted. Released artifacts are reclaimed within the grace window. State converges after a relay failure. An artifact uploaded by an in-progress publish is never deleted before its `RETAIN_MANIFEST` arrives. An artifact released by one manifest and retained by another during GC is kept.
+- **Acceptance criteria:** An artifact that is still referenced is never deleted from S3. An idle retained artifact leaves L2
+  after the idle window and is served from S3 on the next request. Released artifacts are reclaimed within the grace window. State converges after a relay failure. An artifact uploaded by an in-progress publish is never deleted before its `RETAIN_MANIFEST` arrives. An artifact released by one manifest and retained by another during GC is kept.
 
 ---
 
@@ -1055,7 +1063,7 @@ Hot artifacts gain from per-node caching. Retention driven only by manifests ign
 
 **Describe the solution you'd like**
 - An optional per-node L1 that caches independently, evicts automatically and is never replicated.
-- Separate protected L2 and evictable L1 storage areas.
+- Separate L2 and L1 storage areas; L1 evicts on its own, independently of L2 idle eviction (B-44).
 - Popularity signals feed into retention decisions.
 
 **Additional context**
@@ -1063,7 +1071,7 @@ Hot artifacts gain from per-node caching. Retention driven only by manifests ign
 - **Module:** `cdn/artifact_storage`, `cdn/retention`.
 - **Doc reference:** `cdn.md` §3 Artifact Storage and Regional L2, §4 Phase 4, Core Principle 4.
 - **Depends on:** B-44.
-- **Acceptance criteria:** L1 eviction never touches protected L2 data. The hit rate for popular assets improves.
+- **Acceptance criteria:** L1 eviction never touches L2 data. The hit rate for popular assets improves.
 
 ---
 
@@ -1136,7 +1144,8 @@ Something has to own the order, so that every intermediate state is safe and a f
 - Quicksilver schema, owned by this draft (typed accessors included): `deployment/{deployment_id} → {runtime settings, bindings,
   env/secret references, manifest_hash}` and `worker/{worker_id}/active → deployment_id`.
 - **Publish and activate**, in this order:
-  1. Publish the artifacts and manifest with the CDN publish client (B-33). It returns `manifest_hash` once uploaded and retained.
+  1. Publish the artifacts and manifest with the CDN publish client (B-33), into the `workers` or `pages` retention namespace.
+     It returns `manifest_hash` once uploaded and retained.
   2. *(Optional)* wait for manifest readiness (B-45).
   3. Write `deployment/{deployment_id}` to Quicksilver.
   4. Write `worker/{worker_id}/active` to make it live. Can be batched with step 3, or written later.
@@ -1144,7 +1153,7 @@ Something has to own the order, so that every intermediate state is safe and a f
   a deployment points at, and Compute never sees a deployment whose artifacts are not cached yet. A deploy that fails after step 1
   leaves a retained manifest that nothing uses (harmless, cleaned up by a retry or a release).
 - **Rollback:** write a previous `deployment_id` to `worker/{worker_id}/active`. Keep the N previous deployments' manifests retained,
-  so a rollback is served from L2.
+  so a rollback within the idle window (B-44) is served from L2; an older one fetches from S3.
 - **Delete** runs in reverse: remove `deployment/{deployment_id}` (it must not be active), then `RELEASE_MANIFEST`.
 - Every step is idempotent, keyed by `deployment_id`.
 
@@ -1153,7 +1162,7 @@ Something has to own the order, so that every intermediate state is safe and a f
 - **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §3 Deployment Integration.
 - **Depends on:** B-24, B-33, B-45.
 - **Acceptance criteria:** Killing the control plane between any two steps and rerunning the deploy produces the same end state.
-  No Quicksilver deployment ever references an unretained manifest. A rollback serves the old version with no S3 fallback.
+  No Quicksilver deployment ever references an unretained manifest. A rollback to a deployment read within the idle window serves the old version with no S3 fallback.
 
 ---
 
