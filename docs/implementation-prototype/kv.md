@@ -497,8 +497,9 @@ Cache-fill messages may be dropped under load.
 
 An older cache fill must never overwrite a newer value or an applied delete. A fill carries the sequence its source
 had applied, which must be at least the receiver's own applied sequence for the namespace. The receiver inserts it
-only once it has applied up to that sequence itself; until then it waits, or drops the fill like any fill under load.
-Later events then apply on top in order.
+only when its current applied sequence exactly matches the fill's source sequence; until then it waits, or drops the
+fill like any fill under load. If the receiver has advanced beyond that sequence, it discards the fill, even if it
+accepted the fill earlier. Later events then apply on top in order.
 
 ### Relay Failure Handling
 
