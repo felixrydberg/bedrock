@@ -11,13 +11,18 @@ hyper.workspace = true
 hyper-util.workspace = true
 prometheus-client.workspace = true
 serde.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 # RocksDB runs real threads and files, so simulation builds use the in-memory engine (B-23a).
+# The simulated S3 SDK lacks conditional writes and checksums, so simulation builds use the in-memory store (B-07).
+# In normal builds the shim re-exports the real `aws-sdk-s3`.
 [target.'cfg(not(madsim))'.dependencies]
+aws-sdk-s3.workspace = true
+base64.workspace = true
 rocksdb.workspace = true
 
 [dev-dependencies]

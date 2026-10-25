@@ -20,9 +20,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # librocksdb-sys (B-05) generates its bindings with bindgen, which needs libclang.
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      # S3 client contract tests (B-07) run against SeaweedFS, as in deploy/docker-compose.local.yml. Service containers
+      # cannot pass the `server -s3` command, so it starts here.
+      - run: docker run -d -p 8333:8333 chrislusf/seaweedfs:4.01 server -s3 -dir=/data
+      - name: Wait for SeaweedFS S3 gateway
+        run: |
+          if ! timeout 60s bash -c 'until curl --fail --silent --output /dev/null --max-time 2 http://127.0.0.1:8333; do sleep 1; done'; then
+            echo "::error::SeaweedFS S3 gateway at http://127.0.0.1:8333 did not respond within 60 seconds"
+            exit 1
+          fi
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+        env:
+          BEDROCK_TEST_S3_ENDPOINT: http://127.0.0.1:8333
 
   # Simulation build (B-23a): RocksDB is compiled out, so no libclang. rustdoc needs the cfg too, or doctests build
   # `bedrock-lib` without it against madsim-built dependencies.
