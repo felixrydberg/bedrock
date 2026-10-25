@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
+use bedrock_lib::datasets::Dataset;
 use bedrock_lib::node::{
     ApiConfig, Budget, Location, NodeConfig, RelayConfig, Role, ServiceConfig, Tier,
 };
@@ -45,6 +46,8 @@ const BUCKET: &str = "bedrock";
 struct Trace(Arc<Mutex<Vec<(u128, String)>>>, Instant);
 
 impl Trace {
+    // `tokio::time::Instant` is std's under madsim, which simulates its `now`.
+    #[allow(clippy::disallowed_methods)]
     fn new() -> Self {
         Trace(Arc::default(), Instant::now())
     }
@@ -79,11 +82,11 @@ fn node_config(name: &str, ip: &str) -> NodeConfig {
     }
 }
 
-fn service_config(node: NodeConfig, datasets: &[&str]) -> ServiceConfig {
+fn service_config(node: NodeConfig, datasets: &[Dataset]) -> ServiceConfig {
     ServiceConfig {
         node,
         roles: vec![Role::L1],
-        datasets: datasets.iter().map(|d| d.to_string()).collect(),
+        datasets: datasets.iter().map(|d| d.name.to_string()).collect(),
         relays: vec!["10.0.1.3:7000".into()],
         api: "10.0.1.4:7000".into(),
         s3_endpoint: format!("http://{S3}"),
