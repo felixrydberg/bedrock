@@ -37,7 +37,7 @@ pub struct Location {
 }
 
 /// Resource budgets for the process; unset means no limit.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Budget {
     pub cpus: Option<f64>,
     pub memory_mb: Option<u64>,
@@ -66,22 +66,14 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
-    /// Rejects configs that name no roles or relays, or datasets this binary does not host.
-    pub fn validate(&self, hosted_datasets: &[&str]) -> Result<(), ConfigError> {
+    /// Rejects configs that name no roles, datasets or relays. `datasets::Registry::open` rejects datasets this
+    /// binary does not host.
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.roles.is_empty() {
             return Err(ConfigError("roles must name at least one of l1, l2".into()));
         }
         if self.datasets.is_empty() {
             return Err(ConfigError("datasets must not be empty".into()));
-        }
-        if let Some(d) = self
-            .datasets
-            .iter()
-            .find(|d| !hosted_datasets.contains(&d.as_str()))
-        {
-            return Err(ConfigError(format!(
-                "dataset {d:?} is not hosted by this binary (hosted: {hosted_datasets:?})"
-            )));
         }
         if self.relays.is_empty() {
             return Err(ConfigError("relays must not be empty".into()));
@@ -243,20 +235,18 @@ mod tests {
             assert_eq!(c.node.location.cell, "eu-1b");
             assert_eq!(c.node.budget.memory_mb, Some(512));
             assert!(c.node.data_dir.is_dir());
-            c.validate(&["quicksilver", "kv", "auth"])
-                .map_err(|e| e.0)?;
+            c.validate().map_err(|e| e.0)?;
             Ok(())
         });
     }
 
     #[test]
-    fn rejects_foreign_dataset_and_empty_roles() {
+    fn rejects_empty_roles() {
         Jail::expect_with(|jail| {
             jail.create_file("bedrock.toml", KV_TOML)?;
             let mut c: ServiceConfig = load().map_err(|e| e.0)?;
-            assert!(c.validate(&["cdn"]).is_err());
             c.roles.clear();
-            assert!(c.validate(&["quicksilver", "kv"]).is_err());
+            assert!(c.validate().is_err());
             Ok(())
         });
     }

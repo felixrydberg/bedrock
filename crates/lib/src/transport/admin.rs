@@ -111,7 +111,9 @@ impl Admin {
 struct RuntimeTimer;
 
 impl hyper::rt::Timer for RuntimeTimer {
-    #[allow(clippy::useless_conversion)] // madsim's `Instant` is std's
+    // madsim's `Instant` is std's, and madsim simulates its `now`; the lints guard normal builds.
+    #[allow(clippy::useless_conversion)]
+    #[cfg_attr(madsim, allow(clippy::disallowed_methods))]
     fn now(&self) -> std::time::Instant {
         tokio::time::Instant::now().into()
     }
@@ -221,6 +223,7 @@ mod tests {
 
     #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
     #[cfg_attr(madsim, tokio::test)]
+    #[cfg_attr(madsim, allow(clippy::disallowed_methods))] // as on `RuntimeTimer::now`
     async fn timer_deadline_uses_runtime_clock() {
         use hyper::rt::Timer;
 

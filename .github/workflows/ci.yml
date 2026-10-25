@@ -34,3 +34,21 @@ jobs:
       - run: cargo test --workspace
         env:
           BEDROCK_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+
+  # Simulation build (B-23a): RocksDB is compiled out, so no libclang. rustdoc needs the cfg too, or doctests build
+  # `bedrock-lib` without it against madsim-built dependencies.
+  madsim:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg madsim -D warnings
+      RUSTDOCFLAGS: --cfg madsim
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: madsim
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

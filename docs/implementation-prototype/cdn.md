@@ -37,7 +37,7 @@ bedrock/
 - Implement Foyer as the initial cache backend.
 - Support filesystem storage as an alternative.
 - Maintain local artifact inventories and verify checksums.
-- Support protected L2 storage and optional unreplicated L1 caching.
+- Support L2 storage that evicts idle artifacts, and optional unreplicated L1 caching.
 
 ### Artifact Transfer
 
@@ -52,7 +52,8 @@ bedrock/
 Reuse KV's regional buckets and placement system (§9–10).
 
 - Map artifact hashes to virtual buckets.
-- Maintain two verified replicas per retained artifact.
+- Maintain two verified replicas per retained artifact while it is in use. Artifacts not read within a configurable idle
+  window are evicted from L2 and fetched from S3 again on the next miss.
 - Use existing placement and health infrastructure to select replica holders.
 - Track local artifact availability independently of bucket ownership.
 - Implement CDN-specific replica repair and bucket migration.
@@ -62,7 +63,8 @@ Reuse KV's regional buckets and placement system (§9–10).
 
 Reuse KV's replication and sequencing system (§8).
 
-- Introduce a `cdn` dataset with regional retention namespaces.
+- Introduce a `cdn` dataset with global retention namespaces, replicated to every region. The deploy control plane uses
+  `workers` and `pages`; the CDN treats namespace names as opaque. Retention records are never evicted.
 - Implement `RETAIN_MANIFEST`, `RELEASE_MANIFEST`, `RETAIN_ARTIFACT`, and `RELEASE_ARTIFACT`.
 - Expand manifests into artifact retention requirements.
 - Track shared artifact references across deployments.
@@ -98,7 +100,7 @@ Quicksilver. It publishes before it activates, and resolves which manifest is li
 *Requires KV Phases 2, 4, and 5.*
 
 - Register CDN with shared relays.
-- Implement regional retention streams.
+- Implement global retention streams.
 - Reuse bucket placement for artifact distribution.
 - Implement two-replica L2 storage.
 - Implement peer-to-peer transfers and fallback.
@@ -130,7 +132,7 @@ Quicksilver. It publishes before it activates, and resolves which manifest is li
 
 1. **Reuse KV's distributed infrastructure** for membership, health, relays, placement, and replication.
 2. **S3 remains authoritative** for artifact bytes.
-3. **L2 maintains two regional replicas** of retained artifacts.
+3. **L2 maintains two regional replicas** of retained artifacts in use; idle ones are evicted and refetched from S3.
 4. **L1 is optional and unreplicated.**
 5. **Replication streams describe desired retention**, not artifact bytes.
 6. **Relays coordinate communication**, while storage nodes transfer artifacts directly.

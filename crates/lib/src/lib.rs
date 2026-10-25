@@ -1,7 +1,7 @@
 //! Shared distributed core linked by every Bedrock binary.
 
 pub mod buckets {}
-pub mod datasets {}
+pub mod datasets;
 pub mod health {}
 pub mod membership {}
 pub mod node;
