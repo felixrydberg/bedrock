@@ -277,23 +277,22 @@ Internal cache partitioning or additional engine instances can be introduced lat
 
 Both datasets use the same event format.
 
-Each dataset has separate logical replication stream pools.
+**Sequence:** the only replication counter. It orders authoritative changes within one namespace, starting at 1, and
+reflects authoritative commit order. Other sections call it the namespace revision, or the revision.
+
+There is no dataset-wide or stream-wide counter. Each dataset has separate logical stream pools, but streams are only
+roads: a node merges every stream it receives, and ordering, gap detection and resume all use the per-namespace
+sequence.
 
 ```text
 quicksilver-0
-  seq 100 → infrastructure → SET placement/A
-  seq 101 → infrastructure → DELETE placement/B
+  infrastructure seq 408 → SET placement/A
+  infrastructure seq 409 → DELETE placement/B
 
 kv-0
-  seq 200 → store-A → SET foo
-  seq 201 → store-B → SET bar
+  store-A seq 550 → SET foo
+  store-B seq 12  → SET bar
 ```
-
-### Sequence Types
-
-**Stream sequence:** Orders transport events within a stream partition.
-
-**Namespace revision:** Orders authoritative changes within one namespace.
 
 An event contains:
 
@@ -302,24 +301,30 @@ An event contains:
   "dataset": "quicksilver",
   "namespace": "infrastructure",
   "stream": "quicksilver-0",
-  "sequence": 1052,
-  "namespace_revision": 408,
+  "sequence": 408,
   "epoch": 7,
+  "committed_at": 1761400000000,
   "operation": "SET",
   "key": "d1/123/owner",
   "value": "eu-node-7"
 }
 ```
 
-Namespace revisions reflect authoritative commit order.
-
 Replicas must:
 
-- Detect missing revisions.
+- Detect missing sequences.
 - Ignore duplicates.
 - Apply updates in order.
-- Atomically persist applied revisions with data changes.
+- Atomically persist applied sequences with data changes.
 - Recover missing history from relays or authoritative storage.
+
+A subscriber resumes by exchanging heads: on reconnect the relay sends the latest sequence per namespace in the
+subscribed buckets, and the node requests what it has not applied. This also covers namespaces created while it was
+disconnected.
+
+A delete travels as an ordered `DELETE` event like any other change. The stream needs no separate tombstone records,
+because events apply strictly in order. Deletes are recorded locally only where a node must answer "not found"
+without a network round trip (the KV read path's negative caching).
 
 Independent namespaces do not require shared total ordering.
 
@@ -490,7 +495,11 @@ Fills are never broadcast to every node (that grows as O(N²) with cell size) an
 
 Cache-fill messages may be dropped under load.
 
-An older cache fill must never overwrite a newer value or deletion tombstone.
+An older cache fill must never overwrite a newer value or an applied delete. A fill carries the sequence its source
+had applied, which must be at least the receiver's own applied sequence for the namespace. The receiver inserts it
+only when its current applied sequence exactly matches the fill's source sequence; until then it waits, or drops the
+fill like any fill under load. If the receiver has advanced beyond that sequence, it discards the fill, even if it
+accepted the fill earlier. Later events then apply on top in order.
 
 ### Relay Failure Handling
 
@@ -591,10 +600,12 @@ Snapshots use an engine-neutral logical format containing:
 
 - Keys and values.
 - Revisions.
-- Tombstones.
 - Snapshot boundaries.
 - Required recovery metadata.
 - Integrity checksums.
+
+A full snapshot holds only live keys and no tombstones. Deletes after its boundary come from the replayed log, in
+order, so a deleted key cannot come back.
 
 RocksDB and SurrealKV must be able to restore equivalent logical state.
 
@@ -751,7 +762,7 @@ Recovered records must be validated using:
 - Checksums.
 - Namespace revisions.
 - Writer epochs.
-- Versioned tombstones.
+- Ordered `DELETE` events, replayed strictly after the snapshot boundary.
 - Verified snapshot boundaries.
 - Authoritative freshness requirements.
 
@@ -820,7 +831,8 @@ The system provides:
 - Missing-revision detection.
 - Atomic data and cursor commits.
 - Writer epochs and fencing.
-- Versioned tombstones.
+- Deletes as ordered `DELETE` events; local not-found records only for negative caching on the KV read path.
+- Cache fills only from sources at least as far along as the receiver.
 - Durable snapshot and log recovery.
 - Independent downstream progress.
 - Minimum-revision read options.
@@ -917,7 +929,7 @@ Add `full_replica` placement, adaptive cache promotion, regional load balancing,
 13. **Local cache failures trigger automatic fallback and rebuilding.**
 14. **Unhealthy storage is isolated without unnecessarily disabling unrelated services.**
 15. **L2 bucket ownership is redistributed when cache nodes fail.**
-16. **Recovered data is validated against revisions, checksums, epochs, and tombstones.**
+16. **Recovered data is validated against revisions, checksums, epochs, and snapshot boundaries.**
 17. **L1/L2 caches are disposable; authoritative durable history is not.**
 18. **Replication correctness and recovery guarantees remain independent of the storage adapter.**
 
