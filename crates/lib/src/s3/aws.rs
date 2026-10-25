@@ -90,7 +90,7 @@ impl ObjectStore for S3Store {
             .key(key)
             .checksum_sha256(BASE64.encode(sum))
             .metadata(CHECKSUM_META, hex(&sum))
-            .body(ByteStream::from(body));
+            .body(ByteStream::from(body.clone()));
         if mode == Put::Create {
             request = request.if_none_match("*");
         }
@@ -98,18 +98,28 @@ impl ObjectStore for S3Store {
             Ok(_) => Ok(()),
             Err(e) if status(&e) == Some(412) => {
                 // The key exists. It may hold our own body from an earlier attempt whose response was lost.
-                let head = self
+                let existing = self
                     .client
-                    .head_object()
+                    .get_object()
                     .bucket(&self.bucket)
                     .key(key)
                     .send()
                     .await
                     .map_err(|e| classify(key, e))?;
-                match head.metadata().and_then(|m| m.get(CHECKSUM_META)) {
-                    Some(stored) if *stored == hex(&sum) => Ok(()),
-                    _ => Err(S3Error::AlreadyExists { key: key.into() }),
+                if existing.metadata().and_then(|m| m.get(CHECKSUM_META)) == Some(&hex(&sum)) {
+                    let stored =
+                        existing
+                            .body
+                            .collect()
+                            .await
+                            .map_err(|e| S3Error::Unavailable {
+                                detail: format!("{key}: reading body: {e}"),
+                            })?;
+                    if stored.into_bytes().as_ref() == body {
+                        return Ok(());
+                    }
                 }
+                Err(S3Error::AlreadyExists { key: key.into() })
             }
             Err(e) => Err(classify(key, e)),
         }

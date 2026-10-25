@@ -101,6 +101,15 @@ pub async fn corruption_is_an_error_not_a_miss(h: &mut impl Harness) {
         matches!(&got, Err(S3Error::Corruption { key, .. }) if key == "k"),
         "{got:?}"
     );
+    // Matching checksum metadata alone must not make a create retry succeed.
+    assert_eq!(
+        store.put("k", bytes("value"), Put::Create).await,
+        Err(S3Error::AlreadyExists { key: "k".into() })
+    );
+    assert!(matches!(
+        store.get("k").await,
+        Err(S3Error::Corruption { .. })
+    ));
     // Rewriting the key repairs it.
     store
         .put("k", bytes("value"), Put::Overwrite)

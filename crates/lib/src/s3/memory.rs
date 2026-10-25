@@ -49,7 +49,7 @@ impl ObjectStore for MemoryStore {
         if mode == Put::Create
             && let Some(existing) = objects.get(key)
         {
-            return if existing.sha256 == sha256 {
+            return if existing.body == body {
                 Ok(())
             } else {
                 Err(S3Error::AlreadyExists { key: key.into() })
