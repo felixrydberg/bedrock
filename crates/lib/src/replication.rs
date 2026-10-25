@@ -217,10 +217,13 @@ impl<H: ApplyHook> Applier<H> {
             }),
         };
         let sequence = event.sequence;
-        if sequence <= progress.applied || progress.pending.contains_key(&sequence) {
+        if sequence <= progress.applied {
             return Ok(Outcome::Duplicate);
         }
-        progress.pending.insert(sequence, event);
+        // A redelivered buffered event keeps the buffered copy but still drains, so it retries a failed commit.
+        let redelivered = progress.pending.contains_key(&sequence);
+        progress.pending.entry(sequence).or_insert(event);
+        let applied_before = progress.applied;
 
         while let Some(entry) = progress.pending.first_entry()
             && *entry.key() == progress.applied + 1
@@ -240,6 +243,9 @@ impl<H: ApplyHook> Applier<H> {
             progress.applied += 1;
         }
 
+        if redelivered && progress.applied == applied_before {
+            return Ok(Outcome::Duplicate);
+        }
         Ok(match progress.pending.first_key_value() {
             None => Outcome::Applied(progress.applied),
             Some((&next, _)) => Outcome::Gap {
@@ -510,6 +516,43 @@ mod tests {
         let applier = new_applier(engine.clone(), keyspace());
         assert_eq!(applier.applied("ns"), Ok(4));
         assert_eq!(applier.applied("unknown"), Ok(0));
+    }
+
+    #[test]
+    fn redelivery_retries_a_failed_commit() {
+        /// Fails its first call, then behaves like `keyspace()`.
+        struct FailOnce(bool, Keyspace);
+
+        impl ApplyHook for FailOnce {
+            fn apply(
+                &mut self,
+                engine: &dyn StorageEngine,
+                e: &Event,
+                batch: &mut WriteBatch,
+            ) -> StorageResult<()> {
+                if !std::mem::replace(&mut self.0, true) {
+                    return Err(StorageError::IoError(ErrorContext {
+                        engine: "test",
+                        instance: "kv".into(),
+                        file: None,
+                        partition: None,
+                        detail: "transient".into(),
+                    }));
+                }
+                self.1.apply(engine, e, batch)
+            }
+        }
+
+        let engine = Arc::new(MemoryEngine::new("kv"));
+        let mut applier = new_applier(engine.clone(), FailOnce(false, keyspace()));
+        assert!(matches!(
+            applier.offer(ev("ns", 1)),
+            Err(ApplyError::Storage(_))
+        ));
+        assert_eq!(applier.backlog().collect::<Vec<_>>(), [("ns", 1)]);
+        assert_eq!(applier.offer(ev("ns", 1)), Ok(Outcome::Applied(1)));
+        assert_eq!(revisions(&engine), BTreeMap::from([("ns".into(), 1)]));
+        assert_eq!(applier.backlog().count(), 0);
     }
 
     #[test]

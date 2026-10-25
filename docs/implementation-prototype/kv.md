@@ -322,8 +322,9 @@ A subscriber resumes by exchanging heads: on reconnect the relay sends the lates
 subscribed buckets, and the node requests what it has not applied. This also covers namespaces created while it was
 disconnected.
 
-The replication stream needs no tombstones, because events apply strictly in order. Deletes are recorded locally
-only where a node must answer "not found" without a network round trip (the KV read path's negative caching).
+A delete travels as an ordered `DELETE` event like any other change. The stream needs no separate tombstone records,
+because events apply strictly in order. Deletes are recorded locally only where a node must answer "not found"
+without a network round trip (the KV read path's negative caching).
 
 Independent namespaces do not require shared total ordering.
 
