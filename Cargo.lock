@@ -613,15 +613,18 @@ dependencies = [
 name = "bedrock-lib"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "figment",
  "http-body-util",
  "hyper 1.12.0",
  "hyper-util",
+ "madsim-aws-sdk-s3",
  "madsim-tokio",
  "madsim-tonic",
  "prometheus-client",
  "rocksdb",
  "serde",
+ "sha2 0.10.9",
  "tempfile",
  "tracing",
  "tracing-subscriber",

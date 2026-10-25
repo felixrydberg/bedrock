@@ -212,7 +212,7 @@ mod tests {
         datasets = ["quicksilver", "kv"]
         relays = ["relay-1:7300"]
         api = "api:7000"
-        s3_endpoint = "http://minio:9000"
+        s3_endpoint = "http://s3:8333"
 
         [location]
         region = "eu"
