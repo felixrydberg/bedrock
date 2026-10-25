@@ -42,7 +42,7 @@ const fn dataset(
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-kv");
-    let _datasets = Registry::open(DATASETS, &config.datasets, |d| {
+    let datasets = Registry::open(DATASETS, &config.datasets, |d| {
         datasets::open_engine(&config.node.data_dir, d)
     })?;
     // ponytail: role subsystems don't exist yet; each starts here as its issue lands.
@@ -50,7 +50,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         tracing::info!(?role, "role enabled");
     }
     let admin = node::start_admin(&config.node).await?;
-    admin.set_ready(true);
+    admin.set_ready(datasets.is_healthy());
     node::shutdown_signal().await;
     admin.set_ready(false);
     tracing::info!("shutting down");

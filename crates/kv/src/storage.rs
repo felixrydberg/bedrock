@@ -16,8 +16,11 @@ pub enum Keyspace {
 
 impl Keyspace {
     /// Every key of `namespace` in this keyspace starts with this; use it with `KeyRange::prefix`.
+    ///
+    /// # Panics
+    /// Panics if `namespace` contains NUL.
     pub fn prefix(self, namespace: &str) -> Vec<u8> {
-        debug_assert!(!namespace.contains('\0'), "namespace ID contains NUL");
+        assert!(!namespace.contains('\0'), "namespace ID contains NUL");
         let mut out = match self {
             Keyspace::L1 => b"l1/".to_vec(),
             Keyspace::L2 { bucket } => [b"l2/".as_slice(), &bucket.to_be_bytes(), b"/"].concat(),
@@ -37,6 +40,13 @@ impl Keyspace {
 mod tests {
     use super::*;
     use bedrock_lib::storage::KeyRange;
+
+    #[test]
+    fn rejects_nul_in_namespace_for_every_keyspace() {
+        for ks in [Keyspace::L1, Keyspace::L2 { bucket: 7 }, Keyspace::Meta] {
+            assert!(std::panic::catch_unwind(|| ks.prefix("ns\0other")).is_err());
+        }
+    }
 
     #[test]
     fn namespace_prefix_excludes_nested_namespace() {

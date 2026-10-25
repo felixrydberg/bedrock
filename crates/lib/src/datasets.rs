@@ -91,12 +91,33 @@ pub struct Dataset {
 /// An isolated store inside a dataset. Namespaces share their dataset's engine instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Namespace {
-    pub id: String,
+    id: String,
     pub home_region: String,
     pub quotas: Quotas,
     // ponytail: opaque grants until Auth (B-37) defines their shape.
     pub permissions: Vec<String>,
     pub overrides: PolicyOverrides,
+}
+
+impl Namespace {
+    /// Creates a namespace whose ID cannot contain the keyspace separator, NUL.
+    pub fn new(id: impl Into<String>, home_region: impl Into<String>) -> Result<Self, ConfigError> {
+        let id = id.into();
+        if id.contains('\0') {
+            return Err(ConfigError("namespace ID contains NUL".into()));
+        }
+        Ok(Self {
+            id,
+            home_region: home_region.into(),
+            quotas: Quotas::default(),
+            permissions: Vec::new(),
+            overrides: PolicyOverrides::default(),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 /// Unset means no limit.
@@ -161,6 +182,16 @@ impl Registry {
     pub fn iter(&self) -> impl Iterator<Item = &Instance> {
         self.instances.values()
     }
+
+    /// Ready only when every enabled dataset opened successfully and can serve reads and writes.
+    pub fn is_healthy(&self) -> bool {
+        self.iter().all(|instance| {
+            instance
+                .engine
+                .as_ref()
+                .is_ok_and(|engine| engine.health().is_ok())
+        })
+    }
 }
 
 /// The node's engine for `dataset`: RocksDB in `data_dir/{dataset}`, or in memory in simulation builds, which compile
@@ -185,7 +216,17 @@ pub fn open_engine(data_dir: &Path, dataset: &Dataset) -> StorageResult<Arc<dyn 
 mod tests {
     use super::*;
     use crate::storage::memory::MemoryEngine;
-    use crate::storage::{ErrorContext, StorageError};
+    use crate::storage::{
+        ErrorContext, KeyRange, Scan, Snapshot, StorageError, StorageStats, WriteBatch,
+    };
+
+    #[test]
+    fn namespace_ids_are_nul_free() {
+        let ns = Namespace::new("customer-123/store-A", "eu").unwrap();
+        assert_eq!(ns.id(), "customer-123/store-A");
+        assert_eq!(ns.home_region, "eu");
+        assert!(Namespace::new("customer-123\0store-A", "eu").is_err());
+    }
 
     fn dataset(name: &'static str) -> Dataset {
         Dataset {
@@ -281,6 +322,7 @@ mod tests {
         let names: Vec<_> = r.iter().map(|i| i.dataset.name).collect();
         assert_eq!(names, ["kv", "quicksilver"]);
         assert!(r.get("auth").is_none());
+        assert!(r.is_healthy());
 
         let engine = |name| r.get(name).unwrap().engine.as_ref().unwrap();
         engine("kv").put(b"k", b"v").unwrap();
@@ -306,6 +348,58 @@ mod tests {
         .unwrap();
         assert!(r.get("kv").unwrap().engine.is_err());
         assert!(r.get("quicksilver").unwrap().engine.is_ok());
+        assert!(!r.is_healthy());
+        let healthy = r.get("quicksilver").unwrap().engine.as_ref().unwrap();
+        healthy.put(b"k", b"v").unwrap();
+        assert_eq!(healthy.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn opened_but_unhealthy_engine_prevents_readiness() {
+        struct Unhealthy;
+
+        impl StorageEngine for Unhealthy {
+            fn get(&self, _: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+                unreachable!()
+            }
+            fn scan(&self, _: &KeyRange) -> StorageResult<Scan<'_>> {
+                unreachable!()
+            }
+            fn write(&self, _: WriteBatch) -> StorageResult<()> {
+                unreachable!()
+            }
+            fn revision(&self, _: &str) -> StorageResult<Option<u64>> {
+                unreachable!()
+            }
+            fn snapshot(&self) -> StorageResult<Box<dyn Snapshot + '_>> {
+                unreachable!()
+            }
+            fn restore(&self, _: &dyn Snapshot) -> StorageResult<()> {
+                unreachable!()
+            }
+            fn stats(&self) -> StorageResult<StorageStats> {
+                unreachable!()
+            }
+            fn disk_usage(&self) -> StorageResult<u64> {
+                unreachable!()
+            }
+            fn health(&self) -> StorageResult<()> {
+                Err(StorageError::Unavailable(ErrorContext {
+                    engine: "test",
+                    instance: "cdn".into(),
+                    file: None,
+                    partition: None,
+                    detail: "unhealthy after opening".into(),
+                }))
+            }
+        }
+
+        let r = Registry::open(&[dataset("cdn")], &["cdn".into()], |_| {
+            Ok(Arc::new(Unhealthy))
+        })
+        .unwrap();
+        assert!(r.get("cdn").unwrap().engine.is_ok());
+        assert!(!r.is_healthy());
     }
 
     #[test]

@@ -733,7 +733,7 @@ Applying `RETAIN_MANIFEST` must not make both cold holders independently downloa
 - If the first holder fails or times out, the second falls back to S3 using B-31's retries and timeouts.
   Artifact bytes use the existing bulk channel; relays continue carrying metadata.
 - A reconciler (B-20):
-  - desired = retained artifacts in my buckets, retained or read within the idle window (B-44)
+  - desired = retained artifacts in my buckets only when read within the idle window (B-44); initial retention prewarming remains separate
   - actual = local inventory
   - repair = fetch via B-31
 - Publish local artifact availability to the regional directory (B-19), separate from ownership.
@@ -1150,10 +1150,11 @@ Something has to own the order, so that every intermediate state is safe and a f
   3. Write `deployment/{deployment_id}` to Quicksilver.
   4. Write `worker/{worker_id}/active` to make it live. Can be batched with step 3, or written later.
 - **Why this order:** Quicksilver only ever names manifests that exist and are retained, so CDN GC (B-44) cannot delete artifacts
-  a deployment points at, and Compute never sees a deployment whose artifacts are not cached yet. A deploy that fails after step 1
+  a deployment points at. A deploy that fails after step 1
   leaves a retained manifest that nothing uses (harmless, cleaned up by a retry or a release).
-- **Rollback:** write a previous `deployment_id` to `worker/{worker_id}/active`. Keep the N previous deployments' manifests retained,
-  so a rollback within the idle window (B-44) is served from L2; an older one fetches from S3.
+- **Rollback:** write a previous `deployment_id` to `worker/{worker_id}/active`. Keep the N previous deployments' manifests retained.
+  Only requested artifacts that remain warm within the idle window (B-44) are guaranteed to be served from L2; cold artifacts may
+  fetch from S3 unless the full manifest was prewarmed (B-45). Reading the deployment record does not warm its full manifest.
 - **Delete** runs in reverse: remove `deployment/{deployment_id}` (it must not be active), then `RELEASE_MANIFEST`.
 - Every step is idempotent, keyed by `deployment_id`.
 
@@ -1162,7 +1163,8 @@ Something has to own the order, so that every intermediate state is safe and a f
 - **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §3 Deployment Integration.
 - **Depends on:** B-24, B-33, B-45.
 - **Acceptance criteria:** Killing the control plane between any two steps and rerunning the deploy produces the same end state.
-  No Quicksilver deployment ever references an unretained manifest. A rollback to a deployment read within the idle window serves the old version with no S3 fallback.
+  No Quicksilver deployment ever references an unretained manifest. Rollback requests for artifacts that remain warm within the
+  idle window need no S3 fallback; cold artifacts may require S3 unless the full manifest is prewarmed.
 
 ---
 

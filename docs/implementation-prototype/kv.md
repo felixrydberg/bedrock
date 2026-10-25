@@ -518,7 +518,8 @@ Example: a D1 database changes ownership.
 9. Leaves acknowledge progress.
 
 Quicksilver is `full_replica`: every datacenter keeps the complete namespace across its L2 nodes, so a lookup that misses
-L1 is one hop inside the cell and never falls through to the home region or L3.
+L1 is one hop inside the cell while local L2 is healthy. If local L2 is unavailable, the lookup can fall through to healthy
+peers, the home region, or L3.
 
 Critical ownership transitions use fencing epochs.
 
