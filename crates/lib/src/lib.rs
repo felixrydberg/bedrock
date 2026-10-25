@@ -2,7 +2,7 @@
 
 pub mod buckets {}
 pub mod datasets;
-pub mod health {}
+pub mod health;
 pub mod membership {}
 pub mod node;
 pub mod placement {}
