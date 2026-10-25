@@ -3,6 +3,7 @@
 ## Find the relevant context
 
 - For issue work, fetch the current issue and relevant dependencies with `gh issue view <number> --repo felixrydberg/bedrock`. Keep GitHub numbers and plan IDs together (for example, #26 / B-23a).
+- When assigned an issue, search repository comments, TODOs and FIXMEs for both its GitHub issue number and plan ID (for example, #26 and B-23a), and read the issue's discussion with `gh issue view <number> --repo felixrydberg/bedrock --comments`. Identify features or integration work explicitly deferred until this task is complete. Implement and test that deferred work as part of the task when its prerequisites are satisfied; report any remaining blockers or conflicts with the issue's scope.
 - Use the issue for scope and acceptance criteria; use `docs/implementation-prototype/feature-drafts.md` sections 1 and 4 for agreed architecture and section 2 for the dependency table. Later, uncreated work remains a draft.
 - Explicit user decisions take precedence. Report contradictions before implementing affected behavior; continue independent work where the intended behavior is clear. Do not silently resolve conflicting requirements by inventing a design.
 - Read only the documents needed: `kv.md` for storage/replication/read semantics, `cdn.md` for artifacts/retention, `code-structure.md` for module responsibilities, and `notes.md` for early product context. These files are under `docs/implementation-prototype/`.
