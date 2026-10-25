@@ -50,7 +50,7 @@ impl ObjectStore for MemoryStore {
             && let Some(existing) = objects.get(key)
         {
             return if existing.body == body {
-                Ok(())
+                verify(key, body, Some(&existing.sha256)).map(|_| ())
             } else {
                 Err(S3Error::AlreadyExists { key: key.into() })
             };
@@ -77,7 +77,7 @@ impl ObjectStore for MemoryStore {
 
 #[cfg(test)]
 mod tests {
-    use super::MemoryStore;
+    use super::*;
     use crate::s3::contract::{Harness, s3_contract};
 
     struct Memory;
@@ -95,4 +95,19 @@ mod tests {
     }
 
     s3_contract!(Memory);
+
+    #[tokio::test]
+    async fn create_retry_rejects_invalid_checksum() {
+        let store = MemoryStore::default();
+        let body = b"value".to_vec();
+        store.put("k", body.clone(), Put::Create).await.unwrap();
+        store.lock().get_mut("k").unwrap().sha256 = "invalid".into();
+
+        let got = store.put("k", body, Put::Create).await;
+        assert!(matches!(got, Err(S3Error::Corruption { .. })), "{got:?}");
+        assert!(matches!(
+            store.get("k").await,
+            Err(S3Error::Corruption { .. })
+        ));
+    }
 }

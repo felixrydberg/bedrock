@@ -25,10 +25,12 @@ const CHECKSUM_META: &str = "sha256";
 pub struct S3Store {
     client: Client,
     bucket: String,
+    attempt_timeout: Duration,
 }
 
 impl S3Store {
     pub fn new(config: &S3Config) -> Self {
+        let attempt_timeout = Duration::from_millis(config.attempt_timeout_ms);
         let sdk = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .endpoint_url(&config.endpoint)
@@ -44,7 +46,7 @@ impl S3Store {
             .retry_config(RetryConfig::standard().with_max_attempts(config.max_attempts))
             .timeout_config(
                 TimeoutConfig::builder()
-                    .operation_attempt_timeout(Duration::from_millis(config.attempt_timeout_ms))
+                    .operation_attempt_timeout(attempt_timeout)
                     .build(),
             )
             // The store sends and checks its own SHA-256. The SDK's default CRC32 trailers would only duplicate it,
@@ -55,6 +57,7 @@ impl S3Store {
         S3Store {
             client: Client::from_conf(sdk),
             bucket: config.bucket.clone(),
+            attempt_timeout,
         }
     }
 }
@@ -108,10 +111,11 @@ impl ObjectStore for S3Store {
                     .map_err(|e| classify(key, e))?;
                 if existing.metadata().and_then(|m| m.get(CHECKSUM_META)) == Some(&hex(&sum)) {
                     let stored =
-                        existing
-                            .body
-                            .collect()
+                        tokio::time::timeout(self.attempt_timeout, existing.body.collect())
                             .await
+                            .map_err(|_| S3Error::Unavailable {
+                                detail: format!("{key}: reading body: timed out"),
+                            })?
                             .map_err(|e| S3Error::Unavailable {
                                 detail: format!("{key}: reading body: {e}"),
                             })?;
@@ -195,6 +199,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
 
     use super::*;
     use crate::s3::contract::{Harness, s3_contract};
@@ -296,5 +303,65 @@ mod tests {
         let store = S3Store::new(&config("http://127.0.0.1:1".into(), "b".into()));
         let got = store.get("k").await;
         assert!(matches!(got, Err(S3Error::Unavailable { .. })), "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn create_retry_body_timeout_and_read_error_are_unavailable() {
+        for stall in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = config(
+                format!("http://{}", listener.local_addr().unwrap()),
+                "b".into(),
+            );
+            config.max_attempts = 1;
+            config.attempt_timeout_ms = 1_000;
+            let store = S3Store::new(&config);
+            let server = tokio::spawn(async move {
+                for method in ["PUT", "GET"] {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    let mut request = String::new();
+                    while !request.ends_with("\r\n\r\n") {
+                        assert_ne!(stream.read_line(&mut request).await.unwrap(), 0);
+                    }
+                    assert!(request.starts_with(method), "{request}");
+                    if method == "PUT" {
+                        stream.read_exact(&mut [0; 5]).await.unwrap();
+                        stream.get_mut().write_all(
+                            b"HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        ).await.unwrap();
+                    } else {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nx-amz-meta-sha256: {}\r\nConnection: close\r\n\r\nv",
+                            hex(&sha256(b"value")),
+                        );
+                        stream
+                            .get_mut()
+                            .write_all(response.as_bytes())
+                            .await
+                            .unwrap();
+                        stream.get_mut().flush().await.unwrap();
+                        // Keep the advertised body incomplete, either stalled or disconnected.
+                        if stall {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            });
+            let got = tokio::time::timeout(
+                Duration::from_secs(5),
+                store.put("k", b"value".to_vec(), Put::Create),
+            )
+            .await;
+            server.abort();
+            let got = got.expect("create retry did not bound its body read");
+            let Err(S3Error::Unavailable { detail }) = got else {
+                panic!("{got:?}");
+            };
+            assert!(detail.starts_with("k: reading body:"), "{detail}");
+            if stall {
+                assert!(detail.contains("timed out"), "{detail}");
+            }
+        }
     }
 }
