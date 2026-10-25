@@ -495,7 +495,10 @@ Fills are never broadcast to every node (that grows as O(N²) with cell size) an
 
 Cache-fill messages may be dropped under load.
 
-An older cache fill must never overwrite a newer value or deletion tombstone.
+An older cache fill must never overwrite a newer value or an applied delete. A fill carries the sequence its source
+had applied, which must be at least the receiver's own applied sequence for the namespace. The receiver inserts it
+only once it has applied up to that sequence itself; until then it waits, or drops the fill like any fill under load.
+Later events then apply on top in order.
 
 ### Relay Failure Handling
 
@@ -596,10 +599,12 @@ Snapshots use an engine-neutral logical format containing:
 
 - Keys and values.
 - Revisions.
-- Tombstones.
 - Snapshot boundaries.
 - Required recovery metadata.
 - Integrity checksums.
+
+A full snapshot holds only live keys and no tombstones. Deletes after its boundary come from the replayed log, in
+order, so a deleted key cannot come back.
 
 RocksDB and SurrealKV must be able to restore equivalent logical state.
 
@@ -756,7 +761,7 @@ Recovered records must be validated using:
 - Checksums.
 - Namespace revisions.
 - Writer epochs.
-- Versioned tombstones.
+- Ordered `DELETE` events, replayed strictly after the snapshot boundary.
 - Verified snapshot boundaries.
 - Authoritative freshness requirements.
 
@@ -825,7 +830,8 @@ The system provides:
 - Missing-revision detection.
 - Atomic data and cursor commits.
 - Writer epochs and fencing.
-- Versioned tombstones.
+- Deletes as ordered `DELETE` events; local not-found records only for negative caching on the KV read path.
+- Cache fills only from sources at least as far along as the receiver.
 - Durable snapshot and log recovery.
 - Independent downstream progress.
 - Minimum-revision read options.
@@ -922,7 +928,7 @@ Add `full_replica` placement, adaptive cache promotion, regional load balancing,
 13. **Local cache failures trigger automatic fallback and rebuilding.**
 14. **Unhealthy storage is isolated without unnecessarily disabling unrelated services.**
 15. **L2 bucket ownership is redistributed when cache nodes fail.**
-16. **Recovered data is validated against revisions, checksums, epochs, and tombstones.**
+16. **Recovered data is validated against revisions, checksums, epochs, and snapshot boundaries.**
 17. **L1/L2 caches are disposable; authoritative durable history is not.**
 18. **Replication correctness and recovery guarantees remain independent of the storage adapter.**
 
