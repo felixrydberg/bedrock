@@ -25,7 +25,7 @@ jobs:
       - run: docker run -d -p 8333:8333 chrislusf/seaweedfs:4.01 server -s3 -dir=/data
       - name: Wait for SeaweedFS S3 gateway
         run: |
-          if ! timeout 60s bash -c 'until curl --silent --output /dev/null --max-time 2 http://127.0.0.1:8333; do sleep 1; done'; then
+          if ! timeout 60s bash -c 'until curl --fail --silent --output /dev/null --max-time 2 http://127.0.0.1:8333; do sleep 1; done'; then
             echo "::error::SeaweedFS S3 gateway at http://127.0.0.1:8333 did not respond within 60 seconds"
             exit 1
           fi
