@@ -277,23 +277,22 @@ Internal cache partitioning or additional engine instances can be introduced lat
 
 Both datasets use the same event format.
 
-Each dataset has separate logical replication stream pools.
+**Sequence:** the only replication counter. It orders authoritative changes within one namespace, starting at 1, and
+reflects authoritative commit order. Other sections call it the namespace revision, or the revision.
+
+There is no dataset-wide or stream-wide counter. Each dataset has separate logical stream pools, but streams are only
+roads: a node merges every stream it receives, and ordering, gap detection and resume all use the per-namespace
+sequence.
 
 ```text
 quicksilver-0
-  seq 100 → infrastructure → SET placement/A
-  seq 101 → infrastructure → DELETE placement/B
+  infrastructure seq 408 → SET placement/A
+  infrastructure seq 409 → DELETE placement/B
 
 kv-0
-  seq 200 → store-A → SET foo
-  seq 201 → store-B → SET bar
+  store-A seq 550 → SET foo
+  store-B seq 12  → SET bar
 ```
-
-### Sequence Types
-
-**Stream sequence:** Orders transport events within a stream partition.
-
-**Namespace revision:** Orders authoritative changes within one namespace.
 
 An event contains:
 
@@ -302,24 +301,29 @@ An event contains:
   "dataset": "quicksilver",
   "namespace": "infrastructure",
   "stream": "quicksilver-0",
-  "sequence": 1052,
-  "namespace_revision": 408,
+  "sequence": 408,
   "epoch": 7,
+  "committed_at": 1761400000000,
   "operation": "SET",
   "key": "d1/123/owner",
   "value": "eu-node-7"
 }
 ```
 
-Namespace revisions reflect authoritative commit order.
-
 Replicas must:
 
-- Detect missing revisions.
+- Detect missing sequences.
 - Ignore duplicates.
 - Apply updates in order.
-- Atomically persist applied revisions with data changes.
+- Atomically persist applied sequences with data changes.
 - Recover missing history from relays or authoritative storage.
+
+A subscriber resumes by exchanging heads: on reconnect the relay sends the latest sequence per namespace in the
+subscribed buckets, and the node requests what it has not applied. This also covers namespaces created while it was
+disconnected.
+
+The replication stream needs no tombstones, because events apply strictly in order. Deletes are recorded locally
+only where a node must answer "not found" without a network round trip (the KV read path's negative caching).
 
 Independent namespaces do not require shared total ordering.
 

@@ -8,7 +8,7 @@ pub mod node;
 pub mod placement {}
 pub mod reconciliation {}
 pub mod relays {}
-pub mod replication {}
+pub mod replication;
 pub mod s3 {}
 pub mod storage;
 pub mod transport;
