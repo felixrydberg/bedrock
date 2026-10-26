@@ -2,6 +2,9 @@
 //!
 //! Every dataset, including `cdn` retention, replicates the same [`Event`]s. Operations are only `SET` and `DELETE`;
 //! what an event means locally is up to the dataset's [`ApplyHook`], so writers and relays stay generic.
+//! [`subscriptions`] carries events from a source's log to an applier (B-10).
+
+pub mod subscriptions;
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -136,9 +139,12 @@ pub struct Applier<H> {
     waiting_namespaces: Gauge,
 }
 
+/// Out-of-order events buffered per namespace. One that does not fit is dropped and reported as a gap, so the
+/// subscriber requests it again (B-10).
+pub const MAX_PENDING: usize = 4096;
+
 struct Progress {
     applied: u64,
-    // ponytail: unbounded; cap it once catch-up (B-10) can refill what a cap drops.
     pending: BTreeMap<u64, Event>,
 }
 
@@ -222,6 +228,17 @@ impl<H: ApplyHook> Applier<H> {
         }
         // A redelivered buffered event keeps the buffered copy but still drains, so it retries a failed commit.
         let redelivered = progress.pending.contains_key(&sequence);
+        if !redelivered && sequence != progress.applied + 1 && progress.pending.len() >= MAX_PENDING
+        {
+            let first = progress
+                .pending
+                .first_key_value()
+                .map_or(sequence, |(&s, _)| s);
+            return Ok(Outcome::Gap {
+                applied: progress.applied,
+                missing: progress.applied + 1..first.min(sequence),
+            });
+        }
         progress.pending.entry(sequence).or_insert(event);
         let applied_before = progress.applied;
 
@@ -253,6 +270,10 @@ impl<H: ApplyHook> Applier<H> {
                 missing: progress.applied + 1..next,
             },
         })
+    }
+
+    pub fn dataset(&self) -> &str {
+        &self.dataset
     }
 
     /// The last sequence applied to `namespace`, 0 if none.
@@ -516,6 +537,29 @@ mod tests {
         let applier = new_applier(engine.clone(), keyspace());
         assert_eq!(applier.applied("ns"), Ok(4));
         assert_eq!(applier.applied("unknown"), Ok(0));
+    }
+
+    #[test]
+    fn full_buffer_drops_and_redelivery_fills() {
+        let engine = Arc::new(MemoryEngine::new("kv"));
+        let mut applier = new_applier(engine.clone(), keyspace());
+        let last = MAX_PENDING as u64 + 1;
+        for sequence in 2..=last {
+            applier.offer(ev("ns", sequence)).unwrap();
+        }
+        let dropped = applier.offer(ev("ns", last + 1));
+        assert_eq!(
+            dropped,
+            Ok(Outcome::Gap {
+                applied: 0,
+                missing: 1..2
+            })
+        );
+        assert_eq!(applier.offer(ev("ns", 1)), Ok(Outcome::Applied(last)));
+        assert_eq!(
+            applier.offer(ev("ns", last + 1)),
+            Ok(Outcome::Applied(last + 1))
+        );
     }
 
     #[test]
