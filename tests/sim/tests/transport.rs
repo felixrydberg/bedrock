@@ -79,6 +79,7 @@ async fn exchange(server: &str) {
     // Request/response.
     let reply = peers
         .call(
+            server,
             Class::Control,
             TIMEOUT,
             client(Class::Control).send(msg(1, "ping")),
@@ -90,6 +91,7 @@ async fn exchange(server: &str) {
     // Server stream.
     let mut stream = peers
         .call(
+            server,
             Class::Control,
             TIMEOUT,
             client(Class::Control).watch(msg(100, "")),
@@ -99,7 +101,7 @@ async fn exchange(server: &str) {
         .into_inner();
     let mut ids = Vec::new();
     while let Some(m) = peers
-        .call(Class::Control, TIMEOUT, stream.message())
+        .call(server, Class::Control, TIMEOUT, stream.message())
         .await
         .unwrap()
     {
@@ -112,6 +114,7 @@ async fn exchange(server: &str) {
     for _ in 0..BULK_STREAMS {
         let rsp = peers
             .call(
+                server,
                 Class::Bulk,
                 TIMEOUT,
                 client(Class::Bulk).watch(msg(0, "bulk")),
@@ -125,6 +128,7 @@ async fn exchange(server: &str) {
     for id in 0..10 {
         peers
             .call(
+                server,
                 Class::Control,
                 TIMEOUT,
                 client(Class::Control).send(msg(id, "ping")),
@@ -139,6 +143,7 @@ async fn exchange(server: &str) {
     {
         let err = peers
             .call(
+                server,
                 Class::Bulk,
                 TIMEOUT,
                 client(Class::Bulk).send(msg(0, "ping")),
