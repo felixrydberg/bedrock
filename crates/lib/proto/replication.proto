@@ -1,0 +1,45 @@
+// Replication subscriptions (B-10). A subscriber opens one `Subscribe` stream per dataset, asks for namespaces from a
+// sequence and acknowledges what it applied; the source pushes each namespace's events in order.
+syntax = "proto3";
+package bedrock.replication;
+
+// `kv.md` §8. No value means DELETE.
+message Event {
+  string dataset = 1;
+  string namespace = 2;
+  string stream = 3;
+  uint64 sequence = 4;
+  uint64 epoch = 5;
+  uint64 committed_at = 6;
+  bytes key = 7;
+  optional bytes value = 8;
+}
+
+// Starts, or restarts after a gap, `namespace` from sequence `from`.
+message Subscribe {
+  string dataset = 1;
+  string namespace = 2;
+  uint64 from = 3;
+}
+
+message Ack {
+  string dataset = 1;
+  string namespace = 2;
+  uint64 applied = 3;
+}
+
+message Request {
+  oneof kind {
+    Subscribe subscribe = 1;
+    Ack ack = 2;
+  }
+}
+
+// Consecutive events of one namespace.
+message Batch {
+  repeated Event events = 1;
+}
+
+service Replication {
+  rpc Subscribe(stream Request) returns (stream Batch);
+}
