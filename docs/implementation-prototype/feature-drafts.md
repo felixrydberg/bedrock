@@ -27,7 +27,7 @@ not KV-specific behaviour. So the order is:
    extra adapters, advanced retention. These can also run in parallel.
 
 Things deliberately left out of the shared core because only one product uses them:
-the cache-fill broadcast channel (KV only), SurrealKV (KV phase 3), `full_replica` (KV phase 6),
+SurrealKV (KV phase 3), `full_replica` (KV phase 6),
 and every CDN phase 3/4 item. Performance and protocol constraints such as sequence compression
 are out of scope for this plan.
 
@@ -113,14 +113,14 @@ Rules this implies:
 | [B-20](https://github.com/felixrydberg/bedrock/issues/21) | Reconciliation framework | Shared core | `lib/reconciliation` | B-16 |
 | [B-21](https://github.com/felixrydberg/bedrock/issues/22) | L2 bucket redistribution on node failure | Shared core | `lib/buckets` + `lib/reconciliation` | B-19, B-20 |
 | [B-22](https://github.com/felixrydberg/bedrock/issues/23) | Tiered read fallback and cache rebuild | Shared core | `lib/health` + `lib/reconciliation` | B-14, B-19, B-11 |
-| [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Home-region read protection: coalescing and per-cell limits | Shared core | `lib/reconciliation` + home-region service | B-22 |
+| [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Origin read protection: coalescing and per-cell limits | Shared core | `lib/reconciliation` + origin cells (`bedrock-kv`) | B-22 |
 | [B-23](https://github.com/felixrydberg/bedrock/issues/25) | Hardening gate: TLA+ model, deterministic simulation, real-binary crash tests | Shared core | `lib` (test support), `docs/spec/` | B-23a, B-01 … B-22b |
 | **H — First KV** |||||
 | B-24 | Quicksilver dataset | KV | `kv/namespaces` | B-23 |
 | B-25 | KV namespace directory and management | KV | `kv/namespaces` | B-24 |
 | B-26 | KV write path | KV | `kv/operations` | B-25 |
 | B-27 | KV read path through L1/L2 | KV | `kv/operations`, `kv/storage` | B-26 |
-| B-28 | Replication policies and basic eviction | KV | `kv/storage`, `kv/namespaces` | B-27 |
+| B-28 | Cache policies, origin cells and basic eviction | KV | `kv/storage`, `kv/namespaces` | B-27 |
 | B-29 | KV end-to-end acceptance | KV | `kv` | B-24 … B-28 |
 | **I — First CDN** (parallel with H; no dependency on KV drafts) |||||
 | B-30 | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
@@ -131,7 +131,7 @@ Rules this implies:
 | B-35 | Artifact retrieval interface | CDN | `cdn/artifact_transfer` | B-33, B-34 |
 | B-36 | CDN end-to-end acceptance | CDN | `cdn` | B-30 … B-35 |
 | **J — KV refinements** |||||
-| B-37 | Cache-fill broadcast queue | KV | `lib/relays`, `kv/operations` | B-29 |
+| ~~B-37~~ | ~~Cache-fill broadcast queue~~ (dropped, decision 11) | — | — | — |
 | B-38 | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
 | B-39 | SurrealKV storage adapter | KV | `lib/storage` | B-29 |
 | B-40 | `full_replica` placement and completeness | KV | `kv/storage`, `lib/buckets` | B-29 |
@@ -163,7 +163,7 @@ Rules this implies:
 | KV Phase 1 (engine, datasets, writes, replication, S3) | B-01 … B-11, plus KV parts in B-24 … B-26 |
 | KV Phase 2 (storage fault tolerance) | B-14, B-22, B-23a, B-23 |
 | KV Phase 3 (SurrealKV) | B-39 |
-| KV Phase 4 (relays, streams, replay) | B-17 … B-19 (cache-fill moved to B-37) |
+| KV Phase 4 (relays, streams, replay) | B-17 … B-19 (cache-fill broadcast dropped, decision 11) |
 | KV Phase 5 (L1/L2, buckets, discovery, redistribution) | B-15, B-16, B-19, B-21, B-27, B-28 |
 | KV Phase 6 (optimisation) | B-38, B-40, B-41 |
 | CDN Phase 1 (artifact foundation) | B-30, B-31, B-33, B-35 |
@@ -371,9 +371,9 @@ Created: [#23](https://github.com/felixrydberg/bedrock/issues/23) — Feature �
 
 ---
 
-#### B-22b — Home-region read protection: coalescing and per-cell limits
+#### B-22b — Origin read protection: coalescing and per-cell limits
 
-Created: [#24](https://github.com/felixrydberg/bedrock/issues/24) — Feature 🚀: Request coalescing and per-cell rate limits on the home-region read service
+Created: [#24](https://github.com/felixrydberg/bedrock/issues/24) — Feature 🚀: Request coalescing at every tier and per-cell rate limits on origin reads
 
 ---
 
@@ -433,12 +433,13 @@ Labels: enhancement
 
 **Is your feature request related to a problem? Please describe.**
 Customer KV stores are namespaces with a home region, quotas and permissions.
-Any API node must be able to find a namespace's home writer.
+Any node must be able to find a namespace's home writer and its origin cell (§4 decision 11).
 
 **Describe the solution you'd like**
-- A `kv` dataset with the default `on_demand` policy.
-- Namespace directory stored in Quicksilver: ID → home region, quotas, permissions, policy overrides.
-- Create, delete and list namespaces. Deletion uses range deletion.
+- A `kv` dataset with the default `cached` policy (B-28).
+- Namespace directory stored in Quicksilver: ID → home region, `writer`, `origin_cell`, `epoch`, quotas, permissions, policy overrides.
+- On create, assign the origin to the least-loaded cell of the home DC. Adding a cell never reassigns existing namespaces.
+- Create, delete and list namespaces. Deletion uses range deletion at the origin; edge copies expire with their TTL.
 - Application bindings reference existing namespace IDs.
 
 **Additional context**
@@ -446,7 +447,7 @@ Any API node must be able to find a namespace's home writer.
 - **Module:** `kv/namespaces`.
 - **Doc reference:** `kv.md` §2 Namespace, §12 step 2; `notes.md` (KV dataset).
 - **Depends on:** B-24.
-- **Acceptance criteria:** A created namespace is resolvable from every region. Quota limits are enforced. A deleted namespace frees its storage.
+- **Acceptance criteria:** A created namespace, its writer and its origin cell are resolvable from every region. Adding a cell to the home DC leaves every existing assignment unchanged. Quota limits are enforced. A deleted namespace frees its storage at the origin.
 
 ---
 
@@ -458,7 +459,7 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Writes can arrive at any API node. They must be forwarded to the namespace's home writer, committed durably and replicated to subscriber regions.
+Writes can arrive at any API node. They must be forwarded to the namespace's home writer, committed durably and replicated to its origin cell.
 
 **Describe the solution you'd like**
 - Operations: `PUT`, `DELETE` (and optionally batch).
@@ -472,70 +473,77 @@ Writes can arrive at any API node. They must be forwarded to the namespace's hom
 - **Module:** `kv/operations`.
 - **Doc reference:** `kv.md` §12.
 - **Depends on:** B-25.
-- **Acceptance criteria:** A write sent to a non-home region commits in the home region. Active subscriber regions receive it. Regions with no subscription do not.
+- **Acceptance criteria:** A write sent to a non-home region commits in the home region. The origin cell applies it; no other cell receives the event for a `cached` namespace. A minimum-revision read with the returned revision sees the write from any region.
 
 ---
 
 #### B-27 — KV read path through L1/L2
 
 ```
-Title:  Feature 🚀: Customer KV read path through L1, L2, peers and home region
+Title:  Feature 🚀: Customer KV read path through L1, L2, the regional tier and the origin cell
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Reads must be served locally whenever possible and still meet freshness requirements, falling back through the regional hierarchy to the home region and S3.
+Reads must be served locally whenever possible and still meet freshness requirements. Under §4 decision 11 an edge cell only
+caches KV, so a miss climbs a fixed tier chain to the namespace's origin cell.
 
 **Describe the solution you'd like**
 - `GET` and `LIST` (prefix) using the B-22 `SourceChain` with KV tiers:
   - L1: `l1/{ns}/{key}`
   - L2 bucket owner in this cell: `l2/{bucket}/{ns}/{key}`
-  - healthy peers in this cell
-  - home region
-  - S3
-- Reads stay inside the cell. There is no sibling-cell tier; it can be added to the `SourceChain` later if miss rates justify it.
-- Validate the returned value against revision and tombstone.
-- Fill caches according to policy.
-- **Missing keys:** cache "not found at revision N" entries, overwritten by later writes, so repeated lookups of a key that doesn't
-  exist don't reach L2, the home region or S3. Storing all keys and only some values (Quicksilver v2 style) is the stronger option,
-  worth it only if such lookups turn out to be common.
-- On first read, establish an `on_demand` subscription at a consistent boundary (B-10).
-- Minimum-revision read option. Cells apply revisions independently, so a client moved between cells can see an older revision;
-  passing the last revision it saw prevents its reads from going backwards.
+  - the region's regional-tier cell for `(ns, bucket)` (B-19)
+  - the origin cell from the namespace directory (B-25), which holds the full namespace
+  - S3 single-key read (B-11), only while the origin cell is unavailable (§4 still open, item 2)
+- Cache entries carry `value`, `revision` and `fetched_at` and are served while younger than `cache_ttl`. Hot keys are refreshed
+  from the next tier before they expire.
+- A fill is accepted only from a source at least as far along as the receiver, and never overwrites a newer revision.
+- **Missing keys:** cache "not found at revision N" entries with the same TTL, so repeated lookups of a key that doesn't
+  exist don't reach the regional tier or the origin. Storing all keys and only some values (Quicksilver v2 style) is the stronger
+  option, worth it only if such lookups turn out to be common.
+- No subscription is created on read. Subscriptions exist only at the origin cell and for namespaces that opt into push (B-28).
+- Minimum-revision read option: cache entries older than the requested revision are skipped and the origin waits until it has
+  applied it, so a client reads its own writes and never goes backwards, from any cell.
 
 **Additional context**
 - **Implementation:** KV.
 - **Module:** `kv/operations`, `kv/storage` (keyspaces).
-- **Doc reference:** `kv.md` §9, §13.
+- **Doc reference:** `kv.md` §9, §13; `feature-drafts.md` §4 decision 11.
 - **Depends on:** B-26.
-- **Acceptance criteria:** A cold read in a remote region succeeds and populates L1/L2. A second read is a local hit. Writes after the first read reach the subscribed region. A deleted key never reappears. A repeated read of a missing key is answered locally until the key is written. A minimum-revision read never returns an older revision, even from another cell.
+- **Acceptance criteria:** A cold read in a remote region succeeds through the regional tier and populates L1/L2. A second read is a local hit. A write becomes visible everywhere within the TTL of each tier. A deleted key never reappears. A repeated read of a missing key is answered locally until its entry expires. A minimum-revision read never returns an older revision, even from another cell. Concurrent misses for one key send one request per tier upstream.
 
 ---
 
 #### B-28 — Replication policies and basic eviction
 
 ```
-Title:  Feature 🚀: Apply global / on_demand / home_only policies and basic L1/L2 eviction
+Title:  Feature 🚀: Cached / global / home_only policies, origin cells and basic L1/L2 eviction
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Namespaces need their configured policy to take effect. Caches also need a bound so a node's disk does not fill up.
+Namespaces need their configured policy to take effect, and every KV namespace needs an origin cell that holds it in full
+(§4 decision 11). Caches also need a bound so a node's disk does not fill up.
 
 **Describe the solution you'd like**
-- `global`: propagate to every eligible DC; L2 holds the working set.
-- `on_demand`: propagate only to active subscribers.
-- `home_only`: forward remote reads to the home region.
-- Basic eviction based on storage pressure and access recency, respecting pinned prefixes.
-- Unsubscribe idle `on_demand` namespaces.
+- `cached` (KV default): pull and cache with `cache_ttl` (default 60 s, per-namespace override above a floor), refresh hot keys
+  before they expire. Added to `lib/datasets` next to the existing policies.
+- `global` (opt-in): push to every eligible DC; L2 holds the working set.
+- `home_only`: no edge caching; every read goes to the origin cell.
+- `on_demand` stays the push-on-first-read policy used by `auth` (B-42); KV no longer uses it.
+- **Origin cell:** holds its namespaces in L2 with 2–3 bucket replicas, subscribed through the relays, and never evicts them.
+  Moving an origin (rebalancing, retiring a cell) rebuilds the new cell from the bucket (B-11), flips the directory entry with an
+  epoch bump, keeps both cells subscribed for a grace period, then the old cell stops serving, unsubscribes and deletes the
+  namespace's range with its applied revision through B-20 reconciliation. Moves are rate-limited.
+- Basic eviction based on storage pressure and access recency, respecting pinned prefixes. Expired cache entries go first.
 - `full_replica` namespaces (Quicksilver) are never evicted from L2; their placement and completeness are B-40.
 
 **Additional context**
 - **Implementation:** KV.
 - **Module:** `kv/storage`, `kv/namespaces`.
-- **Doc reference:** `kv.md` §3, §16.
+- **Doc reference:** `kv.md` §3, §9 Cells, §16; `feature-drafts.md` §4 decision 11.
 - **Depends on:** B-27.
-- **Acceptance criteria:** Each policy behaves as documented in an integration test. Disk usage stays within budget under load. Evicted data is still readable through fallback.
+- **Acceptance criteria:** Each policy behaves as documented in an integration test. Moving an origin never serves a read older than the client's minimum revision, and an interrupted move resumes after a restart with no data left behind on the old cell. Disk usage stays within budget under load. Evicted data is still readable through fallback.
 
 ---
 
@@ -552,12 +560,13 @@ Labels: enhancement
 **Describe the solution you'd like**
 - Scenarios on the B-02 compose profile:
   - write in EU, read in US
-  - kill an L2 node mid-traffic
+  - kill an L2 node mid-traffic, at the edge and at the origin cell
+  - move a namespace's origin cell under load
   - kill a relay
   - corrupt a KV instance while Quicksilver keeps serving
   - restart a writer
 - Run the B-23 invariants against the deployed cluster.
-- Basic KV dashboards: hit rates, replication lag, fallback rate.
+- Basic KV dashboards: hit rates per tier, origin fetch rate, replication lag to the origin, fallback rate.
 
 **Additional context**
 - **Implementation:** KV.
@@ -816,28 +825,8 @@ Labels: enhancement
 
 #### B-37 — Cache-fill broadcast queue
 
-```
-Title:  Feature 🚀: Best-effort relay cache-fill broadcast channel
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-When one node resolves a KV miss, other nodes in the region that want the same value fetch it again.
-A best-effort broadcast lets interested nodes cache it for free.
-
-**Describe the solution you'd like**
-- A second relay channel, separate from replication, that broadcasts `(dataset, ns, key, value, revision)` after a resolved miss.
-- Sent only to the owners of the key's bucket and that namespace's L1 subscribers in the same cell, never to every node.
-  Broadcasting each miss to all N nodes grows as O(N²) with cell size. Fills never travel up the relay tree.
-- Droppable under load.
-- Receivers cache it only if interested, and an older fill never overwrites a newer value or tombstone.
-
-**Additional context**
-- **Implementation:** KV refinement. The code lives in `lib/relays`, but KV is its only user, so it is deferred.
-- **Module:** `lib/relays`, `kv/operations`.
-- **Doc reference:** `kv.md` §10 B, §13 step 10, principle 11.
-- **Depends on:** B-29.
-- **Acceptance criteria:** Fills are dropped under load without any correctness impact. A property test shows stale fills never overwrite newer data.
+Dropped (§4 decision 11). With pull and TTL caching, the regional tier already shares a resolved miss with every cell in the
+region, so a separate broadcast channel adds nothing.
 
 ---
 
@@ -950,7 +939,7 @@ Labels: enhancement
 `notes.md` lists an Auth dataset (API key hashes, permissions, status) replicated `on_demand`. It is not in the main architecture doc yet.
 
 **Describe the solution you'd like**
-- An `auth` dataset using the `on_demand` policy.
+- An `auth` dataset using the `on_demand` policy (push on first read). It never uses the `cached` TTL model: a revocation must not wait for a TTL.
 - Fail-closed behaviour for revocations: revocation must be enforced authoritatively, not only eventually.
 
 **Additional context**
@@ -1256,7 +1245,7 @@ Labels: enhancement
    A member is a node that is receiving updates. Routing decisions use a local per-peer circuit breaker fed by real traffic (B-13).
    There is no separate membership or placement epoch; bucket owners reject requests for buckets they don't own (B-16).
 5. **Cells.** A cell (one DC by default) has its own membership, buckets, L2 and relays. Its maximum size is set by the
-   bucket count (about 10,000 nodes with 2²⁰ buckets); the actual size is chosen for blast radius. Large sites run several cells. Reads stay inside the cell. Moving traffic between cells is out of scope for now.
+   bucket count (about 10,000 nodes with 2²⁰ buckets); the actual size is chosen for blast radius. Large sites run several cells. Reads stay inside the cell, except KV misses, which go to the namespace's regional-tier cell and origin cell (decision 11). Moving client traffic between cells is out of scope for now.
 6. **Relay tree.** Relays form tiers in static config (region top → optional DC → cell). The downstream dials and the upstream
    pushes; gaps are pulled from the replay log. Fan-out is routed by `(namespace, bucket)`.
 7. **KV and CDN are backing services.** Nothing in their tracks knows about Workers, Pages or deployments. That lives in
@@ -1272,7 +1261,30 @@ Labels: enhancement
    needs them. `code-structure.md` reflects this, including `storage` moving out of `kv/` (B-01).
 10. **Crate naming.** The shared crate is the package `bedrock-lib` (`use bedrock_lib::…`) in `crates/lib`; the binary
     crates are `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` (B-01).
+11. **KV is pulled and cached at the edge, with one origin cell per namespace** (Cloudflare Workers KV model: a central store
+    behind tiered caches). Decided 2026-10-26; it replaces subscribing every reading cell to a KV namespace.
+    - **Edge:** cells hold KV only as cache entries (`value`, `revision`, `fetched_at`), served while younger than the namespace's
+      `cache_ttl` (default 60 s, per-namespace override above a floor). Hot keys are refreshed before they expire; missing keys
+      are cached the same way. No cell outside the origin subscribes to a `cached` namespace, so an unread namespace costs
+      nothing and goes dormant by itself. Adding or removing an edge cell needs no protocol.
+    - **Regional tier:** in each region, the cell chosen by rendezvous hash of `(namespace, bucket)` over the region's cells
+      (list and entry addresses in Quicksilver). Only it fetches from the origin for that region, with misses coalesced at every tier (B-22b).
+    - **Origin:** the namespace's full state lives in one cell of its home DC, held in L2 like `full_replica` with 2–3 bucket
+      replicas and fed by the normal relay subscription. The Quicksilver namespace directory assigns it explicitly
+      (`writer`, `origin_cell`, `epoch`), never by hashing: new namespaces go to the least-loaded cell, adding a cell moves
+      nothing, and rebalancing or retiring a cell moves chosen namespaces deliberately and rate-limited. A new origin is rebuilt
+      from the bucket (B-11); the old one stops serving, unsubscribes and deletes the namespace's range with its applied
+      revision through B-20 reconciliation.
+    - **Bucket:** holds only the log and snapshots, to rebuild state. It is not on the normal KV read path.
+    - **Consistency:** reads are eventually consistent within the TTL of each tier. A fill is accepted only from a source at
+      least as far along as the receiver. A minimum-revision read skips cache entries older than the revision and waits at
+      the origin, so a client reads its own writes.
+    - **Push stays** for `quicksilver` (`full_replica` in every cell), `auth` (revocations cannot wait for a TTL) and `cdn`.
+      A KV namespace can opt into `global` or `full_replica`. The cache-fill broadcast (B-37) is dropped.
 
 ### Still open
 
 1. **Auth dataset scope (B-42).** It is only mentioned in `notes.md`, so it needs a short design before it becomes an issue.
+2. **KV reads while the origin cell is down (decision 11).** Edge caches keep serving hot keys; whether cold misses then fail,
+   wait for the rebuild, or fall back to B-11's single-key read from the bucket is not decided. B-27 assumes the bucket
+   fallback until this is settled.

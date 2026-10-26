@@ -7,9 +7,10 @@ A globally distributed, S3-backed key-value platform inspired by Cloudflare Quic
 The platform initially supports two datasets:
 
 - **Quicksilver:** Critical infrastructure metadata, including deployment routing, D1 ownership, Durable Object placement, KV namespace ownership, and system configuration.
-- **KV:** Customer key-value stores with home-region writes, on-demand caching, and automatic eviction.
+- **KV:** Customer key-value stores with home-region writes, one origin cell per namespace, and TTL caching everywhere else.
 
 Both datasets run on the **same Rust binary, replication protocol, sequence system, regional relays, and L1/L2 caching architecture**.
+Quicksilver is pushed to every cell; a customer KV namespace is pushed only to its origin cell and pulled into other cells' caches (§3, §9 Cells).
 
 Storage engines are interchangeable through a common Rust abstraction.
 
@@ -90,16 +91,21 @@ There are no exposed application-level shards. Regional L2 bucket partitioning r
 
 | Policy | Propagation | Regional L2 storage |
 |---|---|---|
+| `cached` | Origin cell only; other cells pull on a miss | Origin: complete namespace. Elsewhere: entries younger than `cache_ttl` |
 | `global` | All eligible datacenters | Working set + recent changes |
 | `on_demand` | Active subscribers only | Requested data |
-| `home_only` | Home region only | No remote requirement |
+| `home_only` | Origin cell only | No remote copies |
 | `full_replica` | All eligible datacenters | Complete namespace |
+
+**Cached** is the default for customer KV. The namespace's origin cell holds it in full; every other cell caches what it reads
+for `cache_ttl` (default 60 seconds) and refreshes hot keys before they expire. Nothing is pushed outside the origin, so a
+namespace nobody reads in a cell costs that cell nothing.
 
 **Global** means all eligible datacenters receive updates, but older, unpinned data may be evicted.
 
-**On-demand** means only active regions receive updates, allowing customer data to be cached according to demand.
+**On-demand** means only active subscribers receive updates, starting from their first read. Auth uses it, because a revocation must not wait for a TTL.
 
-**Home-only** forwards remote requests to the authoritative home region.
+**Home-only** sends every read to the origin cell.
 
 **Full-replica** requires every eligible datacenter to retain the entire namespace distributed across L2 nodes.
 
@@ -396,10 +402,27 @@ A cell is a self-contained cluster: its own membership, virtual buckets, L2 and 
   10,000 nodes). The actual size is chosen for blast radius, since a bad deploy or relay bug takes down one cell. Large sites split into several cells.
 - Relays per cell grow with the node count (minimum 2), so connections and egress never sit on one machine.
 - Each cell has its own bucket ownership table. Cells do not know each other's buckets.
-- Reads stay inside the cell: L1 → cell L2 → cell peers → home region → S3.
+- Reads stay inside the cell, except customer KV misses (below).
 - Cells apply revisions independently. A client moved between cells uses minimum-revision reads so it never sees an older value.
-- Losing a cell moves its traffic to cold caches elsewhere. The home region coalesces concurrent misses and rate-limits per cell to absorb it.
-- Moving traffic between cells is out of scope for now.
+- Losing a cell moves its traffic to cold caches elsewhere. Misses are coalesced at every tier and origin cells rate-limit per cell to absorb it.
+- Moving client traffic between cells is out of scope for now.
+
+### Customer KV: Origin Cells and Tiered Caching
+
+Customer KV follows the Cloudflare Workers KV model: one store holds each namespace in full, and every other location only caches.
+
+- **Origin cell.** Each namespace has one origin cell in its home DC. It holds the namespace in L2 like `full_replica`, with
+  2–3 bucket replicas, fed by the relay subscription. The Quicksilver namespace directory assigns it explicitly
+  (`writer`, `origin_cell`, `epoch`): new namespaces go to the least-loaded cell, and adding a cell moves nothing.
+- **Regional tier.** In each region, the cell chosen by rendezvous hash of `(namespace, bucket)` over the region's cells
+  fetches from the origin for the whole region. The cell list and entry addresses live in Quicksilver.
+- **Edge.** Every other cell caches entries (`value`, `revision`, `fetched_at`) for `cache_ttl`. A miss walks
+  L1 → cell L2 → regional tier → origin cell. Concurrent misses for a key are coalesced at each tier.
+- **Bucket.** Holds only the log and snapshots, to rebuild a cell. It is not on the normal read path.
+- **Moving an origin** (rebalancing, retiring a cell) is deliberate and rate-limited: the new cell rebuilds from the bucket,
+  the directory entry flips with an epoch bump, both cells stay subscribed for a grace period, then the old cell stops serving,
+  unsubscribes and deletes the namespace's range with its applied revision. The deletion is a reconciliation repair, so an
+  interrupted move finishes after a restart.
 
 ```text
             Home writer
@@ -482,18 +505,10 @@ Old history may be evicted when durable recovery remains possible.
 
 Relays must accurately advertise which contiguous revision ranges are available.
 
-#### B. Cache-Fill Broadcast Queue
+#### B. Cache Fills
 
-A best-effort channel shares resolved cache misses.
-
-1. A node requests an uncached value.
-2. A peer or authoritative source retrieves it.
-3. The relay sends the value and revision to the key's bucket owners and the namespace's L1 subscribers in the same cell.
-4. Interested leaves optionally cache it.
-
-Fills are never broadcast to every node (that grows as O(N²) with cell size) and never travel up the relay tree.
-
-Cache-fill messages may be dropped under load.
+There is no separate cache-fill broadcast channel. Customer KV fills travel down the tier chain (origin → regional tier →
+cell L2 → L1, §9), which already shares a resolved miss with the whole region. Fills never travel up the relay tree.
 
 An older cache fill must never overwrite a newer value or an applied delete. A fill carries the sequence its source
 had applied, which must be at least the receiver's own applied sequence for the namespace. The receiver inserts it
@@ -542,29 +557,27 @@ Example: a namespace homed in Europe is cached in America.
 4. The writer durably commits the operation.
 5. A namespace revision is assigned.
 6. The event enters the KV stream.
-7. Active subscriber regions receive the update.
-8. The US relay temporarily caches the event.
-9. Relevant L1/L2 nodes receive it.
-10. Replicas atomically apply the update and revision.
+7. The namespace's origin cell receives the update through its relays.
+8. Its L2 bucket owners atomically apply the update and revision.
+9. Other cells see it when their cached entry expires, or immediately for a minimum-revision read.
 
-Regions without active subscriptions do not continuously receive customer updates.
+Only the origin cell receives events for a `cached` namespace.
 
 ## 13. Customer KV Read Sequence
 
 Example: a US node requests a European customer's key.
 
-1. Check local L1.
-2. On a miss, determine the regional L2 bucket owner.
-3. Fetch from L2 when sufficiently fresh.
-4. If L2 misses or is unavailable, select another healthy peer.
-5. If no regional source is suitable, use the home-region service.
-6. The home region can retrieve cold state from S3-backed L3.
-7. Validate the returned value and revision.
-8. Populate healthy caches according to policy.
-9. Establish necessary update subscriptions and synchronize revisions.
-10. Optionally broadcast the cache fill.
+1. Check local L1; serve the entry if it is younger than `cache_ttl`.
+2. On a miss, ask the cell's L2 bucket owner.
+3. On a miss there, ask the region's regional-tier cell for `(namespace, bucket)`.
+4. On a miss there, ask the namespace's origin cell, which holds the namespace in full.
+5. While the origin cell is unavailable, the last resort is a single-key read from the S3 snapshot and log (§14; still an open decision).
+6. Validate the returned value and revision.
+7. Fill each tier on the way back with its TTL.
 
-Subscriptions and snapshot reads must have a consistent revision boundary to prevent missed concurrent updates.
+A minimum-revision read skips any cached entry older than the requested revision and waits at the origin until it has
+applied it. No subscription is created on read; subscriptions and snapshot reads keep a consistent revision boundary where
+they are used (the origin cell and push policies).
 
 ## 14. L3 — Engine-Independent S3 Persistence
 
@@ -900,11 +913,11 @@ Validate transaction semantics, recovery behavior, corruption reporting, and per
 
 ### Phase 4 — Hierarchical Replication
 
-Introduce regional relays, persistent update streams, bounded replay history, and independent cache-fill channels.
+Introduce regional relays, persistent update streams and bounded replay history.
 
 ### Phase 5 — Regional Caching
 
-Implement per-node L1, distributed L2 buckets, healthy-peer discovery, on-demand subscriptions, and automatic redistribution.
+Implement per-node L1, distributed L2 buckets, healthy-peer discovery, origin cells with tiered TTL caching, and automatic redistribution.
 
 ### Phase 6 — Advanced Optimization
 
@@ -921,10 +934,10 @@ Add `full_replica` placement, adaptive cache promotion, regional load balancing,
 5. **L1 and L2 share a dataset's local engine instance** but use separate logical keyspaces.
 6. **Regional relays use separate storage** for bounded replay history.
 7. **Docker with host networking and NVMe bind mounts** is the default deployment.
-8. **Global, on-demand, home-only, and full-replica policies** control replication and retention.
+8. **Cached, global, on-demand, home-only, and full-replica policies** control replication and retention.
 9. **Every cell independently operates an L1/L2 cluster.** A datacenter is one or more cells.
 10. **A tree of relays coordinates replication, cache discovery, and recent event replay.**
-11. **Cache-fill broadcasts remain separate from authoritative replication.**
+11. **Customer KV is pushed only to its origin cell and cached by TTL everywhere else.**
 12. **S3 persists engine-independent snapshots and archived logs.**
 13. **Local cache failures trigger automatic fallback and rebuilding.**
 14. **Unhealthy storage is isolated without unnecessarily disabling unrelated services.**

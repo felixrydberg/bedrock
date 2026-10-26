@@ -8,7 +8,7 @@ KV Datasets:
 - KV
     - Stores
         - Customer KV stores usable through Workers
-    - Replicated on_demand
+    - Origin cell per namespace, TTL-cached elsewhere (`cached`, feature-drafts §4 decision 11)
 - Auth
     - Stores
         - API Key hashes, permissions, status
