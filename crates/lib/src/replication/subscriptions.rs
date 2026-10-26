@@ -323,6 +323,12 @@ impl Subscription {
         let applied = self.applied.get(namespace);
         applied.wait_until(|&a| a >= revision).await;
     }
+
+    /// Stops applying and waits for the task to finish before its applier can be replaced.
+    pub async fn stop(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 
 impl Drop for Subscription {
@@ -382,8 +388,6 @@ async fn session<H: ApplyHook>(
     applied: &Applied,
 ) -> Ended {
     let (requests, rx) = mpsc::unbounded_channel();
-    // The sequence each namespace was last requested from; a gap there is already being filled.
-    let mut requested = BTreeMap::new();
     for namespace in namespaces {
         let from = match applier.applied(namespace) {
             Ok(sequence) => sequence + 1,
@@ -391,7 +395,6 @@ async fn session<H: ApplyHook>(
         };
         applied.set(namespace, from - 1);
         let _ = requests.send(subscribe(applier.dataset(), namespace, from));
-        requested.insert(namespace.clone(), from);
     }
 
     let channel = match peers.channel(upstream, Class::Control) {
@@ -415,32 +418,52 @@ async fn session<H: ApplyHook>(
             Ok(None) => return Ended::Upstream(Status::unavailable("stream ended")),
             Err(status) => return Ended::Upstream(status),
         };
-        let mut acks = BTreeMap::new();
-        for event in batch.events {
-            let namespace = event.namespace.clone();
-            match applier.offer(event.into()) {
-                Ok(Outcome::Applied(sequence)) => {
-                    applied.set(&namespace, sequence);
-                    acks.insert(namespace, sequence);
-                }
-                Ok(Outcome::Duplicate) => {}
-                // Out of order (another source, or the applier's buffer was full): ask again from the first missing.
-                Ok(Outcome::Gap { applied, .. }) => {
-                    if requested.insert(namespace.clone(), applied + 1) != Some(applied + 1) {
-                        let _ =
-                            requests.send(subscribe(applier.dataset(), &namespace, applied + 1));
-                    }
-                }
-                Err(ApplyError::Rejected(reason)) => {
-                    tracing::warn!(upstream, reason, "dropped a malformed event");
-                }
-                Err(ApplyError::Storage(error)) => return Ended::Storage(error),
-            }
-        }
-        for (namespace, sequence) in acks {
-            let _ = requests.send(ack(applier.dataset(), &namespace, sequence));
+        if let Err(error) = apply_batch(applier, applied, batch, &requests, upstream) {
+            return Ended::Storage(error);
         }
     }
+}
+
+fn apply_batch<H: ApplyHook>(
+    applier: &mut Applier<H>,
+    applied: &Applied,
+    batch: pb::Batch,
+    requests: &mpsc::UnboundedSender<pb::Request>,
+    upstream: &str,
+) -> Result<(), StorageError> {
+    let mut acks = BTreeMap::new();
+    let mut gaps = BTreeMap::new();
+    for event in batch.events {
+        let namespace = event.namespace.clone();
+        match applier.offer(event.into()) {
+            Ok(Outcome::Applied(sequence)) => {
+                applied.set(&namespace, sequence);
+                gaps.remove(&namespace);
+                acks.insert(namespace, sequence);
+            }
+            Ok(Outcome::Duplicate) => {}
+            Ok(Outcome::Gap {
+                applied: sequence,
+                missing,
+            }) => {
+                applied.set(&namespace, sequence);
+                acks.insert(namespace.clone(), sequence);
+                gaps.insert(namespace, missing.start);
+            }
+            Err(ApplyError::Rejected(reason)) => {
+                tracing::warn!(upstream, reason, "dropped a malformed event");
+            }
+            Err(ApplyError::Storage(error)) => return Err(error),
+        }
+    }
+    // Retry only the gap left after the batch; a later batch can retry again if it persists.
+    for (namespace, from) in gaps {
+        let _ = requests.send(subscribe(applier.dataset(), &namespace, from));
+    }
+    for (namespace, sequence) in acks {
+        let _ = requests.send(ack(applier.dataset(), &namespace, sequence));
+    }
+    Ok(())
 }
 
 fn subscribe(dataset: &str, namespace: &str, from: u64) -> pb::Request {
@@ -493,5 +516,104 @@ impl From<pb::Event> for Event {
             key: e.key,
             operation: e.value.map_or(Operation::Delete, Operation::Set),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replication::ApplierMetrics;
+    use crate::storage::memory::MemoryEngine;
+    use crate::storage::{StorageEngine, StorageResult, WriteBatch};
+
+    struct Hook;
+
+    impl ApplyHook for Hook {
+        fn apply(
+            &mut self,
+            _: &dyn StorageEngine,
+            _: &Event,
+            _: &mut WriteBatch,
+        ) -> StorageResult<()> {
+            Ok(())
+        }
+    }
+
+    fn batch(sequences: &[u64]) -> pb::Batch {
+        pb::Batch {
+            events: sequences
+                .iter()
+                .map(|&sequence| pb::Event {
+                    dataset: "kv".into(),
+                    namespace: "ns".into(),
+                    sequence,
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn gaps_publish_progress_and_retry_only_the_remaining_gap() {
+        let engine = Arc::new(MemoryEngine::new("kv"));
+        let mut applier = Applier::new("kv", engine.clone(), Hook, &ApplierMetrics::default());
+        applier
+            .offer(batch(&[5]).events.pop().unwrap().into())
+            .unwrap();
+        let applied = Arc::<Applied>::default();
+        let subscription = Subscription {
+            applied: applied.clone(),
+            task: tokio::spawn(std::future::pending()),
+        };
+        let (requests, mut rx) = mpsc::unbounded_channel();
+
+        apply_batch(&mut applier, &applied, batch(&[1, 2]), &requests, "source").unwrap();
+        assert_eq!(engine.revision("ns"), Ok(Some(2)));
+        tokio::time::timeout(Duration::from_secs(1), subscription.wait_for("ns", 2))
+            .await
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), subscribe("kv", "ns", 3));
+        assert_eq!(rx.try_recv().unwrap(), ack("kv", "ns", 2));
+        assert!(rx.try_recv().is_err());
+
+        // An earlier request must not suppress a retry after the missing cursor advances.
+        apply_batch(&mut applier, &applied, batch(&[3]), &requests, "source").unwrap();
+        assert_eq!(rx.try_recv().unwrap(), subscribe("kv", "ns", 4));
+        assert_eq!(rx.try_recv().unwrap(), ack("kv", "ns", 3));
+        assert!(rx.try_recv().is_err());
+
+        // A gap resolved within a batch needs no replay.
+        apply_batch(
+            &mut applier,
+            &applied,
+            batch(&[7, 4, 6]),
+            &requests,
+            "source",
+        )
+        .unwrap();
+        assert_eq!(applied.get("ns").get(), 7);
+        assert_eq!(rx.try_recv().unwrap(), ack("kv", "ns", 7));
+        assert!(rx.try_recv().is_err());
+        subscription.stop().await;
+    }
+
+    #[tokio::test]
+    async fn stop_waits_until_the_task_releases_its_resources() {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (held, mut released) = tokio::sync::oneshot::channel::<()>();
+        let subscription = Subscription {
+            applied: Arc::default(),
+            task: tokio::spawn(async move {
+                let _held = held;
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }),
+        };
+        ready.await.unwrap();
+        subscription.stop().await;
+        assert_eq!(
+            released.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
     }
 }

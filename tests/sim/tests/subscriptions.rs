@@ -187,7 +187,7 @@ async fn scenario(server: String, log: Arc<FlakyLog>) {
 
     // The next source read fails and ends a stream, and the first subscriber restarts from its engine.
     log.fail.store(true, Ordering::SeqCst);
-    drop(subscription);
+    subscription.stop().await;
     let subscription = start(&first, &first_applied);
     resume.send(()).unwrap();
 
