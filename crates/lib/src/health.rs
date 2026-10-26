@@ -10,7 +10,7 @@
 //! The view is local to this node and never shared; removing a node from the cell is B-12's decision.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
@@ -54,6 +54,7 @@ enum Breaker {
     },
     /// A probe is in flight until `probe_until`; after that it was abandoned and the next call probes again.
     HalfOpen {
+        probe: Arc<()>,
         probe_until: Instant,
         backoff: Duration,
     },
@@ -162,28 +163,36 @@ impl Health {
             .map_or(State::Closed, Breaker::state)
     }
 
-    /// A call to `peer` that gives up after `timeout` is starting. If the breaker is due a probe, this is it.
-    pub(crate) fn begin(&self, peer: &str, timeout: Duration) {
+    /// A call to `peer` that gives up after `timeout` is starting. Returns its identity if it owns the probe.
+    pub(crate) fn begin(&self, peer: &str, timeout: Duration) -> Option<Arc<()>> {
         let now = now();
+        let mut probe = None;
         self.update(peer, |b| match *b {
-            Breaker::Open { until, backoff } if now >= until => Some(Breaker::HalfOpen {
-                probe_until: now + timeout,
+            Breaker::Open {
+                until: probe_until,
                 backoff,
-            }),
-            Breaker::HalfOpen {
+            }
+            | Breaker::HalfOpen {
                 probe_until,
                 backoff,
-            } if now >= probe_until => Some(Breaker::HalfOpen {
-                probe_until: now + timeout,
-                backoff,
-            }),
+                ..
+            } if now >= probe_until => {
+                let identity = Arc::new(());
+                probe = Some(identity.clone());
+                Some(Breaker::HalfOpen {
+                    probe: identity,
+                    probe_until: now + timeout,
+                    backoff,
+                })
+            }
             _ => None,
         });
+        probe
     }
 
     /// The outcome of a call to `peer`. Outcomes while open come from calls started before it opened, or from fail-open
-    /// routing, and are ignored.
-    pub(crate) fn record(&self, peer: &str, ok: bool) {
+    /// routing, and are ignored. Only the call owning the active probe may resolve a half-open breaker.
+    pub(crate) fn record(&self, peer: &str, probe: Option<Arc<()>>, ok: bool) {
         let now = now();
         self.update(peer, |b| match b {
             Breaker::Closed {
@@ -211,9 +220,16 @@ impl Health {
                     backoff: BASE_BACKOFF,
                 })
             }
-            Breaker::HalfOpen { .. } if ok => Some(Breaker::closed(now)),
-            Breaker::HalfOpen { backoff, .. } => Some(Breaker::reopen(*backoff, now)),
-            Breaker::Open { .. } => None,
+            Breaker::HalfOpen {
+                probe: active,
+                backoff,
+                ..
+            } if probe.as_ref().is_some_and(|p| Arc::ptr_eq(p, active)) => Some(if ok {
+                Breaker::closed(now)
+            } else {
+                Breaker::reopen(*backoff, now)
+            }),
+            Breaker::Open { .. } | Breaker::HalfOpen { .. } => None,
         });
     }
 
@@ -249,8 +265,8 @@ mod tests {
 
     fn fail(health: &Health, peer: &str, times: u32) {
         for _ in 0..times {
-            health.begin(peer, PROBE_TIMEOUT);
-            health.record(peer, false);
+            let probe = health.begin(peer, PROBE_TIMEOUT);
+            health.record(peer, probe, false);
         }
     }
 
@@ -276,7 +292,8 @@ mod tests {
                 State::Closed,
                 "tripped early at call {i}"
             );
-            health.record("a", i % 3 == 0);
+            let probe = health.begin("a", PROBE_TIMEOUT);
+            health.record("a", probe, i % 3 == 0);
         }
         assert_eq!(health.state("a"), State::Open);
     }
@@ -289,12 +306,12 @@ mod tests {
         sleep(BASE_BACKOFF).await;
         assert_eq!(health.route(&["a", "b"]), [&"a", &"b"]);
 
-        health.begin("a", PROBE_TIMEOUT);
+        let probe = health.begin("a", PROBE_TIMEOUT);
         assert_eq!(health.state("a"), State::HalfOpen);
         // Only one probe at a time.
         assert_eq!(health.route(&["a", "b"]), [&"b"]);
 
-        health.record("a", true);
+        health.record("a", probe, true);
         assert_eq!(health.state("a"), State::Closed);
         assert_eq!(health.route(&["a", "b"]), [&"a", &"b"]);
     }
@@ -325,10 +342,51 @@ mod tests {
         let health = Health::new(&Admin::new());
         health.trip("a");
         sleep(BASE_BACKOFF).await;
-        health.begin("a", PROBE_TIMEOUT);
+        let _ = health.begin("a", PROBE_TIMEOUT);
         assert_eq!(health.route(&["a", "b"]), [&"b"]);
         sleep(PROBE_TIMEOUT).await;
         assert_eq!(health.route(&["a", "b"]), [&"a", &"b"]);
+    }
+
+    #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+    #[cfg_attr(madsim, tokio::test)]
+    async fn only_the_active_probe_can_resolve_half_open() {
+        for ok in [true, false] {
+            for interrupted in [true, false] {
+                let health = Health::new(&Admin::new());
+                let closed_call = health.begin("a", PROBE_TIMEOUT);
+                health.trip("a");
+                let open_call = health.begin("a", PROBE_TIMEOUT);
+                sleep(BASE_BACKOFF).await;
+                let old_probe = health.begin("a", PROBE_TIMEOUT);
+                assert!(old_probe.is_some());
+                let concurrent_call = health.begin("a", PROBE_TIMEOUT);
+
+                for call in [closed_call, open_call, concurrent_call] {
+                    assert!(call.is_none());
+                    health.record("a", call, ok);
+                    assert_eq!(health.state("a"), State::HalfOpen);
+                }
+
+                if interrupted {
+                    health.trip("a");
+                    sleep(BASE_BACKOFF * 2).await;
+                } else {
+                    sleep(PROBE_TIMEOUT).await;
+                }
+                let active_probe = health.begin("a", PROBE_TIMEOUT);
+                assert!(active_probe.is_some());
+                health.record("a", old_probe, ok);
+                assert_eq!(health.state("a"), State::HalfOpen);
+                assert_eq!(health.route(&["a", "b"]), [&"b"]);
+
+                health.record("a", active_probe, ok);
+                assert_eq!(
+                    health.state("a"),
+                    if ok { State::Closed } else { State::Open }
+                );
+            }
+        }
     }
 
     #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
