@@ -419,10 +419,15 @@ Customer KV follows the Cloudflare Workers KV model: one store holds each namesp
 - **Edge.** Every other cell caches entries (`value`, `revision`, `fetched_at`) for `cache_ttl`. A miss walks
   L1 → cell L2 → regional tier → origin cell. Concurrent misses for a key are coalesced at each tier.
 - **Bucket.** Holds only the log and snapshots, to rebuild a cell. It is not on the normal read path.
-- **Moving an origin** (rebalancing, retiring a cell) is deliberate and rate-limited: the new cell rebuilds from the bucket,
-  the directory entry flips with an epoch bump, both cells stay subscribed for a grace period, then the old cell stops serving,
-  unsubscribes and deletes the namespace's range with its applied revision. The deletion is a reconciliation repair, so an
-  interrupted move finishes after a restart.
+- **Adding capacity.** A new node joins its cell through its relay stream, takes over buckets and loads them from peers or the
+  bucket before serving them. A new cell needs its nodes and relays plus one Quicksilver write adding it to the region's cell
+  list. No existing origin assignment changes, so adding capacity never moves data on its own.
+- **Moving an origin** is one operation on one namespace, run on the fly: the directory records the target, the target cell
+  rebuilds from the bucket and catches up while the old cell keeps serving, the directory flips with an epoch bump, and after a
+  grace period the old cell stops serving, unsubscribes and deletes the namespace's range with its applied revision. Every step
+  is a reconciliation repair, so an interrupted move finishes after a restart. Draining a cell or a single namespace uses the
+  generic drain (feature-drafts B-21b), which calls this operation for each origin namespace involved, at a set rate. Draining
+  works the same way for every dataset; each dataset decides what has to move.
 
 ```text
             Home writer

@@ -7,7 +7,7 @@ which module it lives in, which doc section it comes from, what it depends on, a
 
 Sources: `docs/implementation-prototype/kv.md`, `cdn.md`, `code-structure.md`, `notes.md`.
 
-> Status: B-01 to B-23 (including B-18b, B-22b and B-23a, but not B-09b) are created as GitHub issues (linked below, the issue is the source of truth). Later drafts are still drafts. When a draft is created, replace its body here with a link to the issue.
+> Status: B-01 to B-23 (including B-18b, B-22b and B-23a, but not B-09b or B-21b) are created as GitHub issues (linked below, the issue is the source of truth). Later drafts are still drafts. When a draft is created, replace its body here with a link to the issue.
 
 ---
 
@@ -112,6 +112,7 @@ Rules this implies:
 | **G — Shared core: reconciliation, recovery, hardening** |||||
 | [B-20](https://github.com/felixrydberg/bedrock/issues/21) | Reconciliation framework | Shared core | `lib/reconciliation` | B-16 |
 | [B-21](https://github.com/felixrydberg/bedrock/issues/22) | L2 bucket redistribution on node failure | Shared core | `lib/buckets` + `lib/reconciliation` | B-19, B-20 |
+| B-21b | Drain nodes, cells and namespaces for every dataset | Shared core | `lib/reconciliation` + `lib/placement` | B-15, B-20, B-21 |
 | [B-22](https://github.com/felixrydberg/bedrock/issues/23) | Tiered read fallback and cache rebuild | Shared core | `lib/health` + `lib/reconciliation` | B-14, B-19, B-11 |
 | [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Origin read protection: coalescing and per-cell limits | Shared core | `lib/reconciliation` + origin cells (`bedrock-kv`) | B-22 |
 | [B-23](https://github.com/felixrydberg/bedrock/issues/25) | Hardening gate: TLA+ model, deterministic simulation, real-binary crash tests | Shared core | `lib` (test support), `docs/spec/` | B-23a, B-01 … B-22b |
@@ -137,6 +138,7 @@ Rules this implies:
 | B-40 | `full_replica` placement and completeness | KV | `kv/storage`, `lib/buckets` | B-29 |
 | B-41 | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
 | B-42 | Auth dataset | KV | `kv/namespaces` | B-29 |
+| B-53 | Dormant namespaces: evict idle namespaces from origin cells under storage pressure | KV | `kv/storage`, `kv/namespaces` | B-29 |
 | **K — CDN refinements** (parallel with J) |||||
 | B-43 | Artifact replica repair and bucket migration | CDN | `cdn/retention` | B-36 |
 | B-44 | Coordinated eviction, GC and failure recovery | CDN | `cdn/retention` | B-43 |
@@ -165,7 +167,7 @@ Rules this implies:
 | KV Phase 3 (SurrealKV) | B-39 |
 | KV Phase 4 (relays, streams, replay) | B-17 … B-19 (cache-fill broadcast dropped, decision 11) |
 | KV Phase 5 (L1/L2, buckets, discovery, redistribution) | B-15, B-16, B-19, B-21, B-27, B-28 |
-| KV Phase 6 (optimisation) | B-38, B-40, B-41 |
+| KV Phase 6 (optimisation) | B-38, B-40, B-41, B-53 |
 | CDN Phase 1 (artifact foundation) | B-30, B-31, B-33, B-35 |
 | CDN Phase 2 (distributed CDN) | B-32, B-34 |
 | CDN Phase 3 (retention and recovery) | B-43, B-44 |
@@ -365,6 +367,60 @@ Created: [#22](https://github.com/felixrydberg/bedrock/issues/22) — Feature �
 
 ---
 
+#### B-21b — Drain nodes, cells and namespaces
+
+```
+Title:  Feature 🚀: Generic drain for nodes, cells and single namespaces, with a per-dataset drain hook
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+Retiring a node or a cell, relieving a full one, and moving one hot KV tenant are all the same job: stop placing new data on a
+target, move off what has to move, and report when nothing is left. Each dataset means something different by "move": KV origins
+move to another cell, Quicksilver is already in every cell, CDN artifacts have their own holders in each cell. Without one drain,
+every dataset grows its own half-finished version.
+
+**Describe the solution you'd like**
+- **One operation:** `drain(scope, datasets, namespace?)`, through an operator API and CLI.
+  - `scope` is a node or a cell. `datasets` is all of them (the default) or a list. `namespace` narrows the drain to one namespace.
+  - The drain is a record in Quicksilver (`topology/drains/{id}`: scope, datasets, namespace, state, rate), changed only by
+    ordinary writes with an epoch bump, so every node sees the same drains. Deleting the record cancels the drain.
+- **Placement:** B-15 and B-16 never choose a draining node or cell for new assignments: bucket owners, new KV origins, and the
+  regional tier. Existing assignments stay until the drain moves them.
+- **Execution** runs in each binary's B-20 reconciliation: the desired state excludes the draining target, and the dataset's
+  drain hook says what that means for each unit it holds. Moves are rate-limited and limited in concurrency per drain.
+- **Per-dataset drain hook:** for a scope and optional namespace, return the moves needed, "nothing to move", or `Unsupported`
+  (an explicit error, never a silent no-op):
+
+  | Dataset | Drain a node | Drain a cell | Drain one namespace from a cell |
+  |---|---|---|---|
+  | `quicksilver` (`full_replica`) | Buckets move to other nodes in the cell (B-21) | Nothing to move: every cell holds it | `Unsupported`: it must be in every cell |
+  | `kv` | Origin buckets move to other nodes (B-21); cache buckets are dropped | Each namespace whose origin is the cell moves with `move_namespace` (B-28); caches are dropped | `move_namespace` for that namespace |
+  | `auth` (`on_demand`) | Buckets move to other nodes | Nothing to move: each cell subscribes on its own | `Unsupported` |
+  | `cdn` | Artifact holders move within the cell (B-21, B-43) | Nothing to move: each cell keeps its own holders; the cells taking its traffic can prewarm (B-45) | `Unsupported` until the CDN defines one |
+
+- **Progress and completion:** each dataset reports the units left on the target. The drain is complete when every selected
+  dataset reports zero; then the node can be stopped, or the cell removed from the region's cell list. Taking client traffic away
+  from a drained cell belongs to the front door, outside this issue.
+- **Metrics** (labelled by dataset and scope kind only): units left, moves started, completed and failed. Per-drain detail goes
+  through introspection.
+
+**Additional context**
+- **Implementation:** Shared core. The engine, the drain record and placement eligibility live in `lib`; each dataset's hook lives
+  with its dataset: KV in B-28, Quicksilver in B-24, Auth in B-42, CDN in B-43.
+- **Module:** `lib/reconciliation`, `lib/placement`.
+- **Doc reference:** `kv.md` §9 Cells and Customer KV: Origin Cells and Tiered Caching, §15.5; `cdn.md` §3; `feature-drafts.md` §4 decision 11.
+- **Depends on:** B-15, B-20, B-21.
+- **Acceptance criteria:**
+  - Draining a node under load leaves it holding nothing for any dataset, with no read going backwards.
+  - Draining a cell moves every KV origin it holds and reports "nothing to move" for Quicksilver, Auth and the CDN; the cell gets
+    no new assignments while it drains.
+  - Draining one KV namespace moves only that namespace; asking the same of a dataset that cannot returns `Unsupported`.
+  - An interrupted drain resumes after a restart. Cancelling a drain makes the target eligible again and leaves no partial copies.
+  - Moves never exceed the drain's rate and concurrency limits.
+
+---
+
 #### B-22 — Tiered read fallback and cache rebuild
 
 Created: [#23](https://github.com/felixrydberg/bedrock/issues/23) — Feature 🚀: Generic tiered read fallback and validated cache rebuilding
@@ -414,6 +470,7 @@ Quicksilver is a KV dataset only: the CDN never reads it.
 - Generic metadata keys and values. Typed schemas for specific consumers (for example Worker deployment config) belong to
   those consumers, not to this dataset.
 - Ownership transitions use fencing epochs (B-09).
+- Drain hook (B-21b): a node drain moves its buckets; a cell drain has nothing to move; a namespace drain is `Unsupported`.
 
 **Additional context**
 - **Implementation:** KV.
@@ -532,9 +589,18 @@ Namespaces need their configured policy to take effect, and every KV namespace n
 - `home_only`: no edge caching; every read goes to the origin cell.
 - `on_demand` stays the push-on-first-read policy used by `auth` (B-42); KV no longer uses it.
 - **Origin cell:** holds its namespaces in L2 with 2–3 bucket replicas, subscribed through the relays, and never evicts them.
-  Moving an origin (rebalancing, retiring a cell) rebuilds the new cell from the bucket (B-11), flips the directory entry with an
-  epoch bump, keeps both cells subscribed for a grace period, then the old cell stops serving, unsubscribes and deletes the
-  namespace's range with its applied revision through B-20 reconciliation. Moves are rate-limited.
+- **Move one namespace, on the fly** (`move_namespace(ns, to_cell)`, through an operator API and CLI; `to_cell` defaults to the
+  least-loaded cell in the home DC). This is the only primitive; everything else that moves origin data calls it. A move is a
+  change of desired state in the namespace directory, carried out by the cells' B-20 reconciliation:
+  1. Write `origin_cell: to`, `moving_from: from`, `state: moving` with an epoch bump. The old cell keeps serving.
+  2. The target cell rebuilds the namespace from the bucket (B-11), subscribes at the consistent boundary (B-10) and catches up.
+  3. Once caught up, the target writes `state: active` with the next epoch. Readers now resolve to it.
+  4. After a grace period, the old cell's reconciliation stops serving, unsubscribes and deletes the namespace's range with its
+     applied revision in one atomic batch.
+  A crash at any step resumes from the directory state; cancelling before step 3 drops the target's partial copy.
+- **KV drain hook** for the generic drain (B-21b): draining a cell calls `move_namespace` for each namespace whose origin it is,
+  choosing targets by load; draining one namespace calls it once, which is how a single hot tenant moves. Edge cache entries
+  on a drained cell or node are dropped, not moved.
 - Basic eviction based on storage pressure and access recency, respecting pinned prefixes. Expired cache entries go first.
 - `full_replica` namespaces (Quicksilver) are never evicted from L2; their placement and completeness are B-40.
 
@@ -543,7 +609,7 @@ Namespaces need their configured policy to take effect, and every KV namespace n
 - **Module:** `kv/storage`, `kv/namespaces`.
 - **Doc reference:** `kv.md` §3, §9 Cells, §16; `feature-drafts.md` §4 decision 11.
 - **Depends on:** B-27.
-- **Acceptance criteria:** Each policy behaves as documented in an integration test. Moving an origin never serves a read older than the client's minimum revision, and an interrupted move resumes after a restart with no data left behind on the old cell. Disk usage stays within budget under load. Evicted data is still readable through fallback.
+- **Acceptance criteria:** Each policy behaves as documented in an integration test. Moving a single namespace under load never serves a read older than the client's minimum revision, and an interrupted move resumes after a restart with no data left behind on the old cell. A B-21b cell drain moves every origin namespace through the same operation and leaves the cell empty, without new namespaces being placed on it. Disk usage stays within budget under load. Evicted data is still readable through fallback.
 
 ---
 
@@ -562,6 +628,7 @@ Labels: enhancement
   - write in EU, read in US
   - kill an L2 node mid-traffic, at the edge and at the origin cell
   - move a namespace's origin cell under load
+  - add a node to an origin cell, and add a new cell to a DC, under load
   - kill a relay
   - corrupt a KV instance while Quicksilver keeps serving
   - restart a writer
@@ -572,7 +639,9 @@ Labels: enhancement
 - **Implementation:** KV.
 - **Doc reference:** `kv.md` §12, §13, §15, §18.
 - **Depends on:** B-24 … B-28.
-- **Acceptance criteria:** Every scenario passes in CI or in a nightly job.
+- **Acceptance criteria:** Every scenario passes in CI or in a nightly job. Adding a node or a cell takes a deploy plus at most
+  one Quicksilver write, with no manual data steps; no read goes backwards and no node serves a bucket or namespace it has not
+  finished loading.
 
 ---
 
@@ -941,6 +1010,7 @@ Labels: enhancement
 **Describe the solution you'd like**
 - An `auth` dataset using the `on_demand` policy (push on first read). It never uses the `cached` TTL model: a revocation must not wait for a TTL.
 - Fail-closed behaviour for revocations: revocation must be enforced authoritatively, not only eventually.
+- Drain hook (B-21b): a node drain moves its buckets; a cell drain has nothing to move; a namespace drain is `Unsupported`.
 
 **Additional context**
 - **Implementation:** KV refinement (new dataset). Needs scoping before work starts.
@@ -948,6 +1018,60 @@ Labels: enhancement
 - **Doc reference:** `notes.md`; `kv.md` §17 Freshness Guarantees ("access revocations require fencing… or fail-closed").
 - **Depends on:** B-29.
 - **Acceptance criteria:** A revoked key is rejected in every region within the agreed bound, or the check fails closed.
+
+---
+
+#### B-53 — Dormant namespaces at the origin
+
+```
+Title:  Feature 🚀: Evict idle KV namespaces from origin cells under storage pressure and rehydrate them from the bucket
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+An origin cell holds every namespace homed on it in full and never evicts it (§4 decision 11, B-28). Most namespaces go quiet,
+so origin disks fill with data nobody reads, and the only relief today is moving namespaces to another cell. Edge cells already
+drop idle data through their TTL; the origin needs the same, without breaking its "complete or absent" rule.
+
+**Describe the solution you'd like**
+- **Whole namespaces only.** An origin holds a namespace completely or not at all. Evicting part of one would leave the origin
+  answering misses it cannot answer.
+- **Nothing is lost by evicting.** A write is acknowledged only after its batch is in the bucket (B-09), so the bucket's snapshot
+  and log (B-11) always hold everything the origin has. Before marking a namespace dormant, compact it to a fresh snapshot so
+  rehydration replays only a short log.
+- **States in the Quicksilver namespace directory:** `active → dormant → rehydrating → active`, each change an ordinary write
+  with an epoch bump, so every node sees the same decision and stale changes are rejected (B-24).
+- **Choosing what to evict:** origin nodes record each namespace's last access (reads served and writes applied, rounded to the
+  hour) and report it to the cell's B-19 directory. When a cell passes a high disk watermark (for example 85%), a background
+  sweeper next to the B-11 compactor in `bedrock-api` marks the least recently used namespaces dormant until the cell is projected
+  under a low watermark (for example 75%). Namespaces accessed within a minimum idle age (for example 30 days), and namespaces
+  whose policy says `dormancy: never`, are never chosen. If pressure remains with nothing eligible, it alerts; the fix is
+  moving namespaces to another cell (B-28).
+- **Evicting:** a dormant namespace is a B-20 reconciliation repair on every origin node: stop serving, unsubscribe, delete the
+  range with its applied revision in one atomic batch. An interrupted eviction finishes after a restart.
+- **Writes while dormant** are unaffected: they go to the writer and the bucket log as usual. Rehydration picks them up.
+- **Rehydrating:** a miss that reaches the origin for a dormant namespace answers with a retryable "rehydrating" error and requests
+  rehydration (several requests for one namespace collapse into one directory change). Origin nodes restore their buckets from
+  the snapshot, replay the log after it, subscribe at the consistent boundary (B-10), then the namespace returns to `active`.
+  Edge cells keep serving their unexpired entries meanwhile. Rehydrations are rate-limited per cell.
+- **Metrics** (labelled by cell only): dormant namespace count, evictions, rehydrations, rehydration duration, reads rejected
+  while rehydrating, disk use against the watermarks. Per-namespace state goes through introspection.
+
+**Additional context**
+- **Implementation:** KV refinement. Edge cells need nothing new; this only applies to origin cells.
+- **Module:** `kv/storage`, `kv/namespaces` (states and sweeper), with `lib/reconciliation` and `lib/replication` reused.
+- **Doc reference:** `kv.md` §9 Customer KV: Origin Cells and Tiered Caching, §14, §16; `feature-drafts.md` §4 decision 11.
+- **Depends on:** B-29.
+- **Known limits:** the first read after dormancy waits for a full namespace restore, which grows with the namespace's size.
+  Where the per-namespace last-access figures are aggregated (the B-19 directory is the proposal here) and whether the sweeper
+  lives in `bedrock-api` need confirming before this becomes an issue.
+- **Acceptance criteria:**
+  - Under disk pressure, idle namespaces are evicted least recently used first until the cell is under the low watermark;
+    namespaces inside the minimum idle age or marked `dormancy: never` are never evicted.
+  - A read of a dormant namespace, after rehydration, returns the latest value, including writes made while it was dormant.
+  - A minimum-revision read never returns an older revision across eviction and rehydration.
+  - A crash at any point during eviction or rehydration converges to a complete `active` namespace or a fully removed `dormant` one.
+  - Concurrent misses for one dormant namespace cause one rehydration.
 
 ---
 
@@ -970,6 +1094,8 @@ CDN-specific repair is needed: verified copies, peer-first sourcing, throttling.
 - Replica repair: restore 2 verified holders after a holder is lost, sourcing from peers first and S3 second.
 - Bucket migration during rebalance, with handoff and no gap in availability.
 - Repair throttling that respects transfer backpressure.
+- Drain hook (B-21b): a node drain moves its artifact holders within the cell; a cell drain has nothing to move, and the cells
+  taking its traffic can prewarm (B-45).
 
 **Additional context**
 - **Implementation:** CDN refinement (CDN Phase 3). **Do this first among the CDN refinements.**
@@ -1272,10 +1398,16 @@ Labels: enhancement
     - **Origin:** the namespace's full state lives in one cell of its home DC, held in L2 like `full_replica` with 2–3 bucket
       replicas and fed by the normal relay subscription. The Quicksilver namespace directory assigns it explicitly
       (`writer`, `origin_cell`, `epoch`), never by hashing: new namespaces go to the least-loaded cell, adding a cell moves
-      nothing, and rebalancing or retiring a cell moves chosen namespaces deliberately and rate-limited. A new origin is rebuilt
+      nothing. One operation moves one namespace on the fly (`move_namespace`, B-28); the generic drain (B-21b) calls it for every
+      origin on a draining cell, or for one hot tenant, rate-limited. A new origin is rebuilt
       from the bucket (B-11); the old one stops serving, unsubscribes and deletes the namespace's range with its applied
       revision through B-20 reconciliation.
     - **Bucket:** holds only the log and snapshots, to rebuild state. It is not on the normal KV read path.
+    - **Adding capacity is a deploy, not a migration.** A new node joins its cell through its relay stream (B-12), takes over
+      buckets (B-16) and loads them from peers or the bucket before serving (B-21). A new cell is its nodes and relays (they dial
+      upstream; upstreams keep no list) plus one Quicksilver write adding it to the region's cell list. Existing origin
+      assignments never change on their own. With about 10,000 nodes per cell, one cell holds a lot of origin data; when one
+      fills, new namespaces go elsewhere and chosen ones move (B-28), and idle ones go dormant (B-53). B-29 and B-23 test this.
     - **Consistency:** reads are eventually consistent within the TTL of each tier. A fill is accepted only from a source at
       least as far along as the receiver. A minimum-revision read skips cache entries older than the revision and waits at
       the origin, so a client reads its own writes.
