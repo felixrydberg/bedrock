@@ -603,13 +603,13 @@ s3://platform/
     infrastructure/
       manifest.json
       snapshots/
-      logs/
+      log/
 
   kv/
     store-A/
       manifest.json
       snapshots/
-      logs/
+      log/
 ```
 
 ### Portable Snapshot Format

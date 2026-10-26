@@ -16,6 +16,7 @@ use bedrock_lib::datasets::Dataset;
 use bedrock_lib::node::{
     ApiConfig, Budget, Location, NodeConfig, RelayConfig, Role, ServiceConfig, Tier,
 };
+use bedrock_lib::s3::S3Config;
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
@@ -88,7 +89,7 @@ fn service_config(node: NodeConfig, datasets: &[Dataset]) -> ServiceConfig {
         roles: vec![Role::L1],
         datasets: datasets.iter().map(|d| d.name.to_string()).collect(),
         relays: vec!["10.0.1.3:7000".into()],
-        api: "10.0.1.4:7000".into(),
+        api: "10.0.1.4:7002".into(),
         s3_endpoint: format!("http://{S3}"),
     }
 }
@@ -171,7 +172,16 @@ async fn scenario() -> u64 {
                 })),
                 _ => Box::pin(bedrock_api::run(ApiConfig {
                     node,
-                    s3_endpoint: format!("http://{S3}"),
+                    write_listen: format!("{ip}:7002").parse().unwrap(),
+                    s3: S3Config {
+                        endpoint: format!("http://{S3}"),
+                        bucket: BUCKET.into(),
+                        region: "us-east-1".into(),
+                        access_key_id: "sim".into(),
+                        secret_access_key: "sim".into(),
+                        max_attempts: 3,
+                        attempt_timeout_ms: 30_000,
+                    },
                 })),
             };
             let t = trace.clone();

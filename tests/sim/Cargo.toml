@@ -7,24 +7,24 @@ publish = false
 description = "Deterministic simulation tests for the shared core (B-23a); most only compile under `--cfg madsim`."
 
 [target.'cfg(madsim)'.dev-dependencies]
-bedrock-api = { path = "../../crates/api" }
 bedrock-cdn = { path = "../../crates/cdn" }
 bedrock-kv = { path = "../../crates/kv" }
 bedrock-relay = { path = "../../crates/relay" }
 aws-sdk-s3.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1"] }
-hyper = { version = "1", features = ["client", "server", "http1"] }
-hyper-util = { version = "0.1", features = ["service", "tokio"] }
 madsim.workspace = true
-http-body-util = "0.1"
 
-# `tests/transport.rs` runs in both builds.
+# `tests/transport.rs`, `subscriptions.rs` and `writes.rs` run in both builds.
 [build-dependencies]
 protoc-bin-vendored = "3"
 tonic-build = { package = "madsim-tonic-build", version = "0.6" }
 
 [dev-dependencies]
+bedrock-api = { path = "../../crates/api" }
 bedrock-lib.workspace = true
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 prost.workspace = true
 tokio.workspace = true
 tokio-stream = { version = "0.1", features = ["net"] }

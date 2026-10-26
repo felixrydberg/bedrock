@@ -14,6 +14,7 @@ use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::s3::S3Config;
 use crate::transport::admin::Admin;
 
 /// Settings every binary has.
@@ -60,7 +61,7 @@ pub struct ServiceConfig {
     pub datasets: Vec<String>,
     /// Relay endpoints to subscribe through, cell relays first.
     pub relays: Vec<String>,
-    /// `bedrock-api` endpoint for writes.
+    /// `bedrock-api` endpoint for writes, its `write_listen`.
     pub api: String,
     pub s3_endpoint: String,
 }
@@ -109,12 +110,14 @@ impl RelayConfig {
     }
 }
 
-/// `bedrock-api`.
+/// `bedrock-api`. Relays subscribe on `listen`; writes arrive over HTTP on `write_listen`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ApiConfig {
     #[serde(flatten)]
     pub node: NodeConfig,
-    pub s3_endpoint: String,
+    pub write_listen: SocketAddr,
+    /// The bucket batches are committed to (B-09).
+    pub s3: S3Config,
 }
 
 macro_rules! as_node {

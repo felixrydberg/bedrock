@@ -5,8 +5,13 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
+# Served through hyper rather than `axum::serve`, which does not run under madsim (#9).
+axum = { version = "0.8", default-features = false, features = ["http1"] }
 bedrock-lib.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["service"] }
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
 
 [lints]
