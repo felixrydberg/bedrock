@@ -14,6 +14,7 @@ use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::s3::S3Config;
 use crate::transport::admin::Admin;
 
 /// Settings every binary has.
@@ -60,7 +61,7 @@ pub struct ServiceConfig {
     pub datasets: Vec<String>,
     /// Relay endpoints to subscribe through, cell relays first.
     pub relays: Vec<String>,
-    /// `bedrock-api` endpoint for writes.
+    /// `bedrock-api` endpoint for writes, its `write_listen`.
     pub api: String,
     pub s3_endpoint: String,
 }
@@ -109,12 +110,27 @@ impl RelayConfig {
     }
 }
 
-/// `bedrock-api`.
-#[derive(Debug, Clone, Deserialize)]
+/// `bedrock-api`. Relays subscribe on `listen`; writes arrive over HTTP on `write_listen`.
+#[derive(Clone, Deserialize)]
 pub struct ApiConfig {
     #[serde(flatten)]
     pub node: NodeConfig,
-    pub s3_endpoint: String,
+    pub write_listen: SocketAddr,
+    /// Required bearer credential granting write access to every dataset and namespace.
+    pub write_token: String,
+    /// The bucket batches are committed to (B-09).
+    pub s3: S3Config,
+}
+
+impl fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiConfig")
+            .field("node", &self.node)
+            .field("write_listen", &self.write_listen)
+            .field("write_token", &"<redacted>")
+            .field("s3", &self.s3)
+            .finish()
+    }
 }
 
 macro_rules! as_node {
@@ -150,11 +166,30 @@ impl std::error::Error for ConfigError {}
 #[allow(clippy::disallowed_methods)]
 pub fn load<T: DeserializeOwned + AsRef<NodeConfig>>() -> Result<T, ConfigError> {
     let path = std::env::var("BEDROCK_CONFIG").unwrap_or_else(|_| "bedrock.toml".into());
-    let config: T = Figment::new()
-        .merge(Toml::file(&path))
-        .merge(Env::prefixed("BEDROCK_").split("__").ignore(&["config"]))
-        .extract()
-        .map_err(|e| ConfigError(format!("config ({path}): {e}")))?;
+    let mut source = Figment::new().merge(Toml::file(&path)).merge(
+        Env::prefixed("BEDROCK_")
+            .split("__")
+            .ignore(&["config", "write_token"]),
+    );
+    // Credentials must stay literal: Env's value parser interprets numbers, booleans and quoted strings.
+    let token_env = Env::prefixed("BEDROCK_").only(&["write_token"]);
+    let mut tokens = token_env.iter();
+    if let Some((_, token)) = tokens.next() {
+        if tokens.next().is_some() {
+            return Err(ConfigError("multiple BEDROCK_WRITE_TOKEN variables".into()));
+        }
+        source = source.merge(("write_token", token));
+    }
+    let config: T = source.extract().map_err(|e| {
+        if e.path
+            .first()
+            .is_some_and(|key| key.eq_ignore_ascii_case("write_token"))
+        {
+            ConfigError(format!("config ({path}): write_token must be a string"))
+        } else {
+            ConfigError(format!("config ({path}): {e}"))
+        }
+    })?;
     let dir = &config.as_ref().data_dir;
     std::fs::create_dir_all(dir)
         .map_err(|e| ConfigError(format!("data_dir {}: {e}", dir.display())))?;
@@ -267,6 +302,59 @@ mod tests {
             let c: RelayConfig = load().map_err(|e| e.0)?;
             assert_eq!(c.tier, Tier::Cell);
             assert!(c.validate().is_err());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn api_requires_write_token_and_redacts_it() {
+        let config = Figment::new()
+            .merge(Toml::string(KV_TOML))
+            .merge(("write_listen", "127.0.0.1:7002"))
+            .merge(("s3.endpoint", "http://s3:8333"))
+            .merge(("s3.bucket", "bedrock"))
+            .merge(("s3.access_key_id", "local"))
+            .merge(("s3.secret_access_key", "local"));
+        let error = config.extract::<ApiConfig>().unwrap_err();
+        assert!(error.to_string().contains("write_token"));
+        let config: ApiConfig = config
+            .merge(("write_token", "private-writer-token"))
+            .extract()
+            .unwrap();
+        assert_eq!(config.write_token, "private-writer-token");
+        assert!(!format!("{config:?}").contains("private-writer-token"));
+    }
+
+    #[test]
+    fn api_write_token_env_is_literal() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "bedrock.toml",
+                &format!("write_token = 9274512836401927\n{KV_TOML}"),
+            )?;
+            jail.set_env("BEDROCK_WRITE_LISTEN", "127.0.0.1:7002");
+            jail.set_env("BEDROCK_S3__ENDPOINT", "http://s3:8333");
+            jail.set_env("BEDROCK_S3__BUCKET", "bedrock");
+            jail.set_env("BEDROCK_S3__ACCESS_KEY_ID", "local");
+            jail.set_env("BEDROCK_S3__SECRET_ACCESS_KEY", "local");
+            let error = load::<ApiConfig>().unwrap_err();
+            assert!(error.to_string().contains("write_token"));
+            assert!(!error.to_string().contains("9274512836401927"));
+            for token in ["9274512836401927", "false", "\"quoted-token\""] {
+                jail.set_env("BEDROCK_WRITE_TOKEN", token);
+                let config: ApiConfig = load().map_err(|e| e.0)?;
+                assert_eq!(config.write_token, token);
+            }
+            #[cfg(unix)]
+            {
+                jail.set_env("bedrock_write_token", "another-token");
+                assert!(
+                    load::<ApiConfig>()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("multiple")
+                );
+            }
             Ok(())
         });
     }

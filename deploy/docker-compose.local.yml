@@ -40,7 +40,13 @@ services:
       BEDROCK_LOCATION__REGION: eu
       BEDROCK_LOCATION__DC: eu-1
       BEDROCK_LOCATION__CELL: eu-1a
-      BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_WRITE_LISTEN: 0.0.0.0:7002
+      BEDROCK_WRITE_TOKEN: "${BEDROCK_WRITE_TOKEN:?Set a random write API bearer token}"
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      # SeaweedFS runs without auth locally, so any credentials work.
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   relay-eu-1:
     <<: *relay
@@ -83,7 +89,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   cdn-eu-1:
@@ -100,7 +106,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[cdn]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   kv-eu-2:
@@ -116,7 +122,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   cdn-eu-2:
@@ -132,7 +138,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[cdn]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   kv-eu-3:
@@ -148,7 +154,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   cdn-eu-3:
@@ -164,7 +170,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[cdn]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   relay-us-1:
@@ -206,7 +212,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   cdn-us-1:
@@ -222,7 +228,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[cdn]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   kv-us-2:
@@ -238,7 +244,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   cdn-us-2:
@@ -254,7 +260,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[cdn]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   kv-us-3:
@@ -270,7 +276,7 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
 
   cdn-us-3:
@@ -286,5 +292,5 @@ services:
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[cdn]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
-      BEDROCK_API: api:7000
+      BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333

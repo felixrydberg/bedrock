@@ -2,9 +2,11 @@
 //!
 //! Every dataset, including `cdn` retention, replicates the same [`Event`]s. Operations are only `SET` and `DELETE`;
 //! what an event means locally is up to the dataset's [`ApplyHook`], so writers and relays stay generic.
-//! [`subscriptions`] carries events from a source's log to an applier (B-10).
+//! [`writer`] assigns sequences and commits events (B-09); [`subscriptions`] carries them from a source's log to an
+//! applier (B-10).
 
 pub mod subscriptions;
+pub mod writer;
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;

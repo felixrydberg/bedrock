@@ -1,8 +1,17 @@
 node_id = "api-1"
 listen = "0.0.0.0:7000"
 admin_listen = "0.0.0.0:7001"
+write_listen = "0.0.0.0:7002"
+# Required via BEDROCK_WRITE_TOKEN. Clients send Authorization: Bearer <token>.
+# This credential grants PUT and DELETE access to all datasets/namespaces; use a random secret and a trusted network
+# or a TLS-terminating proxy for the HTTP write endpoint.
 data_dir = "/data"
-s3_endpoint = "https://s3.example.internal"
+
+# Credentials come from BEDROCK_S3__ACCESS_KEY_ID and BEDROCK_S3__SECRET_ACCESS_KEY. They need get, list and put, not
+# delete: only the compactor deletes (B-11).
+[s3]
+endpoint = "https://s3.example.internal"
+bucket = "bedrock"
 
 [location]
 region = "core"
