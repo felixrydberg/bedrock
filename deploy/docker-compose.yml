@@ -37,8 +37,8 @@ services:
     build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-api } }
     image: bedrock-api
     environment:
-      # Required by the API at startup; other profiles do not need the writer credential.
-      BEDROCK_WRITE_TOKEN: "${BEDROCK_WRITE_TOKEN:-}"
+      # Required by Compose even when the api profile is disabled.
+      BEDROCK_WRITE_TOKEN: "${BEDROCK_WRITE_TOKEN:?Set a random write API bearer token}"
     volumes: [/var/lib/bedrock/api:/data, ./config/api.toml:/etc/bedrock/config.toml:ro]
     cpus: 1
     mem_limit: 2g
