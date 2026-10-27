@@ -22,6 +22,8 @@ use tokio::time::timeout;
 
 const NAMESPACES: [&str; 2] = ["a", "b"];
 const WRITES: usize = 200;
+const WRITE_TOKEN: &str = "test-writer-token";
+const AUTHORIZATION: &str = "Bearer test-writer-token";
 
 /// Records every event it applies, in order.
 #[derive(Clone, Default)]
@@ -41,21 +43,27 @@ async fn send(
     path: &str,
     idempotency_key: &str,
     body: String,
+    authorization: &[&str],
 ) -> (StatusCode, String) {
     let stream = TcpStream::connect(api).await.unwrap();
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .unwrap();
     tokio::spawn(connection);
-    let request = hyper::Request::builder()
+    let mut request = hyper::Request::builder()
         .method(method)
         .uri(path)
         .header("host", "api")
-        .header("idempotency-key", idempotency_key)
-        .body(Full::new(Bytes::from(body)))
-        .unwrap();
+        .header("idempotency-key", idempotency_key);
+    for value in authorization {
+        request = request.header("authorization", *value);
+    }
+    let request = request.body(Full::new(Bytes::from(body))).unwrap();
     let response = sender.send_request(request).await.unwrap();
     let status = response.status();
+    if status == StatusCode::UNAUTHORIZED {
+        assert_eq!(response.headers()["www-authenticate"], "Bearer");
+    }
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8(body.to_vec()).unwrap())
 }
@@ -73,6 +81,45 @@ async fn scenario(api: SocketAddr, replication: String) {
     let namespaces = NAMESPACES.map(String::from).to_vec();
     let subscription = Subscription::start(peers, replication, applier, namespaces);
 
+    for method in ["PUT", "DELETE"] {
+        for authorization in [
+            vec![],
+            vec!["Bearer wrong-token"],
+            vec!["Bearer test-writer-token-extra"],
+            vec!["Basic test-writer-token"],
+            vec!["Bearer"],
+            vec!["Bearer "],
+            vec![AUTHORIZATION, "Bearer wrong-token"],
+            vec!["Bearer wrong-token", AUTHORIZATION],
+        ] {
+            let (status, _) = send(
+                api,
+                method,
+                "/v1/kv/a/key/0",
+                "w0",
+                "unauthorized".into(),
+                &authorization,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {authorization:?}"
+            );
+        }
+    }
+
+    let (status, _) = send(
+        api,
+        "PUT",
+        "/v1/kv/a/key/0",
+        "",
+        String::new(),
+        &[AUTHORIZATION],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
     let writes: Vec<_> = (0..WRITES)
         .map(|i| {
             tokio::spawn(async move {
@@ -83,11 +130,26 @@ async fn scenario(api: SocketAddr, replication: String) {
                     ("PUT", i.to_string())
                 };
                 let path = format!("/v1/kv/{namespace}/key/{}", i % 5);
-                let (status, sequence) =
-                    send(api, method, &path, &format!("w{i}"), body.clone()).await;
+                let (status, sequence) = send(
+                    api,
+                    method,
+                    &path,
+                    &format!("w{i}"),
+                    body.clone(),
+                    &[AUTHORIZATION],
+                )
+                .await;
                 assert_eq!(status, StatusCode::OK, "{sequence}");
                 if i % 10 == 0 {
-                    let retried = send(api, method, &path, &format!("w{i}"), body).await;
+                    let retried = send(
+                        api,
+                        method,
+                        &path,
+                        &format!("w{i}"),
+                        body,
+                        &["bEaReR test-writer-token"],
+                    )
+                    .await;
                     assert_eq!(retried, (StatusCode::OK, sequence.clone()), "retry of w{i}");
                 }
                 (namespace, sequence.parse::<u64>().unwrap(), i)
@@ -103,6 +165,10 @@ async fn scenario(api: SocketAddr, replication: String) {
             "{namespace} sequence {sequence} acknowledged twice"
         );
     }
+
+    // A committed idempotency key still requires authorization on every retry.
+    let (status, _) = send(api, "DELETE", "/v1/kv/a/key/0", "w0", String::new(), &[]).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     for (namespace, acked) in &acked {
         let head = acked.len() as u64;
@@ -159,7 +225,10 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
         .unwrap();
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = http.local_addr().unwrap();
-    tokio::spawn(bedrock_api::serve(http, bedrock_api::app(writer.clone())));
+    tokio::spawn(bedrock_api::serve(
+        http,
+        bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
+    ));
     let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replication = grpc.local_addr().unwrap().to_string();
     tokio::spawn(
@@ -206,7 +275,10 @@ async fn simulated() {
                 .await
                 .unwrap();
             let http = TcpListener::bind(api).await.unwrap();
-            tokio::spawn(bedrock_api::serve(http, bedrock_api::app(writer.clone())));
+            tokio::spawn(bedrock_api::serve(
+                http,
+                bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
+            ));
             tonic::transport::Server::builder()
                 .add_service(ReplicationServer::new(Source::new(writer.log())))
                 .serve(replication)

@@ -592,6 +592,7 @@ dependencies = [
  "hyper-util",
  "madsim-tokio",
  "madsim-tonic",
+ "subtle",
  "tracing",
 ]
 

@@ -5,14 +5,17 @@
 //!
 //! `PUT /v1/{dataset}/{namespace}/{key}` sets the key to the request body and `DELETE` deletes it. The response body is
 //! the committed sequence. With an `Idempotency-Key` header, a retry returns the first commit's sequence.
+//! Every write requires `Authorization: Bearer <write_token>`; the configured token grants access to all writes.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::extract::{Path, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::put;
 use bedrock_lib::node::{self, ApiConfig, ConfigError};
 use bedrock_lib::replication::Operation;
@@ -23,6 +26,7 @@ use bedrock_lib::s3::ObjectStore;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
@@ -37,10 +41,11 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     let writer = Writer::open(store, now)
         .await
         .map_err(|e| ConfigError(format!("loading the log: {e}")))?;
+    let app = app(writer.clone(), config.write_token)?;
     let writes = TcpListener::bind(config.write_listen)
         .await
         .map_err(|e| ConfigError(format!("write_listen {}: {e}", config.write_listen)))?;
-    tokio::spawn(serve(writes, app(writer.clone())));
+    tokio::spawn(serve(writes, app));
     let replication = tonic::transport::Server::builder()
         .add_service(ReplicationServer::new(Source::new(writer.log())))
         .serve(config.node.listen);
@@ -58,14 +63,49 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// The write routes over `writer`.
-pub fn app<S: ObjectStore + 'static>(writer: Arc<Writer<S>>) -> Router {
-    Router::new()
+/// The write routes over `writer`, restricted to holders of `write_token`.
+pub fn app<S: ObjectStore + 'static>(
+    writer: Arc<Writer<S>>,
+    write_token: String,
+) -> Result<Router, ConfigError> {
+    if write_token.is_empty() || !write_token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ConfigError(
+            "write_token must be nonempty printable ASCII without spaces".into(),
+        ));
+    }
+    Ok(Router::new()
         .route(
             "/v1/{dataset}/{namespace}/{*key}",
             put(write::<S>).delete(write::<S>),
         )
-        .with_state(writer)
+        .route_layer(middleware::from_fn_with_state(
+            Arc::<str>::from(write_token),
+            authorize,
+        ))
+        .with_state(writer))
+}
+
+async fn authorize(State(write_token): State<Arc<str>>, request: Request, next: Next) -> Response {
+    let mut credentials = request.headers().get_all(header::AUTHORIZATION).iter();
+    let authorized = match (credentials.next(), credentials.next()) {
+        (Some(value), None) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.split_once(' '))
+            .is_some_and(|(scheme, token)| {
+                scheme.eq_ignore_ascii_case("Bearer")
+                    && bool::from(token.as_bytes().ct_eq(write_token.as_bytes()))
+            }),
+        _ => false,
+    };
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Serves `app` over HTTP/1 through hyper. `axum::serve` does not run under madsim (#9).
@@ -126,4 +166,18 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     since_epoch.as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bedrock_lib::s3::memory::MemoryStore;
+
+    #[tokio::test]
+    async fn rejects_unusable_write_tokens() {
+        let writer = Writer::open(MemoryStore::default(), || 0).await.unwrap();
+        for token in ["", " ", "with space", "with\nnewline", "non-ascii-å"] {
+            assert!(app(writer.clone(), token.into()).is_err());
+        }
+    }
 }

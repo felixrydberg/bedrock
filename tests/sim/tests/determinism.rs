@@ -173,6 +173,7 @@ async fn scenario() -> u64 {
                 _ => Box::pin(bedrock_api::run(ApiConfig {
                     node,
                     write_listen: format!("{ip}:7002").parse().unwrap(),
+                    write_token: "simulation-writer-token".into(),
                     s3: S3Config {
                         endpoint: format!("http://{S3}"),
                         bucket: BUCKET.into(),

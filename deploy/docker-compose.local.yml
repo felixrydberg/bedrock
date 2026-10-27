@@ -41,6 +41,7 @@ services:
       BEDROCK_LOCATION__DC: eu-1
       BEDROCK_LOCATION__CELL: eu-1a
       BEDROCK_WRITE_LISTEN: 0.0.0.0:7002
+      BEDROCK_WRITE_TOKEN: "${BEDROCK_WRITE_TOKEN:?Set a random write API bearer token}"
       BEDROCK_S3__ENDPOINT: http://s3:8333
       BEDROCK_S3__BUCKET: bedrock
       # SeaweedFS runs without auth locally, so any credentials work.
