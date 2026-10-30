@@ -13,7 +13,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use object_store::ObjectStore;
 use slatedb::{CloseReason, Db, ErrorKind, Settings, WriteBatch};
-use tokio_stream::StreamExt;
 
 use super::namespace::{Changes, NamespaceDatabase, NamespaceFactory};
 use super::{Entry, ErrorContext, KeyRange, StorageError, StorageResult};
@@ -70,23 +69,48 @@ fn valid_identity(identity: &str) -> bool {
 impl NamespaceFactory for SlateFactory {
     async fn namespaces(&self) -> StorageResult<Vec<(String, String)>> {
         let mut scopes = BTreeSet::new();
-        let mut objects = self.store.list(None);
-        while let Some(object) = objects.next().await {
-            let object = object.map_err(|_| {
-                StorageError::Unavailable(context("namespace", "namespace listing failed".into()))
-            })?;
-            let path = object.location.as_ref();
-            let mut pieces = path.split('/');
-            if let (Some(dataset), Some(namespace), Some("state")) =
-                (pieces.next(), pieces.next(), pieces.next())
-            {
-                if !valid_identity(dataset) || !valid_identity(namespace) {
+        let listing_error =
+            |_| StorageError::Unavailable(context("namespace", "namespace listing failed".into()));
+        let mut datasets = self
+            .store
+            .list_with_delimiter(None)
+            .await
+            .map_err(listing_error)?
+            .common_prefixes;
+        datasets.sort();
+        for dataset in datasets {
+            let mut namespaces = self
+                .store
+                .list_with_delimiter(Some(&dataset))
+                .await
+                .map_err(listing_error)?
+                .common_prefixes;
+            namespaces.sort();
+            for namespace in namespaces {
+                let children = self
+                    .store
+                    .list_with_delimiter(Some(&namespace))
+                    .await
+                    .map_err(listing_error)?;
+                if !children
+                    .common_prefixes
+                    .contains(&namespace.clone().join("state"))
+                {
+                    continue;
+                }
+                let dataset_name = dataset.as_ref();
+                let namespace_name = namespace
+                    .as_ref()
+                    .strip_prefix(dataset_name)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .unwrap_or_default();
+                if !valid_identity(dataset_name) || !valid_identity(namespace_name) {
                     return Err(StorageError::Corruption(context(
                         "namespace",
                         "invalid stored namespace identity".into(),
                     )));
                 }
-                scopes.insert((dataset.to_owned(), namespace.to_owned()));
+                scopes.insert((dataset_name.to_owned(), namespace_name.to_owned()));
             }
         }
         Ok(scopes.into_iter().collect())

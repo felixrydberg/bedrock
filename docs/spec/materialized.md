@@ -54,21 +54,20 @@ completed all seven invariants with `MaxSeq=3`, `MaxTime=4`, `MaxEpoch=2`:
 
 A scratch mutation allowed `Ack` against buffered rather than durable progress.
 TLC rejected `NoLostAck` with the trace `Stage -> Ack` (16 generated / 15 distinct
-states). The checked-in source was never mutated. Logs are in
-`.codex-tmp/tlc-materialized-atomic.log`,
-`.codex-tmp/tlc-materialized-atomic-position.log`, and
-`.codex-tmp/tlc-materialized-atomic-mutation.log`.
+states). The checked-in source was never mutated.
 The old journal/publication model's results do not validate this replacement.
 
-Run the checked-in configuration from `docs/spec` in PowerShell:
+Run the checked-in configuration from `docs/spec` in PowerShell. Put the TLC
+tools JAR at `./tools/tla2tools.jar` or replace that relative classpath with its
+location; Java 17 must be available on `PATH`:
 
 ```powershell
-& 'C:/Program Files/Java/jdk-17/bin/java.exe' `
+java `
   '-XX:+UseParallelGC' `
   '-Dtlc2.tool.fp.FPSet.impl=tlc2.tool.fp.MemFPSet' `
-  -cp C:/Users/balle/Documents/GitHub/bedrock/.codex-tmp/tools/tla2tools.jar `
+  -cp './tools/tla2tools.jar' `
   tlc2.TLC -workers 2 `
-  -metadir C:/Users/balle/Documents/GitHub/bedrock/.codex-tmp/tlc-materialized-atomic `
+  -metadir './states/materialized' `
   -config materialized.cfg materialized.tla
 ```
 

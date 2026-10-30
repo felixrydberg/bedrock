@@ -5,7 +5,7 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
-async-trait = "0.1"
+async-trait.workspace = true
 figment.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
@@ -24,8 +24,8 @@ tracing-subscriber.workspace = true
 # Native object I/O stays outside simulation; namespace I/O uses its deterministic adapter model.
 [target.'cfg(not(madsim))'.dependencies]
 tonic-prost.workspace = true
-slatedb = { version = "=0.17.0", default-features = false }
-object_store = { version = "0.14.2", features = ["aws"] }
+slatedb.workspace = true
+object_store.workspace = true
 rocksdb.workspace = true
 
 [build-dependencies]

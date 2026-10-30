@@ -19,7 +19,8 @@ Storage engines are interchangeable through a common Rust abstraction.
 ```text
           Authoritative Home Writers
                      |
-              Durable Write Logs
+       Per-Namespace Materialized SlateDB State
+            + Retained Events
                      |
           Global Replication Network
                      |
@@ -418,12 +419,13 @@ Customer KV follows the Cloudflare Workers KV model: one store holds each namesp
   fetches from the origin for the whole region. The cell list and entry addresses live in Quicksilver.
 - **Edge.** Every other cell caches entries (`value`, `revision`, `fetched_at`) for `cache_ttl`. A miss walks
   L1 → cell L2 → regional tier → origin cell. Concurrent misses for a key are coalesced at each tier.
-- **Bucket.** Holds only the log and snapshots, to rebuild a cell. It is not on the normal read path.
+- **Bucket.** Holds per-namespace materialized SlateDB state and retained events for validated cell recovery (§14).
 - **Adding capacity.** A new node joins its cell through its relay stream, takes over buckets and loads them from peers or the
   bucket before serving them. A new cell needs its nodes and relays plus one Quicksilver write adding it to the region's cell
   list. No existing origin assignment changes, so adding capacity never moves data on its own.
 - **Moving an origin** is one operation on one namespace, run on the fly: the directory records the target, the target cell
-  rebuilds from the bucket and catches up while the old cell keeps serving, the directory flips with an epoch bump, and after a
+  rebuilds the namespace from validated current materialized state and its represented revision, then uses retained events for any
+  required catchup while the old cell keeps serving; the directory flips with an epoch bump, and after a
   grace period the old cell stops serving, unsubscribes and deletes the namespace's range with its applied revision. Every step
   is a reconciliation repair, so an interrupted move finishes after a restart. Draining a cell or a single namespace uses the
   generic drain (feature-drafts B-21b), which calls this operation for each origin namespace involved, at a set rate. Draining

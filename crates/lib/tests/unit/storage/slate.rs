@@ -16,6 +16,9 @@ struct WalFaultStore {
     inner: InMemory,
     fault: AtomicUsize,
     failures: AtomicUsize,
+    recursive_lists: AtomicUsize,
+    listing_calls: std::sync::Mutex<Vec<String>>,
+    listing_failure: std::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Display for WalFaultStore {
@@ -71,14 +74,24 @@ impl ObjectStore for WalFaultStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> ObjectStream<ObjectMeta> {
+        self.recursive_lists.fetch_add(1, Ordering::SeqCst);
         self.inner.list(prefix)
     }
 
     fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> ObjectStream<ObjectMeta> {
+        self.recursive_lists.fetch_add(1, Ordering::SeqCst);
         self.inner.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
+        let name = prefix.map_or("", |path| path.as_ref());
+        self.listing_calls.lock().unwrap().push(name.into());
+        if self.listing_failure.lock().unwrap().as_deref() == Some(name) {
+            return Err(object_store::Error::Generic {
+                store: "listing-fault-test",
+                source: Box::new(std::io::Error::other("injected listing failure")),
+            });
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -154,6 +167,90 @@ async fn failed_native_wal_flush_requires_restart_and_recovers_only_remote_batch
 
 fn factory() -> SlateFactory {
     SlateFactory::new(Arc::new(InMemory::new()))
+}
+
+async fn put_listing_object(store: &WalFaultStore, path: &str) {
+    store
+        .inner
+        .put_opts(
+            &Path::parse(path).unwrap(),
+            b"object".to_vec().into(),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn namespace_discovery_lists_prefixes_and_ignores_unrelated_objects() {
+    let store = Arc::new(WalFaultStore::default());
+    for path in [
+        "root-file",
+        "kv/readme",
+        "kv/one/state/manifest/1",
+        "kv/two/state/wal/1",
+        "cdn/assets/state/sst/1",
+        "kv/not-a-db/state",
+        "kv/stateful/stateful/object",
+        r"bad\dataset/not-a-db/objects/value",
+        r"kv/bad\namespace/objects/value",
+    ] {
+        put_listing_object(&store, path).await;
+    }
+    let factory = SlateFactory::new(store.clone());
+    let expected = vec![
+        ("cdn".into(), "assets".into()),
+        ("kv".into(), "one".into()),
+        ("kv".into(), "two".into()),
+    ];
+    assert_eq!(factory.namespaces().await.unwrap(), expected);
+    let calls = std::mem::take(&mut *store.listing_calls.lock().unwrap());
+    assert!(
+        calls
+            .iter()
+            .all(|path| !path.split('/').any(|part| part == "state")),
+        "namespace discovery must stop before listing engine objects: {calls:?}"
+    );
+    for index in 0..128 {
+        put_listing_object(&store, &format!("kv/one/state/wal/{index}")).await;
+    }
+    assert_eq!(factory.namespaces().await.unwrap(), expected);
+    assert_eq!(
+        store.listing_calls.lock().unwrap().len(),
+        calls.len(),
+        "more engine objects must not require more namespace listings"
+    );
+    assert_eq!(store.recursive_lists.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn namespace_discovery_preserves_listing_failures_at_every_stage() {
+    for prefix in ["", "kv", "kv/one"] {
+        let store = Arc::new(WalFaultStore::default());
+        put_listing_object(&store, "kv/one/state/manifest/1").await;
+        *store.listing_failure.lock().unwrap() = Some(prefix.into());
+        let result = SlateFactory::new(store).namespaces().await;
+        assert!(
+            matches!(result, Err(StorageError::Unavailable(_))),
+            "{prefix}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn namespace_discovery_rejects_invalid_confirmed_namespace_identities() {
+    for path in [
+        r"bad\dataset/one/state/manifest/1",
+        r"kv/bad\namespace/state/manifest/1",
+    ] {
+        let store = Arc::new(WalFaultStore::default());
+        put_listing_object(&store, path).await;
+        let result = SlateFactory::new(store).namespaces().await;
+        assert!(
+            matches!(result, Err(StorageError::Corruption(_))),
+            "{path}: {result:?}"
+        );
+    }
 }
 
 #[tokio::test]
