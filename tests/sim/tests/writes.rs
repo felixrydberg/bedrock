@@ -211,18 +211,30 @@ async fn scenario(api: SocketAddr, replication: String) {
     }
 }
 
+async fn open_writer() -> Arc<bedrock_lib::replication::writer::Writer> {
+    use bedrock_lib::replication::materialized::Retention;
+    use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Writer};
+    use bedrock_lib::storage::namespace::memory::MemoryFactory;
+    Writer::open(
+        || 1_700_000_000_000,
+        Persistence {
+            factory: Arc::new(MemoryFactory::default()),
+            retention: Retention::default(),
+            metrics: PersistenceMetrics::default(),
+        },
+    )
+    .await
+    .unwrap()
+}
+
 #[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread")]
 async fn http_writes_commit_once_and_reach_subscribers_in_order() {
     use bedrock_lib::replication::subscriptions::Source;
     use bedrock_lib::replication::subscriptions::pb::replication_server::ReplicationServer;
-    use bedrock_lib::replication::writer::Writer;
-    use bedrock_lib::s3::memory::MemoryStore;
     use tokio::net::TcpListener;
 
-    let writer = Writer::open(MemoryStore::default(), || 1_700_000_000_000)
-        .await
-        .unwrap();
+    let writer = open_writer().await;
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = http.local_addr().unwrap();
     tokio::spawn(bedrock_api::serve(
@@ -258,8 +270,6 @@ fn same_seed_same_schedule() {
 async fn simulated() {
     use bedrock_lib::replication::subscriptions::Source;
     use bedrock_lib::replication::subscriptions::pb::replication_server::ReplicationServer;
-    use bedrock_lib::replication::writer::Writer;
-    use bedrock_lib::s3::memory::MemoryStore;
     use tokio::net::TcpListener;
 
     let handle = madsim::runtime::Handle::current();
@@ -271,9 +281,7 @@ async fn simulated() {
         .ip(api.ip())
         .build()
         .spawn(async move {
-            let writer = Writer::open(MemoryStore::default(), || 1_700_000_000_000)
-                .await
-                .unwrap();
+            let writer = open_writer().await;
             let http = TcpListener::bind(api).await.unwrap();
             tokio::spawn(bedrock_api::serve(
                 http,

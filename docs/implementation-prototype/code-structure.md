@@ -56,7 +56,7 @@ The I/O rules in `clippy.toml` apply to every crate; adapters opt out with an ex
 | `storage`        | `StorageEngine` contract and adapters (RocksDB), shared by all binaries |
 | `datasets`       | Dataset → namespace model and policy resolution                       |
 | `node`           | Node config (file + `BEDROCK_*` env), roles, logging and graceful shutdown |
-| `s3`             | L3 S3 client with checksums and versioned manifests                   |
+| `s3`             | Namespace-engine object I/O and checksummed CDN artifact storage     |
 | `transport`      | Node-to-node transport and observability baseline                     |
 | `kv/storage`     | KV keyspaces and eviction only, on top of `lib/storage`               |
 

@@ -8,10 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::subscriptions::pb::replication_server::ReplicationServer;
 use bedrock_lib::replication::subscriptions::{Log, MemoryLog, Source, Subscription, Watched};
+use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
 use bedrock_lib::replication::{Applier, ApplierMetrics, ApplyHook, Event, Operation, stream};
 use bedrock_lib::storage::memory::MemoryEngine;
+use bedrock_lib::storage::namespace::memory::MemoryFactory;
 use bedrock_lib::storage::{KeyRange, StorageEngine, StorageResult, WriteBatch};
 use bedrock_lib::transport::Peers;
 use bedrock_lib::transport::admin::Admin;
@@ -266,6 +269,129 @@ async fn simulated() {
             // Let the source bind first.
             sleep(Duration::from_millis(10)).await;
             scenario(server.to_string(), log).await;
+        })
+        .await
+        .unwrap();
+}
+
+/// An expired cursor requires a consistent materialized-state bootstrap, then an
+/// ordinary subscription from target+1. The service lifecycle controls readiness.
+async fn materialized_recovery_scenario(server: String, writer: Arc<Writer>) {
+    let write = Write {
+        dataset: "kv".into(),
+        namespace: "a".into(),
+        key: b"k".to_vec(),
+        operation: Operation::Set(b"one".to_vec()),
+        idempotency_key: None,
+    };
+    assert_eq!(writer.commit(write.clone()).await.unwrap(), 1);
+    // Model a cursor older than the source's retained stream window.
+    writer.log().prune("kv", "a", 1).unwrap();
+    let engine = Arc::new(MemoryEngine::new("kv"));
+    let peers = Arc::new(Peers::new(&Admin::new()));
+    let first = Subscription::start(
+        peers.clone(),
+        server.clone(),
+        applier(engine.clone(), Recorder::default()),
+        vec!["a".into()],
+    );
+    let reason = timeout(Duration::from_secs(5), first.recovery_required())
+        .await
+        .unwrap();
+    assert_eq!(reason.code(), tonic::Code::OutOfRange);
+    first.stop().await;
+    writer
+        .bootstrap("kv", "a")
+        .await
+        .unwrap()
+        .install(engine.as_ref(), "a", KeyRange::prefix(b"a\0"))
+        .unwrap();
+    let recorded = Recorder::default();
+    let resumed = Subscription::start(
+        peers,
+        server,
+        applier(engine.clone(), recorded.clone()),
+        vec!["a".into()],
+    );
+    assert_eq!(
+        writer
+            .commit(Write {
+                operation: Operation::Delete,
+                ..write
+            })
+            .await
+            .unwrap(),
+        2
+    );
+    timeout(Duration::from_secs(5), resumed.wait_for("a", 2))
+        .await
+        .unwrap();
+    assert_eq!(recorded.sequences("a"), vec![2]);
+    assert_eq!(engine.revision("a").unwrap(), Some(2));
+    assert_eq!(engine.get(b"a\0k").unwrap(), None);
+    resumed.stop().await;
+}
+
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread")]
+async fn expired_cursor_bootstraps_then_resumes_after_materialized_boundary() {
+    let writer = Writer::open(
+        || 123,
+        Persistence {
+            factory: Arc::new(MemoryFactory::default()),
+            retention: Retention::default(),
+            metrics: PersistenceMetrics::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(ReplicationServer::new(Source::new(writer.log())))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    materialized_recovery_scenario(addr.to_string(), writer).await;
+    server.abort();
+}
+
+#[cfg(madsim)]
+#[madsim::test]
+async fn expired_cursor_bootstraps_then_resumes_after_materialized_boundary() {
+    let handle = madsim::runtime::Handle::current();
+    let addr: std::net::SocketAddr = "10.0.0.2:7000".parse().unwrap();
+    let writer = Writer::open(
+        || 123,
+        Persistence {
+            factory: Arc::new(MemoryFactory::default()),
+            retention: Retention::default(),
+            metrics: PersistenceMetrics::default(),
+        },
+    )
+    .await
+    .unwrap();
+    let log = writer.log();
+    handle
+        .create_node()
+        .name("source")
+        .ip(addr.ip())
+        .build()
+        .spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(ReplicationServer::new(Source::new(log)))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+    handle
+        .create_node()
+        .name("replica")
+        .ip("10.0.0.1".parse().unwrap())
+        .build()
+        .spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            materialized_recovery_scenario(addr.to_string(), writer).await;
         })
         .await
         .unwrap();

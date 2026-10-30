@@ -40,17 +40,6 @@ message Batch {
   repeated Event events = 1;
 }
 
-// One write-once batch object in the bucket, `{dataset}/{namespace}/log/{first:020}` (B-09, B-11).
-message LogBatch {
-  repeated LogEntry entries = 1;
-}
-
-message LogEntry {
-  Event event = 1;
-  // The client's idempotency key, "" for none. Kept so the writer still recognises a retry after a restart.
-  string idempotency_key = 2;
-}
-
 service Replication {
   rpc Subscribe(stream Request) returns (stream Batch);
 }

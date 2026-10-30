@@ -37,7 +37,7 @@ Storage engines are interchangeable through a common Rust abstraction.
       RocksDB                SurrealKV
 
               L3: S3 Storage
-          Snapshots + Log Archive
+       Materialized State + Events
 ```
 
 Each cell independently manages its caches, shard assignments, and node health. A datacenter is one cell by default; large sites run several (see §9 Cells).
@@ -576,7 +576,7 @@ Example: a US node requests a European customer's key.
 2. On a miss, ask the cell's L2 bucket owner.
 3. On a miss there, ask the region's regional-tier cell for `(namespace, bucket)`.
 4. On a miss there, ask the namespace's origin cell, which holds the namespace in full.
-5. While the origin cell is unavailable, the last resort is a single-key read from the S3 snapshot and log (§14; still an open decision).
+5. While the origin cell is unavailable, the last resort is a single-key read from the S3 materialized state (§14).
 6. Validate the returned value and revision.
 7. Fill each tier on the way back with its TTL.
 
@@ -584,65 +584,58 @@ A minimum-revision read skips any cached entry older than the requested revision
 applied it. No subscription is created on read; subscriptions and snapshot reads keep a consistent revision boundary where
 they are used (the origin cell and push policies).
 
-## 14. L3 — Engine-Independent S3 Persistence
+## 14. L3 — Atomic Materialized State and Retained Events
 
-S3 provides long-term recoverable state.
+The generic API writer commits directly to a per-namespace SlateDB database in S3
+(#11 / B-11; explicit protocol replacement, 2026-10-30). One atomic engine batch
+stores the original retained events, resolved SET/DELETE state and metadata,
+namespace revision and original committed_at, retry key/result/fixed expiry,
+and an optional represented Raft index/term. Standalone writes await remote durable
+flush before acknowledgement. Buffered engine apply alone is not durable commit.
 
-It stores:
+Engine manifests, WAL and SSTs live under {dataset}/{namespace}/state/. There is
+no separate raw S3 journal, published/ object, pruned/ object, archive migration
+or compatibility path. Bedrock progress and event-trim metadata are rows inside
+the database. Engine sequence numbers are not Bedrock namespace revisions; a
+progress record is not a native SlateDB checkpoint.
 
-- Immutable namespace snapshots.
-- Archived ordered change logs.
-- Versioned manifests.
-- Recovery checkpoints.
+Event history and retry protection have independently configurable time windows,
+both defaulting to 24 hours. Preserve original event bodies, commit timestamps and
+fixed retry expiry. Logical expiry is enforced immediately on reads, even when
+physical rows remain. Event-triggered asynchronous cleanup removes expired rows
+without losing resolved state and meters failures independently of completed
+writes. There is no idle namespace polling; physical cleanup may wait for activity
+or an explicit operation. Preserve native compaction, checkpoint/reference protection
+and GC, including the engine's internal maintenance tasks while handles are open.
 
-Example:
+### Recovery Contract
 
-```text
-s3://platform/
-  quicksilver/
-    infrastructure/
-      manifest.json
-      snapshots/
-      log/
+1. Open the namespace's fenced engine handle and recover remote-durable database state.
+2. Validate the coherent state/revision/time and retry records before readiness.
+3. Read recent original events from retained database rows for stream resumption.
+4. For an obsolete cursor, install a consistent live-key view and revision atomically
+   through the pushed replica's adapter, then resume strictly after that boundary.
 
-  kv/
-    store-A/
-      manifest.json
-      snapshots/
-      log/
-```
+Startup never reconstructs current state by replaying a separate raw journal.
+Missing referenced objects, corruption and unavailability are explicit errors;
+only an absent application key is Ok(None). Native block checksums protect ranged
+SST reads. Single-key reads use indexed storage rather than a whole namespace scan.
+Later B-39 adds customer-KV readers and caches; local pushed StorageEngine and
+CDN artifact CacheStorage retain their existing contracts.
 
-### Portable Snapshot Format
+### Future Raft Integration
 
-Snapshots use an engine-neutral logical format containing:
+B-09b is not implemented by B-11. It may acknowledge after majority-fsynced commit
+before SlateDB persistence, then batch committed entries through the same atomic
+operation with represented index/term. Keep its committed not-yet-durable tail for
+retry lookup and recovery; never renew retry expiry during replay. Fence stale
+publishers as well as stale proposals.
 
-- Keys and values.
-- Revisions.
-- Snapshot boundaries.
-- Required recovery metadata.
-- Integrity checksums.
-
-A full snapshot holds only live keys and no tombstones. Deletes after its boundary come from the replayed log, in
-order, so a deleted key cannot come back.
-
-RocksDB and SurrealKV must be able to restore equivalent logical state.
-
-Engine-native checkpoints can optionally accelerate local recovery.
-
-### Recovery Sequence
-
-1. Obtain the required authoritative revision.
-2. Locate the latest valid snapshot.
-3. Download from S3 or a suitable healthy peer.
-4. Validate its integrity.
-5. Restore through the configured storage adapter.
-6. Replay missing durable changes.
-7. Atomically mark restored data ready.
-8. Resume replication.
-
-S3 snapshots may lag acknowledged writes. Any changes after the snapshot must remain recoverable from durable logs.
-
-For cold single-key reads, authoritative storage should provide indexed or independently retrievable objects rather than requiring an entire large namespace download.
+A native recoverable checkpoint is separate from namespace progress. Truncate a
+Raft prefix only when that checkpoint covers every namespace affected by the prefix,
+including closed namespaces, and recovery metadata records cutoff index, term and
+membership. Track committed, buffered, remote-durable and reader-visible positions
+separately. Extend the TLA+ model before implementing this quorum/truncation protocol.
 
 ## 15. Storage-Agnostic Fault Tolerance
 
@@ -943,7 +936,7 @@ Add `full_replica` placement, adaptive cache promotion, regional load balancing,
 9. **Every cell independently operates an L1/L2 cluster.** A datacenter is one or more cells.
 10. **A tree of relays coordinates replication, cache discovery, and recent event replay.**
 11. **Customer KV is pushed only to its origin cell and cached by TTL everywhere else.**
-12. **S3 persists engine-independent snapshots and archived logs.**
+12. **S3 persists atomic namespace state and time-retained events in SlateDB.**
 13. **Local cache failures trigger automatic fallback and rebuilding.**
 14. **Unhealthy storage is isolated without unnecessarily disabling unrelated services.**
 15. **L2 bucket ownership is redistributed when cache nodes fail.**
