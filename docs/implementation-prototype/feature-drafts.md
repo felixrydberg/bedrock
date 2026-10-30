@@ -9,6 +9,13 @@ Sources: `docs/implementation-prototype/kv.md`, `cdn.md`, `code-structure.md`, `
 
 > Status: B-01 to B-23 (including B-18b, B-22b and B-23a, but not B-09b or B-21b) are created as GitHub issues (linked below, the issue is the source of truth). Later drafts are still drafts. When a draft is created, replace its body here with a link to the issue.
 
+> Architecture update, 2026-10-29: decision 11 replaces customer-KV origin cells with per-namespace S3 databases,
+> an API writer and read-only KV caches. This document records the new decision; the older customer-KV origin text in
+> `kv.md` and `code-structure.md` is superseded and still needs synchronization. Section 5 audits all 26 GitHub issues:
+> eight open issues now have dated scope-amendment comments, linked there, while their original descriptions are preserved.
+> A second amendment below assigns generic writer materialization/recovery to #11 / B-11 before #25 / B-23;
+> B-39 is later customer-KV reader/cache integration. Seven additional materialized-state issue amendments are posted and linked in §5.
+
 ---
 
 ## 1. Strategy
@@ -26,10 +33,20 @@ not KV-specific behaviour. So the order is:
 4. **KV refinements** and **CDN refinements**. Product-specific depth: optimisations,
    extra adapters, advanced retention. These can also run in parallel.
 
-Things deliberately left out of the shared core because only one product uses them:
-SurrealKV (KV phase 3), `full_replica` (KV phase 6),
-and every CDN phase 3/4 item. Performance and protocol constraints such as sequence compression
-are out of scope for this plan.
+**Hardening order:** B-11 provides the generic API-writer atomic persistence and recovery contract before the initial
+B-23 gate. That gate covers its real backend, atomic event/state/revision/retry records, durable database recovery, publication
+fencing and protected-view GC alongside the retained shared core and minimal reference workload. It does not depend on
+B-39. Only after that gate passes does B-39 integrate customer-KV readers/caches on the existing B-11 store, extend the
+model/checkers and rerun every applicable test layer and the seven-night history before B-26/customer-KV acceptance.
+B-09b is later work with the same protocol-first/revalidation requirement.
+Simulation execution follows the latest #26/B-23a discussion: run locally in WSL/Linux/macOS before merging; normal CI
+does not imply a simulation pass. Amend #25's older CI wording accordingly while retaining the required seed/replay and
+seven-night evidence. This document does not enable a simulation CI job or claim an unrun gate passed.
+
+B-11 adds an asynchronous, SlateDB-based atomic S3 persistence contract in `lib/storage` for the generic API writer across datasets.
+B-39 later integrates customer-KV read-only namespace handles and caches on that store; namespace residency and cache policy stay in `kv/storage`.
+Quicksilver, Auth, relay replay and CDN retention continue using the local `StorageEngine` and pushed replication.
+`full_replica` completeness and CDN phase 3/4 items remain later work. Sequence compression is out of scope.
 
 ### Code structure followed
 
@@ -53,9 +70,9 @@ server runs every service, each service is its own process, and code is shared a
 
 | Binary | Hosts | Roles |
 |---|---|---|
-| `bedrock-api` | Authoritative writes and revision ordering (B-09) | — |
+| `bedrock-api` | Authoritative writes and revisions; generic per-namespace materialized state across datasets (B-09, B-11) | — |
 | `bedrock-relay` | Relay tree, fan-out, replay log, cell membership, regional directory | — (`tier` and `upstreams` in config) |
-| `bedrock-kv` | Datasets `quicksilver`, `kv`, `auth` | `l1`, `l2` |
+| `bedrock-kv` | Pushed `quicksilver` and `auth`; S3-backed customer `kv` readers and caches | `l1`, `l2` |
 | `bedrock-cdn` | Dataset `cdn` (retention metadata) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
 
 Rules this implies:
@@ -64,16 +81,21 @@ Rules this implies:
   for everything (`lib/relays` for fan-out and tiers, `lib/replication` for streams, `lib/storage` RocksDB for its replay log,
   `lib/membership` for the cell view). A KV or CDN crash never takes a relay with it, and relays deploy on their own schedule.
 - **`kv`, `cdn`, `relay` and `api` depend on `lib` only, never on each other.**
-- **KV and CDN share infrastructure, not data.** Both write through `bedrock-api` and subscribe through `bedrock-relay`,
-  reusing one replication and sequencing system. `bedrock-kv` subscribes only to KV datasets (`quicksilver`, `kv`, `auth`), and
-  `bedrock-cdn` only to the `cdn` dataset. Neither ever subscribes to the other's datasets.
+- **KV and CDN share infrastructure, not data.** Writes use `bedrock-api` and its sequencing/durability system.
+  `bedrock-kv` subscribes to `quicksilver` and `auth`; `bedrock-cdn` subscribes only to `cdn` retention metadata.
+  Customer `kv` has no relay subscriptions, replay queues or subscription-driven placement. Its readers use S3-backed
+  namespace databases. KV membership still comes from the Quicksilver/Auth relay connection, without another heartbeat.
 - **Retention operations are plain `SET`/`DELETE` writes** to keys in the `cdn` dataset. The write API and relays are generic,
   and only `bedrock-cdn` interprets them when it applies them (manifest expansion, reference counts).
 - **The CDN serves by hash and knows nothing about deployments.** Workers, Pages, deployments, revisions and which version is live
   belong to the Compute and deploy control plane (track L), a client of KV and the CDN (B-50, B-51).
 - **Each binary has its own service view.** Membership, health, placement, buckets and the regional directory run
   inside each binary for that service's nodes. A node with a broken CDN cache disk is still a healthy KV node, and the reverse.
-- **Both binaries need a durable local engine**, so the `StorageEngine` adapters live in `lib/storage`, not `kv/storage`.
+- **Shared storage implementations live in `lib/storage`.** Keep the existing synchronous local `StorageEngine` contract
+  for pushed datasets. B-11 adds a separate asynchronous namespace persistence/recovery contract; B-39 adds customer-KV readers. Do not block on S3 inside
+  the local trait or pretend a read-only handle can write/restore. Dataset identity and permissions remain independent of
+  whether a dataset has a relay-fed local engine. API materialization spans datasets; B-39 replaces the KV-reader
+  one-local-engine-per-dataset assumption only for customer KV. `kv/storage` owns handle retention, memory/disk budgets and cache eviction; CDN keeps `CacheStorage`.
 
 ---
 
@@ -95,7 +117,7 @@ Rules this implies:
 | [B-08](https://github.com/felixrydberg/bedrock/issues/8) | Replication event model and ordered applier | Shared core | `lib/replication` | B-04, B-06 |
 | [B-09](https://github.com/felixrydberg/bedrock/issues/9) | Dev write API (Axum, single node) batching writes to S3 | Shared core | `lib/replication` + `api` bin | B-08, B-02, B-07 |
 | [B-10](https://github.com/felixrydberg/bedrock/issues/10) | Stream subscriptions with consistent revision boundary | Shared core | `lib/replication` | B-09, B-03 |
-| [B-11](https://github.com/felixrydberg/bedrock/issues/11) | Portable snapshots, log archive and recovery | Shared core | `lib/replication` | B-09, B-07 |
+| [B-11](https://github.com/felixrydberg/bedrock/issues/11) | Generic API atomic materialized state, retained events and recovery | Shared core | `lib/storage`, `lib/replication`, `lib/s3`, `api` wiring | B-09, B-07, B-04, B-06, B-23a |
 | B-09b | Raft write quorum for the API (later) | Shared core | `lib/replication` + `api` bin | B-09, B-10, B-11, B-13 |
 | **D — Shared core: cluster** |||||
 | [B-13](https://github.com/felixrydberg/bedrock/issues/12) | Peer reachability from real traffic | Shared core | `lib/health` | B-03 |
@@ -114,15 +136,16 @@ Rules this implies:
 | [B-21](https://github.com/felixrydberg/bedrock/issues/22) | L2 bucket redistribution on node failure | Shared core | `lib/buckets` + `lib/reconciliation` | B-19, B-20 |
 | B-21b | Drain nodes, cells and namespaces for every dataset | Shared core | `lib/reconciliation` + `lib/placement` | B-15, B-20, B-21 |
 | [B-22](https://github.com/felixrydberg/bedrock/issues/23) | Tiered read fallback and cache rebuild | Shared core | `lib/health` + `lib/reconciliation` | B-14, B-19, B-11 |
-| [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Origin read protection: coalescing and per-cell limits | Shared core | `lib/reconciliation` + origin cells (`bedrock-kv`) | B-22 |
-| [B-23](https://github.com/felixrydberg/bedrock/issues/25) | Hardening gate: TLA+ model, deterministic simulation, real-binary crash tests | Shared core | `lib` (test support), `docs/spec/` | B-23a, B-01 … B-22b |
+| [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Read protection: coalescing and per-cell limits (amendment pending, §5) | Shared core | `lib/reconciliation` + callers | B-22 |
+| [B-23](https://github.com/felixrydberg/bedrock/issues/25) | Hardening gate: TLA+ model, deterministic simulation, real-binary crash tests | Shared core | `lib` (test support), `docs/spec/` | B-23a, created B-01 … B-22b; excludes later B-09b/B-21b |
 | **H — First KV** |||||
 | B-24 | Quicksilver dataset | KV | `kv/namespaces` | B-23 |
 | B-25 | KV namespace directory and management | KV | `kv/namespaces` | B-24 |
-| B-26 | KV write path | KV | `kv/operations` | B-25 |
-| B-27 | KV read path through L1/L2 | KV | `kv/operations`, `kv/storage` | B-26 |
-| B-28 | Cache policies, origin cells and basic eviction | KV | `kv/storage`, `kv/namespaces` | B-27 |
-| B-29 | KV end-to-end acceptance | KV | `kv` | B-24 … B-28 |
+| B-39 | Customer-KV readers and caches on B-11 materialized storage | KV storage integration | `lib/storage`, `lib/s3`, `kv/storage` | B-23, B-04, B-06, B-07, B-11 |
+| B-26 | KV write path and durable namespace publication | KV | `kv/operations`, `api` wiring | B-25, B-39 |
+| B-27 | KV reads through cache-affinity routing and S3 namespace readers | KV | `kv/operations`, `kv/storage` | B-26 |
+| B-28 | Namespace reader residency, cache budgets and basic eviction | KV | `kv/storage`, `kv/namespaces` | B-27 |
+| B-29 | KV end-to-end acceptance | KV | `kv`, `api`, storage integration tests | B-24 … B-28, B-39 |
 | **I — First CDN** (parallel with H; no dependency on KV drafts) |||||
 | B-30 | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
 | B-31 | Artifact transfer | CDN | `cdn/artifact_transfer` | B-30 |
@@ -134,11 +157,10 @@ Rules this implies:
 | **J — KV refinements** |||||
 | ~~B-37~~ | ~~Cache-fill broadcast queue~~ (dropped, decision 11) | — | — | — |
 | B-38 | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
-| B-39 | SurrealKV storage adapter | KV | `lib/storage` | B-29 |
 | B-40 | `full_replica` placement and completeness | KV | `kv/storage`, `lib/buckets` | B-29 |
 | B-41 | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
 | B-42 | Auth dataset | KV | `kv/namespaces` | B-29 |
-| B-53 | Dormant namespaces: evict idle namespaces from origin cells under storage pressure | KV | `kv/storage`, `kv/namespaces` | B-29 |
+| B-53 | Namespace residency fairness and cold-open tuning at scale | KV | `kv/storage`, `kv/namespaces` | B-29 |
 | **K — CDN refinements** (parallel with J) |||||
 | B-43 | Artifact replica repair and bucket migration | CDN | `cdn/retention` | B-36 |
 | B-44 | Coordinated eviction, GC and failure recovery | CDN | `cdn/retention` | B-43 |
@@ -164,9 +186,9 @@ Rules this implies:
 |---|---|
 | KV Phase 1 (engine, datasets, writes, replication, S3) | B-01 … B-11, plus KV parts in B-24 … B-26 |
 | KV Phase 2 (storage fault tolerance) | B-14, B-22, B-23a, B-23 |
-| KV Phase 3 (SurrealKV) | B-39 |
+| Generic materialized namespace engine; later customer-KV readers/caches | B-11; B-39 after B-23 and before B-26 |
 | KV Phase 4 (relays, streams, replay) | B-17 … B-19 (cache-fill broadcast dropped, decision 11) |
-| KV Phase 5 (L1/L2, buckets, discovery, redistribution) | B-15, B-16, B-19, B-21, B-27, B-28 |
+| KV Phase 5 (cache routing and residency; pushed-data redistribution stays shared) | B-15, B-16, B-19, B-27, B-28 |
 | KV Phase 6 (optimisation) | B-38, B-40, B-41, B-53 |
 | CDN Phase 1 (artifact foundation) | B-30, B-31, B-33, B-35 |
 | CDN Phase 2 (distributed CDN) | B-32, B-34 |
@@ -226,6 +248,14 @@ Created: [#6](https://github.com/felixrydberg/bedrock/issues/6) — Feature 🚀
 
 Created: [#7](https://github.com/felixrydberg/bedrock/issues/7) — Feature 🚀: Shared S3 (L3) client with checksums and versioned manifests
 
+Object-I/O cleanup, 2026-10-30 (explicit user decision): standardize on the upstream
+`object_store::ObjectStore` interface and configured S3 backend. Remove the custom trait,
+duplicate AWS/memory clients and identical-body create behavior. Full-object checksum
+helpers retain artifact SHA-256 verification and distinguish absent keys from a missing
+bucket; native engine reads retain ranged I/O and block integrity. Namespace simulation
+continues through its deterministic storage model. Run the same native contract against
+InMemory and the configured live S3 provider, including strict create, CAS and range reads.
+
 ---
 
 ### C — Shared core: replication
@@ -247,7 +277,7 @@ Created: [#9](https://github.com/felixrydberg/bedrock/issues/9) — Feature 🚀
 #### B-09b — Replicated write quorum (Raft) for the write API
 
 ```
-Title:  Feature 🚀: Raft quorum for the write API with S3 archive and automatic failover
+Title:  Feature 🚀: Raft quorum for the write API with SlateDB persistence and automatic failover
 Labels: enhancement
 ```
 
@@ -258,18 +288,34 @@ At scale the write path needs automatic failover, fencing of old leaders and low
 **Describe the solution you'd like**
 - Run `bedrock-api` as a 3 or 5 node Raft group (`openraft`) in the core region. One leader is the only writer, the rest are followers.
 - Acknowledge a write once a majority has fsynced it. The state machine assigns per-namespace revisions when entries are applied. The Raft term fences old leaders.
-- The leader batches committed entries and archives them to S3 with deterministic keys (`If-None-Match: *`). After a leader change the new leader reads the last archived batch from S3 and continues. A repeated upload is a harmless 412.
-- Raft log truncation only after the batch is archived and snapshotted.
-- Committed entries are published to the dataset stream (B-10), from the leader or a caught-up follower.
-- Start with one group for the whole core region. Splitting into groups per namespace range is a later step.
+- Batch committed entries directly through B-11's atomic SlateDB persistence operation: original retained events,
+  resolved state, fixed retry result/expiry, namespace revision/time and represented Raft index/term advance together.
+  Remote flush follows buffered apply. Retain the majority-committed but not yet SlateDB-durable tail for recovery and
+  retry lookup; do not add a parallel raw S3 event journal.
+- Keep Raft-committed, applied, SlateDB-durable and reader-visible positions separate. Truncate only after a verified
+  recoverable native checkpoint covers every namespace affected by the global prefix, including closed/lazy namespaces.
+  Store the cutoff's index, term and membership. A namespace progress record is not a native checkpoint.
+- Materialize all datasets through B-11; publish pushed datasets to their B-10 streams. Customer `kv` uses B-39 readers and is
+  never sent through relays. The generic writer selects a storage/delivery contract, not product-specific KV/CDN logic.
+- Only one leader publishes each namespace database. Fence stale S3 publishers as well as stale Raft proposals; a term
+  change alone must not let an old process publish an older manifest. Reuse B-11's atomic persistence operation after
+  majority-fsynced Raft commit. Recover retry records from both durable state and the committed not-yet-durable tail;
+  persist their original fixed expiry.
+- Start with one group for the whole core region. Assigning namespaces across multiple groups is later work; see
+  [future API writer scaling](future-development.md#horizontally-scaled-api-writers) for the proposed direction.
+- Metrics: quorum commit latency, failover/recovery duration, persistence lag and retained tail/backpressure,
+  with namespace detail in introspection rather than metric labels.
 
 **Additional context**
 - **Implementation:** Shared core.
 - **Module:** `lib/replication` plus the `api` crate.
 - **Doc reference:** `kv.md` §8, §11, §12, §15.9.
 - **Depends on:** B-09, B-10, B-11, B-13.
-- **Known limits:** writes stop without a majority. Entries not yet archived are lost if a majority of nodes is lost at once, so run nodes in separate failure domains and archive frequently.
-- **Acceptance criteria:** Killing the leader loses no acknowledged write and a new leader accepts writes within the election timeout. An old-term leader cannot commit. The new leader does not duplicate or skip archived batches. Revisions stay gap-free across failover.
+- **Known limits:** writes stop without a majority. Committed entries not yet SlateDB-durable can be lost if a majority of nodes is lost at once; separate failure domains and persist frequently.
+- **Acceptance criteria:** Killing the leader loses no acknowledged write, including a write committed before S3 publication.
+  A new leader accepts writes within the election timeout plus documented recovery time. An old-term leader cannot commit
+  or publish stale storage state. Persistence/replay retries do not double-apply data or skip revisions. Raft truncation cannot
+  strand a closed namespace. Update TLA+ before this protocol change, then rerun the applicable B-23 gates and nightly history.
 
 ---
 
@@ -279,9 +325,52 @@ Created: [#10](https://github.com/felixrydberg/bedrock/issues/10) — Feature �
 
 ---
 
-#### B-11 — Portable snapshots, log archive and recovery
+#### B-11 — Generic API atomic materialized state, retained events and recovery
 
-Created: [#11](https://github.com/felixrydberg/bedrock/issues/11) — Feature 🚀: Engine-neutral S3 snapshots, archived logs and snapshot+replay recovery
+Created: [#11](https://github.com/felixrydberg/bedrock/issues/11) — Generic API atomic materialized state, retained events and recovery
+
+Alpha cleanup, 2026-10-30: materialized storage is the sole write/recovery path; no archive compatibility or migration code is retained.
+
+Protocol replacement, 2026-10-30 (explicit user decision): the standalone API writer commits directly to SlateDB.
+One atomic engine WriteBatch stores the original retained events, resolved SET/DELETE state and metadata,
+namespace revision and original committed_at, retry key/result with fixed expiry, and optional represented Raft
+index/term. Await remote durable flush before acknowledging standalone writes. Buffered apply is not durable commit.
+Remove the separate raw S3 journal and published/pruned object protocol, with no legacy archive compatibility.
+Startup opens and validates durable database state and recent retained events; it never rebuilds current state from a raw journal.
+Engine sequence numbers are not Bedrock namespace revisions. Namespace progress, including the event trim boundary,
+is stored in the database; it is not a native SlateDB checkpoint.
+
+Pin an Apache-2.0 SlateDB source/format baseline, preserve attribution, and take upstream correctness fixes. Keep atomic
+batches, consistent views, native checkpoint/reference protection, compaction and GC. Later reader replacements must
+preserve the storage protocol or explicitly migrate it. Route range/conditional object I/O through lib/s3 using the
+existing S3Config and official object_store AWS client. Native create and CAS remain strict; request retries use
+atomic namespace retry records rather than identical-body object creates. Verify engine block checksums on ranged SST reads; do not fetch a whole SST to
+serve a block. Missing referenced objects and ambiguous conditional outcomes are explicit errors. A faithful separate
+adapter under cfg(madsim) models buffered versus remote-durable batches.
+
+Event retention and retry protection are independently configurable, both defaulting to 24 hours. Preserve original
+events and fixed retry expiry; neither retry nor restart extends expiry. Enforce logical expiry on reads even when
+physical rows remain. After successful namespace activity, schedule bounded asynchronous cleanup and meter failures
+independently of the completed write. There is no idle namespace polling; physical cleanup may wait for another event
+or explicit operation. Current resolved state survives event-history deletion. Retain fenced single-publisher engine
+handles for the writer lifetime. SlateDB's own maintenance timers, compaction and protected-view GC remain; removing
+all internal engine timers is not claimed by the Bedrock scheduling rule.
+
+Future B-09b is not implemented here. It may acknowledge after majority-fsynced Raft commit before batched SlateDB
+persistence, using the same atomic persistence operation. Keep committed not-yet-durable entries for retry lookup and
+recovery, with their original expiry. A native SlateDB checkpoint is separate from a progress record. Truncate a Raft
+prefix only after a recoverable checkpoint covers every affected namespace, including closed ones, and records the
+cutoff index, term and membership. Fence stale storage publishers in addition to stale Raft proposals.
+
+A subscriber whose cursor predates retained events bootstraps a consistent live-key state/revision view then resumes
+strictly after its boundary. Validate integrity and revision before readiness. Portable live-key export remains optional
+separate work. Keep pushed local StorageEngine and CDN artifact CacheStorage contracts unchanged; B-11 does not depend
+on later B-39 readers/caches.
+
+Acceptance covers normal and cfg(madsim) atomic-batch/flush recovery, acknowledgement crash boundaries, retry after
+restart or ambiguous completion, fixed expiry, separate logical retention, namespace isolation, corruption, stale handles,
+protected native views, obsolete-cursor bootstrap and asynchronous cleanup failure. Follow B-23a runtime/I/O seams and
+update TLA+ before implementation. The bounded standalone model does not establish the full B-23 gate or nightly history.
 
 ---
 
@@ -375,18 +464,17 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Retiring a node or a cell, relieving a full one, and moving one hot KV tenant are all the same job: stop placing new data on a
-target, move off what has to move, and report when nothing is left. Each dataset means something different by "move": KV origins
-move to another cell, Quicksilver is already in every cell, CDN artifacts have their own holders in each cell. Without one drain,
-every dataset grows its own half-finished version.
+Retiring a node or a cell means stopping new assignments, releasing local work and moving only state that requires another
+holder. Customer KV readers own no persistent namespace state: finish reads, close handles and drop cached bytes.
+Quicksilver is retained in every cell, while CDN artifacts have their own holders. One drain coordinates these different hooks.
 
 **Describe the solution you'd like**
 - **One operation:** `drain(scope, datasets, namespace?)`, through an operator API and CLI.
   - `scope` is a node or a cell. `datasets` is all of them (the default) or a list. `namespace` narrows the drain to one namespace.
-  - The drain is a record in Quicksilver (`topology/drains/{id}`: scope, datasets, namespace, state, rate), changed only by
-    ordinary writes with an epoch bump, so every node sees the same drains. Deleting the record cancels the drain.
-- **Placement:** B-15 and B-16 never choose a draining node or cell for new assignments: bucket owners, new KV origins, and the
-  regional tier. Existing assignments stay until the drain moves them.
+  - The drain is a record in Quicksilver (`topology/drains/{id}`: scope, datasets, namespace, state, rate), changed by
+    ordinary ordered writes. Deleting the record cancels the drain; it does not introduce a membership/placement epoch.
+- **Placement:** B-15 and B-16 exclude draining targets from replicated bucket assignments and customer-KV cache affinity.
+  Existing replicated assignments hand off; customer-KV cache traffic reroutes without moving an authoritative dataset.
 - **Execution** runs in each binary's B-20 reconciliation: the desired state excludes the draining target, and the dataset's
   drain hook says what that means for each unit it holds. Moves are rate-limited and limited in concurrency per drain.
 - **Per-dataset drain hook:** for a scope and optional namespace, return the moves needed, "nothing to move", or `Unsupported`
@@ -395,7 +483,7 @@ every dataset grows its own half-finished version.
   | Dataset | Drain a node | Drain a cell | Drain one namespace from a cell |
   |---|---|---|---|
   | `quicksilver` (`full_replica`) | Buckets move to other nodes in the cell (B-21) | Nothing to move: every cell holds it | `Unsupported`: it must be in every cell |
-  | `kv` | Origin buckets move to other nodes (B-21); cache buckets are dropped | Each namespace whose origin is the cell moves with `move_namespace` (B-28); caches are dropped | `move_namespace` for that namespace |
+  | `kv` | Stop new reads, finish in-flight reads, close readers and release caches | Apply the same reader/cache drain on its nodes; S3 data stays in place | Close that namespace's readers and release its local cache |
   | `auth` (`on_demand`) | Buckets move to other nodes | Nothing to move: each cell subscribes on its own | `Unsupported` |
   | `cdn` | Artifact holders move within the cell (B-21, B-43) | Nothing to move: each cell keeps its own holders; the cells taking its traffic can prewarm (B-45) | `Unsupported` until the CDN defines one |
 
@@ -413,9 +501,9 @@ every dataset grows its own half-finished version.
 - **Depends on:** B-15, B-20, B-21.
 - **Acceptance criteria:**
   - Draining a node under load leaves it holding nothing for any dataset, with no read going backwards.
-  - Draining a cell moves every KV origin it holds and reports "nothing to move" for Quicksilver, Auth and the CDN; the cell gets
-    no new assignments while it drains.
-  - Draining one KV namespace moves only that namespace; asking the same of a dataset that cannot returns `Unsupported`.
+  - Draining a cell releases its customer-KV readers/caches and reports "nothing to move" across cells for Quicksilver,
+    Auth and the CDN; the cell gets no new assignments while it drains. No customer-KV S3 data is copied or deleted.
+  - Draining one KV namespace affects only its local handles/caches; unsupported dataset operations return `Unsupported`.
   - An interrupted drain resumes after a restart. Cancelling a drain makes the target eligible again and leaves no partial copies.
   - Moves never exceed the drain's rate and concurrency limits.
 
@@ -489,22 +577,90 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Customer KV stores are namespaces with a home region, quotas and permissions.
-Any node must be able to find a namespace's home writer and its origin cell (§4 decision 11).
+Customer KV stores are namespaces with a home writer, quotas, permissions and their own S3-backed database. A namespace
+directory must locate that storage without assigning an origin cell or tracking which nodes happen to cache it.
 
 **Describe the solution you'd like**
-- A `kv` dataset with the default `cached` policy (B-28).
-- Namespace directory stored in Quicksilver: ID → home region, `writer`, `origin_cell`, `epoch`, quotas, permissions, policy overrides.
-- On create, assign the origin to the least-loaded cell of the home DC. Adding a cell never reassigns existing namespaces.
-- Create, delete and list namespaces. Deletion uses range deletion at the origin; edge copies expire with their TTL.
+- Customer `kv` is a logical dataset using B-11 materialized storage through B-39 readers, not a relay subscription or a local replicated engine instance.
+- Namespace directory in Quicksilver: stable ID → home region/writer, canonical S3 storage identity and format version,
+  quotas, permissions, cache/read-residency policy and deletion state. Writer fencing is separate from cache placement.
+- Create, delete and list namespaces. An empty namespace needs only its directory entry; create engine objects on first write.
+  No `origin_cell`, global active/dormant state, cached-key inventory or per-namespace membership heartbeat.
+- Deletion first prevents new authorized opens through the directory, then retires the namespace through B-39's safe
+  lifecycle. Existing reads/checkpoints must be accounted for before deleting S3 objects. Never confuse namespace deletion
+  with evicting a local reader or its cached bytes.
 - Application bindings reference existing namespace IDs.
+- Metrics: namespace operations by outcome; quota rejection counts. Namespace IDs/details use introspection, not labels.
 
 **Additional context**
 - **Implementation:** KV.
 - **Module:** `kv/namespaces`.
-- **Doc reference:** `kv.md` §2 Namespace, §12 step 2; `notes.md` (KV dataset).
+- **Doc reference:** §4 decision 11; `kv.md` §2 Namespace; `notes.md` (KV dataset). Older origin-cell text is superseded.
 - **Depends on:** B-24.
-- **Acceptance criteria:** A created namespace, its writer and its origin cell are resolvable from every region. Adding a cell to the home DC leaves every existing assignment unchanged. Quota limits are enforced. A deleted namespace frees its storage at the origin.
+- **Acceptance criteria:** Every region resolves the same namespace/storage identity and home writer. Empty namespaces
+  create no engine objects. Adding a cell changes no storage identity. Quotas and deletion checks are enforced even when a
+  reader/cache entry is warm. Deleting one namespace cannot delete a sibling namespace's objects.
+
+---
+
+#### B-39 — Customer-KV readers and caches on B-11 materialized storage
+
+```
+Title:  Feature 🚀: Customer-KV namespace readers and caches on the shared materialized store
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+Customer KV needs read-only access to B-11's durable namespace state with bounded local working sets. Its readers must
+preserve coherent views and freshness while fetching blocks on demand. The generic API-writer engine and its recovery
+protocol already belong to B-11; customer-KV reader integration follows the full B-23 gate.
+
+**Describe the solution you'd like**
+- Reuse B-11's pinned SlateDB source/format baseline, attribution, asynchronous storage contract and checkpoint/recovery
+  protocol. Add read-only get/metadata-aware reads, prefix scan, open/close, health and position reporting as needed.
+  Keep consistent views, atomic batches, checkpoint protection, compaction and GC. Later replacement readers must preserve
+  SST/manifest/recovery compatibility or explicitly migrate; matching method names alone is insufficient.
+  Reuse structured error semantics: absent key is `Ok(None)`; corruption/unavailability/unsupported operations are errors.
+  Preserve the local `StorageEngine`, its existing adapters and their contract suite for pushed datasets.
+- One engine database per customer namespace under a canonical namespace-derived S3 prefix. No per-node authoritative
+  shard, database per virtual bucket or segment per namespace inside one global database. Readers load only databases
+  requested on that node. Shared caches have process-wide budgets and namespace isolation; no cache allocation per dormant
+  namespace. A single large namespace remains one writer/database; splitting it is future work, not claimed linear scaling.
+- Consume B-11's generic materialized namespace state without changing its commit authority. Preserve namespace revisions,
+  deletes, metadata, expiration and `committed_at`; engine sequence numbers are not Bedrock namespace revisions.
+- Respect separate committed, applied, S3-published and reader-visible positions. Use a coherent recent-state read/wait
+  path for minimum-revision requests while S3 readers lag. B-11 owns validated durable-database recovery, retry expiry
+  and stale-publisher fencing; future Raft additionally retains its committed not-yet-durable tail. Native checkpoints are
+  distinct from namespace progress; portable export is optional separate work.
+- Reuse B-11's `lib/s3` range-I/O and conditional publication adapter, extending only for demonstrated reader needs. Do not implement a block read by
+  fetching the whole namespace/SST. Specify range integrity explicitly: preserve full-object SHA-256 checks for existing
+  archives/exports and verify the engine's checksummed blocks for ranged SST reads. Account for codecs, ETags/conditional
+  operations, retry outcome ambiguity, missing referenced objects and atomic manifest visibility.
+- Keep compaction, checkpoint/reference protection and GC. Reuse B-11's bounded event-triggered namespace flows;
+  no idle namespace polling. Logical expiry is enforced even when physical cleanup waits for a later event/manual operation.
+  Keep S3 data retention distinct from reader/cache residency. Changing/removing a segment or expiring S3 objects is not
+  cache eviction. Reader WAL replay, if enabled, consumes the native engine WAL, never a separate Bedrock journal or relay subscription.
+- All time, tasks, RNG, network/S3 and filesystem work follows B-23a. Either port the actual engine to those seams or
+  compile it out in `cfg(madsim)` and validate a faithful buffered/committed storage model plus real-engine crash tests.
+  Upstream deterministic tests do not by themselves establish Bedrock simulation compatibility. Update TLA+ before the
+  publication/recovery protocol and run the applicable B-23 checks/nightly history before dependent product acceptance.
+- Metrics: commit-to-publication lag, reader lag, engine opens/closes, range bytes, cache bytes, compaction/GC outcomes
+  and backlog, using low-cardinality labels. Expose namespace positions and resource usage through introspection/top-N.
+
+**Additional context**
+- **Implementation:** Customer-KV reader/cache integration after the full shared-core gate; this reuses the uncreated
+  B-39 ID and replaces its former engine-creation scope. B-11 is its prerequisite, never its dependent. CDN remains independent.
+- **Module:** `lib/storage`, `lib/s3`, `kv/storage` and KV reader wiring; generic writer/recovery remains B-11.
+- **Doc reference:** §1 storage boundary and §4 decision 11; [SlateDB](https://github.com/slatedb/slatedb),
+  [custom WAL boundary](https://docs.rs/slatedb/0.17.0/slatedb/wal/index.html).
+- **Depends on:** B-23, B-04, B-06, B-07, B-11. B-09b is a later integration, not a prerequisite for S3-durable operation.
+- **Known limits:** many small namespaces create many manifests/SSTs; open handles and maintenance must be bounded.
+  Cold opens may require several object requests. The Frankfurt-to-R2-EU 100–300 ms cold-read goal is a benchmark target,
+  not a latency guarantee. No petabyte capacity or automatic writer scaling is established.
+- **Acceptance criteria:** normal and simulated reader contract/fault checks cover coherent views, minimum revisions,
+  publication lag, corruption, safe GC with live readers, pressure/idle closure and reopen. The readers reopen B-11 format
+  fixtures and preserve its crash/recovery guarantees. A cold point read fetches bounded metadata/blocks rather than a full namespace. Unrelated namespaces and local
+  Quicksilver/Auth stores remain usable after one namespace fails. The current local engines still pass their own contracts.
 
 ---
 
@@ -516,100 +672,121 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Writes can arrive at any API node. They must be forwarded to the namespace's home writer, committed durably and replicated to its origin cell.
+Writes can arrive in any region. They must reach the home writer, commit durably and become visible through the namespace's
+S3 database without customer-KV relay delivery.
 
 **Describe the solution you'd like**
-- Operations: `PUT`, `DELETE` (and optionally batch).
+- Operations: `PUT`, `DELETE` and bulk/batch operations; preserve value metadata and TTL/expiration.
 - Look up the home writer through the directory, then forward to it.
-- Commit through B-09, which assigns the revision and publishes the event.
-- Return the committed revision to the client.
+- Commit through B-11 atomic persistence and remote flush (or majority-fsynced B-09b when implemented); B-39 integrates KV readers. The write API remains generic over
+  datasets and opaque payloads; it never imports the `kv` binary. No customer `kv` event is published to a relay stream.
+- Return the committed namespace revision. S3 publication and reader visibility can lag a future Raft acknowledgement;
+  expose the recent-state read/wait path rather than weakening minimum-revision reads.
 - Values are validated against quota and size limits.
+- Bound the active writer pool and persistence work; open its engine before standalone persistence. Future Raft may
+  commit before namespace persistence, but must bound and backpressure its committed not-yet-durable tail.
+- Metrics: commit latency, publication lag, forwarding, rejected/busy writes and pending materialization bytes.
 
 **Additional context**
 - **Implementation:** KV.
-- **Module:** `kv/operations`.
-- **Doc reference:** `kv.md` §12.
-- **Depends on:** B-25.
-- **Acceptance criteria:** A write sent to a non-home region commits in the home region. The origin cell applies it; no other cell receives the event for a `cached` namespace. A minimum-revision read with the returned revision sees the write from any region.
+- **Module:** `kv/operations`, generic storage/commit interfaces in `lib`, `api` wiring.
+- **Doc reference:** §4 decision 11; `kv.md` §12's former origin delivery is superseded.
+- **Depends on:** B-25, B-39.
+- **Acceptance criteria:** Cross-region writes commit in the home region and survive the configured failure scenarios.
+  They produce no customer-KV relay subscription/event. A minimum-revision read sees a write even while its S3 publication
+  is delayed. Deletes, expiration, metadata, retries and batched writes preserve ordering and namespace isolation.
 
 ---
 
-#### B-27 — KV read path through L1/L2
+#### B-27 — KV reads through cache-affinity routing and S3 namespace readers
 
 ```
-Title:  Feature 🚀: Customer KV read path through L1, L2, the regional tier and the origin cell
+Title:  Feature 🚀: Customer KV get and list through bounded caches and S3 namespace readers
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Reads must be served locally whenever possible and still meet freshness requirements. Under §4 decision 11 an edge cell only
-caches KV, so a miss climbs a fixed tier chain to the namespace's origin cell.
+Reads should reuse cached blocks and open namespace readers without loading a whole namespace or subscribing to its writes.
+Every eligible KV reader can reach the same S3 state; hashing chooses cache affinity, not ownership of authoritative data.
 
 **Describe the solution you'd like**
-- `GET` and `LIST` (prefix) using the B-22 `SourceChain` with KV tiers:
-  - L1: `l1/{ns}/{key}`
-  - L2 bucket owner in this cell: `l2/{bucket}/{ns}/{key}`
-  - the region's regional-tier cell for `(ns, bucket)` (B-19)
-  - the origin cell from the namespace directory (B-25), which holds the full namespace
-  - S3 single-key read (B-11), only while the origin cell is unavailable (§4 still open, item 2)
-- Cache entries carry `value`, `revision` and `fetched_at` and are served while younger than `cache_ttl`. Hot keys are refreshed
-  from the next tier before they expire.
-- A fill is accepted only from a source at least as far along as the receiver, and never overwrites a newer revision.
-- **Missing keys:** cache "not found at revision N" entries with the same TTL, so repeated lookups of a key that doesn't
-  exist don't reach the regional tier or the origin. Storing all keys and only some values (Quicksilver v2 style) is the stronger
-  option, worth it only if such lookups turn out to be common.
-- No subscription is created on read. Subscriptions exist only at the origin cell and for namespaces that opt into push (B-28).
-- Minimum-revision read option: cache entries older than the requested revision are skipped and the origin waits until it has
-  applied it, so a client reads its own writes and never goes backwards, from any cell.
+- `GET`, metadata-aware get and bulk reads: optional local L1 → preferred healthy KV cache reader in the cell → that reader's
+  B-39 namespace view and block cache → S3 range reads. Coalesce identical misses and namespace opens. No mandatory regional
+  cache tier, origin cell or cold namespace restore. B-22's generic freshness/fallback helpers remain reusable after §5 amendments.
+- Reuse B-15/B-16 hashing over `(namespace, original key)` for cache affinity if useful. A routing change only changes the
+  preferred cache: another eligible reader may serve, and no bucket copy, replica-completeness check or relay handoff is needed.
+  Keep original keys in the namespace database; hashes must not replace the index needed for prefix listing.
+- `LIST` scans the namespace database's complete ordered view, never the incomplete entry/block caches. One reader can
+  execute a list without scattering to cache holders. Use an opaque cursor bound to namespace, prefix and last returned
+  original key; it must not encode a physical node. Default pages do not promise a snapshot spanning multiple requests.
+- Keep key revision, namespace view revision, observation/freshness information and expiration distinct. A key last changed
+  at revision 5 may be valid in a namespace view at revision 100. Enforce minimum revision against the view that proves the
+  result, including an absence, not merely against the key's last mutation. Never let an older fill replace a newer verified
+  result; a stale reader must not reset cache freshness indefinitely by re-serving old state.
+- Preserve configurable entry `cache_ttl` (default 60 seconds, with the agreed floor). Immutable SST blocks are retained by
+  cache budgets; a block's age is not proof that the namespace view is current. Publication/reader-refresh limits are separate.
+- Refresh/pin namespace views through B-11's manifest/checkpoint protocol integrated by B-39. For data newer than the S3 view, use a coherent
+  committed recent-state read path or wait for publication; this includes updates, deletes and listing, not just misses.
+  No customer-KV relay subscription, Raft feed to every reader, or cache-fill broadcast is created.
+- Cache not-found results at a proven namespace view revision with a bounded TTL. Enforce key expiration at read time
+  using the recorded expiration, rather than waiting for compaction. Authorization/deletion checks precede serving caches.
+- Metrics: cache hit/miss and negative-hit rates, source-read latency/bytes, coalescing, reader lag, freshness waits,
+  errors and reopen latency. Namespace/key/cursor details stay in introspection/top-N.
 
 **Additional context**
 - **Implementation:** KV.
-- **Module:** `kv/operations`, `kv/storage` (keyspaces).
-- **Doc reference:** `kv.md` §9, §13; `feature-drafts.md` §4 decision 11.
+- **Module:** `kv/operations`, `kv/storage`, B-39's shared asynchronous read contract.
+- **Doc reference:** §4 decision 11; the origin/tier portions of `kv.md` §9 and §13 are superseded.
 - **Depends on:** B-26.
-- **Acceptance criteria:** A cold read in a remote region succeeds through the regional tier and populates L1/L2. A second read is a local hit. A write becomes visible everywhere within the TTL of each tier. A deleted key never reappears. A repeated read of a missing key is answered locally until its entry expires. A minimum-revision read never returns an older revision, even from another cell. Concurrent misses for one key send one request per tier upstream.
+- **Acceptance criteria:** A cold cross-region read opens only its namespace and fetches relevant blocks; a repeat hits
+  cache. Killing the preferred cache reader succeeds through another reader without authoritative data movement.
+  Minimum-revision get/list/not-found checks work across delayed S3 publication, reopen and node changes. Deletes cannot
+  be resurrected by an old fill; expired data is not served. Pagination survives cache eviction and routing changes.
+  Concurrent identical misses/opens cause one operation per receiving coalescer, and freshness bounds include publication
+  and reader-refresh lag rather than claiming cache TTL alone bounds all staleness.
 
 ---
 
-#### B-28 — Replication policies and basic eviction
+#### B-28 — Namespace reader residency, cache budgets and basic eviction
 
 ```
-Title:  Feature 🚀: Cached / global / home_only policies, origin cells and basic L1/L2 eviction
+Title:  Feature 🚀: Per-node namespace reader retention and bounded customer-KV caching
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Namespaces need their configured policy to take effect, and every KV namespace needs an origin cell that holds it in full
-(§4 decision 11). Caches also need a bound so a node's disk does not fill up.
+Open readers retain namespace metadata and cached blocks consume memory/disk. Bound both independently, including in the
+home region, so many dormant applications cost only directory metadata and S3 objects instead of permanent local state.
 
 **Describe the solution you'd like**
-- `cached` (KV default): pull and cache with `cache_ttl` (default 60 s, per-namespace override above a floor), refresh hot keys
-  before they expire. Added to `lib/datasets` next to the existing policies.
-- `global` (opt-in): push to every eligible DC; L2 holds the working set.
-- `home_only`: no edge caching; every read goes to the origin cell.
-- `on_demand` stays the push-on-first-read policy used by `auth` (B-42); KV no longer uses it.
-- **Origin cell:** holds its namespaces in L2 with 2–3 bucket replicas, subscribed through the relays, and never evicts them.
-- **Move one namespace, on the fly** (`move_namespace(ns, to_cell)`, through an operator API and CLI; `to_cell` defaults to the
-  least-loaded cell in the home DC). This is the only primitive; everything else that moves origin data calls it. A move is a
-  change of desired state in the namespace directory, carried out by the cells' B-20 reconciliation:
-  1. Write `origin_cell: to`, `moving_from: from`, `state: moving` with an epoch bump. The old cell keeps serving.
-  2. The target cell rebuilds the namespace from the bucket (B-11), subscribes at the consistent boundary (B-10) and catches up.
-  3. Once caught up, the target writes `state: active` with the next epoch. Readers now resolve to it.
-  4. After a grace period, the old cell's reconciliation stops serving, unsubscribes and deletes the namespace's range with its
-     applied revision in one atomic batch.
-  A crash at any step resumes from the directory state; cancelling before step 3 drops the target's partial copy.
-- **KV drain hook** for the generic drain (B-21b): draining a cell calls `move_namespace` for each namespace whose origin it is,
-  choosing targets by load; draining one namespace calls it once, which is how a single hot tenant moves. Edge cache entries
-  on a drained cell or node are dropped, not moved.
-- Basic eviction based on storage pressure and access recency, respecting pinned prefixes. Expired cache entries go first.
-- `full_replica` namespaces (Quicksilver) are never evicted from L2; their placement and completeness are B-40.
+- Customer-KV cache/residency policy is independent of `ReplicationPolicy`. There are no customer-KV `global`,
+  `full_replica` or `on_demand` push overrides. Shared policies for Quicksilver/Auth/CDN stay intact. Any home-region-only
+  access restriction, if exposed, is a read-routing policy and must not recreate an origin cell.
+- Hard node/process-wide limits for cached disk bytes, RAM (blocks plus reader/manifest overhead), open namespace readers
+  and concurrent opens/fetches. Use soft per-namespace cached-byte shares with borrowing of unused capacity and explicit
+  optional caps. These limit local residency, not a namespace's total persistent size; total-size quotas belong to B-25.
+- Reclaim cold blocks under disk pressure. Close least-recently-used idle readers under metadata/handle pressure, with a
+  configurable idle timeout even below the pressure threshold. Reader and block lifetimes are separate: closing a reader
+  need not discard useful blocks, and evicting blocks need not close a reader. Quicksilver/Auth local stores have separate budgets.
+- Finish in-flight operations before closing a reader and release its checkpoint/reference protection safely. Coalesce
+  concurrent reopens. Failure to open one namespace is isolated; process readiness does not require opening every namespace.
+- All KV nodes, including home-region nodes, make these decisions locally. No global dormant/rehydrating directory state,
+  eviction announcement, customer-KV subscription, whole-database restore or authoritative data migration. Persistent TTL
+  and S3 GC must never be triggered merely because a cache/reader became idle.
+- B-21b drain hook stops new cache routing, lets reads finish, closes the selected readers and releases local cache state.
+  It never deletes the S3 namespace database. API writer-handle retention is separate and must preserve the committed tail.
+- Metrics: open readers, opens/evictions by reason, coalesced reopens, disk/RAM usage against budgets and cache churn.
+  Per-namespace shares, last access and handle state use introspection/top-N, not namespace metric labels.
 
 **Additional context**
 - **Implementation:** KV.
 - **Module:** `kv/storage`, `kv/namespaces`.
-- **Doc reference:** `kv.md` §3, §9 Cells, §16; `feature-drafts.md` §4 decision 11.
+- **Doc reference:** §4 decision 11; supersedes customer-KV origin/residency behavior in `kv.md` §3, §9 and §16.
 - **Depends on:** B-27.
-- **Acceptance criteria:** Each policy behaves as documented in an integration test. Moving a single namespace under load never serves a read older than the client's minimum revision, and an interrupted move resumes after a restart with no data left behind on the old cell. A B-21b cell drain moves every origin namespace through the same operation and leaves the cell empty, without new namespaces being placed on it. Disk usage stays within budget under load. Evicted data is still readable through fallback.
+- **Acceptance criteria:** More namespaces than the open-reader limit do not produce unbounded handles, background tasks
+  or memory. Disk and RAM stay within documented budgets, accounting for bounded in-flight work. One busy namespace cannot
+  starve others. Evicting one node's copy leaves other readers and S3 unchanged. A closed namespace reopens without a full
+  restore or lost minimum-revision guarantee. Draining readers does not lose data or interrupt in-flight operations.
 
 ---
 
@@ -624,24 +801,25 @@ Labels: enhancement
 "KV works" has to be shown on the real binary and Docker deployment, not only in unit tests.
 
 **Describe the solution you'd like**
-- Scenarios on the B-02 compose profile:
-  - write in EU, read in US
-  - kill an L2 node mid-traffic, at the edge and at the origin cell
-  - move a namespace's origin cell under load
-  - add a node to an origin cell, and add a new cell to a DC, under load
-  - kill a relay
-  - corrupt a KV instance while Quicksilver keeps serving
-  - restart a writer
-- Run the B-23 invariants against the deployed cluster.
-- Basic KV dashboards: hit rates per tier, origin fetch rate, replication lag to the origin, fallback rate.
+- Scenarios on the B-02 compose profile: EU write/US read; hot and cold namespace reads; reader loss and cache-affinity
+  changes under load; namespace eviction/reopen; bounded handles across many inactive namespaces; delayed/failing S3;
+  writer crash before/after checkpoint publication; and one namespace's corruption while Quicksilver and other namespaces serve.
+- Kill a relay: Quicksilver/Auth recovery still works, while already authorized customer-KV S3 reads do not depend on a
+  customer-KV relay stream. Authorization/control-plane outages follow their own fail-closed policy, not a cache bypass.
+- Exercise get/metadata, bulk operations, TTL/expiration, deletes, prefix list and pagination across node/revision changes.
+  Apply the B-23 safety checks to the new storage protocol as well as the retained pushed-data paths. When B-09b lands,
+  add leader changes and minimum-revision reads during committed-but-unpublished writes before claiming Raft durability.
+- Dashboards: cache hit rates, namespace open/close and resource budgets, publication/reader lag, S3 bytes/requests,
+  freshness waits and errors. Record cold-open/key-read p50/p95/p99, sustained writes, compaction throughput and object growth;
+  report Frankfurt-to-R2-EU results against the 100–300 ms goal without claiming an unmeasured SLA.
 
 **Additional context**
 - **Implementation:** KV.
-- **Doc reference:** `kv.md` §12, §13, §15, §18.
-- **Depends on:** B-24 … B-28.
-- **Acceptance criteria:** Every scenario passes in CI or in a nightly job. Adding a node or a cell takes a deploy plus at most
-  one Quicksilver write, with no manual data steps; no read goes backwards and no node serves a bucket or namespace it has not
-  finished loading.
+- **Doc reference:** §4 decision 11 and B-39's storage contract; legacy origin scenarios are superseded.
+- **Depends on:** B-24 … B-28, B-39.
+- **Acceptance criteria:** Every applicable scenario passes in CI or a nightly job. Adding a node/cell needs no customer-KV
+  data migration. No minimum-revision read goes backwards; no uncommitted, unverified or expired result is served as fresh.
+  No customer-KV relay subscription is created, and no test requires a complete namespace on a KV node before serving.
 
 ---
 
@@ -737,7 +915,7 @@ The `cdn` dataset belongs to the CDN: `bedrock-kv` never hosts or subscribes to 
   - expands manifests into artifact retention requirements
   - keeps reference counts shared across manifests
   - stores this derived state in a local `lib/storage` instance
-- Derived state can be thrown away: on wipe or corruption it is rebuilt from the `cdn` dataset's snapshot and replay (B-11).
+- Derived state can be thrown away: on wipe or corruption it is rebuilt from a consistent `cdn` materialized-state scan and subsequent retained database events (B-11).
   No artifact locations are stored globally.
 
 **Additional context**
@@ -748,7 +926,7 @@ The `cdn` dataset belongs to the CDN: `bedrock-kv` never hosts or subscribes to 
 - **Acceptance criteria:**
   - Retaining two manifests that share artifacts gives correct refcounts.
   - Releasing one keeps the shared artifacts.
-  - Wiping `bedrock-cdn`'s local state rebuilds identical refcounts from the `cdn` dataset's snapshot and replay.
+  - Wiping `bedrock-cdn`'s local state rebuilds identical refcounts from the `cdn` dataset's consistent materialized state plus committed tail.
   - `bedrock-kv` receives no `cdn` events, and the `kv` and `cdn` crates have no dependency on each other.
 
 ---
@@ -894,26 +1072,28 @@ Labels: enhancement
 
 #### B-37 — Cache-fill broadcast queue
 
-Dropped (§4 decision 11). With pull and TTL caching, the regional tier already shares a resolved miss with every cell in the
-region, so a separate broadcast channel adds nothing.
+Dropped (§4 decision 11). Customer KV uses read-driven caches over S3 namespace databases. Cache fills/evictions are local,
+and neither a customer-KV relay subscription nor a separate fill-broadcast channel is required.
 
 ---
 
 #### B-38 — Full cache lifecycle and eviction
 
 ```
-Title:  Feature 🚀: HOT/WARM/COLD cache lifecycle, recent-update window and memory layer
+Title:  Feature 🚀: Adaptive KV cache admission and lifecycle across memory and disk
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-The basic eviction from B-28 does not model the documented lifecycle or the L1 recent-update window, and there is no memory layer.
+The bounded reader/block residency from B-28 needs workload-driven admission and eviction tuning. Pushed datasets still
+need their own recent-update behavior; customer KV receives no push stream.
 
 **Describe the solution you'd like**
-- Lifecycle states HOT / WARM / COLD / UNHEALTHY / REBUILDING.
-- An optional memory layer above the engine.
-- An L1 recent-update window for globally replicated datasets.
-- Eviction scoring by frequency, age, pressure, dataset priority, policy and active subscriptions.
+- Tune hot/warm/cold admission and pressure behavior using measured cache reuse; keep reader-handle and block lifetimes separate.
+- Reuse the selected engine cache rather than introducing a second memory/disk layer for the same blocks without evidence.
+- Preserve the L1 recent-update window for pushed datasets only. Customer KV admission follows reads and freshness checks.
+- Score by frequency, age, pressure and policy, respecting B-28's hard budgets and namespace fairness.
+- Metrics: hit rate, admission/eviction reasons, cache churn and p99 read latency; namespace details remain introspection/top-N.
 
 **Additional context**
 - **Implementation:** KV refinement.
@@ -921,30 +1101,6 @@ The basic eviction from B-28 does not model the documented lifecycle or the L1 r
 - **Doc reference:** `kv.md` §9 L1, §16.
 - **Depends on:** B-29.
 - **Acceptance criteria:** Hit rate improves on a benchmark workload compared with B-28. State transitions are observable in metrics.
-
----
-
-#### B-39 — SurrealKV storage adapter
-
-```
-Title:  Feature 🚀: SurrealKV adapter implementing the StorageEngine contract
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-The architecture promises interchangeable engines. A second adapter proves the abstraction and gives us a pure-Rust option.
-
-**Describe the solution you'd like**
-- `SurrealKvAdapter` that passes the B-04 contract suite and the B-23 fault suite.
-- Validate transaction semantics, recovery, corruption reporting and performance against RocksDB.
-- Explicit `Unsupported` for any capabilities it lacks.
-
-**Additional context**
-- **Implementation:** KV refinement (KV Phase 3). It lives in `lib/storage` next to RocksDB, so `bedrock-cdn` could use it too.
-- **Module:** `lib/storage`.
-- **Doc reference:** `kv.md` §6, §19 Phase 3.
-- **Depends on:** B-29.
-- **Acceptance criteria:** All contract and fault tests pass. A benchmark comparison with RocksDB is written up. S3 snapshots restore equivalent state across both engines.
 
 ---
 
@@ -963,6 +1119,8 @@ keeps what arrived, but nothing yet guarantees coverage or rebuilds it after a n
 - `full_replica` placement so that every key of the namespace is held across the L2 nodes in each DC.
 - Eviction of covered keys is forbidden.
 - Completeness tracking, with degraded status until redundancy and completeness are restored.
+- This applies to pushed namespaces such as Quicksilver, not customer-KV cache readers. No customer-KV replica-completeness
+  or bucket-rebuild requirement is reintroduced. Metrics cover retained-data coverage/degradation with low-cardinality labels.
 
 **Additional context**
 - **Implementation:** KV refinement (KV Phase 6).
@@ -981,12 +1139,13 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Hot keys and uneven bucket load cause hotspots that static placement cannot fix.
+Many hot keys can be spread by cache affinity, but a single hot key can still overload its preferred reader.
 
 **Describe the solution you'd like**
-- Promote hot keys to more nodes, or to L1 everywhere.
-- Load-aware source selection in the regional directory.
-- Optional engine-specific repair mechanisms (`kv.md` §15.7) can be scoped here if needed.
+- Promote hot customer-KV keys to additional cache readers or L1s using measured load; no durable shard movement or push feed.
+- Load-aware selection among eligible readers, with misses coalesced and S3/recent-state requests bounded.
+- Measure metadata duplication and cache reuse as readers spread; do not imply read-side scaling increases one writer's capacity.
+- Metrics: source load, promotions, cache-hit distribution and p99 latency; hot-key/namespace details use top-N/introspection.
 
 **Additional context**
 - **Implementation:** KV refinement (KV Phase 6).
@@ -1021,57 +1180,43 @@ Labels: enhancement
 
 ---
 
-#### B-53 — Dormant namespaces at the origin
+#### B-53 — Namespace residency fairness and cold-open tuning at scale
 
 ```
-Title:  Feature 🚀: Evict idle KV namespaces from origin cells under storage pressure and rehydrate them from the bucket
+Title:  Feature 🚀: Tune namespace reader residency, fairness and cold-open cost at scale
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-An origin cell holds every namespace homed on it in full and never evicts it (§4 decision 11, B-28). Most namespaces go quiet,
-so origin disks fill with data nobody reads, and the only relief today is moving namespaces to another cell. Edge cells already
-drop idle data through their TTL; the origin needs the same, without breaking its "complete or absent" rule.
+Basic namespace residency is already mandatory in B-28. At large namespace counts, cold-open churn, tiny S3 objects and
+uneven cache use need measured tuning without introducing a global namespace dormancy protocol.
 
 **Describe the solution you'd like**
-- **Whole namespaces only.** An origin holds a namespace completely or not at all. Evicting part of one would leave the origin
-  answering misses it cannot answer.
-- **Nothing is lost by evicting.** A write is acknowledged only after its batch is in the bucket (B-09), so the bucket's snapshot
-  and log (B-11) always hold everything the origin has. Before marking a namespace dormant, compact it to a fresh snapshot so
-  rehydration replays only a short log.
-- **States in the Quicksilver namespace directory:** `active → dormant → rehydrating → active`, each change an ordinary write
-  with an epoch bump, so every node sees the same decision and stale changes are rejected (B-24).
-- **Choosing what to evict:** origin nodes record each namespace's last access (reads served and writes applied, rounded to the
-  hour) and report it to the cell's B-19 directory. When a cell passes a high disk watermark (for example 85%), a background
-  sweeper next to the B-11 compactor in `bedrock-api` marks the least recently used namespaces dormant until the cell is projected
-  under a low watermark (for example 75%). Namespaces accessed within a minimum idle age (for example 30 days), and namespaces
-  whose policy says `dormancy: never`, are never chosen. If pressure remains with nothing eligible, it alerts; the fix is
-  moving namespaces to another cell (B-28).
-- **Evicting:** a dormant namespace is a B-20 reconciliation repair on every origin node: stop serving, unsubscribe, delete the
-  range with its applied revision in one atomic batch. An interrupted eviction finishes after a restart.
-- **Writes while dormant** are unaffected: they go to the writer and the bucket log as usual. Rehydration picks them up.
-- **Rehydrating:** a miss that reaches the origin for a dormant namespace answers with a retryable "rehydrating" error and requests
-  rehydration (several requests for one namespace collapse into one directory change). Origin nodes restore their buckets from
-  the snapshot, replay the log after it, subscribe at the consistent boundary (B-10), then the namespace returns to `active`.
-  Edge cells keep serving their unexpired entries meanwhile. Rehydrations are rate-limited per cell.
-- **Metrics** (labelled by cell only): dormant namespace count, evictions, rehydrations, rehydration duration, reads rejected
-  while rehydrating, disk use against the watermarks. Per-namespace state goes through introspection.
+- Benchmark many mostly idle namespaces, bursts across more namespaces than fit in the handle pool, one large/hot tenant,
+  cache-node replacement and concurrent opens. Vary idle timeout, per-namespace shares and open/fetch concurrency.
+- Tune pressure watermarks, borrowing and admission using observed memory/manifest overhead as well as cached block bytes.
+  Preserve node hard limits; do not pre-open every namespace, restore full databases or announce evictions to other regions.
+- Measure the number/size of namespace manifests/SSTs, request cost, cold-open metadata requests, replay tail and GC backlog.
+  Coordinate bounded maintenance with B-39. Namespace grouping/segmentation remains a separate future decision if evidence
+  warrants it, not an automatic rewrite of the per-namespace storage contract.
+- Report cold namespace-open plus key-read p50/p95/p99 for the actual Frankfurt/R2-EU path against the 100–300 ms target.
+  Warm-block, cold-block and cold-handle results must be separate. No global latency or petabyte-capacity guarantee.
+- Metrics: reader churn, open/fetch queues, budget pressure, fairness and maintenance backlog with low-cardinality labels.
+  Namespace sizes, last access and allocations are introspection/top-N only.
 
 **Additional context**
-- **Implementation:** KV refinement. Edge cells need nothing new; this only applies to origin cells.
-- **Module:** `kv/storage`, `kv/namespaces` (states and sweeper), with `lib/reconciliation` and `lib/replication` reused.
-- **Doc reference:** `kv.md` §9 Customer KV: Origin Cells and Tiered Caching, §14, §16; `feature-drafts.md` §4 decision 11.
+- **Implementation:** KV refinement, replacing the former origin dormancy/rehydration proposal.
+- **Module:** `kv/storage`, `kv/namespaces`, shared engine maintenance from B-11 via B-39.
+- **Doc reference:** §4 decision 11; B-28's mandatory residency policy.
 - **Depends on:** B-29.
-- **Known limits:** the first read after dormancy waits for a full namespace restore, which grows with the namespace's size.
-  Where the per-namespace last-access figures are aggregated (the B-19 directory is the proposal here) and whether the sweeper
-  lives in `bedrock-api` need confirming before this becomes an issue.
+- **Known limits:** storage capacity, one writer's throughput, manifest growth, maintenance and cold-open costs are separate
+  limits. Closing local readers saves no S3 storage; persistent retention/deletion is an explicit data-lifecycle decision.
 - **Acceptance criteria:**
-  - Under disk pressure, idle namespaces are evicted least recently used first until the cell is under the low watermark;
-    namespaces inside the minimum idle age or marked `dormancy: never` are never evicted.
-  - A read of a dormant namespace, after rehydration, returns the latest value, including writes made while it was dormant.
-  - A minimum-revision read never returns an older revision across eviction and rehydration.
-  - A crash at any point during eviction or rehydration converges to a complete `active` namespace or a fully removed `dormant` one.
-  - Concurrent misses for one dormant namespace cause one rehydration.
+  - The documented workload stays within bounded memory/disk/handle budgets and avoids starvation between namespaces.
+  - Reopening a closed namespace reads relevant metadata/blocks without a full restore or a new customer-KV subscription.
+  - Minimum revisions, expiration, delete safety and namespace isolation survive eviction, reopen and node replacement.
+  - Concurrent misses share one open; in-flight reads finish safely during eviction and checkpoint release.
+  - Publish reproducible latency/resource/object-count results and any limits found; an unmet target is reported as such.
 
 ---
 
@@ -1127,7 +1272,7 @@ Retention state must also recover cleanly after node and relay failures, without
   - it is older than the grace period, and no retained manifest references it at deletion time (re-checked, since a new deploy
     can retain the same content hash again).
 - Orphans from failed publishes (uploaded, never retained) are swept separately, only after a much longer grace period than any publish takes.
-- Recovery of retention state after relay and node loss, using replay and snapshots.
+- Recovery of retention state after relay and node loss, using B-11's consistent materialized-state view and subsequent retained database events, resuming the stream boundary.
 - Reconciliation without per-artifact global location tracking.
 
 **Additional context**
@@ -1361,19 +1506,26 @@ Labels: enhancement
 1. **Separate binaries.** `bedrock-kv` (Quicksilver, KV, Auth), `bedrock-cdn` (`cdn` retention metadata and artifacts),
    `bedrock-relay` (relay tree and membership) and `bedrock-api` (writes), all linking `lib` and never each other.
    KV and CDN run as separate processes on every machine; relays run on a few machines per cell. See §1 "Deployment model".
-2. **`StorageEngine` trait and adapters live in `lib/storage`.** Both binaries need a durable local engine, and
-   `cdn` must not depend on `kv`. `kv/storage` keeps only KV keyspaces and eviction.
+2. **Storage contracts and adapters live in `lib/storage`.** The synchronous local `StorageEngine` remains for pushed
+   datasets, relay replay and CDN metadata. B-11 adds asynchronous S3 materialized storage for generic API writers across
+   datasets; B-39 later integrates KV readers. `kv/storage` owns reader retention/cache policy; CDN retains `CacheStorage`.
 3. **KV and CDN share infrastructure, not datasets.** Retention operations are plain writes to the `cdn` dataset through the
    generic `bedrock-api` and `bedrock-relay`; only `bedrock-cdn` interprets them (B-32). `bedrock-kv` never subscribes to `cdn`,
-   and `bedrock-cdn` never subscribes to `quicksilver`, `kv` or `auth`. The CDN serves by `manifest_hash`.
+   and `bedrock-cdn` never subscribes to `quicksilver`, `kv` or `auth`. Customer `kv` has no relay delivery at all;
+   Quicksilver carries its directory metadata. The CDN serves by `manifest_hash`. Shared writers/storage remain generic
+   and never import another binary's product code.
 4. **No heartbeat or gossip protocol.** Membership comes from the subscriber streams nodes already hold to their cell relays (B-12):
    relays merge their connected lists and publish them as a replicated namespace, with a grace period on disconnect.
    A member is a node that is receiving updates. Routing decisions use a local per-peer circuit breaker fed by real traffic (B-13).
-   There is no separate membership or placement epoch; bucket owners reject requests for buckets they don't own (B-16).
+   There is no separate membership or placement epoch; owners reject requests for replicated buckets they don't own (B-16).
+   Customer-KV hash routing only selects a preferred cache; another eligible reader can serve without owning persistent data.
 5. **Cells.** A cell (one DC by default) has its own membership, buckets, L2 and relays. Its maximum size is set by the
-   bucket count (about 10,000 nodes with 2²⁰ buckets); the actual size is chosen for blast radius. Large sites run several cells. Reads stay inside the cell, except KV misses, which go to the namespace's regional-tier cell and origin cell (decision 11). Moving client traffic between cells is out of scope for now.
+   bucket count (about 10,000 nodes with 2²⁰ buckets); the actual size is chosen for blast radius. Large sites run several cells.
+   Customer-KV misses read shared S3 namespace state; minimum-revision reads can use the home writer's recent-state path.
+   There is no mandatory regional KV tier or origin cell. Moving client traffic between cells is out of scope for now.
 6. **Relay tree.** Relays form tiers in static config (region top → optional DC → cell). The downstream dials and the upstream
-   pushes; gaps are pulled from the replay log. Fan-out is routed by `(namespace, bucket)`.
+   pushes; gaps are pulled from the replay log. Fan-out for pushed datasets is routed by `(namespace, bucket)`.
+   `quicksilver`, `auth` and `cdn` continue using this path; customer-KV values/revisions are not published through it.
 7. **KV and CDN are backing services.** Nothing in their tracks knows about Workers, Pages or deployments. That lives in
    track L (Compute and deploy control plane), which uses KV and the CDN as clients and owns the publish/activate/rollback order.
 8. **Observability policy.**
@@ -1387,36 +1539,145 @@ Labels: enhancement
    needs them. `code-structure.md` reflects this, including `storage` moving out of `kv/` (B-01).
 10. **Crate naming.** The shared crate is the package `bedrock-lib` (`use bedrock_lib::…`) in `crates/lib`; the binary
     crates are `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` (B-01).
-11. **KV is pulled and cached at the edge, with one origin cell per namespace** (Cloudflare Workers KV model: a central store
-    behind tiered caches). Decided 2026-10-26; it replaces subscribing every reading cell to a KV namespace.
-    - **Edge:** cells hold KV only as cache entries (`value`, `revision`, `fetched_at`), served while younger than the namespace's
-      `cache_ttl` (default 60 s, per-namespace override above a floor). Hot keys are refreshed before they expire; missing keys
-      are cached the same way. No cell outside the origin subscribes to a `cached` namespace, so an unread namespace costs
-      nothing and goes dormant by itself. Adding or removing an edge cell needs no protocol.
-    - **Regional tier:** in each region, the cell chosen by rendezvous hash of `(namespace, bucket)` over the region's cells
-      (list and entry addresses in Quicksilver). Only it fetches from the origin for that region, with misses coalesced at every tier (B-22b).
-    - **Origin:** the namespace's full state lives in one cell of its home DC, held in L2 like `full_replica` with 2–3 bucket
-      replicas and fed by the normal relay subscription. The Quicksilver namespace directory assigns it explicitly
-      (`writer`, `origin_cell`, `epoch`), never by hashing: new namespaces go to the least-loaded cell, adding a cell moves
-      nothing. One operation moves one namespace on the fly (`move_namespace`, B-28); the generic drain (B-21b) calls it for every
-      origin on a draining cell, or for one hot tenant, rate-limited. A new origin is rebuilt
-      from the bucket (B-11); the old one stops serving, unsubscribes and deletes the namespace's range with its applied
-      revision through B-20 reconciliation.
-    - **Bucket:** holds only the log and snapshots, to rebuild state. It is not on the normal KV read path.
-    - **Adding capacity is a deploy, not a migration.** A new node joins its cell through its relay stream (B-12), takes over
-      buckets (B-16) and loads them from peers or the bucket before serving (B-21). A new cell is its nodes and relays (they dial
-      upstream; upstreams keep no list) plus one Quicksilver write adding it to the region's cell list. Existing origin
-      assignments never change on their own. With about 10,000 nodes per cell, one cell holds a lot of origin data; when one
-      fills, new namespaces go elsewhere and chosen ones move (B-28), and idle ones go dormant (B-53). B-29 and B-23 test this.
-    - **Consistency:** reads are eventually consistent within the TTL of each tier. A fill is accepted only from a source at
-      least as far along as the receiver. A minimum-revision read skips cache entries older than the revision and waits at
-      the origin, so a client reads its own writes.
-    - **Push stays** for `quicksilver` (`full_replica` in every cell), `auth` (revocations cannot wait for a TTL) and `cdn`.
-      A KV namespace can opt into `global` or `full_replica`. The cache-fill broadcast (B-37) is dropped.
+11. **Customer KV is per-namespace S3 storage with one logical API writer and read-only KV caches.** Decided 2026-10-29;
+    replaces the 2026-10-26 origin-cell design. B-11 supplies a scoped SlateDB-derived generic API-writer engine across datasets;
+    B-39 later integrates customer-KV readers/caches on that engine embedded in the KV binary,
+    with no separate database service. This decision does not claim that the engine, Raft or the latency targets are implemented.
+    - **Persistent layout:** each namespace has its own stable S3 database identity, manifest, indexed SSTs and recoverable
+      committed tail. Empty namespaces need only Quicksilver directory metadata. Open writer/reader handles on demand;
+      no LSM per virtual bucket, global per-namespace segment manifest or whole-namespace local disk requirement.
+      S3 is on the normal read path. Many small databases have object/open/maintenance costs that B-39/B-53 must measure.
+    - **Writer and durability:** the home bedrock-api writer orders mutations with per-namespace revisions through
+      B-11's shared lib/storage across datasets. One atomic SlateDB batch stores original retained events, resolved
+      values/deletes/metadata, namespace revision and original commit time, retry result/fixed expiry, and optional
+      represented Raft index/term. Standalone acknowledgement awaits remote durable flush. Startup validates the durable
+      database and recent events; no separate raw S3 journal or published/pruned-object protocol is retained.
+      Future B-09b acknowledges majority-fsynced Raft entries before batched SlateDB persistence and retains the committed
+      not-yet-durable tail for retry/recovery. Truncation requires a recoverable native checkpoint covering every namespace
+      in the prefix plus cutoff index/term/membership; a progress record alone is insufficient. Keep committed, buffered,
+      durable and reader-visible positions distinct. Fence stale engine publishers. Portable live-key export is optional.
+    - **Readers and routing:** ordinary `bedrock-kv` nodes read the same namespace databases and cache hot blocks/entries.
+      HRW/virtual buckets may select a preferred reader for `(namespace, key)` to reuse cache; they do not shard persistent
+      data or impose durable ownership. Another eligible reader may serve. Adding/removing a cache node needs no namespace
+      move, replica rebuild or customer-KV relay subscription. Membership still comes from the Quicksilver/Auth connection.
+      One logical writer remains a write-throughput limit even when readers scale out.
+    - **Read semantics:** optional L1 → preferred healthy cell reader → local blocks → S3. No mandatory regional tier or
+      origin cell. `LIST` scans one namespace's full ordered database view; pagination uses original keys and a logical cursor,
+      not cache-node locations or a scatter/merge over cache holders. A minimum-revision read requires a sufficiently new
+      namespace view, including for an absence. Wait for publication or read coherent recent committed state if the S3 view
+      lags; do not fetch only not-found cases. Cache TTL alone does not bound publication/reader-refresh lag.
+    - **Local residency:** every KV node, including the home region, independently bounds disk cache, memory/manifest
+      overhead, open readers and in-flight opens. Soft per-namespace cached-byte shares may borrow free capacity; quotas on
+      total persistent namespace size are separate. Disk pressure evicts cold blocks; handle/memory pressure and idle timeout
+      close idle readers. Finish in-flight reads, coalesce reopen and release checkpoint protection safely. An open reader
+      need not keep all blocks, and useful blocks can outlive a reader. No global dormant/rehydrating state or eviction broadcasts.
+    - **Lifecycle and retention:** closing/evicting a local reader never deletes S3 data or expires customer keys. TTL and
+      namespace deletion are explicit data semantics; KV enforces expiration on reads, and background compaction/GC reclaims
+      obsolete physical data with reader protection. API writer handles have a separate retention policy and recovery duty.
+      B-11 runs bounded, event-triggered asynchronous cleanup, with failures metered independently of completed HTTP responses
+      and no idle polling. Event history and retry records have separate configurable time-based retention, both default 24 hours;
+      recorded retry expiry never moves on retry/restart. Expired event rows can be removed without losing resolved state;
+      preserve native read/checkpoint protection. Idle expiry is logical; physical cleanup may wait for activity. SlateDB's
+      internal compaction/GC remain. Node/cell drains release caches/handles;
+      they do not move an authoritative KV namespace. B-28 is baseline; B-53 tunes fairness and cold-open costs.
+    - **Storage boundary:** preserve the existing synchronous local `StorageEngine` for pushed datasets, and add a shared
+      asynchronous namespace contract in `lib/storage`. Range/conditional object I/O and simulation seams live in `lib/s3`;
+      KV residency stays in `kv/storage`. Dataset identity/authz must not imply opening a relay-fed local engine. Fork only
+      needed capabilities while retaining SST/manifest/recovery compatibility and tests; keep compaction, GC, atomic batches,
+      read views and fencing. Later custom readers/writers must preserve that storage protocol or migrate it explicitly.
+    - **Push remains separate:** Quicksilver, Auth and CDN retention continue their agreed relay policies. Customer KV has
+      no `global`, `full_replica` or `on_demand` push override. B-37 stays dropped. Source WAL replay from S3, when used, is
+      a storage recovery/reader mechanism, not a customer-KV relay stream. This does not change CDN byte placement or Auth policy.
 
 ### Still open
 
 1. **Auth dataset scope (B-42).** It is only mentioned in `notes.md`, so it needs a short design before it becomes an issue.
-2. **KV reads while the origin cell is down (decision 11).** Edge caches keep serving hot keys; whether cold misses then fail,
-   wait for the rebuild, or fall back to B-11's single-key read from the bucket is not decided. B-27 assumes the bucket
-   fallback until this is settled.
+2. **Publication and reader-refresh budgets (B-39/B-27).** Choose measured bounds and overload behavior for publication lag,
+   manifest refresh, recent-state reads/waits and cold namespace opens. The Frankfurt/R2-EU 100–300 ms goal is a measurement
+   target, not a guaranteed S3 latency. An unavailable source is an error, never proof that a key is missing.
+3. **Fork and runtime integration (B-11, reader extension B-39).** Pin the source/format baseline and upstream-update policy;
+   prove Bedrock's I/O, simulation, range-integrity, checkpoint and recovery contracts before selecting engine features to remove.
+4. **Namespace scale (B-53).** Measure per-open metadata, small-object cost, writer/maintenance backlog and cache fairness.
+   Grouping namespaces, paged metadata or partitioning a single large namespace requires a later explicit decision.
+
+---
+
+## 5. GitHub issue compatibility audit — 2026-10-29
+
+Protocol replacement, 2026-10-30: the explicit user decision in B-11 and decision 11 above supersedes older linked
+comments where they require a separate raw S3 journal or asynchronous standalone commit materialization. The links below
+remain historical evidence of the earlier amendments; this local protocol update does not post new GitHub content.
+
+Fetched all **26 issues (14 open, 12 closed)** and all issue comments with the GitHub CLI. Each open issue was also fetched
+with `gh issue view <number> --repo felixrydberg/bedrock --json number,title,state,body,comments,url`.
+The initial audit was read only. The user-authorized follow-up below records the amendments as GitHub comments;
+original issue descriptions, titles, labels and states are preserved.
+
+The initial result was **eight required narrow amendments and six compatible open issues**. The shared mechanisms remain
+useful; the old customer-KV origin requirements cannot be implemented unchanged or silently waived by a new adapter.
+The dated comments below now supersede those specific clauses for affected work. Read each original issue together with
+its amendment; unrelated shared-core work can continue. The table below incorporates the second materialized-state scope
+review; original issue descriptions and prior customer-KV amendment comments remain preserved.
+
+| Issue / plan ID | Result | Required clarification or retained scope |
+|---|---|---|
+| [#9 / B-09](https://github.com/felixrydberg/bedrock/issues/9) (closed) | Follow-up | Preserve S3-durable acknowledgement and completed issue state. B-11 adds generic materialization, separate positions, atomic retry/state records and committed-tail retry lookup; future Raft reuses its seam. |
+| [#10 / B-10](https://github.com/felixrydberg/bedrock/issues/10) (closed) | Follow-up | Preserve exact stream boundaries and completed issue state. B-11 adds consistent materialized-state bootstrap/resume when a cursor predates retained authoritative history, with view/tail GC protection. |
+| [#11 / B-11](https://github.com/felixrydberg/bedrock/issues/11) | Amend | Own generic SlateDB API materialization across datasets, atomic event/state/revision/retry records, direct remote-durable SlateDB commits, time-based retention and durable-database recovery. Future Raft keeps its own committed tail. Replace mandatory portable snapshots/segment compactor with optional separate export. Real engine precedes B-23; no B-39 dependency. |
+| [#13 / B-14](https://github.com/felixrydberg/bedrock/issues/13) | Compatible | Keep local `StorageEngine`/CDN health reporting and failure isolation. B-11 adds generic async namespace errors/health integration; B-39 later integrates KV readers without changing completed local-engine contracts. |
+| [#14 / B-17](https://github.com/felixrydberg/bedrock/issues/14) | Amend | Remove the clause that a cached KV namespace is followed by its origin cell and the requirement to deliver customer `kv` through relays. The KV process still connects for Quicksilver/Auth, so one connection per process and relay-based membership remain valid. |
+| [#15 / B-12](https://github.com/felixrydberg/bedrock/issues/15) | Compatible | Keep membership from existing subscriber streams and service-local views. No additional heartbeat or customer-KV subscription is needed. |
+| [#16 / B-18](https://github.com/felixrydberg/bedrock/issues/16) | Amend | Bounded replay remains for pushed datasets. Beyond retained authoritative history, bootstrap B-11 consistent materialized state then resume after its boundary; do not assume all old events remain. Customer KV has no relay replay queue. |
+| [#17 / B-18b](https://github.com/felixrydberg/bedrock/issues/17) | Compatible | Retain generic relay introspection, `committed_at` and low-cardinality metrics for streams that exist. Customer-KV storage lag is added by B-39/B-27. |
+| [#18 / B-15](https://github.com/felixrydberg/bedrock/issues/18) | Compatible | The pure HRW selector and failure-domain checks still serve replicated data and cache affinity. They do not require customer-KV persistent replicas. |
+| [#19 / B-16](https://github.com/felixrydberg/bedrock/issues/19) | Amend | Scope relay subscribe/unsubscribe handoff, owner-only serving and population readiness to replicated buckets. Customer-KV buckets are cache affinity only; any eligible reader can serve without loading a complete bucket. Keep the shared bucket count/table algorithms. |
+| [#20 / B-19](https://github.com/felixrydberg/bedrock/issues/20) | Amend | Replace mandatory regional-tier/origin-cell resolution and its acceptance test with eligible cache-reader routing plus S3/recent-state fallback. Do not treat cache readers as full namespace replicas. Retain shared locality/health/freshness discovery. |
+| [#21 / B-20](https://github.com/felixrydberg/bedrock/issues/21) | Amend | Remove the required first KV user that moves origins, unsubscribes and deletes an authoritative local range. Retain generic reconciliation, idempotent repair, pushed-data and CDN users. Customer-KV drain only releases local readers/caches. |
+| [#22 / B-21](https://github.com/felixrydberg/bedrock/issues/22) | Amend | Remove mandatory complete customer-KV bucket repopulation/redundancy and origin readiness. New cache targets fetch on demand. Retained-data rebuilding uses B-11 consistent materialized state plus committed tail, with integrity/revision validation before readiness. Keep CDN's existing requirements. |
+| [#23 / B-22](https://github.com/felixrydberg/bedrock/issues/23) | Amend | Replace customer-KV origins with namespace reader/S3 fallback and publication-lag handling. B-11 durable-database recovery and consistent state bootstrap replace mandatory portable-snapshot recovery; B-39 integrates KV readers. Keep generic source-chain and local `StorageEngine` contracts. |
+| [#24 / B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Amend | Protect cache-reader opens, S3 fetches and recent-state reads instead of an origin cell. Preserve bounded queues, per-cell fairness and coalescing; specify its scope per coalescer rather than promising global cross-node deduplication. |
+| [#25 / B-23](https://github.com/felixrydberg/bedrock/issues/25) | Amend | Replace origin moves/`CompleteOrigin` with coherent-view rules. Gate the real B-11 engine, atomic state/revision/retry expiry, committed-tail recovery, safe time-based GC and fencing before product tracks; no B-39 dependency. Later B-39 reader/cache integration reruns applicable layers and nightly history. Preserve retained ownership/redundancy, TLC, DST, mutation/crash checks and #26's local-simulation decision. |
+
+Closed issues [#1–#10 / B-01–B-10](https://github.com/felixrydberg/bedrock/issues?q=is%3Aissue+is%3Aclosed),
+[#12 / B-13](https://github.com/felixrydberg/bedrock/issues/12) and
+[#26 / B-23a](https://github.com/felixrydberg/bedrock/issues/26) were reviewed as prerequisites, not rewritten as new scope.
+In particular, B-11 now owns follow-up to #4/B-04 (generic async materialization contract), #6/B-06 (API per-namespace handles),
+#7/B-07 (engine range/conditional I/O) and #9/B-09 (direct atomic namespace persistence and durable retry lookup).
+B-39 later integrates customer-KV read-only handles/cache policy on those contracts. Closed #9/B-09 and #10/B-10 receive
+narrow follow-up comments without reopening or rewriting their original descriptions; seven materialized-state amendments
+are posted for #9/#10/#11/#16/#22/#23/#25 and linked below. They supersede only changed clauses and preserve the prior customer-KV amendments.
+The #26 simulation seam and runtime rules remain mandatory; upstream SlateDB tests are not a substitute for them.
+Its final discussion comment supersedes the earlier CI simulation requirement. The existing #3/B-03 stream-liveness
+question (simulated HTTP/2 keepalive versus progress/idle handling) remains for #14/B-17 and #15/B-12; removing customer-KV
+subscriptions does not solve or authorize a separate heartbeat protocol for the remaining pushed datasets.
+
+### Amendments recorded in comments — 2026-10-29
+
+Posted through `gh issue comment --body-file` and read back to verify the exact text, one amendment per issue, and unchanged
+original descriptions/titles/states. No implementation or hardening gate is claimed complete by these comments.
+
+| Issue / plan ID | Amendment comment |
+|---|---|
+| #14 / B-17 | [Relay delivery scope](https://github.com/felixrydberg/bedrock/issues/14#issuecomment-6494996597) |
+| #19 / B-16 | [Replicated ownership versus cache affinity](https://github.com/felixrydberg/bedrock/issues/19#issuecomment-6494997449) |
+| #20 / B-19 | [Reader discovery and freshness](https://github.com/felixrydberg/bedrock/issues/20#issuecomment-6494998291) |
+| #21 / B-20 | [Reconciliation and cache drains](https://github.com/felixrydberg/bedrock/issues/21#issuecomment-6494999081) |
+| #22 / B-21 | [Retained-data repair and demand-driven KV fills](https://github.com/felixrydberg/bedrock/issues/22#issuecomment-6495003564) |
+| #23 / B-22 | [S3 reader fallback and revision guarantees](https://github.com/felixrydberg/bedrock/issues/23#issuecomment-6495004223) |
+| #24 / B-22b | [Coalescing and shared read-capacity protection](https://github.com/felixrydberg/bedrock/issues/24#issuecomment-6495004948) |
+| #25 / B-23 | [Protocol invariants and staged hardening gates](https://github.com/felixrydberg/bedrock/issues/25#issuecomment-6495005633) |
+
+### Materialized-state amendments recorded in comments — 2026-10-29
+
+The authorized follow-up adds these comments while preserving the original issue descriptions, states and earlier
+customer-KV amendments. This records the changed scope and acceptance checks; it does not claim implementation or gate completion.
+
+| Issue / plan ID | Amendment comment |
+|---|---|
+| #9 / B-09 (closed) | [Generic writer materialization and committed-tail retries](https://github.com/felixrydberg/bedrock/issues/9#issuecomment-6507616173) |
+| #10 / B-10 (closed) | [Retained-history bootstrap and stream boundary](https://github.com/felixrydberg/bedrock/issues/10#issuecomment-6507616930) |
+| #11 / B-11 | [Generic materialized store, retention and recovery](https://github.com/felixrydberg/bedrock/issues/11#issuecomment-6507617950) |
+| #16 / B-18 | [Relay fallback beyond retained history](https://github.com/felixrydberg/bedrock/issues/16#issuecomment-6507618650) |
+| #22 / B-21 | [Verified materialized-state recovery sources](https://github.com/felixrydberg/bedrock/issues/22#issuecomment-6507619378) |
+| #23 / B-22 | [Materialized recovery and reader integration](https://github.com/felixrydberg/bedrock/issues/23#issuecomment-6507620366) |
+| #25 / B-23 | [Real B-11 engine before the initial hardening gate](https://github.com/felixrydberg/bedrock/issues/25#issuecomment-6507621085) |
