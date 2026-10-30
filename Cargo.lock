@@ -650,6 +650,7 @@ dependencies = [
  "madsim-tonic",
  "madsim-tonic-build",
  "object_store",
+ "percent-encoding",
  "prometheus-client",
  "prost",
  "protoc-bin-vendored",

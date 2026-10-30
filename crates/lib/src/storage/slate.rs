@@ -97,13 +97,22 @@ impl NamespaceFactory for SlateFactory {
                     .strip_prefix(dataset_name)
                     .and_then(|suffix| suffix.strip_prefix('/'))
                     .unwrap_or_default();
-                if !valid_identity(dataset_name) || !valid_identity(namespace_name) {
-                    return Err(StorageError::Corruption(context(
+                let invalid_identity = || {
+                    StorageError::Corruption(context(
                         "namespace",
                         "invalid stored namespace identity".into(),
-                    )));
+                    ))
+                };
+                let dataset_name = percent_encoding::percent_decode_str(dataset_name)
+                    .decode_utf8()
+                    .map_err(|_| invalid_identity())?;
+                let namespace_name = percent_encoding::percent_decode_str(namespace_name)
+                    .decode_utf8()
+                    .map_err(|_| invalid_identity())?;
+                if !valid_identity(&dataset_name) || !valid_identity(&namespace_name) {
+                    return Err(invalid_identity());
                 }
-                scopes.insert((dataset_name.to_owned(), namespace_name.to_owned()));
+                scopes.insert((dataset_name.into_owned(), namespace_name.into_owned()));
             }
         }
         Ok(scopes.into_iter().collect())

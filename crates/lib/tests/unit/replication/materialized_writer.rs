@@ -314,6 +314,48 @@ async fn missing_or_corrupt_retained_event_prevents_startup() {
 
 #[cfg(not(madsim))]
 #[tokio::test]
+async fn real_engine_recovers_encoded_namespace_identity() {
+    let factory = Arc::new(crate::storage::slate::SlateFactory::new(Arc::new(
+        object_store::memory::InMemory::new(),
+    )));
+    let writer = Writer::open(
+        early,
+        config(
+            factory.clone(),
+            Retention::default(),
+            PersistenceMetrics::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let mut entry = write(Some("value"), None);
+    entry.namespace = "space and % sign".into();
+    assert_eq!(writer.commit(entry).await, Ok(1));
+    writer.close().await.unwrap();
+
+    let reopened = Writer::open(
+        early,
+        config(factory, Retention::default(), PersistenceMetrics::default()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reopened
+            .log()
+            .read("kv", "space and % sign", 1, usize::MAX)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let view = reopened.bootstrap("kv", "space and % sign").await.unwrap();
+    assert_eq!(view.sequence, 1);
+    assert_eq!(view.values.get(b"key".as_slice()), Some(&b"value".to_vec()));
+    reopened.close().await.unwrap();
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
 async fn real_engine_recovers_atomic_state_retries_and_retained_events() {
     let factory = Arc::new(crate::storage::slate::SlateFactory::new(Arc::new(
         object_store::memory::InMemory::new(),

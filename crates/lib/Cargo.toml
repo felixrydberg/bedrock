@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 tonic-prost.workspace = true
 slatedb.workspace = true
 object_store.workspace = true
+percent-encoding = "2"
 rocksdb.workspace = true
 
 [build-dependencies]
