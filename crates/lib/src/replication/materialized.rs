@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use super::subscriptions::pb;
 use super::{Event, Operation};
-use crate::storage::namespace::{Changes, NamespaceDatabase, NamespaceFactory};
+use crate::storage::namespace::{Changes, NamespaceDatabase, NamespaceFactory, valid_identity};
 use crate::storage::{
     Entry, ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, WriteBatch,
 };
@@ -187,9 +187,7 @@ fn context(instance: &str, detail: impl Into<String>) -> ErrorContext {
 }
 
 pub(crate) fn validate_scope(dataset: &str, namespace: &str) -> StorageResult<()> {
-    if [dataset, namespace].iter().any(|name| {
-        name.is_empty() || *name == "." || *name == ".." || name.contains(['/', '\\', '\0'])
-    }) {
+    if !valid_identity(dataset) || !valid_identity(namespace) {
         return Err(StorageError::Unsupported(context(
             "namespace",
             "invalid dataset or namespace identity",

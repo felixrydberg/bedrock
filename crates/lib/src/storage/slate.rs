@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use object_store::ObjectStore;
 use slatedb::{CloseReason, Db, ErrorKind, Settings, WriteBatch};
 
-use super::namespace::{Changes, NamespaceDatabase, NamespaceFactory};
+use super::namespace::{Changes, NamespaceDatabase, NamespaceFactory, valid_identity};
 use super::{Entry, ErrorContext, KeyRange, StorageError, StorageResult};
 
 pub struct SlateFactory {
@@ -56,13 +56,6 @@ fn engine_error(instance: &str, operation: &str, error: slatedb::Error) -> Stora
         ErrorKind::Unavailable => StorageError::Unavailable(context),
         _ => StorageError::IoError(context),
     }
-}
-
-fn valid_identity(identity: &str) -> bool {
-    !identity.is_empty()
-        && identity != "."
-        && identity != ".."
-        && !identity.contains(['/', '\\', '\0'])
 }
 
 #[async_trait]
@@ -122,7 +115,7 @@ impl NamespaceFactory for SlateFactory {
         namespace: &str,
     ) -> StorageResult<Arc<dyn NamespaceDatabase>> {
         if !valid_identity(dataset) || !valid_identity(namespace) {
-            return Err(StorageError::IoError(context(
+            return Err(StorageError::Unsupported(context(
                 "namespace",
                 "dataset and namespace must be nonempty single path components".into(),
             )));

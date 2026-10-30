@@ -10,6 +10,13 @@ use super::{Entry, StorageResult};
 
 pub mod memory;
 
+pub(crate) fn valid_identity(identity: &str) -> bool {
+    !identity.is_empty()
+        && identity != "."
+        && identity != ".."
+        && !identity.contains(['/', '\\', '\0'])
+}
+
 pub type Changes = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
 #[async_trait]

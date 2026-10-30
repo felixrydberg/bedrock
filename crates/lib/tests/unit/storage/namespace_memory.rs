@@ -132,7 +132,13 @@ async fn invalid_batch_never_partially_mutates_and_invalid_identities_fail() {
     ));
     assert_eq!(db.get(b"valid").await.unwrap(), None);
     for identity in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
-        assert!(factory.open("kv", identity).await.is_err());
-        assert!(factory.open(identity, "one").await.is_err());
+        assert!(matches!(
+            factory.open("kv", identity).await,
+            Err(StorageError::Unsupported(_))
+        ));
+        assert!(matches!(
+            factory.open(identity, "one").await,
+            Err(StorageError::Unsupported(_))
+        ));
     }
 }

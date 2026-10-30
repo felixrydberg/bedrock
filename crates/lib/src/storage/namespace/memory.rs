@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use super::{Changes, NamespaceDatabase, NamespaceFactory};
+use super::{Changes, NamespaceDatabase, NamespaceFactory, valid_identity};
 use crate::storage::{Entry, ErrorContext, KeyRange, StorageError, StorageResult};
 
 type Identity = (String, String);
@@ -51,13 +51,6 @@ fn context(instance: &str, detail: &str) -> ErrorContext {
 
 fn unavailable(instance: &str, detail: &str) -> StorageError {
     StorageError::Unavailable(context(instance, detail))
-}
-
-fn valid_identity(identity: &str) -> bool {
-    !identity.is_empty()
-        && identity != "."
-        && identity != ".."
-        && !identity.contains(['/', '\\', '\0'])
 }
 
 impl MemoryFactory {
@@ -121,7 +114,7 @@ impl NamespaceFactory for MemoryFactory {
         namespace: &str,
     ) -> StorageResult<Arc<dyn NamespaceDatabase>> {
         if !valid_identity(dataset) || !valid_identity(namespace) {
-            return Err(StorageError::IoError(context(
+            return Err(StorageError::Unsupported(context(
                 "namespace",
                 "dataset and namespace must be nonempty single path components",
             )));
