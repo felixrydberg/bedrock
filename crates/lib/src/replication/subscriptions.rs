@@ -4,7 +4,7 @@
 //! the cursor, so there is no switch-over where a concurrent commit could be missed or sent twice.
 //!
 //! The subscriber's cursor is its applied sequence, which the [`Applier`] commits with the data. That makes
-//! snapshot-then-subscribe exact: an installed snapshot (an engine `restore`, or B-11 from the bucket) carries the
+//! snapshot-then-subscribe exact: installed state (an engine `restore`, or B-11 materialized-state bootstrap) carries the
 //! namespace's revision with its data, and the subscription starts right after it. A reconnect or a restart resumes
 //! the same way.
 //!
@@ -99,10 +99,12 @@ impl<T: Clone> Watched<T> {
 #[derive(Default)]
 pub struct MemoryLog {
     namespaces: Mutex<BTreeMap<(String, String), NamespaceLog>>,
+    retention: Option<(fn() -> u64, u64)>,
 }
 
 struct NamespaceLog {
     events: Vec<Event>,
+    base_sequence: u64,
     head: Arc<Watched<u64>>,
 }
 
@@ -110,19 +112,68 @@ impl NamespaceLog {
     fn new() -> Self {
         NamespaceLog {
             events: Vec::new(),
+            base_sequence: 0,
             head: Arc::new(Watched::new(0)),
         }
     }
 }
 
 impl MemoryLog {
+    /// Enforces the writer's event window on reads, independently of physical GC.
+    pub fn with_retention(clock: fn() -> u64, retention_ms: u64) -> Self {
+        Self {
+            namespaces: Mutex::default(),
+            retention: Some((clock, retention_ms)),
+        }
+    }
+
+    /// Initializes an empty log at an already-installed state boundary.
+    pub fn reset(&self, dataset: &str, namespace: &str, boundary: u64) -> Result<(), String> {
+        let mut namespaces = self.namespaces.lock().unwrap();
+        let log = namespaces
+            .entry((dataset.to_owned(), namespace.to_owned()))
+            .or_insert_with(NamespaceLog::new);
+        if !log.events.is_empty() || log.head.get() != 0 {
+            return Err("cannot reset a non-empty log".into());
+        }
+        log.base_sequence = boundary;
+        log.head.update(|head| *head = boundary);
+        Ok(())
+    }
+
+    /// Drops expired durable events while preserving the namespace head.
+    pub fn prune(&self, dataset: &str, namespace: &str, through: u64) -> Result<(), String> {
+        let mut namespaces = self.namespaces.lock().unwrap();
+        let Some(log) = namespaces.get_mut(&(dataset.to_owned(), namespace.to_owned())) else {
+            return if through == 0 {
+                Ok(())
+            } else {
+                Err("unknown namespace log".into())
+            };
+        };
+        let head = log.head.get();
+        if through > head {
+            return Err(format!("cannot prune through {through} past head {head}"));
+        }
+        let drop_count = usize::try_from(through.saturating_sub(log.base_sequence))
+            .unwrap_or(usize::MAX)
+            .min(log.events.len());
+        log.events.drain(..drop_count);
+        log.base_sequence = log.base_sequence.max(through);
+        Ok(())
+    }
+
     /// Commits `event`, which must carry its namespace's next sequence.
     pub fn append(&self, event: Event) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
         let log = namespaces
             .entry((event.dataset.clone(), event.namespace.clone()))
             .or_insert_with(NamespaceLog::new);
-        let next = log.events.len() as u64 + 1;
+        let next = log
+            .head
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| "sequence overflow".to_owned())?;
         if event.sequence != next {
             return Err(format!("expected sequence {next}, got {}", event.sequence));
         }
@@ -140,11 +191,29 @@ impl Log for MemoryLog {
         from: u64,
         limit: usize,
     ) -> Result<Vec<Event>, Status> {
-        let namespaces = self.namespaces.lock().unwrap();
-        let Some(log) = namespaces.get(&(dataset.to_owned(), namespace.to_owned())) else {
+        let mut namespaces = self.namespaces.lock().unwrap();
+        let Some(log) = namespaces.get_mut(&(dataset.to_owned(), namespace.to_owned())) else {
             return Ok(Vec::new());
         };
-        let start = usize::try_from(from.max(1) - 1).unwrap_or(usize::MAX);
+        if let Some((clock, window)) = self.retention {
+            let now = clock();
+            let expired = log
+                .events
+                .partition_point(|event| now.saturating_sub(event.committed_at) >= window);
+            if expired > 0 {
+                log.base_sequence = log.events[expired - 1].sequence;
+                log.events.drain(..expired);
+            }
+        }
+        let first = log.base_sequence.saturating_add(1);
+        if from.max(1) <= log.base_sequence {
+            return Err(Status::out_of_range(format!(
+                "sequence {} is outside retained history; bootstrap at or after {}",
+                from.max(1),
+                log.base_sequence
+            )));
+        }
+        let start = usize::try_from(from.max(first) - first).unwrap_or(usize::MAX);
         let events = log.events.get(start..).unwrap_or_default();
         Ok(events.iter().take(limit).cloned().collect())
     }
@@ -300,6 +369,7 @@ async fn pump<L: Log>(
 /// Feeds one dataset's namespaces from an upstream into an [`Applier`] until dropped.
 pub struct Subscription {
     applied: Arc<Applied>,
+    recovery: Arc<Watched<Option<Status>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -313,8 +383,20 @@ impl Subscription {
         namespaces: Vec<String>,
     ) -> Self {
         let applied = Arc::<Applied>::default();
-        let task = tokio::spawn(run(peers, upstream, applier, namespaces, applied.clone()));
-        Subscription { applied, task }
+        let recovery = Arc::new(Watched::new(None));
+        let task = tokio::spawn(run(
+            peers,
+            upstream,
+            applier,
+            namespaces,
+            applied.clone(),
+            recovery.clone(),
+        ));
+        Subscription {
+            applied,
+            recovery,
+            task,
+        }
     }
 
     /// Waits until `namespace` has applied at least `revision`, for a minimum-revision read. Callers bound the
@@ -322,6 +404,12 @@ impl Subscription {
     pub async fn wait_for(&self, namespace: &str, revision: u64) {
         let applied = self.applied.get(namespace);
         applied.wait_until(|&a| a >= revision).await;
+    }
+
+    /// Resolves when the source has pruned a required cursor. Applying has stopped: callers stop
+    /// this subscription, recover/install its namespaces, then start again from installed revisions.
+    pub async fn recovery_required(&self) -> Status {
+        self.recovery.wait_until(Option::is_some).await.unwrap()
     }
 
     /// Stops applying and waits for the task to finish before its applier can be replaced.
@@ -364,10 +452,16 @@ async fn run<H: ApplyHook>(
     mut applier: Applier<H>,
     namespaces: Vec<String>,
     applied: Arc<Applied>,
+    recovery: Arc<Watched<Option<Status>>>,
 ) {
     loop {
         match session(&peers, &upstream, &mut applier, &namespaces, &applied).await {
             Ended::Upstream(status) => {
+                if status.code() == tonic::Code::OutOfRange {
+                    tracing::warn!(upstream, %status, "subscription requires materialized-state bootstrap");
+                    recovery.update(|reason| *reason = Some(status));
+                    return;
+                }
                 tracing::warn!(upstream, %status, "subscription stream ended, reconnecting");
                 peers.health().trip(&upstream);
             }
@@ -520,100 +614,5 @@ impl From<pb::Event> for Event {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::replication::ApplierMetrics;
-    use crate::storage::memory::MemoryEngine;
-    use crate::storage::{StorageEngine, StorageResult, WriteBatch};
-
-    struct Hook;
-
-    impl ApplyHook for Hook {
-        fn apply(
-            &mut self,
-            _: &dyn StorageEngine,
-            _: &Event,
-            _: &mut WriteBatch,
-        ) -> StorageResult<()> {
-            Ok(())
-        }
-    }
-
-    fn batch(sequences: &[u64]) -> pb::Batch {
-        pb::Batch {
-            events: sequences
-                .iter()
-                .map(|&sequence| pb::Event {
-                    dataset: "kv".into(),
-                    namespace: "ns".into(),
-                    sequence,
-                    ..Default::default()
-                })
-                .collect(),
-        }
-    }
-
-    #[tokio::test]
-    async fn gaps_publish_progress_and_retry_only_the_remaining_gap() {
-        let engine = Arc::new(MemoryEngine::new("kv"));
-        let mut applier = Applier::new("kv", engine.clone(), Hook, &ApplierMetrics::default());
-        applier
-            .offer(batch(&[5]).events.pop().unwrap().into())
-            .unwrap();
-        let applied = Arc::<Applied>::default();
-        let subscription = Subscription {
-            applied: applied.clone(),
-            task: tokio::spawn(std::future::pending()),
-        };
-        let (requests, mut rx) = mpsc::unbounded_channel();
-
-        apply_batch(&mut applier, &applied, batch(&[1, 2]), &requests, "source").unwrap();
-        assert_eq!(engine.revision("ns"), Ok(Some(2)));
-        tokio::time::timeout(Duration::from_secs(1), subscription.wait_for("ns", 2))
-            .await
-            .unwrap();
-        assert_eq!(rx.try_recv().unwrap(), subscribe("kv", "ns", 3));
-        assert_eq!(rx.try_recv().unwrap(), ack("kv", "ns", 2));
-        assert!(rx.try_recv().is_err());
-
-        // An earlier request must not suppress a retry after the missing cursor advances.
-        apply_batch(&mut applier, &applied, batch(&[3]), &requests, "source").unwrap();
-        assert_eq!(rx.try_recv().unwrap(), subscribe("kv", "ns", 4));
-        assert_eq!(rx.try_recv().unwrap(), ack("kv", "ns", 3));
-        assert!(rx.try_recv().is_err());
-
-        // A gap resolved within a batch needs no replay.
-        apply_batch(
-            &mut applier,
-            &applied,
-            batch(&[7, 4, 6]),
-            &requests,
-            "source",
-        )
-        .unwrap();
-        assert_eq!(applied.get("ns").get(), 7);
-        assert_eq!(rx.try_recv().unwrap(), ack("kv", "ns", 7));
-        assert!(rx.try_recv().is_err());
-        subscription.stop().await;
-    }
-
-    #[tokio::test]
-    async fn stop_waits_until_the_task_releases_its_resources() {
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let (held, mut released) = tokio::sync::oneshot::channel::<()>();
-        let subscription = Subscription {
-            applied: Arc::default(),
-            task: tokio::spawn(async move {
-                let _held = held;
-                started.send(()).unwrap();
-                std::future::pending::<()>().await;
-            }),
-        };
-        ready.await.unwrap();
-        subscription.stop().await;
-        assert_eq!(
-            released.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
-        );
-    }
-}
+#[path = "../../tests/unit/replication/subscriptions.rs"]
+mod tests;

@@ -1,32 +1,30 @@
-//! The single-node commit path behind `bedrock-api` (B-09, `kv.md` §8, §12, §14).
-//!
-//! The writer assigns each namespace's sequences in memory, in order and without gaps, and commits them in batches:
-//! one write-once object per batch at `{dataset}/{namespace}/log/{first:020}`, acknowledged once the put succeeds.
-//! Writes that arrive while a namespace's batch is in flight wait and go out together in the next one. One batch per
-//! namespace is in flight at a time, so a failed batch never leaves a gap behind a later one.
-//!
-//! Committed events go to [`Writer::log`], which [`super::subscriptions::Source`] serves to subscribers (B-10). On start
-//! the writer reads every batch back from the bucket, so acknowledged writes, heads and idempotency keys survive a
-//! restart.
-//!
-//! Create-if-absent guards the sequences: a second instance on the same bucket assigns sequences that already exist, and
-//! its put fails instead of overwriting. That namespace then refuses writes on the second instance until it restarts.
-//! B-09b replaces this writer with a Raft quorum behind the same `commit` and [`Log`] interface.
+//! Single-node ordered commits (#9 / B-09, #11 / B-11).
+//! Each SlateDB batch atomically stores original events, resolved values, retry results
+//! and progress. Only remote durability allows a response or subscription publication.
+//! Future B-09b commits through Raft first and uses the same persistence operation.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use prost::Message;
+use prometheus_client::{
+    encoding::EncodeLabelSet,
+    metrics::{counter::Counter, family::Family},
+};
 use tokio::sync::oneshot;
 
-use super::subscriptions::{MemoryLog, pb};
+use super::materialized::{
+    Committed, Materialized, Progress, Retention, RetryRecord, View, validate_scope,
+};
+use super::subscriptions::MemoryLog;
 use super::{Event, Operation, stream};
-use crate::s3::{ObjectStore, Put, S3Error, S3Result};
+use crate::storage::namespace::NamespaceFactory;
+use crate::storage::{ErrorContext, StorageError, StorageResult};
+use crate::transport::admin::Admin;
 
-/// Writer epoch on every event. Fixed until B-09b fences writers by epoch.
 pub const EPOCH: u64 = 1;
-/// Writes that may wait per namespace for the next batch; more are refused as [`CommitError::Busy`] (backpressure).
+/// Maximum writes waiting for the next namespace batch.
 pub const MAX_QUEUED: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,48 +33,88 @@ pub struct Write {
     pub namespace: String,
     pub key: Vec<u8>,
     pub operation: Operation,
-    /// A retry with the same key, in the same namespace, returns the first commit's sequence and applies nothing.
+    /// Until fixed expiry, a retry returns its original sequence without applying again.
     pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitError {
-    /// The write is malformed. Nothing was committed.
     Invalid(String),
-    /// [`MAX_QUEUED`] writes already wait in the namespace. Nothing was committed.
     Busy,
-    /// Another writer committed to the namespace's log. This one takes no writes there until it restarts.
     Fenced,
-    /// The batch's put failed and may or may not have landed. Retry with the same idempotency key.
+    /// Persistence may have completed; retry with the same idempotency key.
     Unavailable(String),
 }
 
 impl fmt::Display for CommitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CommitError::Invalid(reason) => write!(f, "invalid write: {reason}"),
-            CommitError::Busy => f.write_str("too many writes waiting in this namespace"),
-            CommitError::Fenced => f.write_str("another writer committed to this namespace"),
-            CommitError::Unavailable(detail) => write!(f, "commit outcome unknown: {detail}"),
+            Self::Invalid(reason) => write!(f, "invalid write: {reason}"),
+            Self::Busy => f.write_str("too many writes waiting in this namespace"),
+            Self::Fenced => f.write_str("another writer owns this namespace"),
+            Self::Unavailable(detail) => write!(f, "commit outcome unknown: {detail}"),
         }
     }
 }
-
 impl std::error::Error for CommitError {}
 
-pub struct Writer<S> {
-    store: S,
-    /// Milliseconds since the Unix epoch, for `committed_at`. Wall time comes from the binary (B-23a).
+pub struct Persistence {
+    pub factory: Arc<dyn NamespaceFactory>,
+    pub retention: Retention,
+    pub metrics: PersistenceMetrics,
+}
+
+#[derive(Clone, Default)]
+pub struct PersistenceMetrics {
+    runs: Family<PersistenceLabel, Counter>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct PersistenceLabel {
+    dataset: String,
+    outcome: String,
+}
+
+impl PersistenceMetrics {
+    pub fn new(admin: &Admin) -> Self {
+        let metrics = Self::default();
+        admin.register(
+            "retention_runs",
+            "Event-triggered namespace expiry cleanup runs by outcome",
+            metrics.runs.clone(),
+        );
+        metrics
+    }
+    fn record(&self, dataset: &str, failed: bool) {
+        self.runs
+            .get_or_create(&PersistenceLabel {
+                dataset: dataset.into(),
+                outcome: if failed { "failed" } else { "cleaned" }.into(),
+            })
+            .inc();
+    }
+}
+
+pub struct Writer {
     clock: fn() -> u64,
     log: Arc<MemoryLog>,
     namespaces: Mutex<BTreeMap<(String, String), Arc<Namespace>>>,
+    persistence: Persistence,
+    slots: tokio::sync::Semaphore,
+    closed: AtomicBool,
 }
 
 #[derive(Default)]
 struct Namespace {
     queue: Mutex<Vec<Queued>>,
-    /// Held while a batch commits.
     state: tokio::sync::Mutex<State>,
+    flow: Mutex<CleanupFlow>,
+}
+
+#[derive(Default)]
+struct CleanupFlow {
+    running: bool,
+    requested: u64,
 }
 
 struct Queued {
@@ -86,481 +124,375 @@ struct Queued {
 
 #[derive(Default)]
 struct State {
+    source: Option<Arc<Materialized>>,
     head: u64,
-    // ponytail: every key since the first write, like the log itself; B-11 bounds both to the tail after a snapshot.
-    idempotency: BTreeMap<String, u64>,
-    /// A batch whose put failed with an unknown outcome. It is put again, unchanged, before the next one.
-    unresolved: Option<Batch>,
+    committed_at: u64,
+    retries: BTreeMap<String, RetryRecord>,
+    unresolved: Option<Vec<Committed>>,
     fenced: bool,
 }
 
-struct Batch {
-    object: String,
-    body: Vec<u8>,
-    entries: Vec<(Event, Option<String>)>,
+fn unavailable(detail: &str) -> StorageError {
+    StorageError::Unavailable(ErrorContext {
+        engine: "writer",
+        instance: "api".into(),
+        file: None,
+        partition: None,
+        detail: detail.into(),
+    })
 }
 
-impl Batch {
-    fn new(entries: Vec<(Event, Option<String>)>) -> Self {
-        let first = &entries[0].0;
-        let object = log_object(&first.dataset, &first.namespace, first.sequence);
-        let entries_pb = entries.iter().map(|(event, key)| pb::LogEntry {
-            event: Some(event.clone().into()),
-            idempotency_key: key.clone().unwrap_or_default(),
-        });
-        let body = pb::LogBatch {
-            entries: entries_pb.collect(),
-        };
-        Batch {
-            object,
-            body: body.encode_to_vec(),
-            entries,
-        }
-    }
-}
-
-impl<S: ObjectStore + 'static> Writer<S> {
-    /// Loads every committed batch from `store`. Fails on a batch that does not continue its namespace's log.
-    // ponytail: reads the whole log at start; B-11 starts from the latest manifest instead.
-    pub async fn open(store: S, clock: fn() -> u64) -> S3Result<Arc<Self>> {
-        let writer = Writer {
-            store,
-            clock,
-            log: Arc::default(),
-            namespaces: Mutex::default(),
-        };
-        for object in writer.store.list("").await? {
-            let Some((dataset, namespace, first)) = parse_log_object(&object) else {
-                continue;
-            };
-            let corrupt = |detail: String| S3Error::Corruption {
-                key: object.clone(),
-                detail,
-            };
-            let body = writer
-                .store
-                .get(&object)
-                .await?
-                .ok_or_else(|| S3Error::Unavailable {
-                    detail: format!("{object} was deleted while loading"),
-                })?;
-            let batch =
-                pb::LogBatch::decode(body.as_slice()).map_err(|e| corrupt(e.to_string()))?;
-            let ns = writer.namespace(dataset, namespace);
-            let mut state = ns.state.lock().await;
-            let mut entries = Vec::new();
-            for (i, entry) in batch.entries.into_iter().enumerate() {
-                let event = Event::from(
-                    entry
-                        .event
-                        .ok_or_else(|| corrupt("entry without event".into()))?,
-                );
-                let expected = state.head + 1 + i as u64;
-                if event.dataset != dataset
-                    || event.namespace != namespace
-                    || event.sequence != expected
-                {
-                    return Err(corrupt(format!(
-                        "expected {dataset}/{namespace} sequence {expected}, found {}/{} sequence {}",
-                        event.dataset, event.namespace, event.sequence
-                    )));
-                }
-                let key = Some(entry.idempotency_key).filter(|k| !k.is_empty());
-                entries.push((event, key));
-            }
-            if first != state.head + 1 || entries.is_empty() {
-                return Err(corrupt(format!(
-                    "batch does not follow head {}",
-                    state.head
-                )));
-            }
-            writer.finish(&mut state, entries);
-        }
-        Ok(Arc::new(writer))
-    }
-
-    /// Every committed event, for [`super::subscriptions::Source`].
+impl Writer {
     pub fn log(&self) -> Arc<MemoryLog> {
         self.log.clone()
     }
 
-    /// Commits `write` with the next sequence in its namespace, or returns the earlier sequence of a retry.
+    pub async fn open(clock: fn() -> u64, config: Persistence) -> StorageResult<Arc<Self>> {
+        config.retention.validate()?;
+        let log = Arc::new(MemoryLog::with_retention(
+            clock,
+            config.retention.event_retention_ms,
+        ));
+        let writer = Arc::new(Self {
+            clock,
+            log,
+            namespaces: Mutex::default(),
+            persistence: config,
+            slots: tokio::sync::Semaphore::new(4),
+            closed: AtomicBool::new(false),
+        });
+        let result = async {
+            for (dataset, namespace) in writer.persistence.factory.namespaces().await? {
+                validate_scope(&dataset, &namespace)?;
+                let ns = writer.namespace(&dataset, &namespace);
+                let mut state = ns.state.lock().await;
+                writer.source(&mut state, &dataset, &namespace).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = writer.close().await;
+            return Err(error);
+        }
+        Ok(writer)
+    }
+
+    async fn source(
+        &self,
+        state: &mut State,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<Arc<Materialized>> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(unavailable("writer closed"));
+        }
+        if let Some(source) = &state.source {
+            return Ok(source.clone());
+        }
+        let source = Arc::new(
+            Materialized::open(self.persistence.factory.as_ref(), dataset, namespace).await?,
+        );
+        let restored = async {
+            let progress = source.progress().await?;
+            if progress.raft.is_some() {
+                return Err(unavailable(
+                    "Raft-backed namespace requires the Raft writer",
+                ));
+            }
+            let entries = source.events().await?;
+            self.log
+                .reset(dataset, namespace, progress.pruned_through)
+                .map_err(|detail| unavailable(&detail))?;
+            for entry in entries {
+                self.log
+                    .append(entry.event)
+                    .map_err(|detail| unavailable(&detail))?;
+            }
+            state.head = progress.sequence;
+            state.committed_at = progress.committed_at;
+            state.retries = progress.retries;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = restored {
+            let _ = source.close().await;
+            return Err(error);
+        }
+        state.source = Some(source.clone());
+        Ok(source)
+    }
+
+    /// Owns a complete coherent view before releasing the namespace gate.
+    pub async fn bootstrap(&self, dataset: &str, namespace: &str) -> StorageResult<View> {
+        validate_scope(dataset, namespace)?;
+        let ns = self.namespace(dataset, namespace);
+        let mut state = ns.state.lock().await;
+        if state.unresolved.is_some() {
+            return Err(unavailable("unresolved persistence outcome"));
+        }
+        self.source(&mut state, dataset, namespace)
+            .await?
+            .view()
+            .await
+    }
+
+    /// Cleanup is the only post-response flow. It never decides commit success.
+    pub async fn cleanup(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
+        validate_scope(dataset, namespace)?;
+        let ns = self.namespace(dataset, namespace);
+        let mut state = ns.state.lock().await;
+        if state.fenced || state.unresolved.is_some() {
+            return Ok(());
+        }
+        let source = self.source(&mut state, dataset, namespace).await?;
+        let _slot = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|_| unavailable("persistence closed"))?;
+        let now = (self.clock)().max(state.committed_at);
+        let removed = source.cleanup(now, &self.persistence.retention).await?;
+        self.log
+            .prune(dataset, namespace, removed)
+            .map_err(|detail| unavailable(&detail))?;
+        state.retries.retain(|_, retry| retry.expires_at > now);
+        Ok(())
+    }
+
+    pub async fn close(&self) -> StorageResult<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        let namespaces: Vec<_> = self.namespaces.lock().unwrap().values().cloned().collect();
+        let mut failure = None;
+        for ns in namespaces {
+            let mut state = ns.state.lock().await;
+            if let Some(source) = state.source.take()
+                && let Err(error) = source.close().await
+            {
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub async fn commit(self: &Arc<Self>, write: Write) -> Result<u64, CommitError> {
         validate(&write)?;
-        let namespace = self.namespace(&write.dataset, &write.namespace);
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CommitError::Unavailable("writer closed".into()));
+        }
+        let ns = self.namespace(&write.dataset, &write.namespace);
         let (done, committed) = oneshot::channel();
         {
-            let mut queue = namespace.queue.lock().unwrap();
+            let mut queue = ns.queue.lock().unwrap();
             if queue.len() >= MAX_QUEUED {
                 return Err(CommitError::Busy);
             }
             queue.push(Queued { write, done });
         }
-        // Spawned, so a caller that gives up cannot stop a batch between its put and the log.
-        tokio::spawn(self.clone().drain(namespace));
+        // Caller cancellation cannot interrupt persistence between buffering and durability.
+        tokio::spawn(self.clone().drain(ns));
         committed
             .await
             .unwrap_or_else(|_| Err(CommitError::Unavailable("writer stopped".into())))
     }
 
     fn namespace(&self, dataset: &str, namespace: &str) -> Arc<Namespace> {
-        let mut namespaces = self.namespaces.lock().unwrap();
-        let key = (dataset.to_owned(), namespace.to_owned());
-        namespaces.entry(key).or_default().clone()
+        self.namespaces
+            .lock()
+            .unwrap()
+            .entry((dataset.into(), namespace.into()))
+            .or_default()
+            .clone()
     }
 
-    /// Commits whatever is queued in the namespace as one batch, once the batch in flight is done.
-    async fn drain(self: Arc<Self>, namespace: Arc<Namespace>) {
-        let mut state = namespace.state.lock().await;
-        let queued = std::mem::take(&mut *namespace.queue.lock().unwrap());
+    async fn drain(self: Arc<Self>, ns: Arc<Namespace>) {
+        let mut state = ns.state.lock().await;
+        let queued = std::mem::take(&mut *ns.queue.lock().unwrap());
         if queued.is_empty() {
             return;
         }
-        if let Some(batch) = state.unresolved.take()
-            && let Err(error) = self.put(&mut state, batch).await
+        let dataset = queued[0].write.dataset.clone();
+        let name = queued[0].write.namespace.clone();
+        let setup = if state.fenced {
+            Err(CommitError::Fenced)
+        } else {
+            self.source(&mut state, &dataset, &name)
+                .await
+                .map(|_| ())
+                .map_err(commit_error)
+        };
+        if let Err(error) = setup {
+            for item in queued {
+                let _ = item.done.send(Err(error.clone()));
+            }
+            return;
+        }
+        if let Some(entries) = state.unresolved.take()
+            && let Err(error) = self.persist(&mut state, entries).await
         {
-            for Queued { done, .. } in queued {
-                let _ = done.send(Err(error.clone()));
+            for item in queued {
+                let _ = item.done.send(Err(error.clone()));
             }
             return;
         }
-        if state.fenced {
-            for Queued { done, .. } in queued {
-                let _ = done.send(Err(CommitError::Fenced));
+        let committed_at = (self.clock)().max(state.committed_at);
+        let Some(retry_expires_at) =
+            committed_at.checked_add(self.persistence.retention.retry_retention_ms)
+        else {
+            for item in queued {
+                let _ = item.done.send(Err(CommitError::Unavailable(
+                    "retry expiry exceeds timestamp range".into(),
+                )));
             }
             return;
-        }
-
-        let committed_at = (self.clock)();
+        };
+        state
+            .retries
+            .retain(|_, retry| retry.expires_at > committed_at);
         let mut entries = Vec::new();
         let mut in_batch = BTreeMap::new();
         let mut waiting = Vec::new();
         for Queued { write, done } in queued {
             let key = write.idempotency_key;
-            if let Some(&sequence) = key.as_ref().and_then(|k| state.idempotency.get(k)) {
+            if let Some(sequence) = key
+                .as_ref()
+                .and_then(|key| state.retries.get(key))
+                .map(|retry| retry.sequence)
+            {
                 let _ = done.send(Ok(sequence));
                 continue;
             }
-            if let Some(&sequence) = key.as_ref().and_then(|k| in_batch.get(k)) {
+            if let Some(&sequence) = key.as_ref().and_then(|key| in_batch.get(key)) {
                 waiting.push((done, sequence));
                 continue;
             }
-            let sequence = state.head + entries.len() as u64 + 1;
+            let Some(sequence) = state
+                .head
+                .checked_add(entries.len() as u64)
+                .and_then(|n| n.checked_add(1))
+            else {
+                let _ = done.send(Err(CommitError::Unavailable(
+                    "namespace revision exhausted".into(),
+                )));
+                continue;
+            };
             if let Some(key) = &key {
                 in_batch.insert(key.clone(), sequence);
             }
-            let event = Event {
-                stream: stream(&write.dataset, 0),
-                dataset: write.dataset,
-                namespace: write.namespace,
-                sequence,
-                epoch: EPOCH,
-                committed_at,
-                key: write.key,
-                operation: write.operation,
-            };
-            entries.push((event, key));
+            entries.push(Committed {
+                event: Event {
+                    stream: stream(&write.dataset, 0),
+                    dataset: write.dataset,
+                    namespace: write.namespace,
+                    sequence,
+                    epoch: EPOCH,
+                    committed_at,
+                    key: write.key,
+                    operation: write.operation,
+                },
+                retry_expires_at: if key.is_some() { retry_expires_at } else { 0 },
+                retry_key: key,
+            });
             waiting.push((done, sequence));
         }
         let result = if entries.is_empty() {
             Ok(())
         } else {
-            self.put(&mut state, Batch::new(entries)).await
+            self.persist(&mut state, entries).await
         };
+        drop(state);
         for (done, sequence) in waiting {
             let _ = done.send(result.clone().map(|()| sequence));
         }
+        if result.is_ok() {
+            self.schedule_cleanup(ns, dataset, name);
+        }
     }
 
-    async fn put(&self, state: &mut State, batch: Batch) -> Result<(), CommitError> {
-        match self
-            .store
-            .put(&batch.object, batch.body.clone(), Put::Create)
+    async fn persist(&self, state: &mut State, entries: Vec<Committed>) -> Result<(), CommitError> {
+        let _slot = self
+            .slots
+            .acquire()
             .await
-        {
-            Ok(()) => {
-                self.finish(state, batch.entries);
+            .map_err(|_| CommitError::Unavailable("persistence closed".into()))?;
+        let source = state
+            .source
+            .as_ref()
+            .expect("source opened before persistence");
+        match source.persist(&entries, None).await {
+            Ok(Progress {
+                sequence,
+                committed_at,
+                retries,
+                ..
+            }) => {
+                for entry in entries {
+                    if entry.event.sequence > state.head {
+                        self.log
+                            .append(entry.event)
+                            .expect("batch continues durable log");
+                    }
+                }
+                state.head = sequence;
+                state.committed_at = committed_at;
+                state.retries = retries;
                 Ok(())
             }
-            Err(S3Error::AlreadyExists { key }) => {
-                tracing::error!(
-                    key,
-                    "another writer committed these sequences; refusing writes to the namespace"
-                );
-                state.fenced = true;
-                Err(CommitError::Fenced)
-            }
             Err(error) => {
-                state.unresolved = Some(batch);
-                Err(CommitError::Unavailable(error.to_string()))
+                if matches!(error, StorageError::Fenced(_)) {
+                    state.fenced = true;
+                } else {
+                    state.unresolved = Some(entries);
+                }
+                Err(commit_error(error))
             }
         }
     }
 
-    /// Records a batch that is in the bucket.
-    fn finish(&self, state: &mut State, entries: Vec<(Event, Option<String>)>) {
-        for (event, key) in entries {
-            state.head = event.sequence;
-            if let Some(key) = key {
-                state.idempotency.insert(key, event.sequence);
+    fn schedule_cleanup(self: &Arc<Self>, ns: Arc<Namespace>, dataset: String, name: String) {
+        {
+            let mut flow = ns.flow.lock().unwrap();
+            flow.requested = flow.requested.saturating_add(1);
+            if flow.running {
+                return;
             }
-            // The namespace lock orders every append, so the sequence is always the log's next.
-            self.log.append(event).expect("batch continues the log");
+            flow.running = true;
         }
+        let writer = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let requested = ns.flow.lock().unwrap().requested;
+                let result = writer.cleanup(&dataset, &name).await;
+                writer.persistence.metrics.record(&dataset, result.is_err());
+                let mut flow = ns.flow.lock().unwrap();
+                if flow.requested <= requested {
+                    flow.running = false;
+                    return;
+                }
+            }
+        });
+    }
+}
+
+fn commit_error(error: StorageError) -> CommitError {
+    match error {
+        StorageError::Fenced(_) => CommitError::Fenced,
+        error => CommitError::Unavailable(error.to_string()),
     }
 }
 
 fn validate(write: &Write) -> Result<(), CommitError> {
-    for (what, name) in [("dataset", &write.dataset), ("namespace", &write.namespace)] {
-        if name.is_empty() || name.contains(['/', '\0']) {
-            return Err(CommitError::Invalid(format!(
-                "{what} must be non-empty, without '/' or NUL"
-            )));
-        }
-    }
+    validate_scope(&write.dataset, &write.namespace)
+        .map_err(|error| CommitError::Invalid(error.to_string()))?;
     if write.key.is_empty() {
         return Err(CommitError::Invalid("key must not be empty".into()));
     }
     Ok(())
 }
 
-/// Zero-padded to u64's 20 digits, so listing order is sequence order.
-fn log_object(dataset: &str, namespace: &str, first: u64) -> String {
-    format!("{dataset}/{namespace}/log/{first:020}")
-}
-
-fn parse_log_object(object: &str) -> Option<(&str, &str, u64)> {
-    let mut parts = object.split('/');
-    let (Some(dataset), Some(namespace), Some("log"), Some(first), None) = (
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-    ) else {
-        return None;
-    };
-    Some((dataset, namespace, first.parse().ok()?))
-}
-
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    use super::*;
-    use crate::replication::subscriptions::Log;
-    use crate::s3::memory::MemoryStore;
-
-    /// A [`MemoryStore`] whose puts take a moment, so writes queue behind a batch in flight, and whose next put can be
-    /// made to land but report failure, as when the response is lost.
-    #[derive(Clone, Default)]
-    struct Store {
-        objects: MemoryStore,
-        lose_reply: Arc<AtomicBool>,
-    }
-
-    impl ObjectStore for Store {
-        async fn get(&self, key: &str) -> S3Result<Option<Vec<u8>>> {
-            self.objects.get(key).await
-        }
-
-        async fn put(&self, key: &str, body: Vec<u8>, mode: Put) -> S3Result<()> {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-            self.objects.put(key, body, mode).await?;
-            if self.lose_reply.swap(false, Ordering::SeqCst) {
-                return Err(S3Error::Unavailable {
-                    detail: "response lost".into(),
-                });
-            }
-            Ok(())
-        }
-
-        async fn list(&self, prefix: &str) -> S3Result<Vec<String>> {
-            self.objects.list(prefix).await
-        }
-
-        async fn delete(&self, key: &str) -> S3Result<()> {
-            self.objects.delete(key).await
-        }
-    }
-
-    fn clock() -> u64 {
-        1_700_000_000_000
-    }
-
-    fn set(namespace: &str, key: &str, value: &str, idempotency_key: Option<&str>) -> Write {
-        Write {
-            dataset: "kv".into(),
-            namespace: namespace.into(),
-            key: key.into(),
-            operation: Operation::Set(value.into()),
-            idempotency_key: idempotency_key.map(Into::into),
-        }
-    }
-
-    async fn events(writer: &Writer<Store>, namespace: &str) -> Vec<Event> {
-        writer
-            .log
-            .read("kv", namespace, 1, usize::MAX)
-            .await
-            .unwrap()
-    }
-
-    fn sequences(events: &[Event]) -> Vec<u64> {
-        events.iter().map(|e| e.sequence).collect()
-    }
-
-    #[tokio::test]
-    async fn concurrent_writes_get_gap_free_sequences_in_batches() {
-        let store = Store::default();
-        let writer = Writer::open(store.clone(), clock).await.unwrap();
-        let tasks: Vec<_> = (0..300)
-            .map(|i| {
-                let writer = writer.clone();
-                let namespace = ["a", "b", "c"][i % 3];
-                tokio::spawn(async move {
-                    let sequence = writer
-                        .commit(set(namespace, "k", &i.to_string(), None))
-                        .await;
-                    (namespace, i, sequence.unwrap())
-                })
-            })
-            .collect();
-        let mut committed = BTreeMap::<&str, Vec<(u64, usize)>>::new();
-        for task in tasks {
-            let (namespace, i, sequence) = task.await.unwrap();
-            committed.entry(namespace).or_default().push((sequence, i));
-        }
-
-        for (namespace, mut acked) in committed {
-            acked.sort();
-            let logged = events(&writer, namespace).await;
-            assert_eq!(
-                sequences(&logged),
-                (1..=100).collect::<Vec<_>>(),
-                "{namespace}"
-            );
-            for ((sequence, i), event) in acked.iter().zip(&logged) {
-                assert_eq!(event.sequence, *sequence);
-                assert_eq!(event.operation, Operation::Set(i.to_string().into()));
-            }
-        }
-        let objects = store.list("kv/").await.unwrap();
-        assert!(
-            objects.len() < 300,
-            "{} batches for 300 writes",
-            objects.len()
-        );
-    }
-
-    #[tokio::test]
-    async fn acknowledged_writes_and_keys_survive_a_restart() {
-        let store = Store::default();
-        let writer = Writer::open(store.clone(), clock).await.unwrap();
-        writer.commit(set("a", "x", "1", Some("w1"))).await.unwrap();
-        writer.commit(set("b", "x", "1", None)).await.unwrap();
-        writer.commit(set("a", "y", "2", None)).await.unwrap();
-        let before = events(&writer, "a").await;
-        drop(writer);
-
-        let writer = Writer::open(store, clock).await.unwrap();
-        assert_eq!(events(&writer, "a").await, before);
-        assert_eq!(writer.commit(set("a", "x", "1", Some("w1"))).await, Ok(1));
-        assert_eq!(writer.commit(set("a", "z", "3", None)).await, Ok(3));
-        assert_eq!(writer.commit(set("b", "z", "3", None)).await, Ok(2));
-    }
-
-    #[tokio::test]
-    async fn a_second_instance_cannot_commit_existing_sequences() {
-        let store = Store::default();
-        let first = Writer::open(store.clone(), clock).await.unwrap();
-        let second = Writer::open(store.clone(), clock).await.unwrap();
-        assert_eq!(first.commit(set("a", "x", "first", None)).await, Ok(1));
-        assert_eq!(
-            second.commit(set("a", "x", "second", None)).await,
-            Err(CommitError::Fenced)
-        );
-        assert_eq!(
-            second.commit(set("a", "y", "second", None)).await,
-            Err(CommitError::Fenced)
-        );
-        assert_eq!(first.commit(set("a", "y", "first", None)).await, Ok(2));
-
-        let reloaded = Writer::open(store, clock).await.unwrap();
-        let logged = events(&reloaded, "a").await;
-        assert_eq!(sequences(&logged), [1, 2]);
-        assert!(
-            logged
-                .iter()
-                .all(|e| e.operation == Operation::Set("first".into()))
-        );
-    }
-
-    #[tokio::test]
-    async fn retries_with_the_same_key_apply_once() {
-        let writer = Writer::open(Store::default(), clock).await.unwrap();
-        let (a, b) = tokio::join!(
-            writer.commit(set("a", "x", "1", Some("k"))),
-            writer.commit(set("a", "x", "1", Some("k"))),
-        );
-        assert_eq!((a, b), (Ok(1), Ok(1)));
-        assert_eq!(writer.commit(set("a", "x", "1", Some("k"))).await, Ok(1));
-        // Keys are per namespace.
-        assert_eq!(writer.commit(set("b", "x", "1", Some("k"))).await, Ok(1));
-        assert_eq!(sequences(&events(&writer, "a").await), [1]);
-    }
-
-    #[tokio::test]
-    async fn a_lost_put_response_is_resolved_before_the_next_batch() {
-        let store = Store::default();
-        let writer = Writer::open(store.clone(), clock).await.unwrap();
-        store.lose_reply.store(true, Ordering::SeqCst);
-        let lost = writer.commit(set("a", "x", "1", Some("k"))).await;
-        assert!(matches!(lost, Err(CommitError::Unavailable(_))), "{lost:?}");
-        assert!(events(&writer, "a").await.is_empty());
-
-        // The retry puts the same batch again, finds it landed, and returns its sequence.
-        assert_eq!(writer.commit(set("a", "x", "1", Some("k"))).await, Ok(1));
-        assert_eq!(writer.commit(set("a", "y", "2", None)).await, Ok(2));
-        assert_eq!(sequences(&events(&writer, "a").await), [1, 2]);
-    }
-
-    #[tokio::test]
-    async fn full_queues_and_malformed_writes_are_refused() {
-        let writer = Writer::open(Store::default(), clock).await.unwrap();
-        // Holding the namespace as a batch in flight would, so the commits below queue.
-        let namespace = writer.namespace("kv", "a");
-        let in_flight = namespace.state.lock().await;
-        let queued: Vec<_> = (0..MAX_QUEUED)
-            .map(|i| {
-                let writer = writer.clone();
-                tokio::spawn(
-                    async move { writer.commit(set("a", "k", &i.to_string(), None)).await },
-                )
-            })
-            .collect();
-        while namespace.queue.lock().unwrap().len() < MAX_QUEUED {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            writer.commit(set("a", "k", "v", None)).await,
-            Err(CommitError::Busy)
-        );
-        drop(in_flight);
-        for commit in queued {
-            commit.await.unwrap().unwrap();
-        }
-
-        for write in [
-            set("a/b", "k", "v", None),
-            set("", "k", "v", None),
-            set("a", "", "v", None),
-        ] {
-            assert!(matches!(
-                writer.commit(write).await,
-                Err(CommitError::Invalid(_))
-            ));
-        }
-    }
-}
+#[path = "../../tests/unit/replication/materialized_writer.rs"]
+mod materialized_tests;
+#[cfg(test)]
+#[path = "../../tests/unit/replication/writer.rs"]
+mod tests;

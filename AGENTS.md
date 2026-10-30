@@ -29,6 +29,7 @@
 - For Rust changes, run `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`, plus the issue's relevant acceptance checks.
 - Once #26 provides the harness, validate affected I/O paths in normal and `cfg(madsim)` builds and run the documented seed/replay checks. Never claim an absent harness or an unrun gate passed.
 - Add a focused regression or contract test for non-trivial behavior. Documentation-only edits need link/content checks, not the Rust test suite.
+- Keep unit tests, adapter tests and contract-test helpers in each crate's `tests/` folder. Workspace-level `tests/` is for end-to-end and madsim scenarios. Use test-only module paths when tests need private implementation access.
 
 ## Route by ambiguity and consequence
 
@@ -57,6 +58,7 @@ Choose the cheapest available model that can reliably complete and verify the ta
 
 ## Keep changes small
 
+- In every PR, inspect affected code and dependencies for dead code, superseded paths, duplicate abstractions and unused configuration. Remove what the change makes unnecessary after checking callers, and update the related tests and docs. Prefer existing dependency APIs over project wrappers that add no required behavior; keep unrelated cleanup out of the PR.
 - Reuse existing contracts, helpers and dependencies. Search affected callers before changing a shared interface and update all affected callers and tests.
 - Implement the issue's acceptance criteria without speculative features, dependencies or abstractions. Preserve validation, error handling and failure isolation.
 - Preserve unrelated local work. Do not commit, publish or edit GitHub content when the user asked only for a draft.

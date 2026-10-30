@@ -4,7 +4,8 @@
 //! `listen` (B-10).
 //!
 //! `PUT /v1/{dataset}/{namespace}/{key}` sets the key to the request body and `DELETE` deletes it. The response body is
-//! the committed sequence. With an `Idempotency-Key` header, a retry returns the first commit's sequence.
+//! the committed sequence. An `Idempotency-Key` retry returns the original sequence while it remains
+//! within the configured retry duration (24 hours by default). An expired retry is a new write.
 //! Every write requires `Authorization: Bearer <write_token>`; the configured token grants access to all writes.
 
 use std::sync::Arc;
@@ -21,8 +22,9 @@ use bedrock_lib::node::{self, ApiConfig, ConfigError};
 use bedrock_lib::replication::Operation;
 use bedrock_lib::replication::subscriptions::Source;
 use bedrock_lib::replication::subscriptions::pb::replication_server::ReplicationServer;
-use bedrock_lib::replication::writer::{CommitError, Write, Writer};
-use bedrock_lib::s3::ObjectStore;
+use bedrock_lib::replication::writer::{
+    CommitError, Persistence, PersistenceMetrics, Write, Writer,
+};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
@@ -33,19 +35,32 @@ use tokio::net::TcpListener;
 pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     tracing::info!(node_id = %config.node.node_id, "starting bedrock-api");
     let admin = node::start_admin(&config.node).await?;
+    config
+        .retention
+        .validate()
+        .map_err(|error| ConfigError(error.to_string()))?;
     #[cfg(not(madsim))]
-    let store = bedrock_lib::s3::aws::S3Store::new(&config.s3);
-    // The simulated S3 SDK has no conditional writes, so simulation builds use the in-memory store (B-07).
+    let factory = Arc::new(bedrock_lib::storage::slate::SlateFactory::new(
+        bedrock_lib::s3::object_store(&config.s3)
+            .map_err(|error| ConfigError(error.to_string()))?,
+    ));
     #[cfg(madsim)]
-    let store = bedrock_lib::s3::memory::MemoryStore::default();
-    let writer = Writer::open(store, now)
-        .await
-        .map_err(|e| ConfigError(format!("loading the log: {e}")))?;
+    let factory = Arc::new(bedrock_lib::storage::namespace::memory::MemoryFactory::default());
+    let writer = Writer::open(
+        now,
+        Persistence {
+            factory,
+            retention: config.retention,
+            metrics: PersistenceMetrics::new(&admin),
+        },
+    )
+    .await
+    .map_err(|e| ConfigError(format!("opening durable state: {e}")))?;
     let app = app(writer.clone(), config.write_token)?;
     let writes = TcpListener::bind(config.write_listen)
         .await
         .map_err(|e| ConfigError(format!("write_listen {}: {e}", config.write_listen)))?;
-    tokio::spawn(serve(writes, app));
+    let writes = tokio::spawn(serve(writes, app));
     let replication = tonic::transport::Server::builder()
         .add_service(ReplicationServer::new(Source::new(writer.log())))
         .serve(config.node.listen);
@@ -59,25 +74,24 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
         }
     }
     admin.set_ready(false);
+    writes.abort();
+    writer
+        .close()
+        .await
+        .map_err(|e| ConfigError(format!("closing durable state: {e}")))?;
     tracing::info!("shutting down");
     Ok(())
 }
 
 /// The write routes over `writer`, restricted to holders of `write_token`.
-pub fn app<S: ObjectStore + 'static>(
-    writer: Arc<Writer<S>>,
-    write_token: String,
-) -> Result<Router, ConfigError> {
+pub fn app(writer: Arc<Writer>, write_token: String) -> Result<Router, ConfigError> {
     if write_token.is_empty() || !write_token.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(ConfigError(
             "write_token must be nonempty printable ASCII without spaces".into(),
         ));
     }
     Ok(Router::new()
-        .route(
-            "/v1/{dataset}/{namespace}/{*key}",
-            put(write::<S>).delete(write::<S>),
-        )
+        .route("/v1/{dataset}/{namespace}/{*key}", put(write).delete(write))
         .route_layer(middleware::from_fn_with_state(
             Arc::<str>::from(write_token),
             authorize,
@@ -121,8 +135,8 @@ pub async fn serve(listener: TcpListener, app: Router) {
     }
 }
 
-async fn write<S: ObjectStore + 'static>(
-    State(writer): State<Arc<Writer<S>>>,
+async fn write(
+    State(writer): State<Arc<Writer>>,
     Path((dataset, namespace, key)): Path<(String, String, String)>,
     method: Method,
     headers: HeaderMap,
@@ -169,15 +183,5 @@ fn now() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use bedrock_lib::s3::memory::MemoryStore;
-
-    #[tokio::test]
-    async fn rejects_unusable_write_tokens() {
-        let writer = Writer::open(MemoryStore::default(), || 0).await.unwrap();
-        for token in ["", " ", "with space", "with\nnewline", "non-ascii-å"] {
-            assert!(app(writer.clone(), token.into()).is_err());
-        }
-    }
-}
+#[path = "../tests/unit/startup.rs"]
+mod tests;

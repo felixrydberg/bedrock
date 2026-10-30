@@ -7,10 +7,14 @@
 //! [`WriteBatch`] as the data they describe, so after a crash both are either there or not.
 
 pub mod memory;
+pub mod namespace;
 #[cfg(not(madsim))]
 pub mod rocksdb;
+#[cfg(not(madsim))]
+pub mod slate;
 
 #[cfg(test)]
+#[path = "../tests/support/storage_contract.rs"]
 mod contract;
 
 use std::collections::BTreeMap;
@@ -37,6 +41,8 @@ pub enum StorageError {
     IoError(ErrorContext),
     Corruption(ErrorContext),
     Unavailable(ErrorContext),
+    /// A newer writer owns this engine; this handle cannot publish again.
+    Fenced(ErrorContext),
     /// The adapter does not provide this capability. Adapters report it rather than approximate it.
     Unsupported(ErrorContext),
 }
@@ -60,6 +66,7 @@ impl StorageError {
             StorageError::IoError(c)
             | StorageError::Corruption(c)
             | StorageError::Unavailable(c)
+            | StorageError::Fenced(c)
             | StorageError::Unsupported(c) => c,
         }
     }
@@ -71,6 +78,7 @@ impl fmt::Display for StorageError {
             StorageError::IoError(_) => "I/O error",
             StorageError::Corruption(_) => "corruption",
             StorageError::Unavailable(_) => "unavailable",
+            StorageError::Fenced(_) => "writer fenced",
             StorageError::Unsupported(_) => "unsupported",
         };
         let c = self.context();
@@ -204,7 +212,7 @@ pub trait Snapshot: Send + Sync {
     fn revisions(&self) -> StorageResult<BTreeMap<String, u64>>;
 }
 
-/// One local storage instance. Adapters pass the contract suite in `storage/contract.rs`.
+/// One local storage instance. Adapters pass the contract suite in `tests/support/storage_contract.rs`.
 ///
 /// Calls are synchronous and short; once `write` or `restore` returns `Ok`, the change survives a crash.
 pub trait StorageEngine: Send + Sync {
@@ -252,25 +260,5 @@ pub trait StorageEngine: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prefix_range_end() {
-        assert_eq!(KeyRange::prefix(*b"ab").end, Some(b"ac".to_vec()));
-        assert_eq!(KeyRange::prefix([b'a', 0xFF]).end, Some(b"b".to_vec()));
-        assert_eq!(KeyRange::prefix([0xFF, 0xFF]).end, None);
-        assert_eq!(KeyRange::prefix(Vec::new()), KeyRange::all());
-
-        let r = KeyRange::prefix([b'a', 0xFF]);
-        assert!(r.contains(&[b'a', 0xFF]) && r.contains(&[b'a', 0xFF, 0xFF, 7]));
-        assert!(!r.contains(b"a") && !r.contains(b"b"));
-    }
-
-    #[test]
-    fn inverted_range_is_empty() {
-        assert!(KeyRange::new(*b"b", *b"a").bounds().is_none());
-        assert!(KeyRange::new(*b"a", *b"a").bounds().is_none());
-        assert!(!KeyRange::new(*b"b", *b"a").contains(b"b"));
-    }
-}
+#[path = "../tests/unit/storage.rs"]
+mod tests;

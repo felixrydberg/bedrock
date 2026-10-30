@@ -7,8 +7,8 @@ write_listen = "0.0.0.0:7002"
 # or a TLS-terminating proxy for the HTTP write endpoint.
 data_dir = "/data"
 
-# Credentials come from BEDROCK_S3__ACCESS_KEY_ID and BEDROCK_S3__SECRET_ACCESS_KEY. They need get, list and put, not
-# delete: only the compactor deletes (B-11).
+# Credentials come from BEDROCK_S3__ACCESS_KEY_ID and BEDROCK_S3__SECRET_ACCESS_KEY.
+# SlateDB requires get, list, conditional put and delete permissions.
 [s3]
 endpoint = "https://s3.example.internal"
 bucket = "bedrock"
@@ -17,3 +17,10 @@ bucket = "bedrock"
 region = "core"
 dc = "core-1"
 cell = "core-1a"
+
+# Writes acknowledge only after events, values, retries and progress are durable together.
+# Expiry cleanup is event-triggered; idle physical cleanup may wait.
+# Open SlateDB handles retain internal engine timers; Bedrock does not poll idle namespaces.
+[retention]
+event_retention_ms = 86400000
+retry_retention_ms = 86400000

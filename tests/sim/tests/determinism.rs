@@ -174,6 +174,7 @@ async fn scenario() -> u64 {
                     node,
                     write_listen: format!("{ip}:7002").parse().unwrap(),
                     write_token: "simulation-writer-token".into(),
+                    retention: Default::default(),
                     s3: S3Config {
                         endpoint: format!("http://{S3}"),
                         bucket: BUCKET.into(),
