@@ -169,6 +169,23 @@ fn factory() -> SlateFactory {
     SlateFactory::new(Arc::new(InMemory::new()))
 }
 
+#[tokio::test]
+async fn namespace_discovery_finds_real_database() {
+    let store = Arc::new(WalFaultStore::default());
+    put_listing_object(&store, "unrelated/object").await;
+    let factory = SlateFactory::new(store);
+    let db = factory.open("kv", "one").await.unwrap();
+    db.write(vec![(b"key".to_vec(), Some(b"value".to_vec()))])
+        .await
+        .unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+    assert_eq!(
+        factory.namespaces().await.unwrap(),
+        vec![("kv".into(), "one".into())]
+    );
+}
+
 async fn put_listing_object(store: &WalFaultStore, path: &str) {
     store
         .inner
@@ -322,8 +339,14 @@ async fn namespace_and_dataset_identity_isolate_state() {
         ".",
         "..",
     ] {
-        assert!(factory.open("kv", identity).await.is_err());
-        assert!(factory.open(identity, "one").await.is_err());
+        assert!(matches!(
+            factory.open("kv", identity).await,
+            Err(StorageError::Unsupported(_))
+        ));
+        assert!(matches!(
+            factory.open(identity, "one").await,
+            Err(StorageError::Unsupported(_))
+        ));
     }
 }
 
