@@ -17,7 +17,7 @@ use bedrock_lib::transport::Peers;
 use bedrock_lib::transport::admin::Admin;
 use madsim::runtime::{Handle, NodeHandle, Runtime};
 use tokio::sync::Notify;
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 
 const API: &str = "10.0.2.1";
 const CELL_RELAYS: [&str; 3] = ["10.0.2.11", "10.0.2.12", "10.0.2.13"];
@@ -167,9 +167,12 @@ where
 }
 
 async fn until(what: &str, within: Duration, ready: impl Fn() -> bool) {
-    let deadline = Instant::now() + within;
+    let deadline = bedrock_lib::monotonic_now() + within;
     while !ready() {
-        assert!(Instant::now() < deadline, "{what} within {within:?}");
+        assert!(
+            bedrock_lib::monotonic_now() < deadline,
+            "{what} within {within:?}"
+        );
         sleep(Duration::from_millis(100)).await;
     }
 }
@@ -179,8 +182,8 @@ async fn steady(what: &str, leaf: &Leaf, period: Duration, members: &[&str]) {
     // The leaf samples its applied revision every 100 ms.
     sleep(Duration::from_millis(200)).await;
     let revision = leaf.revision.load(Ordering::Relaxed);
-    let deadline = Instant::now() + period;
-    while Instant::now() < deadline {
+    let deadline = bedrock_lib::monotonic_now() + period;
+    while bedrock_lib::monotonic_now() < deadline {
         assert_eq!(leaf.members(), members, "{what}: membership changed");
         assert_eq!(
             leaf.revision.load(Ordering::Relaxed),
@@ -194,7 +197,7 @@ async fn steady(what: &str, leaf: &Leaf, period: Duration, members: &[&str]) {
 async fn scenario() -> Vec<String> {
     let handle = Handle::current();
     let mut trace = Vec::new();
-    let started = Instant::now();
+    let started = bedrock_lib::monotonic_now();
     let mark = |trace: &mut Vec<String>, event: &str| {
         trace.push(format!("{} {event}", started.elapsed().as_millis()));
     };
