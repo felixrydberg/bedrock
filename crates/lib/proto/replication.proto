@@ -1,5 +1,4 @@
-// Replication subscriptions (B-10). A subscriber opens one `Subscribe` stream per dataset, asks for namespaces from a
-// sequence and acknowledges what it applied; the source pushes each namespace's events in order.
+// Shared replication events and multiplexed relay sessions (B-10/B-17/B-18).
 syntax = "proto3";
 package bedrock.replication;
 
@@ -15,31 +14,78 @@ message Event {
   optional bytes value = 8;
 }
 
-// Starts, or restarts after a gap, `namespace` from sequence `from`.
-message Subscribe {
-  string dataset = 1;
-  string namespace = 2;
-  uint64 from = 3;
-}
-
 message Ack {
   string dataset = 1;
   string namespace = 2;
   uint64 applied = 3;
 }
 
-message Request {
+// V1 relay session. Tier rank: leaf=0, cell=1, dc=2,
+// region=3, writer=4. Zero on Welcome is invalid.
+message Hello { uint32 version = 1; uint32 tier = 2; }
+message Follow {
+  string dataset = 1;
+  string namespace = 2;
+  uint64 from = 3;
+  repeated uint32 buckets = 4;
+}
+message Unfollow { string dataset = 1; string namespace = 2; }
+message Recover {
+  Follow follow = 1;
+  repeated string visited = 2;
+}
+message RelayRequest {
   oneof kind {
-    Subscribe subscribe = 1;
-    Ack ack = 2;
+    Hello hello = 1;
+    Follow follow = 2;
+    Ack ack = 3;
+    Unfollow unfollow = 4;
+    Recover recover = 5;
+    bool progress = 6;
   }
 }
-
-// Consecutive events of one namespace.
-message Batch {
-  repeated Event events = 1;
+message Welcome { uint32 version = 1; uint32 tier = 2; }
+message Delivery {
+  string dataset = 1;
+  string namespace = 2;
+  uint64 from = 3;
+  uint64 through = 4;
+  repeated bytes events = 5;
 }
-
-service Replication {
-  rpc Subscribe(stream Request) returns (stream Batch);
+message ReplayRange {
+  string dataset = 1;
+  string namespace = 2;
+  uint64 first = 3;
+  uint64 last = 4;
+  uint64 head = 5;
+  bool recovered = 6;
 }
+message StateEntry { bytes key = 1; bytes value = 2; }
+// Begin/end delimit a sorted, checksummed live-key view. Entries carry no tombstones.
+message Bootstrap {
+  string dataset = 1;
+  string namespace = 2;
+  uint64 boundary = 3;
+  uint64 committed_at = 4;
+  bool begin = 5;
+  bool end = 6;
+  repeated StateEntry entries = 7;
+  bytes checksum = 8;
+}
+message RelayError {
+  string dataset = 1;
+  string namespace = 2;
+  uint32 code = 3;
+  string detail = 4;
+}
+message RelayFrame {
+  oneof kind {
+    Welcome welcome = 1;
+    Delivery delivery = 2;
+    ReplayRange range = 3;
+    Bootstrap bootstrap = 4;
+    RelayError error = 5;
+    bool tick = 6;
+  }
+}
+service Relay { rpc Session(stream RelayRequest) returns (stream RelayFrame); }

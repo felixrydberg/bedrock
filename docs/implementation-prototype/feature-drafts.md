@@ -149,8 +149,8 @@ Rules this implies:
 | **I — First CDN** (parallel with H; no dependency on KV drafts) |||||
 | B-30 | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
 | B-31 | Artifact transfer | CDN | `cdn/artifact_transfer` | B-30 |
-| B-32 | `cdn` dataset and retention operations | CDN | `cdn/retention` | B-23 |
-| B-33 | Manifests and publish client | CDN | `cdn/manifests` | B-30, B-32 |
+| B-32 | `cdn` retention and shared manifest format/reader | CDN | `cdn/retention`, `cdn/manifests` | B-23, B-30 |
+| B-33 | Publish client using shared manifests/retention | CDN | `cdn/manifests` | B-30, B-32 |
 | B-34 | Regional L2 with two-replica artifact placement | CDN | `cdn/retention`, `cdn/artifact_storage` | B-31, B-32 |
 | B-35 | Artifact retrieval interface | CDN | `cdn/artifact_transfer` | B-33, B-34 |
 | B-36 | CDN end-to-end acceptance | CDN | `cdn` | B-30 … B-35 |
@@ -190,8 +190,8 @@ Rules this implies:
 | KV Phase 4 (relays, streams, replay) | B-17 … B-19 (cache-fill broadcast dropped, decision 11) |
 | KV Phase 5 (cache routing and residency; pushed-data redistribution stays shared) | B-15, B-16, B-19, B-27, B-28 |
 | KV Phase 6 (optimisation) | B-38, B-40, B-41, B-53 |
-| CDN Phase 1 (artifact foundation) | B-30, B-31, B-33, B-35 |
-| CDN Phase 2 (distributed CDN) | B-32, B-34 |
+| CDN Phase 1 (storage, retention metadata + publish) | B-30, B-31, B-32, B-33 |
+| CDN Phase 2 (regional placement + retrieval) | B-34, B-35 |
 | CDN Phase 3 (retention and recovery) | B-43, B-44 |
 | CDN Phase 4 (optimisation) | B-45, B-46, B-47, B-49 (compiled Worker caching moved to B-48 in track L) |
 | Deployment parts of the CDN doc (activation, rollbacks, Worker/Pages retrieval) | B-50, B-51, B-48, B-52 |
@@ -268,9 +268,9 @@ Created: [#8](https://github.com/felixrydberg/bedrock/issues/8) — Feature 🚀
 
 ---
 
-#### B-09 — Dev write API: single node, batched writes to S3
+#### B-09 — Single-node write API with ordered, SlateDB-durable commits
 
-Created: [#9](https://github.com/felixrydberg/bedrock/issues/9) — Feature 🚀: Dev write API (Axum, single node) batching ordered writes to S3 and emitting them to the stream
+Created: [#9](https://github.com/felixrydberg/bedrock/issues/9) — Feature 🚀: Single-node write API with ordered, SlateDB-durable commits
 
 ---
 
@@ -288,19 +288,22 @@ At scale the write path needs automatic failover, fencing of old leaders and low
 **Describe the solution you'd like**
 - Run `bedrock-api` as a 3 or 5 node Raft group (`openraft`) in the core region. One leader is the only writer, the rest are followers.
 - Acknowledge a write once a majority has fsynced it. The state machine assigns per-namespace revisions when entries are applied. The Raft term fences old leaders.
-- Batch committed entries directly through B-11's atomic SlateDB persistence operation: original retained events,
-  resolved state, fixed retry result/expiry, namespace revision/time and represented Raft index/term advance together.
-  Remote flush follows buffered apply. Retain the majority-committed but not yet SlateDB-durable tail for recovery and
-  retry lookup; do not add a parallel raw S3 event journal.
+- Reuse B-11's existing `Materialized::persist(entries, Some(raft_position))` operation for batched database
+  persistence. B-11 owns its atomic records, remote flush and engine format; do not implement another backend,
+  persistence protocol or parallel raw S3 event journal. Retain the majority-committed but not yet SlateDB-durable
+  Raft tail for recovery and retry lookup, preserving original retry expiry.
 - Keep Raft-committed, applied, SlateDB-durable and reader-visible positions separate. Truncate only after a verified
   recoverable native checkpoint covers every namespace affected by the global prefix, including closed/lazy namespaces.
   Store the cutoff's index, term and membership. A namespace progress record is not a native checkpoint.
-- Materialize all datasets through B-11; publish pushed datasets to their B-10 streams. Customer `kv` uses B-39 readers and is
+- Materialize all datasets through B-11; publish pushed datasets through the existing `Relay.Session`. Customer `kv` uses B-39 readers and is
   never sent through relays. The generic writer selects a storage/delivery contract, not product-specific KV/CDN logic.
 - Only one leader publishes each namespace database. Fence stale S3 publishers as well as stale Raft proposals; a term
-  change alone must not let an old process publish an older manifest. Reuse B-11's atomic persistence operation after
-  majority-fsynced Raft commit. Recover retry records from both durable state and the committed not-yet-durable tail;
-  persist their original fixed expiry.
+  change alone must not let an old process publish an older manifest. Integrate existing B-11 fencing with leadership;
+  do not create a second storage-publisher implementation.
+- Own the buffered/durable API consolidation when this first Raft caller lands: identify which `apply`/`publish`
+  entry points are actually needed beside `persist`, migrate their callers and remove superseded wrappers in the
+  same change. `apply` buffers; `persist` applies and flushes; `publish` flushes prior buffered work. Preserve the
+  adapter's buffered-versus-durable model and crash/flush/acknowledgement tests; test-only use alone is not proof of dead code.
 - Start with one group for the whole core region. Assigning namespaces across multiple groups is later work; see
   [future API writer scaling](future-development.md#horizontally-scaled-api-writers) for the proposed direction.
 - Metrics: quorum commit latency, failover/recovery duration, persistence lag and retained tail/backpressure,
@@ -323,11 +326,14 @@ At scale the write path needs automatic failover, fencing of old leaders and low
 
 Created: [#10](https://github.com/felixrydberg/bedrock/issues/10) — Feature 🚀: Replication stream subscriptions and catch-up from a consistent revision boundary
 
+The logical B-10 boundary/cursor/minimum-revision contracts now use B-17's sole `Relay.Session` transport.
+The former `Source`/`Subscription`/`Replication.Subscribe` path was removed; no compatibility implementation is required.
+
 ---
 
 #### B-11 — Generic API atomic materialized state, retained events and recovery
 
-Created: [#11](https://github.com/felixrydberg/bedrock/issues/11) — Generic API atomic materialized state, retained events and recovery
+Created: [#11](https://github.com/felixrydberg/bedrock/issues/11) — Feature 🚀: Generic API materialized state, retained events and recovery
 
 Alpha cleanup, 2026-10-30: materialized storage is the sole write/recovery path; no archive compatibility or migration code is retained.
 
@@ -366,6 +372,13 @@ A subscriber whose cursor predates retained events bootstraps a consistent live-
 strictly after its boundary. Validate integrity and revision before readiness. Portable live-key export remains optional
 separate work. Keep pushed local StorageEngine and CDN artifact CacheStorage contracts unchanged; B-11 does not depend
 on later B-39 readers/caches.
+
+Scope ownership, 2026-10-30: B-11 owns this common persistence/view provider; B-18 owns the existing protected
+state-plus-tail transfer and recovery confirmation over `Relay.Session`. B-32 consumes that path for CDN rebuilds,
+and B-09b adds quorum/retained-tail/checkpoint integration around the existing persistence operation. Neither track
+reimplements the backend, a raw archive, or a product-specific subscription/recovery loop. When an integrating
+track supersedes a helper, it owns caller/test migration and deletion in the same change. Unleased `bootstrap`
+and `View::install` utilities must not be mistaken for protected production scan-plus-tail recovery.
 
 Acceptance covers normal and cfg(madsim) atomic-batch/flush recovery, acknowledgement crash boundaries, retry after
 restart or ambiguous completion, fixed expiry, separate logical retention, namespace isolation, corruption, stale handles,
@@ -420,11 +433,17 @@ Created: [#19](https://github.com/felixrydberg/bedrock/issues/19) — Feature �
 
 Created: [#14](https://github.com/felixrydberg/bedrock/issues/14) — Feature 🚀: bedrock-relay binary with relay tiers, subscriber-initiated streams, bucket-routed fan-out and subscription tracking
 
+One `Relay.Session` transport serves direct and relayed pushed subscriptions. No preserved B-10 wire/API wrapper,
+per-product client or separate heartbeat is required. B-32 integrates richer application behavior at that same boundary.
+
 ---
 
 #### B-18 — Relay replay log
 
 Created: [#16](https://github.com/felixrydberg/bedrock/issues/16) — Feature 🚀: Bounded relay replay log with advertised revision ranges
+
+The shared session recovery path reuses B-11 coherent views and bounded tail-protection leases. Future consumers,
+including B-32 metadata rebuilds, reuse it rather than adding their own bootstrap transport or recovery engine.
 
 ---
 
@@ -532,6 +551,13 @@ Done right after B-01, before any I/O code (B-03, B-04, B-07 onwards follow its 
 #### B-23 — Shared-core hardening gate: TLA+ model, deterministic simulation and crash testing
 
 Created: [#25](https://github.com/felixrydberg/bedrock/issues/25) — Feature 🚀: Shared-core hardening gate: TLA+ model, deterministic simulation and crash testing
+
+B-23 integrates and extends the existing models, production `run(config)` paths, adapter contracts, workload/fault
+scenarios and retained seeds. It does not reimplement B-11 storage or B-17/B-18 subscription/recovery as a second
+reference stack. Reuse scenario/checker code across layers while retaining real-engine and real-socket evidence.
+The 500-seed PR checks, safety/liveness modes, replay hashes, mutation tests, real-binary faults and seven consecutive
+passing nights remain required. Later B-09b/B-32/B-39 work is not an initial prerequisite; applicable integrations
+extend these same checks and rerun the required gate/history.
 
 ---
 
@@ -884,10 +910,10 @@ This must not swamp relay traffic and must not duplicate fetches when many reque
 
 ---
 
-#### B-32 — `cdn` dataset and retention operations
+#### B-32 — `cdn` retention and shared manifest format/reader
 
 ```
-Title:  Feature 🚀: cdn dataset with global retention namespaces and RETAIN/RELEASE operations
+Title:  Feature 🚀: CDN retention operations with shared manifest format and verified reads
 Labels: enhancement
 ```
 
@@ -911,30 +937,44 @@ The `cdn` dataset belongs to the CDN: `bedrock-kv` never hosts or subscribes to 
   | `RELEASE_ARTIFACT` | `DELETE artifact/{sha256}` |
 
 - A client in `cdn/retention` with typed `retain_manifest(...)` etc. that turns calls into those writes.
-- `bedrock-cdn` subscribes to every retention namespace through the relays (B-10/B-17). Its apply hook (B-08):
+- Implement the canonical immutable manifest format (`path → sha256`, plus metadata), encoding/decoding and
+  hash-verified reader in `cdn/manifests` here: retention is its first consumer. Reuse B-30's content-addressed
+  storage/cache for manifest bytes. B-33 consumes this implementation; do not create a provisional retention codec
+  that B-33 later replaces, or make B-32 depend on B-33.
+- `bedrock-cdn` uses the existing B-17 `Relay.Session` client for every retention namespace. Integrate richer
+  application behavior once at its existing data/covered-progress boundary, reusing or consolidating B-08 hook
+  semantics instead of retaining a parallel applier/subscriber. CDN application:
   - expands manifests into artifact retention requirements
   - keeps reference counts shared across manifests
   - stores this derived state in a local `lib/storage` instance
-- Derived state can be thrown away: on wipe or corruption it is rebuilt from a consistent `cdn` materialized-state scan and subsequent retained database events (B-11).
+- Derived state can be thrown away: rebuild using B-18's existing session recovery over B-11's coherent state
+  and lease-protected tail, then the same CDN application behavior. Reuse the transfer, checksum validation,
+  exact-boundary resumption and recovery confirmation; no second bootstrap protocol or mandatory portable archive.
+  State replacement/derived writes and represented covered progress must remain atomic and unready until validated.
   No artifact locations are stored globally.
+- Remove superseded application/rebuild wrappers and migrate their useful tests in this integration. Keep shared
+  log/view/storage primitives and actual inspection/local-install utilities with identified uses. Do not prebuild
+  this product hook framework in earlier core issues merely to replace it here.
 
 **Additional context**
 - **Implementation:** CDN. Writes, ordering and fan-out come from the shared infrastructure. Interpretation lives in `bedrock-cdn`.
-- **Module:** `cdn/retention`.
+- **Module:** `cdn/retention`, shared codec/verified reader in `cdn/manifests`.
 - **Doc reference:** `cdn.md` §3 Declarative Retention, §4 Phase 2, Core Principle 5; §1 "Deployment model" in this file.
-- **Depends on:** B-23.
+- **Depends on:** B-23 and B-30; reuse created B-08/B-11/B-17/B-18 contracts.
 - **Acceptance criteria:**
+  - Manifest encoding/decoding and verified reads use one canonical implementation shared with B-33. A bad hash or missing manifest is an explicit error.
   - Retaining two manifests that share artifacts gives correct refcounts.
   - Releasing one keeps the shared artifacts.
-  - Wiping `bedrock-cdn`'s local state rebuilds identical refcounts from the `cdn` dataset's consistent materialized state plus committed tail.
+  - Live delivery, duplicate/gap handling, restart and obsolete-cursor bootstrap run through the shared session; derived state and covered cursor cannot diverge on a crash.
+  - Wiping `bedrock-cdn`'s local state rebuilds identical refcounts through protected recovery under concurrent writes/GC; corruption, interruption and lease expiry cannot establish readiness.
   - `bedrock-kv` receives no `cdn` events, and the `kv` and `cdn` crates have no dependency on each other.
 
 ---
 
-#### B-33 — Manifests and publish client
+#### B-33 — Publish client using shared manifests and retention
 
 ```
-Title:  Feature 🚀: Immutable, content-addressed manifests and a publish client
+Title:  Feature 🚀: Idempotent publish client using the shared manifest and retention contracts
 Labels: enhancement
 ```
 
@@ -944,7 +984,8 @@ Publishing must guarantee that a returned handle points only at stored, retained
 The CDN is a backing service: it knows manifests and artifacts, never deployments, Workers or which version is live.
 
 **Describe the solution you'd like**
-- An immutable manifest format (`path → sha256`, plus metadata), stored content-addressed in S3 and addressed by `manifest_hash`.
+- Reuse B-32's canonical manifest format, codec and hash-verified reader, and B-30's content-addressed storage/cache.
+  This draft owns publish orchestration, not another manifest implementation or cache backend.
 - A publish client in `cdn/manifests`:
   1. Upload the artifacts.
   2. Upload the manifest.
@@ -956,7 +997,8 @@ The CDN is a backing service: it knows manifests and artifacts, never deployment
   releasing. The deploy control plane (B-50) is the first such caller.
 - Publishing is idempotent: republishing the same content returns the same `manifest_hash` and retains it once.
 - `bedrock-cdn` subscribes to the `cdn` dataset only, never to `quicksilver` or any other KV dataset.
-- `bedrock-cdn` caches manifests locally by hash. They are immutable, so a cached manifest never needs invalidating.
+- Reuse the shared verified manifest cache by hash. Manifests are immutable, so a cached manifest never needs invalidating.
+- Compose B-30 storage and B-32 retention calls directly; no temporary publisher/manifest facade or second subscription/recovery loop.
 
 **Additional context**
 - **Implementation:** CDN.
@@ -1604,9 +1646,14 @@ Labels: enhancement
 
 ## 5. GitHub issue compatibility audit — 2026-10-29
 
-Protocol replacement, 2026-10-30: the explicit user decision in B-11 and decision 11 above supersedes older linked
-comments where they require a separate raw S3 journal or asynchronous standalone commit materialization. The links below
-remain historical evidence of the earlier amendments; this local protocol update does not post new GitHub content.
+Scope consolidation, 2026-10-30: descriptions for #8/#9/#10/#11/#14/#16/#25 now incorporate the approved persistence,
+single-session and recovery contracts. #9/#11 titles match that scope; issue states, labels and discussion remain.
+Drafts B-09b/B-32/B-33 assign reuse and removal ownership, and B-23 reuses the existing validation stack without reducing
+its gate. See [the scope follow-through](temporary-paths-audit.md#scope-follow-through--2026-10-30).
+
+The explicit user decision in B-11 and decision 11 above supersedes older linked comments requiring a separate raw
+S3 journal or asynchronous standalone commit materialization. The audit counts, preserved-body statements and table
+below describe the historical 2026-10-29 review; current descriptions contain the 2026-10-30 consolidation.
 
 Fetched all **26 issues (14 open, 12 closed)** and all issue comments with the GitHub CLI. Each open issue was also fetched
 with `gh issue view <number> --repo felixrydberg/bedrock --json number,title,state,body,comments,url`.

@@ -91,6 +91,7 @@ fn service_config(node: NodeConfig, datasets: &[Dataset]) -> ServiceConfig {
         relays: vec!["10.0.1.3:7000".into()],
         api: "10.0.1.4:7002".into(),
         s3_endpoint: format!("http://{S3}"),
+        subscriptions: Vec::new(),
     }
 }
 
@@ -169,6 +170,8 @@ async fn scenario() -> u64 {
                     node,
                     tier: Tier::Cell,
                     upstreams: vec!["10.0.1.4:7000".into()],
+                    replay_peers: Vec::new(),
+                    replay: Default::default(),
                 })),
                 _ => Box::pin(bedrock_api::run(ApiConfig {
                     node,

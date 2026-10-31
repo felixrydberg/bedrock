@@ -17,3 +17,11 @@ cell = "eu-1a"
 cpus = 2.0
 memory_mb = 4096
 disk_mb = 102400
+
+[[subscriptions]]
+dataset = "cdn"
+namespace = "workers"
+
+[[subscriptions]]
+dataset = "cdn"
+namespace = "pages"

@@ -8,7 +8,7 @@ use prost::Message;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use super::subscriptions::pb;
+use super::pb;
 use super::{Event, Operation};
 use crate::storage::namespace::{Changes, NamespaceDatabase, NamespaceFactory, valid_identity};
 use crate::storage::{
@@ -585,13 +585,26 @@ impl Materialized {
     /// Event-triggered expiry cleanup. Progress and event removals are atomic;
     /// pinned native views remain protected by the engine's own MVCC/checkpoint GC.
     pub async fn cleanup(&self, now: u64, retention: &Retention) -> StorageResult<u64> {
+        self.cleanup_through(now, retention, u64::MAX).await
+    }
+
+    /// A recovery lease protects events after its coherent bootstrap boundary.
+    pub async fn cleanup_through(
+        &self,
+        now: u64,
+        retention: &Retention,
+        through: u64,
+    ) -> StorageResult<u64> {
         retention.validate()?;
         let _guard = self.lock.lock().await;
         let mut view = self.read_progress().await?;
         let mut changes = Vec::new();
         // Read only the expired prefix, not the whole retained history on every write.
         // Bound one pass; further namespace activity can continue physical reclamation.
-        let limit = view.sequence.min(view.pruned_through.saturating_add(1024));
+        let limit = view
+            .sequence
+            .min(view.pruned_through.saturating_add(1024))
+            .min(through);
         while view.pruned_through < limit {
             let sequence = view.pruned_through + 1;
             let encoded = key(b'e', &sequence.to_be_bytes());

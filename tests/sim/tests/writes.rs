@@ -7,10 +7,15 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bedrock_lib::replication::subscriptions::Subscription;
-use bedrock_lib::replication::{Applier, ApplierMetrics, ApplyHook, Event, Operation};
+use bedrock_lib::relays::Hub;
+use bedrock_lib::relays::client::{Selection, Session, Target};
+use bedrock_lib::replication::pb;
+use bedrock_lib::storage::{
+    KeyRange, Scan, Snapshot, StorageEngine, StorageResult, StorageStats, WriteBatch, WriteOp,
+};
+
 use bedrock_lib::storage::memory::MemoryEngine;
-use bedrock_lib::storage::{StorageEngine, StorageResult, WriteBatch};
+
 use bedrock_lib::transport::Peers;
 use bedrock_lib::transport::admin::Admin;
 use http_body_util::{BodyExt, Full};
@@ -25,14 +30,62 @@ const WRITES: usize = 200;
 const WRITE_TOKEN: &str = "test-writer-token";
 const AUTHORIZATION: &str = "Bearer test-writer-token";
 
-/// Records every event it applies, in order.
-#[derive(Clone, Default)]
-struct Recorder(Arc<Mutex<Vec<Event>>>);
-
-impl ApplyHook for Recorder {
-    fn apply(&mut self, _: &dyn StorageEngine, e: &Event, _: &mut WriteBatch) -> StorageResult<()> {
-        self.0.lock().unwrap().push(e.clone());
+/// Records successful commits together with their selector-scoped revisions.
+struct Recorded {
+    engine: MemoryEngine,
+    batches: Mutex<Vec<WriteBatch>>,
+}
+impl Recorded {
+    fn new() -> Self {
+        Self {
+            engine: MemoryEngine::new("auth"),
+            batches: Mutex::default(),
+        }
+    }
+    fn operations(&self, namespace: &str) -> Vec<WriteOp> {
+        let prefix = [namespace.as_bytes(), b"\0"].concat();
+        self.batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|b| b.ops.iter())
+            .filter(|op| match op {
+                WriteOp::Put { key, .. } | WriteOp::Delete { key } => key.starts_with(&prefix),
+                WriteOp::DeleteRange(_) => false,
+            })
+            .cloned()
+            .collect()
+    }
+}
+impl StorageEngine for Recorded {
+    fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.engine.get(key)
+    }
+    fn scan(&self, range: &KeyRange) -> StorageResult<Scan<'_>> {
+        self.engine.scan(range)
+    }
+    fn write(&self, batch: WriteBatch) -> StorageResult<()> {
+        self.engine.write(batch.clone())?;
+        self.batches.lock().unwrap().push(batch);
         Ok(())
+    }
+    fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
+        self.engine.revision(name)
+    }
+    fn snapshot(&self) -> StorageResult<Box<dyn Snapshot + '_>> {
+        self.engine.snapshot()
+    }
+    fn restore(&self, from: &dyn Snapshot) -> StorageResult<()> {
+        self.engine.restore(from)
+    }
+    fn stats(&self) -> StorageResult<StorageStats> {
+        self.engine.stats()
+    }
+    fn disk_usage(&self) -> StorageResult<u64> {
+        self.engine.disk_usage()
+    }
+    fn health(&self) -> StorageResult<()> {
+        self.engine.health()
     }
 }
 
@@ -71,15 +124,24 @@ async fn send(
 /// The client side; `api` serves writes and `replication` serves the committed log.
 async fn scenario(api: SocketAddr, replication: String) {
     let peers = Arc::new(Peers::new(&Admin::new()));
-    let applied = Recorder::default();
-    let applier = Applier::new(
-        "kv",
-        Arc::new(MemoryEngine::new("kv")),
-        applied.clone(),
-        &ApplierMetrics::default(),
-    );
-    let namespaces = NAMESPACES.map(String::from).to_vec();
-    let subscription = Subscription::start(peers, replication, applier, namespaces);
+    let applied = Arc::new(Recorded::new());
+    let subscription = Session::start(
+        peers,
+        vec![replication],
+        NAMESPACES
+            .into_iter()
+            .map(|namespace| Target {
+                selection: Selection {
+                    dataset: "auth".into(),
+                    namespace: namespace.into(),
+                    buckets: Vec::new(),
+                },
+                engine: applied.clone(),
+                prefix: [namespace.as_bytes(), b"\0"].concat(),
+            })
+            .collect(),
+    )
+    .unwrap();
 
     for method in ["PUT", "DELETE"] {
         for authorization in [
@@ -95,7 +157,7 @@ async fn scenario(api: SocketAddr, replication: String) {
             let (status, _) = send(
                 api,
                 method,
-                "/v1/kv/a/key/0",
+                "/v1/auth/a/key/0",
                 "w0",
                 "unauthorized".into(),
                 &authorization,
@@ -112,7 +174,7 @@ async fn scenario(api: SocketAddr, replication: String) {
     let (status, _) = send(
         api,
         "PUT",
-        "/v1/kv/a/key/0",
+        "/v1/auth/a/key/0",
         "",
         String::new(),
         &[AUTHORIZATION],
@@ -129,7 +191,7 @@ async fn scenario(api: SocketAddr, replication: String) {
                 } else {
                     ("PUT", i.to_string())
                 };
-                let path = format!("/v1/kv/{namespace}/key/{}", i % 5);
+                let path = format!("/v1/auth/{namespace}/key/{}", i % 5);
                 let (status, sequence) = send(
                     api,
                     method,
@@ -167,7 +229,7 @@ async fn scenario(api: SocketAddr, replication: String) {
     }
 
     // A committed idempotency key still requires authorization on every retry.
-    let (status, _) = send(api, "DELETE", "/v1/kv/a/key/0", "w0", String::new(), &[]).await;
+    let (status, _) = send(api, "DELETE", "/v1/auth/a/key/0", "w0", String::new(), &[]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     for (namespace, acked) in &acked {
@@ -178,37 +240,46 @@ async fn scenario(api: SocketAddr, replication: String) {
         );
         timeout(
             Duration::from_secs(30),
-            subscription.wait_for(namespace, head),
+            subscription.wait_for("auth", namespace, head),
         )
         .await
         .unwrap_or_else(|_| panic!("{namespace} did not reach {head}"));
-        let events: Vec<_> = applied
-            .0
+        let expected: Vec<_> = acked
+            .values()
+            .map(|i| {
+                let key = format!("{namespace}\0key/{}", i % 5).into_bytes();
+                if i % 7 == 0 {
+                    WriteOp::Delete { key }
+                } else {
+                    WriteOp::Put {
+                        key,
+                        value: i.to_string().into_bytes(),
+                    }
+                }
+            })
+            .collect();
+        assert_eq!(
+            applied.operations(namespace),
+            expected,
+            "{namespace}: committed content/order"
+        );
+        for batch in applied
+            .batches
             .lock()
             .unwrap()
             .iter()
-            .filter(|e| e.namespace == *namespace)
-            .cloned()
-            .collect();
-        assert_eq!(
-            events.iter().map(|e| e.sequence).collect::<Vec<_>>(),
-            (1..=head).collect::<Vec<_>>()
-        );
-        for event in events {
-            let i = acked[&event.sequence];
-            assert_eq!(event.key, format!("key/{}", i % 5).into_bytes());
-            let expected = if i % 7 == 0 {
-                Operation::Delete
-            } else {
-                Operation::Set(i.to_string().into())
-            };
-            assert_eq!(
-                event.operation, expected,
-                "{namespace} sequence {}",
-                event.sequence
+            .filter(|batch| !batch.ops.is_empty())
+        {
+            assert!(
+                batch
+                    .revisions
+                    .keys()
+                    .any(|name| name.starts_with("relay:cursor:")),
+                "data committed without selector cursor"
             );
         }
     }
+    subscription.stop().await;
 }
 
 async fn open_writer() -> Arc<bedrock_lib::replication::writer::Writer> {
@@ -230,8 +301,6 @@ async fn open_writer() -> Arc<bedrock_lib::replication::writer::Writer> {
 #[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread")]
 async fn http_writes_commit_once_and_reach_subscribers_in_order() {
-    use bedrock_lib::replication::subscriptions::Source;
-    use bedrock_lib::replication::subscriptions::pb::replication_server::ReplicationServer;
     use tokio::net::TcpListener;
 
     let writer = open_writer().await;
@@ -245,10 +314,34 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
     let replication = grpc.local_addr().unwrap().to_string();
     tokio::spawn(
         tonic::transport::Server::builder()
-            .add_service(ReplicationServer::new(Source::new(writer.log())))
+            .add_service(pb::relay_server::RelayServer::new(Hub::writer(
+                "writer".into(),
+                writer.clone(),
+                Arc::new(Peers::new(&Admin::new())),
+            )))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc)),
     );
     scenario(api, replication).await;
+    let (status, sequence) = send(
+        api,
+        "PUT",
+        "/v1/kv/customer/key",
+        "customer-write",
+        "value".into(),
+        &[AUTHORIZATION],
+    )
+    .await;
+    assert_eq!((status, sequence), (StatusCode::OK, "1".into()));
+    assert_eq!(
+        writer
+            .bootstrap("kv", "customer")
+            .await
+            .unwrap()
+            .values
+            .get(b"key".as_slice()),
+        Some(&b"value".to_vec())
+    );
+    writer.close().await.unwrap();
 }
 
 #[cfg(madsim)]
@@ -268,8 +361,6 @@ fn same_seed_same_schedule() {
 
 #[cfg(madsim)]
 async fn simulated() {
-    use bedrock_lib::replication::subscriptions::Source;
-    use bedrock_lib::replication::subscriptions::pb::replication_server::ReplicationServer;
     use tokio::net::TcpListener;
 
     let handle = madsim::runtime::Handle::current();
@@ -288,7 +379,11 @@ async fn simulated() {
                 bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
             ));
             tonic::transport::Server::builder()
-                .add_service(ReplicationServer::new(Source::new(writer.log())))
+                .add_service(pb::relay_server::RelayServer::new(Hub::writer(
+                    "writer".into(),
+                    writer.clone(),
+                    Arc::new(Peers::new(&Admin::new())),
+                )))
                 .serve(replication)
                 .await
                 .unwrap();

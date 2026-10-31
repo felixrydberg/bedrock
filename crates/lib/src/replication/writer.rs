@@ -14,10 +14,10 @@ use prometheus_client::{
 };
 use tokio::sync::oneshot;
 
+use super::log::MemoryLog;
 use super::materialized::{
     Committed, Materialized, Progress, Retention, RetryRecord, View, validate_scope,
 };
-use super::subscriptions::MemoryLog;
 use super::{Event, Operation, stream};
 use crate::storage::namespace::NamespaceFactory;
 use crate::storage::{ErrorContext, StorageError, StorageResult};
@@ -130,6 +130,21 @@ struct State {
     retries: BTreeMap<String, RetryRecord>,
     unresolved: Option<Vec<Committed>>,
     fenced: bool,
+    recovery: Vec<std::sync::Weak<RecoveryLease>>,
+}
+
+/// Keeps the committed tail after a coherent view available while it is transferred.
+pub struct RecoveryLease {
+    dataset: String,
+    namespace: String,
+    boundary: u64,
+    expires: tokio::time::Instant,
+}
+
+impl RecoveryLease {
+    pub fn valid(&self) -> bool {
+        tokio::time::Instant::now() < self.expires
+    }
 }
 
 fn unavailable(detail: &str) -> StorageError {
@@ -228,13 +243,75 @@ impl Writer {
         validate_scope(dataset, namespace)?;
         let ns = self.namespace(dataset, namespace);
         let mut state = ns.state.lock().await;
-        if state.unresolved.is_some() {
+        if state.fenced || state.unresolved.is_some() {
             return Err(unavailable("unresolved persistence outcome"));
         }
         self.source(&mut state, dataset, namespace)
             .await?
             .view()
             .await
+    }
+
+    pub async fn begin_recovery(
+        &self,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<(View, Arc<RecoveryLease>)> {
+        validate_scope(dataset, namespace)?;
+        let ns = self.namespace(dataset, namespace);
+        let mut state = ns.state.lock().await;
+        if state.fenced || state.unresolved.is_some() {
+            return Err(unavailable("unresolved persistence outcome"));
+        }
+        state
+            .recovery
+            .retain(|lease| lease.upgrade().is_some_and(|l| l.valid()));
+        if state.recovery.len() >= 4 {
+            return Err(unavailable("namespace recovery capacity exhausted"));
+        }
+        let view = self
+            .source(&mut state, dataset, namespace)
+            .await?
+            .view()
+            .await?;
+        let lease = Arc::new(RecoveryLease {
+            dataset: dataset.into(),
+            namespace: namespace.into(),
+            boundary: view.sequence,
+            expires: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+        });
+        state.recovery.push(Arc::downgrade(&lease));
+        Ok((view, lease))
+    }
+
+    pub async fn recovery_events(
+        &self,
+        dataset: &str,
+        namespace: &str,
+        from: u64,
+        lease: &RecoveryLease,
+    ) -> StorageResult<Vec<Event>> {
+        if !lease.valid()
+            || from <= lease.boundary
+            || lease.dataset != dataset
+            || lease.namespace != namespace
+        {
+            return Err(unavailable(
+                "recovery lease expired or invalid scope/cursor",
+            ));
+        }
+        let ns = self.namespace(dataset, namespace);
+        let mut state = ns.state.lock().await;
+        Ok(self
+            .source(&mut state, dataset, namespace)
+            .await?
+            .events()
+            .await?
+            .into_iter()
+            .filter(|entry| entry.event.sequence >= from)
+            .take(256)
+            .map(|entry| entry.event)
+            .collect())
     }
 
     /// Cleanup is the only post-response flow. It never decides commit success.
@@ -252,7 +329,19 @@ impl Writer {
             .await
             .map_err(|_| unavailable("persistence closed"))?;
         let now = (self.clock)().max(state.committed_at);
-        let removed = source.cleanup(now, &self.persistence.retention).await?;
+        state
+            .recovery
+            .retain(|lease| lease.upgrade().is_some_and(|l| l.valid()));
+        let through = state
+            .recovery
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|lease| lease.boundary)
+            .min()
+            .unwrap_or(u64::MAX);
+        let removed = source
+            .cleanup_through(now, &self.persistence.retention, through)
+            .await?;
         self.log
             .prune(dataset, namespace, removed)
             .map_err(|detail| unavailable(&detail))?;
