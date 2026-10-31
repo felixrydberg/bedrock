@@ -16,7 +16,11 @@ bedrock/crates/
 ├── api/                  # bedrock-api: write API
 ├── relay/                # bedrock-relay: relay process, built on lib
 │
-├── kv/                   # bedrock-kv: quicksilver, kv and auth datasets
+├── quicksilver/          # bedrock-quicksilver: quicksilver and auth datasets
+│   ├── storage
+│   └── namespaces
+│
+├── kv/                   # bedrock-kv: customer KV readers and caches (no virtual buckets)
 │   ├── storage
 │   ├── namespaces
 │   └── operations
@@ -27,7 +31,7 @@ bedrock/crates/
     ├── manifests
     └── retention
 
-Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-kv`, `bedrock-cdn`) runs as its own process, depends on
+Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-quicksilver`, `bedrock-kv`, `bedrock-cdn`) runs as its own process, depends on
 `bedrock-lib` and never on another binary crate. Each binary crate is a library with a `run(config)` entry point
 (service-specific code) plus a `main.rs` that only initialises logging, loads config and calls `run`.
 
@@ -58,5 +62,6 @@ The I/O rules in `clippy.toml` apply to every crate; adapters opt out with an ex
 | `node`           | Node config (file + `BEDROCK_*` env), roles, logging and graceful shutdown |
 | `s3`             | Namespace-engine object I/O and checksummed CDN artifact storage     |
 | `transport`      | Node-to-node transport and observability baseline                     |
-| `kv/storage`     | KV hash-range keyspaces and eviction only, on top of `lib/storage`    |
+| `quicksilver/storage` | Quicksilver/Auth L1/L2 hash-range keyspaces and eviction, on top of `lib/storage` |
+| `kv/storage`     | Customer-KV reader residency and cache eviction (B-28, B-39)          |
 

@@ -11,10 +11,10 @@
 
 ## Architecture boundaries
 
-- Put the shared distributed core in `crates/lib`. `kv`, `cdn`, `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
-- `bedrock-kv` hosts `quicksilver`, `kv` and `auth`; `bedrock-cdn` hosts `cdn` retention metadata and artifact bytes. Each subscribes only to its own datasets.
+- Put the shared distributed core in `crates/lib`. `quicksilver`, `kv`, `cdn`, `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
+- `bedrock-quicksilver` hosts `quicksilver` and `auth`; `bedrock-kv` hosts customer `kv` only, with no virtual buckets and no dataset subscriptions; `bedrock-cdn` hosts `cdn` retention metadata and artifact bytes. Each subscribes only to its own datasets.
 - The write API and relays are generic over datasets. Retention is ordinary SET/DELETE replication interpreted only by CDN apply hooks.
-- `StorageEngine` and its adapters belong in `lib/storage`; KV keyspaces and eviction belong in `kv/storage`. Keep CDN artifact caching behind its separate `CacheStorage` contract.
+- `StorageEngine` and its adapters belong in `lib/storage`; Quicksilver/Auth keyspaces and eviction belong in `quicksilver/storage`, customer-KV reader residency in `kv/storage`. Keep CDN artifact caching behind its separate `CacheStorage` contract.
 - Membership comes from relay subscriber streams; peer reachability comes from real traffic. Do not introduce a separate heartbeat/gossip protocol or membership/placement epoch. Writer fencing is a separate concern.
 - KV and CDN are backing services. Workers, Pages, activation and rollback belong to the future Compute/deploy control plane.
 - Keep metrics labels low-cardinality. Expose namespace/key/hash/subscriber detail through introspection or the agreed top-N mechanism. Preserve the writer's `committed_at` through every hop.

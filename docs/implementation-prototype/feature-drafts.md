@@ -25,10 +25,10 @@ The CDN doc depends on KV phases 1, 2, 4 and 5. Read closely, almost all of thos
 **shared behaviour** (membership, health, buckets, placement, replication, relays, reconciliation),
 not KV-specific behaviour. So the order is:
 
-1. **Foundation.** Workspace, the `bedrock-kv` and `bedrock-cdn` binaries, roles, transport.
+1. **Foundation.** Workspace, the `bedrock-quicksilver`, `bedrock-kv` and `bedrock-cdn` binaries, roles, transport.
 2. **Shared core (`lib/`).** Everything KV *and* CDN need. It has to be built and hardened
    first, with its own test harness, before either product uses it.
-3. **First KV** (`kv/`) and **first CDN** (`cdn/`). Thin product layers on the hardened core.
+3. **First KV** (`quicksilver/` for Quicksilver/Auth, `kv/` for customer KV) and **first CDN** (`cdn/`). Thin product layers on the hardened core.
    The two tracks can run in parallel.
 4. **KV refinements** and **CDN refinements**. Product-specific depth: optimisations,
    extra adapters, advanced retention. These can also run in parallel.
@@ -57,13 +57,14 @@ crates/
 │   └── storage  datasets  s3  transport                                              (decided in B-01, see §4)
 ├── api/          # bedrock/api — write API (B-09)                                         → binary `bedrock-api`
 ├── relay/        # bedrock/relay — relay process: tiers, fan-out, replay, membership      → binary `bedrock-relay`
-├── kv/           # bedrock/kv  — storage (hash-range keyspaces/eviction), namespaces, operations → binary `bedrock-kv`
+├── quicksilver/  # bedrock/quicksilver — quicksilver + auth: storage (hash-range keyspaces), namespaces → binary `bedrock-quicksilver`
+├── kv/           # bedrock/kv  — customer KV: S3 namespace readers, cache residency, operations → binary `bedrock-kv`
 └── cdn/          # bedrock/cdn — artifact_storage, artifact_transfer, manifests, retention → binary `bedrock-cdn`
 ```
 
 ### Deployment model: separate binaries, one shared library
 
-Each service ships as **its own binary** linking `lib`. Every machine runs `bedrock-kv` and `bedrock-cdn`, as separate
+Each service ships as **its own binary** linking `lib`. Every machine runs `bedrock-quicksilver`, `bedrock-kv` and `bedrock-cdn`, as separate
 processes (containers) with their own resource limits, deploys and failure domains. `bedrock-relay` runs on a few machines
 per cell (minimum 3, since membership and placement publication need a majority; more as the cell grows) and per upper tier, and `bedrock-api` in the core region. This matches the public Cloudflare model: every
 server runs every service, each service is its own process, and code is shared as libraries.
@@ -72,19 +73,23 @@ server runs every service, each service is its own process, and code is shared a
 |---|---|---|
 | `bedrock-api` | Authoritative writes and revisions; generic per-namespace materialized state across datasets (B-09, B-11) | — |
 | `bedrock-relay` | Relay tree, fan-out, replay log, cell membership, L2 placement directory and handoffs (§4 decision 13), regional directory | — (`tier` and `upstreams` in config) |
-| `bedrock-kv` | Pushed `quicksilver` and `auth` over relay-assigned hash ranges (§4 decision 13); S3-backed customer `kv` readers and caches | `l1`, `l2` |
+| `bedrock-quicksilver` | Pushed `quicksilver` and `auth` over relay-assigned hash ranges (§4 decision 13) | `l1`, `l2` |
+| `bedrock-kv` | Customer `kv`: S3-backed namespace readers and caches; no hash ranges or buckets (§4 decision 12) | `l1`, `l2` (only logged until B-39) |
 | `bedrock-cdn` | Dataset `cdn` (retention metadata) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
 
 Rules this implies:
 
 - **Relays are their own binary.** `bedrock-relay` holds no product logic: it is generic over datasets and uses `lib`
   for everything (`lib/relays` for fan-out and tiers, `lib/replication` for streams, `lib/storage` RocksDB for its replay log,
-  `lib/membership` for the cell view). A KV or CDN crash never takes a relay with it, and relays deploy on their own schedule.
-- **`kv`, `cdn`, `relay` and `api` depend on `lib` only, never on each other.**
+  `lib/membership` for the cell view). A Quicksilver, KV or CDN crash never takes a relay with it, and relays deploy on their own schedule.
+- **`quicksilver`, `kv`, `cdn`, `relay` and `api` depend on `lib` only, never on each other.**
 - **KV and CDN share infrastructure, not data.** Writes use `bedrock-api` and its sequencing/durability system.
-  `bedrock-kv` subscribes to `quicksilver` and `auth`; `bedrock-cdn` subscribes only to `cdn` retention metadata.
+  `bedrock-quicksilver` subscribes to `quicksilver` and `auth`; `bedrock-cdn` subscribes only to `cdn` retention metadata.
   Customer `kv` has no relay subscriptions, replay queues or subscription-driven placement. Its readers use S3-backed
-  namespace databases. KV membership still comes from the Quicksilver/Auth relay connection, without another heartbeat.
+  namespace databases. `bedrock-kv` holds a relay connection only for its own `kv` membership, without another heartbeat,
+  and reads Quicksilver/Auth (namespace directory, credentials) from `bedrock-quicksilver` nodes, not from a local copy.
+- **Customer KV is isolated from the control plane.** Tenant load (hot namespaces, cold-open storms, slow S3) can exhaust
+  `bedrock-kv` without taking down Quicksilver/Auth, which Workers, CDN and deploy tooling depend on (§4 decision 12).
 - **Retention operations are plain `SET`/`DELETE` writes** to keys in the `cdn` dataset. The write API and relays are generic,
   and only `bedrock-cdn` interprets them when it applies them (manifest expansion, reference counts).
 - **The CDN serves by hash and knows nothing about deployments.** Workers, Pages, deployments, revisions and which version is live
@@ -95,8 +100,8 @@ Rules this implies:
   for pushed datasets. B-11 adds a separate asynchronous namespace persistence/recovery contract; B-39 adds customer-KV readers. Do not block on S3 inside
   the local trait or pretend a read-only handle can write/restore. Dataset identity and permissions remain independent of
   whether a dataset has a relay-fed local engine. API materialization spans datasets; B-39 replaces the KV-reader
-  one-local-engine-per-dataset assumption only for customer KV. `kv/storage` owns handle retention, memory/disk budgets and cache eviction,
-  plus the pushed-data L1/L2 hash-range keyspaces; CDN keeps `CacheStorage`.
+  one-local-engine-per-dataset assumption only for customer KV. `kv/storage` owns handle retention, memory/disk budgets and cache eviction;
+  `quicksilver/storage` owns the pushed-data L1/L2 hash-range keyspaces; CDN keeps `CacheStorage`.
 
 ---
 
@@ -141,7 +146,7 @@ Rules this implies:
 | [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Read protection: coalescing and per-cell limits (amendment pending, §5) | Shared core | `lib/reconciliation` + callers | B-22 |
 | [B-23](https://github.com/felixrydberg/bedrock/issues/25) | Hardening gate: TLA+ model, deterministic simulation, real-binary crash tests | Shared core | `lib` (test support), `docs/spec/` | B-23a, created B-01 … B-22b; excludes later B-09b/B-21b |
 | **H — First KV** |||||
-| B-24 | Quicksilver dataset | KV | `kv/namespaces` | B-23 |
+| B-24 | Quicksilver dataset | KV | `quicksilver/namespaces` | B-23 |
 | B-25 | KV namespace directory and management | KV | `kv/namespaces` | B-24 |
 | B-39 | Customer-KV readers and caches on B-11 materialized storage | KV storage integration | `lib/storage`, `lib/s3`, `kv/storage` | B-23, B-04, B-06, B-07, B-11 |
 | B-26 | KV write path and durable namespace publication | KV | `kv/operations`, `api` wiring | B-25, B-39 |
@@ -159,9 +164,9 @@ Rules this implies:
 | **J — KV refinements** |||||
 | ~~B-37~~ | ~~Cache-fill broadcast queue~~ (dropped, decision 11) | — | — | — |
 | B-38 | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
-| B-40 | `full_replica` placement and completeness | KV | `kv/storage`, `lib/buckets` | B-29 |
+| B-40 | `full_replica` placement and completeness | KV | `quicksilver/storage`, `lib/buckets` | B-24, B-21 |
 | B-41 | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
-| B-42 | Auth dataset | KV | `kv/namespaces` | B-29 |
+| B-42 | Auth dataset | KV | `quicksilver/namespaces` | B-24, B-21b |
 | B-53 | Namespace residency fairness and cold-open tuning at scale | KV | `kv/storage`, `kv/namespaces` | B-29 |
 | **K — CDN refinements** (parallel with J) |||||
 | B-43 | Artifact replica repair and range migration | CDN | `cdn/retention` | B-36 |
@@ -595,7 +600,7 @@ Labels: enhancement
 **Is your feature request related to a problem? Please describe.**
 Infrastructure metadata needs a store that is complete in every datacenter: routing, ownership (D1/DO/KV), system configuration,
 and later deployment records written by the deploy control plane (B-50). The KV namespace directory (B-25) reads from it.
-Quicksilver is a KV dataset only: the CDN never reads it.
+Quicksilver is hosted by `bedrock-quicksilver` (decision 12): the CDN never reads it, and customer KV reads it from those nodes.
 
 **Describe the solution you'd like**
 - A `quicksilver` dataset with an `infrastructure` namespace and the `full_replica` policy: L2 never evicts it.
@@ -608,7 +613,7 @@ Quicksilver is a KV dataset only: the CDN never reads it.
 
 **Additional context**
 - **Implementation:** KV.
-- **Module:** `kv/namespaces`.
+- **Module:** `quicksilver/namespaces`.
 - **Doc reference:** `kv.md` §1, §4, §11; `notes.md` (Quicksilver).
 - **Depends on:** B-23.
 - **Acceptance criteria:** A metadata write in one region is visible in every region. No Quicksilver key is evicted from L2, and pinned keys stay in L1, under eviction pressure. Stale-epoch ownership changes are rejected.
@@ -940,7 +945,7 @@ Labels: enhancement
 **Is your feature request related to a problem? Please describe.**
 Which artifacts the CDN keeps is declared through replicated retention state, not by tracking artifact locations globally.
 This reuses the shared replication and sequencing infrastructure (`bedrock-api`, `bedrock-relay`), not KV itself.
-The `cdn` dataset belongs to the CDN: `bedrock-kv` never hosts or subscribes to it, just as `bedrock-cdn` never subscribes to a KV dataset.
+The `cdn` dataset belongs to the CDN: `bedrock-quicksilver` and `bedrock-kv` never host or subscribe to it, just as `bedrock-cdn` never subscribes to a KV dataset.
 
 **Describe the solution you'd like**
 - A `cdn` dataset (B-06) with global retention namespaces, replicated to every region. The deploy control plane (B-50) uses
@@ -987,7 +992,7 @@ The `cdn` dataset belongs to the CDN: `bedrock-kv` never hosts or subscribes to 
   - Releasing one keeps the shared artifacts.
   - Live delivery, duplicate/gap handling, restart and obsolete-cursor bootstrap run through the shared session; derived state and covered cursor cannot diverge on a crash.
   - Wiping `bedrock-cdn`'s local state rebuilds identical refcounts through protected recovery under concurrent writes/GC; corruption, interruption and lease expiry cannot establish readiness.
-  - `bedrock-kv` receives no `cdn` events, and the `kv` and `cdn` crates have no dependency on each other.
+  - `bedrock-quicksilver` and `bedrock-kv` receive no `cdn` events, and the `quicksilver`, `kv` and `cdn` crates have no dependency on each other.
 
 ---
 
@@ -1117,8 +1122,8 @@ Labels: enhancement
   - kill a relay during publish
   - corrupt a cached artifact
   - many concurrent cold requests for the same artifact
-  - kill `bedrock-cdn` on a machine: `bedrock-kv` on that machine is unaffected
-  - kill `bedrock-kv` on a machine: `bedrock-cdn` there is unaffected, since it depends on no KV process or dataset
+  - kill `bedrock-cdn` on a machine: `bedrock-quicksilver` and `bedrock-kv` on that machine are unaffected
+  - kill `bedrock-quicksilver` or `bedrock-kv` on a machine: `bedrock-cdn` there is unaffected, since it depends on no KV process or dataset
 - Basic CDN dashboards: hit rates, S3 fallback rate, replica counts, transfer throughput.
 
 **Additional context**
@@ -1160,7 +1165,7 @@ need their own recent-update behavior; customer KV receives no push stream.
 
 **Additional context**
 - **Implementation:** KV refinement.
-- **Module:** `kv/storage`.
+- **Module:** `kv/storage`; the pushed-data L1 recent-update window lives in `quicksilver/storage`.
 - **Doc reference:** `kv.md` §9 L1, §16.
 - **Depends on:** B-29.
 - **Acceptance criteria:** Hit rate improves on a benchmark workload compared with B-28. State transitions are observable in metrics.
@@ -1188,9 +1193,9 @@ keeps what arrived, but nothing yet guarantees coverage or rebuilds it after a n
 
 **Additional context**
 - **Implementation:** KV refinement (KV Phase 6).
-- **Module:** `kv/storage`, `lib/buckets`.
+- **Module:** `quicksilver/storage`, `lib/buckets`.
 - **Doc reference:** `kv.md` §3, §9, §15.5, §16.
-- **Depends on:** B-29.
+- **Depends on:** B-24, B-21.
 - **Acceptance criteria:** Killing a node reports degraded until it is rebuilt. Coverage reaches 100% again afterwards.
 
 ---
@@ -1237,9 +1242,9 @@ Labels: enhancement
 
 **Additional context**
 - **Implementation:** KV refinement (new dataset). Needs scoping before work starts.
-- **Module:** `kv/namespaces`.
+- **Module:** `quicksilver/namespaces` (binary `bedrock-quicksilver`, decision 12).
 - **Doc reference:** `notes.md`; `kv.md` §17 Freshness Guarantees ("access revocations require fencing… or fail-closed").
-- **Depends on:** B-29.
+- **Depends on:** B-24, B-21b.
 - **Acceptance criteria:** A revoked key is rejected in every region within the agreed bound, or the check fails closed.
 
 ---
@@ -1554,7 +1559,7 @@ Labels: enhancement
   - roll back and delete a deployment
   - kill the control plane mid-deploy and rerun it
   - kill a relay during a deploy
-  - kill `bedrock-kv` on a machine: served deployments keep working from the CDN and other KV nodes
+  - kill `bedrock-quicksilver` on a machine: served deployments keep working from the CDN and other Quicksilver nodes
 
 **Additional context**
 - **Implementation:** Compute / deploy control plane.
@@ -1567,15 +1572,17 @@ Labels: enhancement
 
 ### Decided
 
-1. **Separate binaries.** `bedrock-kv` (Quicksilver, KV, Auth), `bedrock-cdn` (`cdn` retention metadata and artifacts),
-   `bedrock-relay` (relay tree and membership) and `bedrock-api` (writes), all linking `lib` and never each other.
-   KV and CDN run as separate processes on every machine; relays run on a few machines per cell. See §1 "Deployment model".
+1. **Separate binaries.** `bedrock-quicksilver` (Quicksilver, Auth), `bedrock-kv` (customer KV), `bedrock-cdn` (`cdn` retention
+   metadata and artifacts), `bedrock-relay` (relay tree and membership) and `bedrock-api` (writes), all linking `lib` and never
+   each other. Quicksilver, KV and CDN run as separate processes on every machine; relays run on a few machines per cell.
+   See §1 "Deployment model" and decision 12.
 2. **Storage contracts and adapters live in `lib/storage`.** The synchronous local `StorageEngine` remains for pushed
    datasets, relay replay and CDN metadata. B-11 adds asynchronous S3 materialized storage for generic API writers across
-   datasets; B-39 later integrates KV readers. `kv/storage` owns reader retention/cache policy; CDN retains `CacheStorage`.
+   datasets; B-39 later integrates KV readers. `kv/storage` owns reader retention/cache policy; `quicksilver/storage` owns
+   the pushed L1/L2 keyspaces; CDN retains `CacheStorage`.
 3. **KV and CDN share infrastructure, not datasets.** Retention operations are plain writes to the `cdn` dataset through the
-   generic `bedrock-api` and `bedrock-relay`; only `bedrock-cdn` interprets them (B-32). `bedrock-kv` never subscribes to `cdn`,
-   and `bedrock-cdn` never subscribes to `quicksilver`, `kv` or `auth`. Customer `kv` has no relay delivery at all;
+   generic `bedrock-api` and `bedrock-relay`; only `bedrock-cdn` interprets them (B-32). `bedrock-quicksilver` and `bedrock-kv` never
+   subscribe to `cdn`, and `bedrock-cdn` never subscribes to `quicksilver`, `kv` or `auth`. Customer `kv` has no relay delivery at all;
    Quicksilver carries its directory metadata. The CDN serves by `manifest_hash`. Shared writers/storage remain generic
    and never import another binary's product code.
 4. **No heartbeat or gossip protocol.** Membership comes from the subscriber streams nodes already hold to their cell relays (B-12):
@@ -1583,6 +1590,7 @@ Labels: enhancement
    A member is a node that is receiving updates. Routing decisions use a local per-peer circuit breaker fed by real traffic (B-13).
    There is no separate membership or placement epoch; owners reject requests for L2 ranges they don't own (B-16, decision 13).
    Customer-KV hash routing only selects a preferred cache; another eligible reader can serve without owning persistent data.
+   It hashes `(namespace, key)` directly and uses no ranges or buckets (decisions 12, 13).
 5. **Cells.** A cell (one DC by default) has its own membership, placement directory, L2 and relays. No fixed bucket count
    caps its size (decision 13); the actual size is chosen for blast radius. Large sites run several cells.
    Customer-KV misses read shared S3 namespace state; minimum-revision reads can use the home writer's recent-state path.
@@ -1602,11 +1610,11 @@ Labels: enhancement
 9. **`lib/` holds `storage`, `datasets`, `s3` and `transport`** alongside the seven documented modules, since every binary
    needs them. `code-structure.md` reflects this, including `storage` moving out of `kv/` (B-01).
 10. **Crate naming.** The shared crate is the package `bedrock-lib` (`use bedrock_lib::…`) in `crates/lib`; the binary
-    crates are `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` (B-01).
+    crates are `bedrock-quicksilver`, `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` (B-01, decision 12).
 11. **Customer KV is per-namespace S3 storage with one logical API writer and read-only KV caches.** Decided 2026-10-29;
     replaces the 2026-10-26 origin-cell design. B-11 supplies a scoped SlateDB-derived generic API-writer engine across datasets;
-    B-39 later integrates customer-KV readers/caches on that engine embedded in the KV binary,
-    with no separate database service. This decision does not claim that the engine, Raft or the latency targets are implemented.
+    B-39 later integrates customer-KV readers/caches on that engine embedded in the `bedrock-kv` binary (customer KV only
+    since decision 12), with no separate database service. This decision does not claim that the engine, Raft or the latency targets are implemented.
     - **Persistent layout:** each namespace has its own stable S3 database identity, manifest, indexed SSTs and recoverable
       committed tail. Empty namespaces need only Quicksilver directory metadata. Open writer/reader handles on demand;
       no LSM per virtual bucket, global per-namespace segment manifest or whole-namespace local disk requirement.
@@ -1621,7 +1629,7 @@ Labels: enhancement
       in the prefix plus cutoff index/term/membership; a progress record alone is insufficient. Keep committed, buffered,
       durable and reader-visible positions distinct. Fence stale engine publishers. Portable live-key export is optional.
     - **Readers and routing:** ordinary `bedrock-kv` nodes read the same namespace databases and cache hot blocks/entries.
-      HRW over `(namespace, key)` selects a preferred reader to reuse cache (no virtual buckets, decision 13); it does not shard persistent
+      HRW over `(namespace, key)` selects a preferred reader to reuse cache (no ranges or buckets, decisions 12, 13); it does not shard persistent
       data or impose durable ownership. Another eligible reader may serve. Adding/removing a cache node needs no namespace
       move, replica rebuild or customer-KV relay subscription. Membership still comes from the Quicksilver/Auth connection.
       One logical writer remains a write-throughput limit even when readers scale out.
@@ -1652,8 +1660,20 @@ Labels: enhancement
     - **Push remains separate:** Quicksilver, Auth and CDN retention continue their agreed relay policies. Customer KV has
       no `global`, `full_replica` or `on_demand` push override. B-37 stays dropped. Source WAL replay from S3, when used, is
       a storage recovery/reader mechanism, not a customer-KV relay stream. This does not change CDN byte placement or Auth policy.
-13. **L2 placement: relays assign hash-space ranges; nodes subscribe to the directory.** Decided 2026-10-31. Numbered 13
-    because decision 12 (separate Quicksilver/Auth and customer-KV binaries) is pending on `feature/split-kv-binary`.
+12. **Customer KV is its own binary and uses no virtual buckets.** Decided 2026-10-31.
+    - **Split:** `bedrock-quicksilver` (`crates/quicksilver`) hosts the pushed `quicksilver` and `auth` datasets with today's
+      L1/L2 hash-range keyspaces (decision 13), relay subscriptions and `full_replica` work (B-24, B-40, B-42). `bedrock-kv` (`crates/kv`) is
+      customer KV only: S3 namespace readers and caches (B-27, B-28, B-39, B-53). Each publishes its own membership
+      (`quicksilver`, `kv`); `bedrock-kv` subscribes to no dataset.
+    - **Why:** Quicksilver/Auth are the control plane that Workers, CDN and deploy tooling depend on; customer KV is tenant
+      traffic. A hot namespace, cold-open storm or slow S3 must not exhaust the process serving Quicksilver/Auth. The two
+      also share no storage engine, replication path or scaling signal.
+    - **Routing:** a customer-KV request picks its preferred reader by rendezvous hash of `(namespace, key)` over the
+      healthy `bedrock-kv` members of the cell (B-15), without a placement directory, owner checks or range moves. The
+      relay-assigned ranges of decision 13 (B-16) serve Quicksilver/Auth and CDN.
+    - **Cost:** a fifth binary, one more relay stream per machine (membership only), and cell-local lookups from
+      `bedrock-kv` to `bedrock-quicksilver` for the namespace directory and credentials, cached with minimum-revision checks.
+13. **L2 placement: relays assign hash-space ranges; nodes subscribe to the directory.** Decided 2026-10-31.
     Replaces the fixed 2²⁰ virtual buckets and per-node rendezvous ownership (B-15, B-16) for the pushed `quicksilver` and
     `auth` datasets and the CDN. Customer-KV cache affinity hashes `(namespace, key)` with rendezvous directly and uses no
     ranges (decision 11's readers own no persistent data). Chosen over a hash ring and over simplified buckets.
@@ -1793,13 +1813,29 @@ customer-KV amendments. This records the changed scope and acceptance checks; it
 | #23 / B-22 | [Materialized recovery and reader integration](https://github.com/felixrydberg/bedrock/issues/23#issuecomment-6507620366) |
 | #25 / B-23 | [Real B-11 engine before the initial hardening gate](https://github.com/felixrydberg/bedrock/issues/25#issuecomment-6507621085) |
 
+### Binary-split amendments recorded in comments — 2026-10-31
+
+§4 decision 12 (separate `bedrock-quicksilver` and `bedrock-kv`, no virtual buckets for customer KV) was posted to the
+affected open issues only; closed issues (#1/#2 four-binary wording, #15 membership services) keep their history. Each
+comment was read back and matched the posted text. Original descriptions and earlier amendments are preserved.
+#13, #17, #24 and #41 are unaffected: they name no binary split or customer-KV bucket behavior that changes.
+
+| Issue / plan ID | Amendment comment |
+|---|---|
+| #18 / B-15 | [Customer-KV routing hashes `(namespace, key)` directly](https://github.com/felixrydberg/bedrock/issues/18#issuecomment-6545940022) |
+| #19 / B-16 | [Buckets serve Quicksilver/Auth and CDN only](https://github.com/felixrydberg/bedrock/issues/19#issuecomment-6545940212) |
+| #20 / B-19 | [Directory per bucketed service](https://github.com/felixrydberg/bedrock/issues/20#issuecomment-6545940438) |
+| #21 / B-20 | [Reconciliation users per binary](https://github.com/felixrydberg/bedrock/issues/21#issuecomment-6545940614) |
+| #22 / B-21 | [Reassignment for Quicksilver/Auth and CDN buckets](https://github.com/felixrydberg/bedrock/issues/22#issuecomment-6545940809) |
+| #23 / B-22 | [Preferred reader without buckets](https://github.com/felixrydberg/bedrock/issues/23#issuecomment-6545941037) |
+| #25 / B-23 | [Five binaries in the hardening gate](https://github.com/felixrydberg/bedrock/issues/25#issuecomment-6545941217) |
+
 ### L2 placement amendments recorded in comments — 2026-10-31
 
 §4 decision 13 (relay-assigned hash-space ranges, placement directory in the membership namespace, relay-driven handoffs)
 was posted to the affected open issues; closed issues keep their history. Each comment was read back and matched the posted
 text. Original descriptions and earlier amendments are preserved. #44 is unaffected. The comments name
-`bedrock-quicksilver` and decision 12 from the pending binary split; until that merges, read them as the Quicksilver/Auth
-part of `bedrock-kv`.
+`bedrock-quicksilver` and decision 12; read them as the Quicksilver/Auth side of the binary split.
 
 | Issue / plan ID | Amendment comment |
 |---|---|

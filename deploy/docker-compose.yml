@@ -1,4 +1,4 @@
-# One machine. Every machine runs kv + cdn; relay machines add `--profile relay`, the core region adds `--profile api`.
+# One machine. Every machine runs quicksilver + kv + cdn; relay machines add `--profile relay`, the core region adds `--profile api`.
 # Copy deploy/config/*.toml next to this file (or edit them) and set node_id/location per machine.
 x-service: &service
   network_mode: host
@@ -6,6 +6,14 @@ x-service: &service
   stop_grace_period: 30s
 
 services:
+  quicksilver:
+    <<: *service
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-quicksilver } }
+    image: bedrock-quicksilver
+    volumes: [/var/lib/bedrock/quicksilver:/data, ./config/quicksilver.toml:/etc/bedrock/config.toml:ro]
+    cpus: 2
+    mem_limit: 4g
+
   kv:
     <<: *service
     build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-kv } }

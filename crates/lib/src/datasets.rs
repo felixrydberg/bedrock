@@ -1,7 +1,8 @@
 //! Dataset → namespace model, policy resolution and per-dataset engine instances (B-06, `kv.md` §2–§4, §7).
 //!
 //! Each binary declares the datasets it hosts with their default policies; `lib` stays generic over datasets.
-//! `bedrock-kv` hosts `quicksilver`, `kv` and `auth`, `bedrock-cdn` hosts `cdn`, and neither opens the other's.
+//! `bedrock-quicksilver` hosts `quicksilver` and `auth`, `bedrock-cdn` hosts `cdn`, and neither opens the other's.
+//! `bedrock-kv` (customer KV) hosts no relay-fed dataset.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -139,13 +140,16 @@ pub struct Instance {
 }
 
 impl Registry {
-    /// Opens `enabled` datasets, each of which must be in `hosted`. A dataset hosted by another binary is a
-    /// config error and nothing is opened.
+    /// Opens `enabled` datasets, each of which must be in `hosted`. An empty list, or a dataset hosted by another
+    /// binary, is a config error and nothing is opened.
     pub fn open(
         hosted: &[Dataset],
         enabled: &[String],
         mut open: impl FnMut(&Dataset) -> StorageResult<Arc<dyn StorageEngine>>,
     ) -> Result<Registry, ConfigError> {
+        if enabled.is_empty() {
+            return Err(ConfigError("datasets must not be empty".into()));
+        }
         let datasets = enabled
             .iter()
             .map(|name| {

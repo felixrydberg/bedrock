@@ -1,4 +1,4 @@
-//! KV keyspaces inside a dataset's engine instance (`kv.md` §7). Eviction lands here later (B-28).
+//! Quicksilver/Auth keyspaces inside a dataset's engine instance (`kv.md` §7). Eviction lands here later (B-28).
 //!
 //! Namespace IDs contain `/` (`customer-123/store-A`), so a NUL byte ends the namespace instead: with `/` the prefix
 //! of namespace `a` would also cover every key of namespace `a/b`. Namespace IDs must not contain NUL. Buckets are

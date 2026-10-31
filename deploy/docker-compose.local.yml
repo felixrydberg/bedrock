@@ -1,4 +1,4 @@
-# Local multi-node cluster: 2 regions x 3 machines x (kv + cdn), 2 relays per region, one api, SeaweedFS (S3 on :8333).
+# Local multi-node cluster: 2 regions x 3 machines x (quicksilver + kv + cdn), 2 relays per region, one api, SeaweedFS (S3 on :8333).
 #   docker compose -f deploy/docker-compose.local.yml up -d --build
 # Uses a bridge network (service names as addresses) instead of host networking so every node can share ports.
 # Data lives in deploy/local-data/<service>.
@@ -10,6 +10,10 @@ x-node: &node
 x-kv: &kv
   <<: *node
   image: bedrock-kv
+  pull_policy: never # built by the first service of each kind
+x-quicksilver: &quicksilver
+  <<: *node
+  image: bedrock-quicksilver
   pull_policy: never # built by the first service of each kind
 x-cdn: &cdn
   <<: *node
@@ -87,7 +91,6 @@ services:
       BEDROCK_LOCATION__DC: eu-1
       BEDROCK_LOCATION__CELL: eu-1a
       BEDROCK_ROLES: "[l1, l2]"
-      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
@@ -120,7 +123,6 @@ services:
       BEDROCK_LOCATION__DC: eu-1
       BEDROCK_LOCATION__CELL: eu-1a
       BEDROCK_ROLES: "[l1, l2]"
-      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
@@ -152,7 +154,6 @@ services:
       BEDROCK_LOCATION__DC: eu-1
       BEDROCK_LOCATION__CELL: eu-1a
       BEDROCK_ROLES: "[l1, l2]"
-      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
@@ -210,7 +211,6 @@ services:
       BEDROCK_LOCATION__DC: us-1
       BEDROCK_LOCATION__CELL: us-1a
       BEDROCK_ROLES: "[l1, l2]"
-      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
@@ -242,7 +242,6 @@ services:
       BEDROCK_LOCATION__DC: us-1
       BEDROCK_LOCATION__CELL: us-1a
       BEDROCK_ROLES: "[l1, l2]"
-      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
@@ -274,7 +273,6 @@ services:
       BEDROCK_LOCATION__DC: us-1
       BEDROCK_LOCATION__CELL: us-1a
       BEDROCK_ROLES: "[l1, l2]"
-      BEDROCK_DATASETS: "[quicksilver, kv, auth]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
@@ -291,6 +289,103 @@ services:
       BEDROCK_LOCATION__CELL: us-1a
       BEDROCK_ROLES: "[l1, l2]"
       BEDROCK_DATASETS: "[cdn]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7002
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  quicksilver-eu-1:
+    <<: *quicksilver
+    build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-quicksilver } } # built once, shared by every quicksilver service
+    volumes: [./local-data/quicksilver-eu-1:/data]
+    environment:
+      BEDROCK_NODE_ID: quicksilver-eu-1
+      BEDROCK_LISTEN: 0.0.0.0:7400
+      BEDROCK_ADMIN_LISTEN: 0.0.0.0:7401
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, auth]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7002
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  quicksilver-eu-2:
+    <<: *quicksilver
+    volumes: [./local-data/quicksilver-eu-2:/data]
+    environment:
+      BEDROCK_NODE_ID: quicksilver-eu-2
+      BEDROCK_LISTEN: 0.0.0.0:7400
+      BEDROCK_ADMIN_LISTEN: 0.0.0.0:7401
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, auth]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7002
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  quicksilver-eu-3:
+    <<: *quicksilver
+    volumes: [./local-data/quicksilver-eu-3:/data]
+    environment:
+      BEDROCK_NODE_ID: quicksilver-eu-3
+      BEDROCK_LISTEN: 0.0.0.0:7400
+      BEDROCK_ADMIN_LISTEN: 0.0.0.0:7401
+      BEDROCK_LOCATION__REGION: eu
+      BEDROCK_LOCATION__DC: eu-1
+      BEDROCK_LOCATION__CELL: eu-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, auth]"
+      BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
+      BEDROCK_API: api:7002
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  quicksilver-us-1:
+    <<: *quicksilver
+    volumes: [./local-data/quicksilver-us-1:/data]
+    environment:
+      BEDROCK_NODE_ID: quicksilver-us-1
+      BEDROCK_LISTEN: 0.0.0.0:7400
+      BEDROCK_ADMIN_LISTEN: 0.0.0.0:7401
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, auth]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7002
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  quicksilver-us-2:
+    <<: *quicksilver
+    volumes: [./local-data/quicksilver-us-2:/data]
+    environment:
+      BEDROCK_NODE_ID: quicksilver-us-2
+      BEDROCK_LISTEN: 0.0.0.0:7400
+      BEDROCK_ADMIN_LISTEN: 0.0.0.0:7401
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, auth]"
+      BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
+      BEDROCK_API: api:7002
+      BEDROCK_S3_ENDPOINT: http://s3:8333
+
+  quicksilver-us-3:
+    <<: *quicksilver
+    volumes: [./local-data/quicksilver-us-3:/data]
+    environment:
+      BEDROCK_NODE_ID: quicksilver-us-3
+      BEDROCK_LISTEN: 0.0.0.0:7400
+      BEDROCK_ADMIN_LISTEN: 0.0.0.0:7401
+      BEDROCK_LOCATION__REGION: us
+      BEDROCK_LOCATION__DC: us-1
+      BEDROCK_LOCATION__CELL: us-1a
+      BEDROCK_ROLES: "[l1, l2]"
+      BEDROCK_DATASETS: "[quicksilver, auth]"
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
