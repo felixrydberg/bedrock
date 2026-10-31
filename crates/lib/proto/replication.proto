@@ -22,7 +22,28 @@ message Ack {
 
 // V1 relay session. Tier rank: leaf=0, cell=1, dc=2,
 // region=3, writer=4. Zero on Welcome is invalid.
-message Hello { uint32 version = 1; uint32 tier = 2; }
+// A kv/cdn process's leaf session carries its membership entry (B-12).
+message Hello { uint32 version = 1; uint32 tier = 2; Member member = 3; }
+
+// B-12 cell membership entry, published under dataset `membership`, namespace `{service}.{cell}`.
+// Budgets of zero mean unlimited.
+message Member {
+  enum Status { READY = 0; DRAINING = 1; LEFT = 2; }
+  string node_id = 1;
+  string service = 2;
+  string region = 3;
+  string dc = 4;
+  string cell = 5;
+  repeated string roles = 6;
+  repeated string datasets = 7;
+  double cpus = 8;
+  uint64 memory_mb = 9;
+  uint64 disk_mb = 10;
+  string failure_domain = 11;
+  // LEFT is relay-local: a draining node closed its stream and is removed without grace.
+  Status status = 12;
+  string address = 13;
+}
 message Follow {
   string dataset = 1;
   string namespace = 2;
@@ -42,6 +63,8 @@ message RelayRequest {
     Unfollow unfollow = 4;
     Recover recover = 5;
     bool progress = 6;
+    // Same node as Hello; changes only its status.
+    Member member = 7;
   }
 }
 message Welcome { uint32 version = 1; uint32 tier = 2; }
@@ -89,3 +112,15 @@ message RelayFrame {
   }
 }
 service Relay { rpc Session(stream RelayRequest) returns (stream RelayFrame); }
+
+// Sibling relays (`replay_peers`) watch each other: a snapshot completed by `synced`, then changes.
+// An empty update is a progress tick. A relay shares only what its own sessions hold, never what it
+// learned from a sibling. B-12 shares leaf members; #41 / B-12b adds subscriber interests.
+message SiblingWatch {}
+message SiblingUpdate {
+  repeated Member members = 1;
+  // Only service and node_id are set.
+  repeated Member members_removed = 2;
+  bool synced = 3;
+}
+service Siblings { rpc Watch(SiblingWatch) returns (stream SiblingUpdate); }

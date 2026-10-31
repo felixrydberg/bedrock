@@ -1,10 +1,12 @@
 node_id = "eu-1a-m1"
 listen = "0.0.0.0:7200"
+# Published in the cell membership entry so peers can dial this node.
+advertise = "eu-1a-m1:7200"
 admin_listen = "0.0.0.0:7201"
 data_dir = "/data"
 roles = ["l1", "l2"]
 datasets = ["cdn"]
-relays = ["relay-eu-1a-1:7300", "relay-eu-1a-2:7300"]
+relays = ["relay-eu-1a-1:7300", "relay-eu-1a-2:7300", "relay-eu-1a-3:7300"]
 api = "api.core:7002"
 s3_endpoint = "https://s3.example.internal"
 

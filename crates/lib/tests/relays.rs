@@ -211,6 +211,7 @@ async fn raw(
     tx.send(request(pb::relay_request::Kind::Hello(pb::Hello {
         version: 1,
         tier,
+        member: None,
     })))
     .await
     .unwrap();
@@ -326,6 +327,7 @@ async fn invalid_tier_and_customer_kv_subscriptions_are_rejected() {
         tx.send(request(pb::relay_request::Kind::Hello(pb::Hello {
             version: 1,
             tier,
+            member: None,
         })))
         .await
         .unwrap();

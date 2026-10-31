@@ -127,3 +127,53 @@ fn api_write_token_env_is_literal() {
         Ok(())
     });
 }
+
+#[test]
+fn relay_membership_needs_a_cell_relay_and_its_write_token() {
+    let relay = |extra: &str| {
+        Figment::new()
+            .merge(Toml::string(&format!(
+                r#"
+                node_id = "relay-1"
+                listen = "0.0.0.0:7300"
+                admin_listen = "0.0.0.0:7301"
+                data_dir = "data"
+                tier = "cell"
+                upstreams = ["api:7000"]
+                replay_peers = ["relay-2:7300", "relay-3:7300"]
+                {extra}
+                [location]
+                region = "eu"
+                dc = "eu-1"
+                cell = "eu-1a"
+                [membership]
+                api = "api:7002"
+                "#
+            )))
+            .extract::<RelayConfig>()
+            .unwrap()
+    };
+    let config = relay(
+        r#"advertise = "relay-1:7300"
+                write_token = "private-writer-token""#,
+    );
+    config.validate().unwrap();
+    assert_eq!(config.membership.as_ref().unwrap().grace_ms, 20_000);
+    assert!(!format!("{config:?}").contains("private-writer-token"));
+    // A relay is never its own sibling.
+    assert!(
+        relay(
+            r#"advertise = "relay-2:7300"
+                write_token = "t""#
+        )
+        .validate()
+        .is_err()
+    );
+    assert!(relay(r#"advertise = "relay-1:7300""#).validate().is_err());
+    let mut dc = relay(
+        r#"advertise = "relay-1:7300"
+                write_token = "t""#,
+    );
+    dc.tier = Tier::Dc;
+    assert!(dc.validate().is_err());
+}

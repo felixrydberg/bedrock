@@ -47,7 +47,7 @@ enum Outcome {
 
 /// Outbound connections, one per `(peer, class)`, shared by every caller on the node.
 pub struct Peers {
-    // ponytail: entries are never evicted; drop departed peers once membership exists (B-12) if churn makes this grow.
+    /// Departed cell members are dropped through [`Peers::forget`] (B-12).
     channels: Mutex<BTreeMap<(String, Class), Channel>>,
     calls: Family<CallLabels, Counter>,
     health: Health,
@@ -87,6 +87,15 @@ impl Peers {
             .connect_lazy();
         channels.insert((addr.to_owned(), class), channel.clone());
         Ok(channel)
+    }
+
+    /// Drops `addr`'s connections and breaker, e.g. once it left the cell's membership. Later use starts afresh.
+    pub fn forget(&self, addr: &str) {
+        self.channels
+            .lock()
+            .unwrap()
+            .retain(|(peer, _), _| peer != addr);
+        self.health.forget(addr);
     }
 
     /// Fails `fut` (a unary call or one `Streaming::message` to `addr`) with `DEADLINE_EXCEEDED` after `timeout`, counts

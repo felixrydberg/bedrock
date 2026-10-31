@@ -8,7 +8,7 @@ rust-version.workspace = true
 async-trait.workspace = true
 figment.workspace = true
 http-body-util.workspace = true
-hyper.workspace = true
+hyper = { workspace = true, features = ["client"] }
 hyper-util.workspace = true
 prometheus-client.workspace = true
 prost.workspace = true

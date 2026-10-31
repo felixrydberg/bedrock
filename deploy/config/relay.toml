@@ -1,15 +1,24 @@
 node_id = "relay-eu-1a-1"
 listen = "0.0.0.0:7300"
+# The address siblings and nodes dial; siblings list it in their replay_peers.
+advertise = "relay-eu-1a-1:7300"
 admin_listen = "0.0.0.0:7301"
 data_dir = "/data"
 tier = "cell"
 upstreams = ["relay-eu-1:7300", "relay-eu-2:7300"]
-replay_peers = ["relay-eu-1a-2:7300"]
+# Same-tier siblings: recovery sources and the sibling stream, by advertised address.
+replay_peers = ["relay-eu-1a-2:7300", "relay-eu-1a-3:7300"]
 
 [location]
 region = "eu"
 dc = "eu-1"
 cell = "eu-1a"
+
+# Cell membership (B-12), cell tier only. The cell's relays are this one and its replay_peers; publishing needs a
+# majority, so run at least three. The write credential comes from BEDROCK_WRITE_TOKEN.
+[membership]
+api = "api.core:7002"
+grace_ms = 20000
 
 [replay]
 max_bytes = 1073741824
