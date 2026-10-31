@@ -2,12 +2,15 @@
 //!
 //! Every dataset, including `cdn` retention, replicates the same [`Event`]s. Operations are only `SET` and `DELETE`;
 //! what an event means locally is up to the dataset's [`ApplyHook`], so writers and relays stay generic.
-//! [`writer`] assigns sequences and commits events (B-09); [`subscriptions`] carries them from a source's log to an
-//! applier (B-10).
+//! [`writer`] assigns sequences and commits events (B-09); [`crate::relays`] provides the shared session transport.
 
+pub mod log;
 pub mod materialized;
-pub mod subscriptions;
 pub mod writer;
+
+pub mod pb {
+    tonic::include_proto!("bedrock.replication");
+}
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -319,6 +322,39 @@ impl Heads {
         self.sequences
             .get(&(dataset.to_owned(), namespace.to_owned()))
             .copied()
+    }
+}
+
+impl From<Event> for pb::Event {
+    fn from(e: Event) -> Self {
+        pb::Event {
+            dataset: e.dataset,
+            namespace: e.namespace,
+            stream: e.stream,
+            sequence: e.sequence,
+            epoch: e.epoch,
+            committed_at: e.committed_at,
+            key: e.key,
+            value: match e.operation {
+                Operation::Set(value) => Some(value),
+                Operation::Delete => None,
+            },
+        }
+    }
+}
+
+impl From<pb::Event> for Event {
+    fn from(e: pb::Event) -> Self {
+        Event {
+            dataset: e.dataset,
+            namespace: e.namespace,
+            stream: e.stream,
+            sequence: e.sequence,
+            epoch: e.epoch,
+            committed_at: e.committed_at,
+            key: e.key,
+            operation: e.value.map_or(Operation::Delete, Operation::Set),
+        }
     }
 }
 

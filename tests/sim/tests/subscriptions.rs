@@ -1,91 +1,84 @@
-//! B-10 acceptance: while a writer commits, one replica subscribes from the start and a second installs the first's
-//! snapshot and subscribes from its boundary. A failed source read drops both streams and a subscriber restarts; each
-//! resumes from its cursor. Every sequence must be applied exactly once, in order, and both replicas must end equal.
-//! Runs over real HTTP/2 in normal builds and simulated under `--cfg madsim`.
-
+//! B-10 acceptance through Relay.Session: snapshot boundaries, source disconnects,
+//! subscriber restarts and obsolete-cursor recovery preserve committed ordering.
+use bedrock_lib::relays::Hub;
+use bedrock_lib::relays::client::{Selection, Session, Target};
+use bedrock_lib::replication::pb;
+use bedrock_lib::storage::{
+    KeyRange, Scan, Snapshot, StorageEngine, StorageResult, StorageStats, WriteBatch, WriteOp,
+};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bedrock_lib::replication::Operation;
 use bedrock_lib::replication::materialized::Retention;
-use bedrock_lib::replication::subscriptions::pb::replication_server::ReplicationServer;
-use bedrock_lib::replication::subscriptions::{Log, MemoryLog, Source, Subscription, Watched};
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
-use bedrock_lib::replication::{Applier, ApplierMetrics, ApplyHook, Event, Operation, stream};
 use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::storage::namespace::memory::MemoryFactory;
-use bedrock_lib::storage::{KeyRange, StorageEngine, StorageResult, WriteBatch};
 use bedrock_lib::transport::Peers;
 use bedrock_lib::transport::admin::Admin;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
-use tonic::Status;
-
 const NAMESPACES: [&str; 3] = ["a", "b", "c"];
 const WRITES: u64 = 3000;
-
-/// A [`MemoryLog`] whose next read can be made to fail, dropping every stream that hits it.
-#[derive(Default)]
-struct FlakyLog {
-    log: MemoryLog,
-    fail: AtomicBool,
+/// Records successful commits together with their selector-scoped revisions.
+struct Recorded {
+    engine: MemoryEngine,
+    batches: Mutex<Vec<WriteBatch>>,
 }
-
-impl Log for FlakyLog {
-    async fn read(
-        &self,
-        dataset: &str,
-        namespace: &str,
-        from: u64,
-        limit: usize,
-    ) -> Result<Vec<Event>, Status> {
-        if self.fail.swap(false, Ordering::SeqCst) {
-            return Err(Status::unavailable("injected read failure"));
+impl Recorded {
+    fn new() -> Self {
+        Self {
+            engine: MemoryEngine::new("auth"),
+            batches: Mutex::default(),
         }
-        self.log.read(dataset, namespace, from, limit).await
     }
-
-    fn head(&self, dataset: &str, namespace: &str) -> Arc<Watched<u64>> {
-        self.log.head(dataset, namespace)
-    }
-}
-
-/// Stores values under `{namespace}\0{key}` and records every sequence it applies.
-#[derive(Clone, Default)]
-struct Recorder(Arc<Mutex<Vec<(String, u64)>>>);
-
-impl ApplyHook for Recorder {
-    fn apply(
-        &mut self,
-        _: &dyn StorageEngine,
-        e: &Event,
-        batch: &mut WriteBatch,
-    ) -> StorageResult<()> {
-        let key = [e.namespace.as_bytes(), b"\0", &e.key].concat();
-        match &e.operation {
-            Operation::Set(value) => batch.put(key, value.clone()),
-            Operation::Delete => batch.delete(key),
-        };
-        self.0
+    fn operations(&self, namespace: &str) -> Vec<WriteOp> {
+        let prefix = [namespace.as_bytes(), b"\0"].concat();
+        self.batches
             .lock()
             .unwrap()
-            .push((e.namespace.clone(), e.sequence));
-        Ok(())
-    }
-}
-
-impl Recorder {
-    fn sequences(&self, namespace: &str) -> Vec<u64> {
-        let applied = self.0.lock().unwrap();
-        applied
             .iter()
-            .filter(|(n, _)| n == namespace)
-            .map(|&(_, s)| s)
+            .flat_map(|b| b.ops.iter())
+            .filter(|op| match op {
+                WriteOp::Put { key, .. } | WriteOp::Delete { key } => key.starts_with(&prefix),
+                WriteOp::DeleteRange(_) => false,
+            })
+            .cloned()
             .collect()
     }
 }
-
+impl StorageEngine for Recorded {
+    fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.engine.get(key)
+    }
+    fn scan(&self, range: &KeyRange) -> StorageResult<Scan<'_>> {
+        self.engine.scan(range)
+    }
+    fn write(&self, batch: WriteBatch) -> StorageResult<()> {
+        self.engine.write(batch.clone())?;
+        self.batches.lock().unwrap().push(batch);
+        Ok(())
+    }
+    fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
+        self.engine.revision(name)
+    }
+    fn snapshot(&self) -> StorageResult<Box<dyn Snapshot + '_>> {
+        self.engine.snapshot()
+    }
+    fn restore(&self, from: &dyn Snapshot) -> StorageResult<()> {
+        self.engine.restore(from)
+    }
+    fn stats(&self) -> StorageResult<StorageStats> {
+        self.engine.stats()
+    }
+    fn disk_usage(&self) -> StorageResult<u64> {
+        self.engine.disk_usage()
+    }
+    fn health(&self) -> StorageResult<()> {
+        self.engine.health()
+    }
+}
 /// splitmix64: seeded, so a failing run replays exactly under madsim.
 struct Rng(u64);
 
@@ -99,220 +92,318 @@ impl Rng {
     }
 }
 
-/// Commits sets and deletes over a few keys per namespace, pausing now and then so subscribers interleave. Halfway it
-/// waits for `resume`, so the second half is sure to be read after the faults are set up.
-async fn write(log: Arc<FlakyLog>, resume: oneshot::Receiver<()>) -> BTreeMap<String, u64> {
+fn peers() -> Arc<Peers> {
+    Arc::new(Peers::new(&Admin::new()))
+}
+async fn open_writer() -> Arc<Writer> {
+    Writer::open(
+        || 1_700_000_000_000,
+        Persistence {
+            factory: Arc::new(MemoryFactory::default()),
+            retention: Retention::default(),
+            metrics: PersistenceMetrics::default(),
+        },
+    )
+    .await
+    .unwrap()
+}
+fn start(server: &str, engine: Arc<Recorded>) -> Session {
+    Session::start(
+        peers(),
+        vec![server.into()],
+        NAMESPACES
+            .into_iter()
+            .map(|namespace| Target {
+                selection: Selection {
+                    dataset: "auth".into(),
+                    namespace: namespace.into(),
+                    buckets: Vec::new(),
+                },
+                engine: engine.clone(),
+                prefix: [namespace.as_bytes(), b"\0"].concat(),
+            })
+            .collect(),
+    )
+    .unwrap()
+}
+async fn caught_up(session: &Session, namespace: &str, revision: u64) {
+    timeout(
+        Duration::from_secs(30),
+        session.wait_for("auth", namespace, revision),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{namespace} stalled at {revision}: {:?}", session.error()));
+}
+async fn write(
+    writer: Arc<Writer>,
+    resume: oneshot::Receiver<()>,
+) -> BTreeMap<String, Vec<WriteOp>> {
     let mut rng = Rng(7);
-    let mut heads = BTreeMap::<String, u64>::new();
+    let mut expected = BTreeMap::<String, Vec<WriteOp>>::new();
     let mut resume = Some(resume);
     for i in 0..WRITES {
         if i == WRITES / 2 {
             resume.take().unwrap().await.unwrap();
         }
         let namespace = NAMESPACES[rng.below(3) as usize];
-        let head = heads.entry(namespace.into()).or_default();
-        *head += 1;
         let key = vec![b'x' + rng.below(4) as u8];
+        let physical = [namespace.as_bytes(), b"\0", &key].concat();
         let operation = if rng.below(5) == 0 {
             Operation::Delete
         } else {
             Operation::Set(i.to_be_bytes().to_vec())
         };
-        log.log
-            .append(Event {
-                dataset: "kv".into(),
+        let op = match &operation {
+            Operation::Set(value) => WriteOp::Put {
+                key: physical,
+                value: value.clone(),
+            },
+            Operation::Delete => WriteOp::Delete { key: physical },
+        };
+        let sequence = writer
+            .commit(Write {
+                dataset: "auth".into(),
                 namespace: namespace.into(),
-                stream: stream("kv", 0),
-                sequence: *head,
-                epoch: 1,
-                committed_at: 1_700_000_000_000 + i,
                 key,
                 operation,
+                idempotency_key: None,
             })
+            .await
             .unwrap();
+        let events = expected.entry(namespace.into()).or_default();
+        events.push(op);
+        assert_eq!(sequence, events.len() as u64);
         if rng.below(20) == 0 {
             sleep(Duration::from_millis(1)).await;
         }
     }
-    heads
+    expected
 }
-
-fn applier(engine: Arc<MemoryEngine>, hook: Recorder) -> Applier<Recorder> {
-    Applier::new("kv", engine, hook, &ApplierMetrics::default())
-}
-
-fn namespaces() -> Vec<String> {
-    NAMESPACES.map(String::from).to_vec()
-}
-
-fn state(engine: &MemoryEngine) -> Vec<(Vec<u8>, Vec<u8>)> {
-    engine
-        .scan(&KeyRange::all())
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
-}
-
-async fn caught_up(subscription: &Subscription, heads: &BTreeMap<String, u64>) {
-    for (namespace, &head) in heads {
-        timeout(
-            Duration::from_secs(30),
-            subscription.wait_for(namespace, head),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("{namespace} did not reach {head}"));
-    }
-}
-
-/// The subscriber side; `server` serves `log`.
-async fn scenario(server: String, log: Arc<FlakyLog>) {
-    let peers = Arc::new(Peers::new(&Admin::new()));
-    let (resume, paused) = oneshot::channel();
-    let writer = tokio::spawn(write(log.clone(), paused));
-
-    let first = Arc::new(MemoryEngine::new("kv"));
-    let first_applied = Recorder::default();
-    let start = |engine: &Arc<MemoryEngine>, hook: &Recorder| {
-        let applier = applier(engine.clone(), hook.clone());
-        Subscription::start(peers.clone(), server.clone(), applier, namespaces())
-    };
-    let subscription = start(&first, &first_applied);
-
-    // Mid-stream, the second replica installs the first's snapshot and subscribes from its boundary.
-    timeout(Duration::from_secs(30), subscription.wait_for("a", 100))
-        .await
-        .unwrap();
-    let second = Arc::new(MemoryEngine::new("kv"));
-    second.restore(first.snapshot().unwrap().as_ref()).unwrap();
-    let boundary = second.snapshot().unwrap().revisions().unwrap();
-    let second_applied = Recorder::default();
-    let second_subscription = start(&second, &second_applied);
-
-    // The next source read fails and ends a stream, and the first subscriber restarts from its engine.
-    log.fail.store(true, Ordering::SeqCst);
-    subscription.stop().await;
-    let subscription = start(&first, &first_applied);
-    resume.send(()).unwrap();
-
-    let heads = writer.await.unwrap();
-    caught_up(&subscription, &heads).await;
-    caught_up(&second_subscription, &heads).await;
-    assert!(!log.fail.load(Ordering::SeqCst), "no read failed");
-
-    for (namespace, &head) in &heads {
-        let after = boundary.get(namespace).copied().unwrap_or(0);
-        assert!(
-            after > 0 || namespace != "a",
-            "snapshot taken before any write"
-        );
-        let expected: Vec<u64> = (1..=head).collect();
-        assert_eq!(first_applied.sequences(namespace), expected, "{namespace}");
-        let expected: Vec<u64> = (after + 1..=head).collect();
-        assert_eq!(second_applied.sequences(namespace), expected, "{namespace}");
-    }
-    assert_eq!(state(&first), state(&second));
-}
-
 #[cfg(not(madsim))]
-#[tokio::test(flavor = "multi_thread")]
-async fn snapshot_then_subscribe_under_concurrent_writes() {
-    let log = Arc::new(FlakyLog::default());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(ReplicationServer::new(Source::new(log.clone())))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
-    );
-    scenario(addr.to_string(), log).await;
-}
-
-#[cfg(madsim)]
-#[madsim::test]
-async fn snapshot_then_subscribe_under_concurrent_writes() {
-    simulated().await;
-}
-
-/// One seed must replay one schedule (B-23a). Append any seed that ever failed.
-#[cfg(madsim)]
-#[test]
-fn same_seed_same_schedule() {
-    for seed in [1, 2, 3, 42] {
-        madsim::runtime::Runtime::check_determinism(seed, madsim::Config::default(), simulated);
+mod sockets {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    /// Cancellation closes established HTTP/2 sockets, not only the listener.
+    pub struct Socket {
+        stream: tokio::net::TcpStream,
+        stopped: Pin<Box<dyn Future<Output = ()> + Send>>,
+        closed: bool,
+    }
+    impl Socket {
+        pub fn new(
+            stream: tokio::net::TcpStream,
+            mut stop: tokio::sync::watch::Receiver<bool>,
+        ) -> Self {
+            Self {
+                stream,
+                closed: false,
+                stopped: Box::pin(async move {
+                    while !*stop.borrow_and_update() {
+                        if stop.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }),
+            }
+        }
+        fn closed(&mut self, cx: &mut Context<'_>) -> bool {
+            self.closed = self.closed || self.stopped.as_mut().poll(cx).is_ready();
+            self.closed
+        }
+    }
+    impl tonic::transport::server::Connected for Socket {
+        type ConnectInfo = ();
+        fn connect_info(&self) {}
+    }
+    impl AsyncRead for Socket {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.closed(cx) {
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for Socket {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.closed(cx) {
+                return Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            Pin::new(&mut self.stream).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
     }
 }
-
+#[cfg(not(madsim))]
+async fn source(
+    address: std::net::SocketAddr,
+    writer: Arc<Writer>,
+    mut restart: mpsc::Receiver<oneshot::Sender<()>>,
+) {
+    use tokio_stream::StreamExt;
+    loop {
+        let hub = Hub::writer("writer".into(), writer.clone(), peers());
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
+            .map(move |stream| stream.map(|stream| sockets::Socket::new(stream, stopped.clone())));
+        let task = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(pb::relay_server::RelayServer::new(hub))
+                .serve_with_incoming(incoming),
+        );
+        let command = restart.recv().await;
+        let _ = stop.send(true);
+        task.abort();
+        let _ = task.await;
+        if let Some(ack) = command {
+            sleep(Duration::from_millis(10)).await;
+            ack.send(()).unwrap();
+        } else {
+            return;
+        }
+    }
+}
 #[cfg(madsim)]
-async fn simulated() {
+async fn source(
+    address: std::net::SocketAddr,
+    writer: Arc<Writer>,
+    mut restart: mpsc::Receiver<oneshot::Sender<()>>,
+) {
     let handle = madsim::runtime::Handle::current();
-    let server: std::net::SocketAddr = "10.0.0.2:7000".parse().unwrap();
-    let log = Arc::new(FlakyLog::default());
-    let served = log.clone();
-    handle
+    let node = handle
         .create_node()
         .name("source")
-        .ip(server.ip())
-        .build()
-        .spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(ReplicationServer::new(Source::new(served)))
-                .serve(server)
-                .await
-                .unwrap();
-        });
-    handle
-        .create_node()
-        .name("replicas")
-        .ip("10.0.0.1".parse().unwrap())
-        .build()
-        .spawn(async move {
-            // Let the source bind first.
-            sleep(Duration::from_millis(10)).await;
-            scenario(server.to_string(), log).await;
+        .ip(address.ip())
+        .init(move || {
+            let hub = Hub::writer("writer".into(), writer.clone(), peers());
+            async move {
+                tonic::transport::Server::builder()
+                    .add_service(pb::relay_server::RelayServer::new(hub))
+                    .serve(address)
+                    .await
+                    .unwrap();
+            }
         })
-        .await
-        .unwrap();
+        .build();
+    while let Some(ack) = restart.recv().await {
+        handle.kill(node.id());
+        sleep(Duration::from_millis(10)).await;
+        handle.restart(node.id());
+        ack.send(()).unwrap();
+    }
+    handle.kill(node.id());
 }
-
-/// An expired cursor requires a consistent materialized-state bootstrap, then an
-/// ordinary subscription from target+1. The service lifecycle controls readiness.
+async fn scenario(server: String, writer: Arc<Writer>, restart: mpsc::Sender<oneshot::Sender<()>>) {
+    let (resume, paused) = oneshot::channel();
+    let writing = tokio::spawn(write(writer.clone(), paused));
+    let first = Arc::new(Recorded::new());
+    let session = start(&server, first.clone());
+    caught_up(&session, "a", 100).await;
+    let second = Arc::new(Recorded::new());
+    // Extract per-namespace boundaries from the same atomic snapshot copied to the second replica.
+    let snapshot = first.snapshot().unwrap();
+    second.restore(snapshot.as_ref()).unwrap();
+    let boundary = snapshot.revisions().unwrap();
+    drop(snapshot);
+    let second_session = start(&server, second.clone());
+    let (ack, restarted) = oneshot::channel();
+    restart.send(ack).await.unwrap();
+    session.stop().await;
+    let session = start(&server, first.clone());
+    resume.send(()).unwrap();
+    restarted.await.unwrap();
+    let expected = writing.await.unwrap();
+    for (namespace, ops) in expected {
+        caught_up(&session, &namespace, ops.len() as u64).await;
+        caught_up(&second_session, &namespace, ops.len() as u64).await;
+        assert_eq!(
+            first.operations(&namespace),
+            ops,
+            "{namespace}: duplicate or reordered application"
+        );
+        // Locate the opaque cursor by the namespace's committed data batch, without reproducing its hash.
+        let cursor = first
+            .batches
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|batch| {
+                batch.ops.iter().any(|op| match op {
+                    WriteOp::Put { key, .. } | WriteOp::Delete { key } => {
+                        key.starts_with(&[namespace.as_bytes(), b"\0"].concat())
+                    }
+                    WriteOp::DeleteRange(_) => false,
+                })
+            })
+            .unwrap()
+            .revisions
+            .keys()
+            .find(|name| name.starts_with("relay:cursor:"))
+            .unwrap()
+            .clone();
+        let after = boundary.get(&cursor).copied().unwrap_or(0) as usize;
+        assert_eq!(
+            second.operations(&namespace),
+            ops[after..],
+            "{namespace}: snapshot cursor was not resumed"
+        );
+    }
+    assert_eq!(
+        first.snapshot().unwrap().revisions().unwrap(),
+        second.snapshot().unwrap().revisions().unwrap()
+    );
+    let state = |engine: &Recorded| {
+        engine
+            .scan(&KeyRange::all())
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(state(&first), state(&second));
+    session.stop().await;
+    second_session.stop().await;
+    writer.close().await.unwrap();
+}
+/// An obsolete Follow cursor triggers automatic bootstrap over the same session.
 async fn materialized_recovery_scenario(server: String, writer: Arc<Writer>) {
     let write = Write {
-        dataset: "kv".into(),
+        dataset: "auth".into(),
         namespace: "a".into(),
         key: b"k".to_vec(),
         operation: Operation::Set(b"one".to_vec()),
         idempotency_key: None,
     };
     assert_eq!(writer.commit(write.clone()).await.unwrap(), 1);
-    // Model a cursor older than the source's retained stream window.
-    writer.log().prune("kv", "a", 1).unwrap();
-    let engine = Arc::new(MemoryEngine::new("kv"));
-    let peers = Arc::new(Peers::new(&Admin::new()));
-    let first = Subscription::start(
-        peers.clone(),
-        server.clone(),
-        applier(engine.clone(), Recorder::default()),
-        vec!["a".into()],
-    );
-    let reason = timeout(Duration::from_secs(5), first.recovery_required())
-        .await
-        .unwrap();
-    assert_eq!(reason.code(), tonic::Code::OutOfRange);
-    first.stop().await;
-    writer
-        .bootstrap("kv", "a")
-        .await
-        .unwrap()
-        .install(engine.as_ref(), "a", KeyRange::prefix(b"a\0"))
-        .unwrap();
-    let recorded = Recorder::default();
-    let resumed = Subscription::start(
-        peers,
-        server,
-        applier(engine.clone(), recorded.clone()),
-        vec!["a".into()],
-    );
+    writer.log().prune("auth", "a", 1).unwrap();
+    let engine = Arc::new(Recorded::new());
+    let session = start(&server, engine.clone());
+    caught_up(&session, "a", 1).await;
+    assert_eq!(engine.get(b"a\0k").unwrap(), Some(b"one".to_vec()));
+    assert!(engine.batches.lock().unwrap().iter().any(|b| {
+        b.ops
+            .contains(&WriteOp::DeleteRange(KeyRange::prefix(b"a\0")))
+    }));
+    let installed = engine.snapshot().unwrap().revisions().unwrap();
+    session.stop().await;
+    let resumed = start(&server, engine.clone());
     assert_eq!(
         writer
             .commit(Write {
@@ -323,76 +414,98 @@ async fn materialized_recovery_scenario(server: String, writer: Arc<Writer>) {
             .unwrap(),
         2
     );
-    timeout(Duration::from_secs(5), resumed.wait_for("a", 2))
-        .await
-        .unwrap();
-    assert_eq!(recorded.sequences("a"), vec![2]);
-    assert_eq!(engine.revision("a").unwrap(), Some(2));
+    caught_up(&resumed, "a", 2).await;
+    assert_eq!(
+        engine.operations("a"),
+        vec![
+            WriteOp::Put {
+                key: b"a\0k".to_vec(),
+                value: b"one".to_vec()
+            },
+            WriteOp::Delete {
+                key: b"a\0k".to_vec()
+            }
+        ]
+    );
     assert_eq!(engine.get(b"a\0k").unwrap(), None);
+    let revisions = engine.snapshot().unwrap().revisions().unwrap();
+    let cursor = installed
+        .iter()
+        .find(|(name, value)| name.starts_with("relay:cursor:") && **value == 1)
+        .unwrap()
+        .0;
+    assert_eq!(revisions[cursor], 2);
     resumed.stop().await;
+    writer.close().await.unwrap();
 }
-
+#[cfg(not(madsim))]
+async fn run(recovery: bool) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let writer = open_writer().await;
+    let (restart, commands) = mpsc::channel(1);
+    let serving = tokio::spawn(source(addr, writer.clone(), commands));
+    if recovery {
+        materialized_recovery_scenario(addr.to_string(), writer).await;
+    } else {
+        scenario(addr.to_string(), writer, restart).await;
+    }
+    serving.abort();
+    let _ = serving.await;
+}
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_then_subscribe_under_concurrent_writes() {
+    run(false).await;
+}
 #[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread")]
 async fn expired_cursor_bootstraps_then_resumes_after_materialized_boundary() {
-    let writer = Writer::open(
-        || 123,
-        Persistence {
-            factory: Arc::new(MemoryFactory::default()),
-            retention: Retention::default(),
-            metrics: PersistenceMetrics::default(),
-        },
-    )
-    .await
-    .unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(
-        tonic::transport::Server::builder()
-            .add_service(ReplicationServer::new(Source::new(writer.log())))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
-    );
-    materialized_recovery_scenario(addr.to_string(), writer).await;
-    server.abort();
+    run(true).await;
 }
-
 #[cfg(madsim)]
-#[madsim::test]
-async fn expired_cursor_bootstraps_then_resumes_after_materialized_boundary() {
+async fn simulated(recovery: bool) {
     let handle = madsim::runtime::Handle::current();
     let addr: std::net::SocketAddr = "10.0.0.2:7000".parse().unwrap();
-    let writer = Writer::open(
-        || 123,
-        Persistence {
-            factory: Arc::new(MemoryFactory::default()),
-            retention: Retention::default(),
-            metrics: PersistenceMetrics::default(),
-        },
-    )
-    .await
-    .unwrap();
-    let log = writer.log();
+    let writer = open_writer().await;
+    let (restart, commands) = mpsc::channel(1);
+    let serving = tokio::spawn(source(addr, writer.clone(), commands));
+    let replica_restart = restart.clone();
     handle
         .create_node()
-        .name("source")
-        .ip(addr.ip())
-        .build()
-        .spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(ReplicationServer::new(Source::new(log)))
-                .serve(addr)
-                .await
-                .unwrap();
-        });
-    handle
-        .create_node()
-        .name("replica")
+        .name("replicas")
         .ip("10.0.0.1".parse().unwrap())
         .build()
         .spawn(async move {
             sleep(Duration::from_millis(10)).await;
-            materialized_recovery_scenario(addr.to_string(), writer).await;
+            if recovery {
+                materialized_recovery_scenario(addr.to_string(), writer).await;
+            } else {
+                scenario(addr.to_string(), writer, replica_restart).await;
+            }
         })
         .await
         .unwrap();
+    drop(restart);
+    serving.await.unwrap();
+}
+#[cfg(madsim)]
+#[madsim::test]
+async fn snapshot_then_subscribe_under_concurrent_writes() {
+    simulated(false).await;
+}
+#[cfg(madsim)]
+#[madsim::test]
+async fn expired_cursor_bootstraps_then_resumes_after_materialized_boundary() {
+    simulated(true).await;
+}
+#[cfg(madsim)]
+#[test]
+fn same_seed_same_schedule() {
+    for seed in [1, 2, 3, 42] {
+        madsim::runtime::Runtime::check_determinism(seed, madsim::Config::default(), || {
+            simulated(false)
+        });
+    }
 }

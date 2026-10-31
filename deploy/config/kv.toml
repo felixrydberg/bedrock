@@ -17,3 +17,9 @@ cell = "eu-1a"
 cpus = 2.0
 memory_mb = 4096
 disk_mb = 102400
+
+[[subscriptions]]
+dataset = "quicksilver"
+namespace = "infrastructure"
+# Omitted buckets follows the namespace. L2-only consumers list owned bucket IDs.
+# Customer kv never appears here; Auth namespaces are followed explicitly when needed.

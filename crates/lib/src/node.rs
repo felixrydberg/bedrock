@@ -65,6 +65,9 @@ pub struct ServiceConfig {
     /// `bedrock-api` endpoint for writes, its `write_listen`.
     pub api: String,
     pub s3_endpoint: String,
+    /// Explicit pushed namespace interests; customer KV has no relay subscription.
+    #[serde(default)]
+    pub subscriptions: Vec<crate::relays::client::Selection>,
 }
 
 impl ServiceConfig {
@@ -100,6 +103,19 @@ pub struct RelayConfig {
     pub tier: Tier,
     /// Upstream relays, or `bedrock-api` for the top tier, in preference order.
     pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub replay_peers: Vec<String>,
+    #[serde(default)]
+    pub replay: ReplaySettings,
+}
+
+/// Optional overrides preserve tier defaults without overriding an explicit window.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ReplaySettings {
+    pub max_bytes: Option<u64>,
+    pub window_ms: Option<u64>,
+    pub priorities: std::collections::BTreeMap<String, u32>,
 }
 
 impl RelayConfig {

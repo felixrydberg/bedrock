@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::tests::Factory;
-use crate::replication::subscriptions::Log;
+use crate::replication::log::Log;
 use crate::storage::StorageError;
 use crate::storage::namespace::memory::MemoryFactory;
 

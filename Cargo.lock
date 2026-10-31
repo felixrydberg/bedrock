@@ -671,6 +671,7 @@ version = "0.1.0"
 dependencies = [
  "bedrock-lib",
  "madsim-tokio",
+ "madsim-tonic",
  "tracing",
 ]
 

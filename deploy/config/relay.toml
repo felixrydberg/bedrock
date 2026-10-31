@@ -4,8 +4,14 @@ admin_listen = "0.0.0.0:7301"
 data_dir = "/data"
 tier = "cell"
 upstreams = ["relay-eu-1:7300", "relay-eu-2:7300"]
+replay_peers = ["relay-eu-1a-2:7300"]
 
 [location]
 region = "eu"
 dc = "eu-1"
 cell = "eu-1a"
+
+[replay]
+max_bytes = 1073741824
+window_ms = 300000
+# Region/DC defaults are 3600000/900000 ms. Higher dataset priorities retain longer.

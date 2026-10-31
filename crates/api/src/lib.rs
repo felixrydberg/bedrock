@@ -20,8 +20,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::put;
 use bedrock_lib::node::{self, ApiConfig, ConfigError};
 use bedrock_lib::replication::Operation;
-use bedrock_lib::replication::subscriptions::Source;
-use bedrock_lib::replication::subscriptions::pb::replication_server::ReplicationServer;
 use bedrock_lib::replication::writer::{
     CommitError, Persistence, PersistenceMetrics, Write, Writer,
 };
@@ -62,7 +60,15 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
         .map_err(|e| ConfigError(format!("write_listen {}: {e}", config.write_listen)))?;
     let writes = tokio::spawn(serve(writes, app));
     let replication = tonic::transport::Server::builder()
-        .add_service(ReplicationServer::new(Source::new(writer.log())))
+        .add_service(
+            bedrock_lib::replication::pb::relay_server::RelayServer::new(
+                bedrock_lib::relays::Hub::writer(
+                    config.node.node_id.clone(),
+                    writer.clone(),
+                    Arc::new(bedrock_lib::transport::Peers::new(&admin)),
+                ),
+            ),
+        )
         .serve(config.node.listen);
 
     admin.set_ready(true);

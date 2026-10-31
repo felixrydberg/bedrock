@@ -1,5 +1,7 @@
 # Storage recovery model (#11 / B-11)
 
+Relay protocol and recovery: [#14 / B-17 and #16 / B-18](relays.md).
+
 The standalone writer persists directly to SlateDB in S3. See
 [the atomic namespace protocol model](materialized.md) for its bounded checks and
 explicit limits. There is no separate raw S3 journal, published-object boundary,

@@ -92,6 +92,10 @@ async fn storage_contract(factory: &dyn NamespaceFactory) {
         Some(&b"third".to_vec())
     );
     assert_eq!(view.publish().await.unwrap(), 3);
+    let tail = view.events_from(2, 1).await.unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].event.sequence, 2);
+    assert!(view.events_from(4, 256).await.unwrap().is_empty());
     view.close().await.unwrap();
     let recovered = Materialized::open(factory, "kv", "one").await.unwrap();
     assert_eq!(recovered.view().await.unwrap(), after);
@@ -501,4 +505,23 @@ async fn raft_position_without_any_namespace_event_leaves_empty_storage_healthy(
     let reopened = Materialized::open(&factory, "kv", "one").await.unwrap();
     assert_eq!(reopened.view().await.unwrap().sequence, 0);
     assert!(reopened.events().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bounded_event_range_rejects_pruned_history() {
+    let factory = MemoryFactory::default();
+    let view = Materialized::open(&factory, "kv", "one").await.unwrap();
+    view.apply(&[
+        committed(1, 100, b"a", Some(b"1"), None),
+        committed(2, 200, b"b", Some(b"2"), None),
+    ])
+    .await
+    .unwrap();
+    let retention = Retention {
+        event_retention_ms: 150,
+        retry_retention_ms: 150,
+    };
+    assert_eq!(view.cleanup(300, &retention).await.unwrap(), 1);
+    assert!(view.events_from(1, 256).await.is_err());
+    assert_eq!(view.events_from(2, 256).await.unwrap().len(), 1);
 }
