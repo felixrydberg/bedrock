@@ -5,6 +5,7 @@ mod operations {}
 pub mod storage;
 
 use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, ReplicationPolicy};
+use bedrock_lib::membership;
 use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
 
 pub const DATASETS: &[Dataset] = &[
@@ -78,11 +79,15 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         .collect::<Result<Vec<_>, ConfigError>>()?;
     // ponytail: a skipped subscription keeps the node unready until restart; rebuild the Session if hot recovery matters.
     let skipped = targets.iter().any(Option::is_none);
-    let targets = targets.into_iter().flatten().collect();
-    let session = bedrock_lib::relays::client::Session::start(
-        std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin)),
+    let mut targets: Vec<_> = targets.into_iter().flatten().collect();
+    let (members, target) = membership::View::new("kv", &config.node.location.cell);
+    targets.push(target);
+    let peers = std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin));
+    let session = bedrock_lib::relays::client::Session::join(
+        peers.clone(),
         config.relays.clone(),
         targets,
+        membership::member(&config, "kv"),
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -90,10 +95,16 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     loop {
         tokio::select! {biased;
             ()=&mut shutdown=>break,
-            _=readiness.tick()=>admin.set_ready(!skipped && datasets.is_healthy() && session.ready()),
+            _=readiness.tick()=>{
+                admin.set_ready(!skipped && datasets.is_healthy() && session.ready());
+                if let Err(error)=members.refresh(&session,&peers){
+                    tracing::warn!(%error,"membership view unreadable");
+                }
+            },
         }
     }
     admin.set_ready(false);
+    session.drain().await;
     tracing::info!("shutting down");
     Ok(())
 }

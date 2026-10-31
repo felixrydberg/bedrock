@@ -1,6 +1,7 @@
 //! Pushed-data relay sessions, bounded fan-out and disposable replay (#14/B-17, #16/B-18).
 pub mod client;
 pub mod replay;
+pub mod siblings;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
@@ -38,7 +39,10 @@ struct EncodedEvent {
 
 /// Customer KV persists through the writer but has no pushed delivery contract.
 pub fn pushed(dataset: &str) -> bool {
-    matches!(dataset, "quicksilver" | "auth" | "cdn")
+    matches!(
+        dataset,
+        "quicksilver" | "auth" | "cdn" | crate::membership::DATASET
+    )
 }
 
 pub fn tier_rank(tier: crate::node::Tier) -> u32 {
@@ -70,6 +74,19 @@ struct Inner {
     replay_queue: mpsc::Sender<ReplayItem>,
     replay_pending: Mutex<Option<mpsc::Receiver<ReplayItem>>>,
     replay_bytes: AtomicUsize,
+    /// Draining members whose stream closed, kept as `LEFT` so cell relays remove them without grace (B-12).
+    departed: Mutex<BTreeMap<MemberKey, (pb::Member, tokio::time::Instant)>>,
+    members_changed: Arc<Watched<u64>>,
+}
+
+/// `(service, node_id)`.
+pub type MemberKey = (String, String);
+
+/// A member connected to this relay and its acknowledged revisions, for the regional directory (B-19).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Connected {
+    pub member: pb::Member,
+    pub applied: BTreeMap<Key, u64>,
 }
 
 #[derive(Default)]
@@ -86,6 +103,7 @@ struct Subscriber {
     closed: Arc<Watched<bool>>,
     follows: BTreeMap<Key, Interest>,
     changed: Arc<Watched<u64>>,
+    member: Option<pb::Member>,
 }
 struct Interest {
     from: u64,
@@ -172,6 +190,8 @@ impl Hub {
             replay_queue,
             replay_pending: Mutex::new(Some(replay_pending)),
             replay_bytes: AtomicUsize::new(0),
+            departed: Mutex::default(),
+            members_changed: Arc::new(Watched::new(0)),
         }))
     }
     pub fn with_clock(self, clock: fn() -> u64) -> Self {
@@ -234,6 +254,51 @@ impl Hub {
     }
     fn changed(&self) {
         self.0.changed.update(|v| *v = v.wrapping_add(1));
+    }
+    /// Bumped whenever [`Hub::members`] may have changed.
+    pub fn member_version(&self) -> Arc<Watched<u64>> {
+        self.0.members_changed.clone()
+    }
+    fn members_changed(&self) {
+        self.0.members_changed.update(|v| *v = v.wrapping_add(1));
+    }
+    /// Members on this relay's leaf sessions; the newest session wins a duplicate identity. Graceful leavers stay
+    /// `LEFT` for [`IDLE`].
+    pub fn members(&self) -> BTreeMap<MemberKey, Connected> {
+        let mut members = BTreeMap::new();
+        let now = crate::monotonic_now();
+        let mut departed = self.0.departed.lock().unwrap();
+        let before = departed.len();
+        departed.retain(|_, (_, at)| now.duration_since(*at) < IDLE);
+        if departed.len() != before {
+            self.members_changed();
+        }
+        for (key, (member, _)) in departed.iter() {
+            members.insert(
+                key.clone(),
+                Connected {
+                    member: member.clone(),
+                    applied: BTreeMap::new(),
+                },
+            );
+        }
+        drop(departed);
+        for sub in self.0.subscribers.lock().unwrap().values() {
+            if let Some(member) = &sub.member {
+                members.insert(
+                    crate::membership::key(member),
+                    Connected {
+                        member: member.clone(),
+                        applied: sub
+                            .follows
+                            .iter()
+                            .map(|(key, interest)| (key.clone(), interest.acked))
+                            .collect(),
+                    },
+                );
+            }
+        }
+        members
     }
     fn head(&self, key: &Key) -> Arc<Watched<Option<u64>>> {
         let mut heads = self.0.heads.lock().unwrap();
@@ -308,11 +373,43 @@ impl Hub {
         next
     }
     fn remove(&self, id: u64) {
-        if let Some(sub) = self.0.subscribers.lock().unwrap().remove(&id) {
+        let removed = self.0.subscribers.lock().unwrap().remove(&id);
+        if let Some(sub) = removed {
             sub.closed.update(|v| *v = true);
             sub.changed.update(|v| *v = v.wrapping_add(1));
+            if let Some(mut member) = sub.member {
+                if member.status == pb::member::Status::Draining as i32 {
+                    member.status = pb::member::Status::Left as i32;
+                    self.0.departed.lock().unwrap().insert(
+                        crate::membership::key(&member),
+                        (member, crate::monotonic_now()),
+                    );
+                }
+                self.members_changed();
+            }
         }
         self.changed();
+    }
+    /// The first member must arrive on a leaf Hello; later ones may change only its status.
+    fn member(&self, id: u64, member: pb::Member) -> bool {
+        if crate::membership::validate(&member).is_err() {
+            return false;
+        }
+        let mut subscribers = self.0.subscribers.lock().unwrap();
+        let Some(sub) = subscribers.get_mut(&id) else {
+            return false;
+        };
+        let Some(current) = sub
+            .member
+            .as_mut()
+            .filter(|current| crate::membership::key(current) == crate::membership::key(&member))
+        else {
+            return false;
+        };
+        current.status = member.status;
+        drop(subscribers);
+        self.members_changed();
+        true
     }
     /// Immediate send for control frames: a full queue disconnects the subscriber.
     fn send(&self, id: u64, kind: pb::relay_frame::Kind) -> bool {
@@ -1050,6 +1147,7 @@ impl Hub {
                     kind: Some(pb::relay_request::Kind::Hello(pb::Hello {
                         version: 1,
                         tier: 0,
+                        member: None,
                     })),
                 })
                 .await
@@ -1264,6 +1362,7 @@ impl Hub {
             kind: Some(pb::relay_request::Kind::Hello(pb::Hello {
                 version: 1,
                 tier: self.0.tier,
+                member: None,
             })),
         })
         .await
@@ -1422,15 +1521,19 @@ impl pb::relay_server::Relay for Hub {
         let first = tokio::time::timeout(Duration::from_secs(5), requests.message())
             .await
             .map_err(|_| Status::deadline_exceeded("hello timeout"))??;
-        let tier = match first.and_then(|r| r.kind) {
+        let (tier, member) = match first.and_then(|r| r.kind) {
             Some(pb::relay_request::Kind::Hello(hello))
-                if hello.version == 1 && hello.tier < self.0.tier =>
+                if hello.version == 1
+                    && hello.tier < self.0.tier
+                    && hello.member.as_ref().is_none_or(|member| {
+                        hello.tier == 0 && crate::membership::validate(member).is_ok()
+                    }) =>
             {
-                hello.tier
+                (hello.tier, hello.member)
             }
             _ => {
                 return Err(Status::failed_precondition(
-                    "v1 hello must identify a lower downstream tier",
+                    "v1 hello must identify a lower downstream tier; only a leaf may carry a valid member",
                 ));
             }
         };
@@ -1440,6 +1543,13 @@ impl pb::relay_server::Relay for Hub {
         let closed = Arc::new(Watched::new(false));
         let changed = Arc::new(Watched::new(0));
         let id = self.0.ids.fetch_add(1, Ordering::Relaxed);
+        if let Some(member) = &member {
+            self.0
+                .departed
+                .lock()
+                .unwrap()
+                .remove(&crate::membership::key(member));
+        }
         self.0.subscribers.lock().unwrap().insert(
             id,
             Subscriber {
@@ -1449,8 +1559,10 @@ impl pb::relay_server::Relay for Hub {
                 closed: closed.clone(),
                 follows: BTreeMap::new(),
                 changed: changed.clone(),
+                member,
             },
         );
+        self.members_changed();
         self.send(
             id,
             pb::relay_frame::Kind::Welcome(pb::Welcome {
@@ -1483,6 +1595,7 @@ impl pb::relay_server::Relay for Hub {
                                 hub.acknowledge(id,a);
                             }
                             Some(pb::relay_request::Kind::Progress(true))=>{},
+                            Some(pb::relay_request::Kind::Member(m))=>if !hub.member(id,m){break},
                             _=>break,
                         }},
                         _=>break,

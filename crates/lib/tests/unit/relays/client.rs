@@ -13,6 +13,7 @@ async fn stop_joins_the_task_before_local_storage_can_be_replaced() {
             started.send(()).unwrap();
             std::future::pending::<()>().await;
         }),
+        draining: None,
     };
     ready.await.unwrap();
     session.stop().await;
@@ -20,6 +21,18 @@ async fn stop_joins_the_task_before_local_storage_can_be_replaced() {
         released.try_recv(),
         Err(tokio::sync::oneshot::error::TryRecvError::Closed)
     );
+}
+
+#[tokio::test]
+async fn drain_returns_once_the_draining_task_has_finished() {
+    let session = Session {
+        progress: Arc::default(),
+        changes: Arc::new(Watched::new(0)),
+        task: tokio::spawn(async {}),
+        draining: Some(Arc::new(Watched::new(false))),
+    };
+    // Polling the finished task again would panic.
+    session.drain().await;
 }
 
 fn target(engine: Arc<MemoryEngine>, buckets: Vec<u32>) -> Target {
@@ -353,6 +366,7 @@ async fn installed_bootstrap_and_tail_wait_for_source_confirmation_before_reads_
         progress: progress.clone(),
         changes: changes.clone(),
         task: tokio::spawn(std::future::pending()),
+        draining: None,
     };
     assert!(!session.ready());
     assert!(
@@ -501,6 +515,7 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
         progress,
         changes: Arc::new(Watched::new(0)),
         task: tokio::spawn(std::future::pending()),
+        draining: None,
     };
     assert!(!session.ready());
     assert!(session.error().is_some());

@@ -98,7 +98,7 @@ impl Breaker {
 
 /// This node's breakers, keyed by peer address (`host:port`).
 pub struct Health {
-    // ponytail: entries are never evicted, like `Peers::channels`; drop departed peers once membership exists (B-12).
+    /// Departed cell members are dropped through [`crate::transport::Peers::forget`] (B-12).
     breakers: Mutex<BTreeMap<String, Breaker>>,
     transitions: Family<TransitionLabels, Counter>,
     fail_open: Counter,
@@ -153,6 +153,10 @@ impl Health {
             Breaker::HalfOpen { backoff, .. } => Some(Breaker::reopen(backoff, now)),
             Breaker::Open { .. } => None,
         });
+    }
+
+    pub(crate) fn forget(&self, peer: &str) {
+        self.breakers.lock().unwrap().remove(peer);
     }
 
     pub fn state(&self, peer: &str) -> State {

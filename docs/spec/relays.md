@@ -38,21 +38,21 @@ Run TLC with relays.cfg; record actual results separately.
 ## Deployment and recovery
 
 `bedrock-relay` serves Relay.Session on `listen`. `upstreams` retains preference order;
-the peer's negotiated tier must be higher. `replay_peers` names sibling recovery
-sources, not live parents. Recovery carries a visited path capped at eight relays.
+the peer's negotiated tier must be higher. `replay_peers` names same-tier siblings:
+recovery sources and the [sibling stream](membership.md), not live parents. Recovery carries a visited path capped at eight relays.
 There is one persistent subscription per process; temporary recovery sessions are
 bounded and may use other peers. Control traffic remains separate from artifact
 bulk connections.
 
-Deploy at least two relays per cell, adding approximately one relay per 500–1,000
-nodes. Rotate the configured relay preference across nodes to distribute load;
+Deploy at least three relays per cell (membership publication needs a majority), adding approximately
+one relay per 500–1,000 nodes. Rotate the configured relay preference across nodes to distribute load;
 upper tiers need only a few relays. Provisioning is static configuration here.
 
 KV/CDN `[[subscriptions]]` entries explicitly name dataset, namespace and optional
 bucket IDs. Omitted/empty buckets follow the namespace. The KV binary permits
 Quicksilver/Auth; CDN permits only CDN metadata. Customer `kv` opens/reads do not
-create interests. Automatic ownership and membership publication remain
-#19 / B-16 and #15 / B-12 work; namespace interests here are explicit configuration.
+create interests. Automatic ownership remains #19 / B-16 work; namespace interests here are explicit
+configuration. Leaf sessions also carry [cell membership](membership.md) (#15 / B-12).
 The leaf client stores values under namespace-NUL prefixes and persists its
 selector identity and covered revision in the same local atomic batch. Changing a
 selector restarts recovery from validated state rather than reusing coverage.

@@ -83,6 +83,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             closed: closed.clone(),
             follows,
             changed: changed.clone(),
+            member: None,
         },
     );
     (
@@ -355,4 +356,72 @@ async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
     assert!(!closed.get());
     task.abort();
     writer.close().await.unwrap();
+}
+
+fn member(node_id: &str, status: pb::member::Status) -> pb::Member {
+    pb::Member {
+        node_id: node_id.into(),
+        service: "kv".into(),
+        cell: "eu-1a".into(),
+        status: status as i32,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn members_track_sessions_status_updates_and_graceful_leaves() {
+    let hub = hub();
+    let (_old, _) = subscriber(&hub, 1, 4);
+    let (_new, _) = subscriber(&hub, 2, 4);
+    let (_other, _) = subscriber(&hub, 3, 4);
+    for (id, node) in [(1, "kv-1"), (2, "kv-1"), (3, "kv-2")] {
+        hub.0
+            .subscribers
+            .lock()
+            .unwrap()
+            .get_mut(&id)
+            .unwrap()
+            .member = Some(member(node, pb::member::Status::Ready));
+    }
+    let members = hub.members();
+    assert_eq!(members.len(), 2);
+    assert_eq!(
+        members[&("kv".to_string(), "kv-2".to_string())].applied,
+        BTreeMap::from([(("auth".to_string(), "users".to_string()), 0)])
+    );
+    // Only the same identity may change, and a client cannot claim to have left.
+    assert!(!hub.member(2, member("kv-2", pb::member::Status::Draining)));
+    assert!(!hub.member(2, member("kv-1", pb::member::Status::Left)));
+    let version = hub.member_version().get();
+    // An update changes only the status; the rest of the entry stays as announced.
+    assert!(hub.member(
+        2,
+        pb::Member {
+            address: "elsewhere:7000".into(),
+            ..member("kv-1", pb::member::Status::Draining)
+        }
+    ));
+    assert_ne!(hub.member_version().get(), version);
+    assert_eq!(
+        hub.0.subscribers.lock().unwrap()[&2].member,
+        Some(member("kv-1", pb::member::Status::Draining))
+    );
+    // The newest session for an identity wins; closing it leaves a LEFT marker over the stale one.
+    hub.remove(2);
+    let key = ("kv".to_string(), "kv-1".to_string());
+    assert_eq!(
+        hub.members()[&key].member.status,
+        pb::member::Status::Ready as i32
+    );
+    hub.remove(1);
+    assert_eq!(
+        hub.members()[&key].member.status,
+        pb::member::Status::Left as i32
+    );
+    // An ungraceful close leaves nothing behind.
+    hub.remove(3);
+    assert!(
+        !hub.members()
+            .contains_key(&("kv".to_string(), "kv-2".to_string()))
+    );
 }

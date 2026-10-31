@@ -3,7 +3,7 @@
 pub mod buckets;
 pub mod datasets;
 pub mod health;
-pub mod membership {}
+pub mod membership;
 pub mod node;
 pub mod placement {}
 pub mod reconciliation {}
@@ -15,6 +15,7 @@ pub mod transport;
 
 // madsim's Tokio clock uses `std::time::Instant`; scope the lint exception to this adapter.
 #[cfg_attr(madsim, allow(clippy::disallowed_methods))]
-pub(crate) fn monotonic_now() -> tokio::time::Instant {
+/// Returns the runtime's monotonic clock, including simulated time under madsim.
+pub fn monotonic_now() -> tokio::time::Instant {
     tokio::time::Instant::now()
 }

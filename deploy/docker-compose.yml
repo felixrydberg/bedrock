@@ -28,6 +28,9 @@ services:
     build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-relay } }
     image: bedrock-relay
     volumes: [/var/lib/bedrock/relay:/data, ./config/relay.toml:/etc/bedrock/config.toml:ro]
+    environment:
+      # Cell relays publish membership through the write API.
+      BEDROCK_WRITE_TOKEN: "${BEDROCK_WRITE_TOKEN:?Set a random write API bearer token}"
     cpus: 1
     mem_limit: 2g
 

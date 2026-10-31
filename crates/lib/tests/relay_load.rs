@@ -88,6 +88,7 @@ async fn subscribe(
         kind: Some(pb::relay_request::Kind::Hello(pb::Hello {
             version: 1,
             tier: 0,
+            member: None,
         })),
     })
     .await

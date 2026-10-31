@@ -47,6 +47,7 @@ pub struct Session {
     progress: Arc<Mutex<Progress>>,
     changes: Arc<Watched<u64>>,
     task: tokio::task::JoinHandle<()>,
+    draining: Option<Arc<Watched<bool>>>,
 }
 
 impl Session {
@@ -54,6 +55,29 @@ impl Session {
         peers: Arc<Peers>,
         upstreams: Vec<String>,
         targets: Vec<Target>,
+    ) -> Result<Self, Status> {
+        Self::open(peers, upstreams, targets, None)
+    }
+
+    /// Like [`Session::start`], announcing `member` to the relays, which makes this process a cell member (B-12).
+    pub fn join(
+        peers: Arc<Peers>,
+        upstreams: Vec<String>,
+        targets: Vec<Target>,
+        member: pb::Member,
+    ) -> Result<Self, Status> {
+        crate::membership::validate(&member)?;
+        if member.status != pb::member::Status::Ready as i32 {
+            return Err(Status::invalid_argument("a joining member must be ready"));
+        }
+        Self::open(peers, upstreams, targets, Some(member))
+    }
+
+    fn open(
+        peers: Arc<Peers>,
+        upstreams: Vec<String>,
+        targets: Vec<Target>,
+        member: Option<pb::Member>,
     ) -> Result<Self, Status> {
         if upstreams.is_empty() {
             return Err(Status::invalid_argument("upstreams are required"));
@@ -73,17 +97,20 @@ impl Session {
         }
         let progress = Arc::new(Mutex::new(state));
         let changes = Arc::new(Watched::new(0));
+        let draining = member.as_ref().map(|_| Arc::new(Watched::new(false)));
         let task = tokio::spawn(run(
             peers,
             upstreams,
             consumers,
             progress.clone(),
             changes.clone(),
+            member.zip(draining.clone()),
         ));
         Ok(Self {
             progress,
             changes,
             task,
+            draining,
         })
     }
 
@@ -98,6 +125,30 @@ impl Session {
     /// Most recent connection, protocol or local storage failure, for readiness diagnostics.
     pub fn error(&self) -> Option<Status> {
         self.progress.lock().unwrap().error.clone()
+    }
+
+    /// The validated revision applied for a scope.
+    pub fn applied(&self, dataset: &str, namespace: &str) -> Option<u64> {
+        self.progress
+            .lock()
+            .unwrap()
+            .scopes
+            .get(&(dataset.to_owned(), namespace.to_owned()))
+            .filter(|(_, _, validated)| *validated)
+            .map(|(applied, _, _)| *applied)
+    }
+
+    /// Graceful shutdown of a member: announces `draining`, closes the stream once the relay has it, then stops.
+    /// Cell relays remove a drained member without waiting out the grace period (B-12).
+    pub async fn drain(mut self) {
+        if let Some(draining) = &self.draining {
+            draining.update(|d| *d = true);
+            // A finished task must not be polled again.
+            if tokio::time::timeout(IDLE, &mut self.task).await.is_ok() {
+                return;
+            }
+        }
+        self.stop().await;
     }
 
     /// Stop and join the task before replacing or reusing its local storage.
@@ -521,15 +572,22 @@ async fn send(
         .map_err(|_| Status::unavailable("relay request stream closed"))
 }
 
+type Membership = (pb::Member, Arc<Watched<bool>>);
+
 async fn run(
     peers: Arc<Peers>,
     upstreams: Vec<String>,
     mut consumers: BTreeMap<Scope, Consumer>,
     progress: Arc<Mutex<Progress>>,
     changes: Arc<Watched<u64>>,
+    member: Option<Membership>,
 ) {
+    let drained = || member.as_ref().is_some_and(|(_, draining)| draining.get());
     loop {
         for upstream in peers.health().route(&upstreams) {
+            if drained() {
+                return;
+            }
             for consumer in consumers.values_mut() {
                 consumer.reconnect();
             }
@@ -539,7 +597,18 @@ async fn run(
                     *head = None;
                 }
             });
-            let error = connection(&peers, upstream, &mut consumers, &progress, &changes).await;
+            let error = connection(
+                &peers,
+                upstream,
+                &mut consumers,
+                &progress,
+                &changes,
+                member.as_ref(),
+            )
+            .await;
+            if drained() {
+                return;
+            }
             changed(&progress, &changes, |state| {
                 state.connected = false;
                 state.error = Some(error.clone());
@@ -569,8 +638,9 @@ async fn connection(
     consumers: &mut BTreeMap<Scope, Consumer>,
     progress: &Mutex<Progress>,
     changes: &Watched<u64>,
+    member: Option<&Membership>,
 ) -> Status {
-    match connected(peers, upstream, consumers, progress, changes).await {
+    match connected(peers, upstream, consumers, progress, changes, member).await {
         Ok(()) => Status::unavailable("relay stream ended"),
         Err(error) => error,
     }
@@ -582,6 +652,7 @@ async fn connected(
     consumers: &mut BTreeMap<Scope, Consumer>,
     progress: &Mutex<Progress>,
     changes: &Watched<u64>,
+    member: Option<&Membership>,
 ) -> Result<(), Status> {
     let (requests, receiver) = mpsc::channel(16);
     send(
@@ -590,6 +661,7 @@ async fn connected(
             kind: Some(pb::relay_request::Kind::Hello(pb::Hello {
                 version: 1,
                 tier: 0,
+                member: member.map(|(member, _)| member.clone()),
             })),
         },
     )
@@ -623,6 +695,12 @@ async fn connected(
     });
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     let mut intake = Intake::default();
+    let mut draining = std::pin::pin!(async {
+        match member {
+            Some((_, draining)) => draining.wait_until(|d| *d).await,
+            None => std::future::pending().await,
+        }
+    });
     loop {
         // Keep this read's deadline when sending progress; outbound activity cannot prove the source is alive.
         let frame = {
@@ -631,6 +709,7 @@ async fn connected(
             loop {
                 tokio::select! {
                     biased;
+                    _ = &mut draining => break None,
                     _ = tick.tick() => {
                         send(&requests, pb::RelayRequest {
                             kind: Some(pb::relay_request::Kind::Progress(true)),
@@ -639,9 +718,30 @@ async fn connected(
                             send(&requests, consumers.get(&scope).unwrap().request()).await?;
                         }
                     },
-                    frame = &mut reading => break frame?,
+                    frame = &mut reading => break Some(frame?),
                 }
             }
+        };
+        let Some(frame) = frame else {
+            let (member, _) = member.unwrap();
+            send(
+                &requests,
+                pb::RelayRequest {
+                    kind: Some(pb::relay_request::Kind::Member(pb::Member {
+                        status: pb::member::Status::Draining as i32,
+                        ..member.clone()
+                    })),
+                },
+            )
+            .await?;
+            // Half-close; the relay ends the stream once it has processed the status.
+            drop(requests);
+            while peers
+                .call(upstream, Class::Control, TIMEOUT, stream.message())
+                .await?
+                .is_some()
+            {}
+            return Ok(());
         };
         let Some(frame) = frame else {
             return Ok(());

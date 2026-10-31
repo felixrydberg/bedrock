@@ -401,7 +401,7 @@ A cell is a self-contained cluster: its own membership, virtual buckets, L2 and 
 
 - A datacenter is one cell by default. A cell's maximum size is set by its bucket count (2²⁰ buckets balance well up to about
   10,000 nodes). The actual size is chosen for blast radius, since a bad deploy or relay bug takes down one cell. Large sites split into several cells.
-- Relays per cell grow with the node count (minimum 2), so connections and egress never sit on one machine.
+- Relays per cell grow with the node count (minimum 3, since membership publication needs a majority; B-12), so connections and egress never sit on one machine.
 - Each cell has its own bucket ownership table. Cells do not know each other's buckets.
 - Reads stay inside the cell, except customer KV misses (below).
 - Cells apply revisions independently. A client moved between cells uses minimum-revision reads so it never sees an older value.

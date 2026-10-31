@@ -1,6 +1,7 @@
 # Storage recovery model (#11 / B-11)
 
 Relay protocol and recovery: [#14 / B-17 and #16 / B-18](relays.md).
+Cell membership from relay streams: [#15 / B-12](membership.md).
 
 The standalone writer persists directly to SlateDB in S3. See
 [the atomic namespace protocol model](materialized.md) for its bounded checks and

@@ -53,22 +53,50 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
     let hub = bedrock_lib::relays::Hub::relay(
         config.node.node_id.clone(),
         bedrock_lib::relays::tier_rank(config.tier),
-        peers,
+        peers.clone(),
         config.upstreams.clone(),
         config.replay_peers.clone(),
         replay,
     )
     .with_clock(now);
-    let upstream = hub.start();
+    let mut tasks = vec![hub.start()];
+    // Every relay serves its siblings; only membership watches them so far (#41 / B-12b adds interests).
+    if let Some(settings) = &config.membership {
+        let (siblings, watching) = bedrock_lib::relays::siblings::Siblings::start(
+            peers.clone(),
+            config.replay_peers.clone(),
+        );
+        tasks.push(watching);
+        tasks.push(
+            bedrock_lib::membership::Cell::start(
+                hub.clone(),
+                peers,
+                config.upstreams.clone(),
+                siblings,
+                settings,
+                config.node.advertised(),
+                config.node.location.cell.clone(),
+                config.write_token.clone().unwrap_or_default(),
+            )
+            .map_err(|e| ConfigError(format!("membership: {e}")))?,
+        );
+    }
     let server = tonic::transport::Server::builder()
-        .add_service(bedrock_lib::replication::pb::relay_server::RelayServer::new(hub))
+        .add_service(bedrock_lib::replication::pb::relay_server::RelayServer::new(hub.clone()))
+        .add_service(
+            bedrock_lib::replication::pb::siblings_server::SiblingsServer::new(
+                bedrock_lib::relays::siblings::Server(hub),
+            ),
+        )
         .serve(config.node.listen);
     admin.set_ready(true);
     tokio::select! {biased;
         () = node::shutdown_signal() => {},
         result = server => {result.map_err(|e|ConfigError(format!("relay listen: {e}")))?;},
     }
-    upstream.abort();
+    for task in tasks {
+        task.abort();
+    }
     admin.set_ready(false);
     tracing::info!("shutting down");
     Ok(())

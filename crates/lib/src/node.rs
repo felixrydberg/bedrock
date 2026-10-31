@@ -24,6 +24,9 @@ pub struct NodeConfig {
     pub node_id: String,
     pub location: Location,
     pub listen: SocketAddr,
+    /// `host:port` other nodes dial; defaults to `listen` (B-12 membership entries carry it).
+    #[serde(default)]
+    pub advertise: Option<String>,
     /// Serves `/metrics`, `/health` and `/ready`.
     pub admin_listen: SocketAddr,
     pub data_dir: PathBuf,
@@ -31,11 +34,22 @@ pub struct NodeConfig {
     pub budget: Budget,
 }
 
+impl NodeConfig {
+    pub fn advertised(&self) -> String {
+        self.advertise
+            .clone()
+            .unwrap_or_else(|| self.listen.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Location {
     pub region: String,
     pub dc: String,
     pub cell: String,
+    /// Placement keeps replicas in different failure domains (e.g. a rack); empty means none.
+    #[serde(default)]
+    pub failure_domain: String,
 }
 
 /// Resource budgets for the process; unset means no limit.
@@ -96,17 +110,56 @@ pub enum Tier {
 }
 
 /// `bedrock-relay`. Relays have no roles.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct RelayConfig {
     #[serde(flatten)]
     pub node: NodeConfig,
     pub tier: Tier,
     /// Upstream relays, or `bedrock-api` for the top tier, in preference order.
     pub upstreams: Vec<String>,
+    /// Same-tier sibling relays: recovery sources and the sibling stream (B-12), by advertised address.
     #[serde(default)]
     pub replay_peers: Vec<String>,
     #[serde(default)]
     pub replay: ReplaySettings,
+    /// Cell-tier membership publication (B-12); absent disables it.
+    #[serde(default)]
+    pub membership: Option<MembershipSettings>,
+    /// `bedrock-api` write credential, required with `membership`.
+    #[serde(default)]
+    pub write_token: Option<String>,
+}
+
+impl fmt::Debug for RelayConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RelayConfig")
+            .field("node", &self.node)
+            .field("tier", &self.tier)
+            .field("upstreams", &self.upstreams)
+            .field("replay_peers", &self.replay_peers)
+            .field("replay", &self.replay)
+            .field("membership", &self.membership)
+            .field(
+                "write_token",
+                &self.write_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// The cell's relays are this relay and its `replay_peers`; publishing needs a majority of them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MembershipSettings {
+    /// `bedrock-api` endpoint for writes, its `write_listen`.
+    pub api: String,
+    /// How long a disconnected node stays a member; it may reconnect to any cell relay meanwhile.
+    #[serde(default = "default_grace_ms")]
+    pub grace_ms: u64,
+}
+
+/// Longer than a silent relay's detection ([`crate::relays::IDLE`]) minus its progress interval, so failover fits.
+fn default_grace_ms() -> u64 {
+    20_000
 }
 
 /// Optional overrides preserve tier defaults without overriding an explicit window.
@@ -122,6 +175,31 @@ impl RelayConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.upstreams.is_empty() {
             return Err(ConfigError("upstreams must not be empty".into()));
+        }
+        if let Some(membership) = &self.membership {
+            if self.tier != Tier::Cell {
+                return Err(ConfigError("membership requires a cell-tier relay".into()));
+            }
+            let advertised = self.node.advertised();
+            // Siblings elect the publisher by address, so it must be the one they dial.
+            if advertised
+                .parse::<SocketAddr>()
+                .is_ok_and(|address| address.ip().is_unspecified())
+            {
+                return Err(ConfigError(
+                    "membership requires advertise when listen is an unspecified address".into(),
+                ));
+            }
+            if self.replay_peers.contains(&advertised) {
+                return Err(ConfigError(
+                    "replay_peers must not list this relay's advertised address".into(),
+                ));
+            }
+            if membership.api.is_empty() || self.write_token.as_deref().is_none_or(str::is_empty) {
+                return Err(ConfigError(
+                    "membership requires membership.api and write_token".into(),
+                ));
+            }
         }
         Ok(())
     }
