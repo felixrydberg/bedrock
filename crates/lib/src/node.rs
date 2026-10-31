@@ -180,7 +180,17 @@ impl RelayConfig {
             if self.tier != Tier::Cell {
                 return Err(ConfigError("membership requires a cell-tier relay".into()));
             }
-            if self.replay_peers.contains(&self.node.advertised()) {
+            let advertised = self.node.advertised();
+            // Siblings elect the publisher by address, so it must be the one they dial.
+            if advertised
+                .parse::<SocketAddr>()
+                .is_ok_and(|address| address.ip().is_unspecified())
+            {
+                return Err(ConfigError(
+                    "membership requires advertise when listen is an unspecified address".into(),
+                ));
+            }
+            if self.replay_peers.contains(&advertised) {
                 return Err(ConfigError(
                     "replay_peers must not list this relay's advertised address".into(),
                 ));

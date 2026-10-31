@@ -23,6 +23,18 @@ async fn stop_joins_the_task_before_local_storage_can_be_replaced() {
     );
 }
 
+#[tokio::test]
+async fn drain_returns_once_the_draining_task_has_finished() {
+    let session = Session {
+        progress: Arc::default(),
+        changes: Arc::new(Watched::new(0)),
+        task: tokio::spawn(async {}),
+        draining: Some(Arc::new(Watched::new(false))),
+    };
+    // Polling the finished task again would panic.
+    session.drain().await;
+}
+
 fn target(engine: Arc<MemoryEngine>, buckets: Vec<u32>) -> Target {
     Target {
         selection: Selection {

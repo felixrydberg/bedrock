@@ -170,6 +170,16 @@ fn relay_membership_needs_a_cell_relay_and_its_write_token() {
         .is_err()
     );
     assert!(relay(r#"advertise = "relay-1:7300""#).validate().is_err());
+    // Siblings cannot dial or rank an unspecified address.
+    assert!(relay(r#"write_token = "t""#).validate().is_err());
+    assert!(
+        relay(
+            r#"advertise = "0.0.0.0:7300"
+                write_token = "t""#
+        )
+        .validate()
+        .is_err()
+    );
     let mut dc = relay(
         r#"advertise = "relay-1:7300"
                 write_token = "t""#,

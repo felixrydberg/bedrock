@@ -393,8 +393,19 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
     assert!(!hub.member(2, member("kv-2", pb::member::Status::Draining)));
     assert!(!hub.member(2, member("kv-1", pb::member::Status::Left)));
     let version = hub.member_version().get();
-    assert!(hub.member(2, member("kv-1", pb::member::Status::Draining)));
+    // An update changes only the status; the rest of the entry stays as announced.
+    assert!(hub.member(
+        2,
+        pb::Member {
+            address: "elsewhere:7000".into(),
+            ..member("kv-1", pb::member::Status::Draining)
+        }
+    ));
     assert_ne!(hub.member_version().get(), version);
+    assert_eq!(
+        hub.0.subscribers.lock().unwrap()[&2].member,
+        Some(member("kv-1", pb::member::Status::Draining))
+    );
     // The newest session for an identity wins; closing it leaves a LEFT marker over the stale one.
     hub.remove(2);
     let key = ("kv".to_string(), "kv-1".to_string());

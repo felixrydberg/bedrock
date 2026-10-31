@@ -399,16 +399,17 @@ impl Hub {
         let Some(sub) = subscribers.get_mut(&id) else {
             return false;
         };
-        let accepted = match &sub.member {
-            Some(current) => crate::membership::key(current) == crate::membership::key(&member),
-            None => false,
+        let Some(current) = sub
+            .member
+            .as_mut()
+            .filter(|current| crate::membership::key(current) == crate::membership::key(&member))
+        else {
+            return false;
         };
-        if accepted {
-            sub.member = Some(member);
-            drop(subscribers);
-            self.members_changed();
-        }
-        accepted
+        current.status = member.status;
+        drop(subscribers);
+        self.members_changed();
+        true
     }
     /// Immediate send for control frames: a full queue disconnects the subscriber.
     fn send(&self, id: u64, kind: pb::relay_frame::Kind) -> bool {

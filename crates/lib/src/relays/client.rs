@@ -143,7 +143,10 @@ impl Session {
     pub async fn drain(mut self) {
         if let Some(draining) = &self.draining {
             draining.update(|d| *d = true);
-            let _ = tokio::time::timeout(IDLE, &mut self.task).await;
+            // A finished task must not be polled again.
+            if tokio::time::timeout(IDLE, &mut self.task).await.is_ok() {
+                return;
+            }
         }
         self.stop().await;
     }
