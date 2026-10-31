@@ -50,18 +50,18 @@ The I/O rules in `clippy.toml` apply to every crate; adapters opt out with an ex
 
 | Module           | Responsibility                                                        |
 | ---------------- | --------------------------------------------------------------------- |
-| `membership`     | Cell membership from relay streams, published as a namespace          |
+| `membership`     | Cell membership and the L2 placement directory from relay streams, published as one namespace |
 | `health`         | Per-peer reachability from real traffic, storage health, availability |
-| `buckets`        | Virtual bucket assignment, ownership, and rebalancing                 |
-| `placement`      | Rendezvous hashing, replica selection, and failure-domain awareness   |
+| `buckets`        | 64-bit key hash, hash ranges and owner checks (`feature-drafts.md` §4 decision 13) |
+| `placement`      | Relay range assignment, failure domains; customer-KV rendezvous       |
 | `replication`    | Ordered streams, namespace revisions, replay, snapshots, and recovery |
-| `relays`         | Relay tiers, event fan-out and peer discovery (run by `bedrock-relay`) |
+| `relays`         | Relay tiers, event fan-out, peer discovery and range handoffs (run by `bedrock-relay`) |
 | `reconciliation` | Compare desired state with actual state and schedule repair           |
 | `storage`        | `StorageEngine` contract and adapters (RocksDB), shared by all binaries |
 | `datasets`       | Dataset → namespace model and policy resolution                       |
 | `node`           | Node config (file + `BEDROCK_*` env), roles, logging and graceful shutdown |
 | `s3`             | Namespace-engine object I/O and checksummed CDN artifact storage     |
 | `transport`      | Node-to-node transport and observability baseline                     |
-| `quicksilver/storage` | Quicksilver/Auth L1/L2 bucket keyspaces and eviction, on top of `lib/storage` |
+| `quicksilver/storage` | Quicksilver/Auth L1/L2 hash-range keyspaces and eviction, on top of `lib/storage` |
 | `kv/storage`     | Customer-KV reader residency and cache eviction (B-28, B-39)          |
 
