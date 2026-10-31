@@ -67,32 +67,31 @@ pub enum Role {
     L2,
 }
 
-/// `bedrock-kv` and `bedrock-cdn`.
+/// `bedrock-quicksilver`, `bedrock-kv` and `bedrock-cdn`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceConfig {
     #[serde(flatten)]
     pub node: NodeConfig,
     pub roles: Vec<Role>,
+    /// Relay-fed datasets this process hosts; `bedrock-kv` hosts none and leaves it empty.
+    #[serde(default)]
     pub datasets: Vec<String>,
     /// Relay endpoints to subscribe through, cell relays first.
     pub relays: Vec<String>,
     /// `bedrock-api` endpoint for writes, its `write_listen`.
     pub api: String,
     pub s3_endpoint: String,
-    /// Explicit pushed namespace interests; customer KV has no relay subscription.
+    /// Explicit pushed namespace interests; `bedrock-kv` (customer KV) has no relay subscription.
     #[serde(default)]
     pub subscriptions: Vec<crate::relays::client::Selection>,
 }
 
 impl ServiceConfig {
-    /// Rejects configs that name no roles, datasets or relays. `datasets::Registry::open` rejects datasets this
-    /// binary does not host.
+    /// Rejects configs that name no roles or relays. `datasets::Registry::open` rejects empty dataset lists and
+    /// datasets this binary does not host.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.roles.is_empty() {
             return Err(ConfigError("roles must name at least one of l1, l2".into()));
-        }
-        if self.datasets.is_empty() {
-            return Err(ConfigError("datasets must not be empty".into()));
         }
         if self.relays.is_empty() {
             return Err(ConfigError("relays must not be empty".into()));

@@ -198,6 +198,11 @@ fn rejects_dataset_hosted_elsewhere() {
 }
 
 #[test]
+fn rejects_empty_dataset_list() {
+    assert!(Registry::open(&[dataset("kv")], &[], |_| unreachable!()).is_err());
+}
+
+#[test]
 #[cfg(not(madsim))]
 fn engines_persist_in_separate_dataset_directories() {
     let dir = tempfile::tempdir().unwrap();

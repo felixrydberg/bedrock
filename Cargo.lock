@@ -633,6 +633,7 @@ name = "bedrock-kv"
 version = "0.1.0"
 dependencies = [
  "bedrock-lib",
+ "figment",
  "madsim-tokio",
  "tracing",
 ]
@@ -666,6 +667,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bedrock-quicksilver"
+version = "0.1.0"
+dependencies = [
+ "bedrock-lib",
+ "madsim-tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bedrock-relay"
 version = "0.1.0"
 dependencies = [
@@ -684,6 +694,7 @@ dependencies = [
  "bedrock-cdn",
  "bedrock-kv",
  "bedrock-lib",
+ "bedrock-quicksilver",
  "bedrock-relay",
  "http-body-util",
  "hyper 1.12.0",

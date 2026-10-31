@@ -1,6 +1,6 @@
 //! B-23a spike and determinism check: one seed must reproduce one trace.
 //!
-//! The real `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` entry points boot as simulated nodes and stop
+//! The real `bedrock-quicksilver`, `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` entry points boot as simulated nodes and stop
 //! on a simulated Ctrl-C. Alongside them, two nodes talk over tonic (unary and server stream), the server writes every
 //! message to the simulated S3, and an Axum router answers HTTP over simulated TCP. Run with `RUSTFLAGS="--cfg madsim" cargo test -p bedrock-sim`.
 //! The proto is shared with `tests/transport.rs`, which also runs in normal builds, so `build.rs` compiles it in both.
@@ -157,13 +157,18 @@ async fn scenario() -> u64 {
         ("cdn", "10.0.1.2"),
         ("relay", "10.0.1.3"),
         ("api", "10.0.1.4"),
+        ("quicksilver", "10.0.1.5"),
     ];
     let running: Vec<_> = services
         .iter()
         .map(|&(name, ip)| {
             let node = node_config(name, ip);
             let fut: std::pin::Pin<Box<dyn Future<Output = _> + Send>> = match name {
-                "kv" => Box::pin(bedrock_kv::run(service_config(node, bedrock_kv::DATASETS))),
+                "kv" => Box::pin(bedrock_kv::run(service_config(node, &[]))),
+                "quicksilver" => Box::pin(bedrock_quicksilver::run(service_config(
+                    node,
+                    bedrock_quicksilver::DATASETS,
+                ))),
                 "cdn" => Box::pin(bedrock_cdn::run(service_config(
                     node,
                     bedrock_cdn::DATASETS,

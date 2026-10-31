@@ -1,92 +1,25 @@
-//! `bedrock-kv`: hosts the `quicksilver`, `kv` and `auth` datasets.
+//! `bedrock-kv`: customer KV. It hosts no relay-fed datasets; it only joins the cell membership as service `kv`.
 
-mod namespaces {}
-mod operations {}
-pub mod storage;
-
-use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, ReplicationPolicy};
 use bedrock_lib::membership;
-use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
-
-pub const DATASETS: &[Dataset] = &[
-    // Routing and deployment metadata, complete in every datacenter (`kv.md` §4).
-    dataset("quicksilver", ReplicationPolicy::FullReplica, 60),
-    dataset("kv", ReplicationPolicy::OnDemand, 0),
-    dataset("auth", ReplicationPolicy::OnDemand, 0),
-];
-
-const fn dataset(
-    name: &'static str,
-    replication: ReplicationPolicy,
-    l1_recent_window_seconds: u64,
-) -> Dataset {
-    Dataset {
-        name,
-        defaults: Policy {
-            replication,
-            cache: CachePolicy {
-                l1_recent_window_seconds,
-                // `full_replica` keeps the complete namespace in L2.
-                l2_eviction: !matches!(replication, ReplicationPolicy::FullReplica),
-                pinned_prefixes: Vec::new(),
-            },
-            budget: Budget {
-                cpus: None,
-                memory_mb: None,
-                disk_mb: None,
-            },
-        },
-    }
-}
+use bedrock_lib::node::{self, ConfigError, ServiceConfig};
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
-    tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-kv");
-    let datasets = Registry::open(DATASETS, &config.datasets, |d| {
-        datasets::open_engine(&config.node.data_dir, d)
-    })?;
-    // ponytail: role subsystems don't exist yet; each starts here as its issue lands.
+    check_hosts_nothing_pushed(&config)?;
+    tracing::info!(node_id = %config.node.node_id, "starting bedrock-kv");
+    // ponytail: customer-KV readers (per-namespace S3 databases behind read-only caches) arrive with B-39; roles
+    // are only logged until then.
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
     let admin = node::start_admin(&config.node).await?;
-    let targets = config
-        .subscriptions
-        .iter()
-        .map(|selection| {
-            if !matches!(selection.dataset.as_str(), "quicksilver" | "auth") {
-                return Err(ConfigError(
-                    "KV relay subscriptions permit only quicksilver/auth".into(),
-                ));
-            }
-            let instance = datasets
-                .get(&selection.dataset)
-                .ok_or_else(|| ConfigError("subscribed dataset is not enabled".into()))?;
-            let Ok(engine)=&instance.engine else{return Ok(None)};
-            if let Err(error)=engine.health(){
-                tracing::warn!(dataset=%selection.dataset,%error,"dataset unavailable; other subscriptions continue");
-                return Ok(None);
-            }
-            let mut prefix = selection.namespace.as_bytes().to_vec();
-            prefix.push(0);
-            Ok(Some(bedrock_lib::relays::client::Target {
-                selection: selection.clone(),
-                engine:engine.clone(),
-                prefix,
-            }))
-        })
-        .collect::<Result<Vec<_>, ConfigError>>()?;
-    // ponytail: a skipped subscription keeps the node unready until restart; rebuild the Session if hot recovery matters.
-    let skipped = targets.iter().any(Option::is_none);
-    let mut targets: Vec<_> = targets.into_iter().flatten().collect();
     let (members, target) = membership::View::new("kv", &config.node.location.cell);
-    targets.push(target);
     let peers = std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin));
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
-        targets,
+        vec![target],
         membership::member(&config, "kv"),
     )
     .map_err(|e| ConfigError(e.to_string()))?;
@@ -96,7 +29,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         tokio::select! {biased;
             ()=&mut shutdown=>break,
             _=readiness.tick()=>{
-                admin.set_ready(!skipped && datasets.is_healthy() && session.ready());
+                admin.set_ready(session.ready());
                 if let Err(error)=members.refresh(&session,&peers){
                     tracing::warn!(%error,"membership view unreadable");
                 }
@@ -107,6 +40,16 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     session.drain().await;
     tracing::info!("shutting down");
     Ok(())
+}
+
+/// Customer KV has no pushed data: quicksilver, auth and cdn belong to other binaries.
+fn check_hosts_nothing_pushed(config: &ServiceConfig) -> Result<(), ConfigError> {
+    if config.datasets.is_empty() && config.subscriptions.is_empty() {
+        return Ok(());
+    }
+    Err(ConfigError(
+        "bedrock-kv hosts no relay-fed datasets; datasets and subscriptions must be empty".into(),
+    ))
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 # Cell membership (#15 / B-12)
 
-A member is a `bedrock-kv` or `bedrock-cdn` process that is receiving updates: it holds a leaf
+A member is a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process that is receiving updates: it holds a leaf
 `Relay.Session` to a relay of its own cell. There is no heartbeat or gossip protocol and no epoch.
 
 ## Protocol
@@ -18,7 +18,7 @@ A member is a `bedrock-kv` or `bedrock-cdn` process that is receiving updates: i
   only its own leaf members, never what it learned from a sibling. A sibling counts as live only while its synced
   stream is up. #41 / B-12b reuses this stream for subscriber interests at every tier.
 - **Publication.** Dataset `membership`, namespace `{service}.{cell}`, key node ID, value the encoded `Member`.
-  Cell relays subscribe to both service namespaces through their upstreams like any subscriber. Once that view is
+  Cell relays subscribe to every service namespace (`quicksilver`, `kv`, `cdn`) through their upstreams like any subscriber. Once that view is
   current, the relay with the lowest address among itself and its live siblings publishes, but only while they
   are a strict majority of the configured relays. It writes the diff between the union of live lists and the
   published view through `bedrock-api` with the relay's `write_token`. It then waits until its subscription
@@ -30,9 +30,9 @@ A member is a `bedrock-kv` or `bedrock-cdn` process that is receiving updates: i
 - **Freeze.** Without a majority, or before the relay's subscription is current, nothing is written. With every
   cell relay down, nodes keep their last view. A node cut off from all relays is removed even though its peers
   may still reach it.
-- **Isolation.** KV and CDN, and different cells, use separate namespaces. Relays ignore entries for another
+- **Isolation.** Quicksilver, KV and CDN, and different cells, use separate namespaces. Relays ignore entries for another
   cell; such a node can still receive data through a DC-tier fallback relay but is not a member of that cell.
-- **Nodes.** `bedrock-kv` and `bedrock-cdn` subscribe to their own `{service}.{cell}` namespace in memory
+- **Nodes.** `bedrock-quicksilver`, `bedrock-kv` and `bedrock-cdn` subscribe to their own `{service}.{cell}` namespace in memory
   (`membership::View`). When the view advances, they drop the connections and circuit breakers of members
   that left. Shutdown drains the session: `draining`, half-close, then wait for the relay to end the stream.
 

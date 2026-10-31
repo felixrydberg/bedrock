@@ -1,15 +1,37 @@
 use super::*;
-use bedrock_lib::storage::memory::MemoryEngine;
-use std::sync::Arc;
+use figment::providers::{Format, Toml};
+
+fn config(extra: &str) -> ServiceConfig {
+    figment::Figment::new()
+        .merge(Toml::string(&format!(
+            r#"
+            node_id = "kv-1"
+            listen = "0.0.0.0:7100"
+            admin_listen = "0.0.0.0:7101"
+            data_dir = "data"
+            roles = ["l1"]
+            relays = ["relay-1:7300"]
+            api = "api:7000"
+            s3_endpoint = "http://s3:8333"
+            {extra}
+
+            [location]
+            region = "eu"
+            dc = "eu-1"
+            cell = "eu-1a"
+            "#
+        )))
+        .extract()
+        .unwrap()
+}
 
 #[test]
-fn opens_only_kv_datasets() {
-    let all = ["quicksilver", "kv", "auth"].map(String::from);
-    let r = Registry::open(DATASETS, &all, |d| Ok(Arc::new(MemoryEngine::new(d.name)))).unwrap();
-    assert_eq!(r.iter().count(), 3);
-    let qs = &r.get("quicksilver").unwrap().dataset.defaults;
-    assert_eq!(qs.replication, ReplicationPolicy::FullReplica);
-    assert!(!qs.cache.l2_eviction);
-    assert!(r.get("kv").unwrap().dataset.defaults.cache.l2_eviction);
-    assert!(Registry::open(DATASETS, &["kv".into(), "cdn".into()], |_| unreachable!()).is_err());
+fn hosts_no_datasets_or_subscriptions() {
+    assert!(check_hosts_nothing_pushed(&config("")).is_ok());
+    for dataset in ["quicksilver", "auth", "cdn"] {
+        let with_dataset = config(&format!("datasets = [\"{dataset}\"]"));
+        assert!(check_hosts_nothing_pushed(&with_dataset).is_err());
+    }
+    let subscribed = config("subscriptions = [{ dataset = \"quicksilver\", namespace = \"n\" }]");
+    assert!(check_hosts_nothing_pushed(&subscribed).is_err());
 }

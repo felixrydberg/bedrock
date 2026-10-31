@@ -1,4 +1,4 @@
-# One image per binary: docker build -f deploy/Dockerfile --build-arg BIN=bedrock-kv -t bedrock-kv .
+# One image per binary: docker build -f deploy/Dockerfile --build-arg BIN=bedrock-quicksilver -t bedrock-quicksilver .
 FROM rust:1.92-bookworm AS build
 ARG BIN
 # librocksdb-sys generates its bindings with bindgen, which needs libclang.
