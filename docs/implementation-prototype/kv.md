@@ -86,7 +86,7 @@ Namespaces share their dataset's local storage instance.
 
 Application bindings reference existing namespace IDs.
 
-There are no exposed application-level shards. Regional L2 bucket partitioning remains an internal implementation detail.
+There are no exposed application-level shards. Regional L2 hash-range partitioning remains an internal implementation detail.
 
 ## 3. Replication Policies
 
@@ -249,12 +249,12 @@ Machine A (L1 + L2 + Relay)
 
 StorageEngine: quicksilver
   l1/{namespace}/{key}
-  l2/{bucket}/{namespace}/{key}
+  l2/{hash}/{namespace}/{key}      # {hash}: big-endian 64-bit hash, so an owned range is one contiguous span
   meta/{namespace}/...
 
 StorageEngine: kv
   l1/{namespace}/{key}
-  l2/{bucket}/{namespace}/{key}
+  l2/{hash}/{namespace}/{key}      # {hash}: big-endian 64-bit hash, so an owned range is one contiguous span
   meta/{namespace}/...
 
 StorageEngine: relay
@@ -326,7 +326,7 @@ Replicas must:
 - Recover missing history from relays or authoritative storage.
 
 A subscriber resumes by exchanging heads: on reconnect the relay sends the latest sequence per namespace in the
-subscribed buckets, and the node requests what it has not applied. This also covers namespaces created while it was
+subscribed hash ranges, and the node requests what it has not applied. This also covers namespaces created while it was
 disconnected.
 
 A delete travels as an ordered `DELETE` event like any other change. The stream needs no separate tombstone records,
@@ -353,24 +353,36 @@ For globally replicated datasets, leaves maintain a recent-update window before 
 
 ### L2 — Datacenter-Wide Cache
 
-L2 is distributed across participating machines using internal hash buckets.
+L2 is distributed across participating machines in contiguous ranges of a 64-bit hash of `(dataset, namespace, key)`
+(`feature-drafts.md` §4 decision 13). The cell relays assign the ranges and publish them as the placement directory.
 
 ```text
 US Datacenter
 
-Regional Relays
+Cell Relays (assign ranges, publish the directory)
       |
-      +-- Bucket Group A → Node 1
-      +-- Bucket Group B → Node 2
-      +-- Bucket Group C → Node 3
-      +-- Bucket Group D → Node 4
+      +-- [0x0000…, 0x4000…) → Nodes 1, 3
+      +-- [0x4000…, 0x8000…) → Nodes 2, 4
+      +-- [0x8000…, 0xc000…) → Nodes 3, 1
+      +-- [0xc000…, end)     → Nodes 4, 2
 ```
 
-Each node may serve its own L1 cache and assigned L2 buckets.
+Each node may serve its own L1 cache and assigned L2 ranges.
 
-Bucket assignments differ independently between datacenters.
+Range assignments differ independently between cells.
 
-Optional replicas provide regional redundancy.
+Each range has R owners, in distinct failure domains when possible, for regional redundancy.
+
+- **Directory.** The relays' majority membership publisher writes `range/{start}` entries into the same
+  `membership/{service}.{cell}` namespace as membership. Each entry lists the range's owners as `populating`, `ready` or
+  `leaving`. Every node subscribes to it and routes locally; relays are never on the read path.
+- **Assignment.** A joining member takes ranges, splitting the largest where needed, until its share matches its capacity.
+  A member removed after the grace period has its ranges reassigned. Draining members get nothing new, and a bounded
+  number of ranges move at once.
+- **Handoff.** Relays push each range to its new owners, bootstrap it, and mark an owner `ready` once it has acknowledged
+  the head. A `leaving` owner keeps serving until every new owner is `ready`; then its relay revokes the range, and the
+  node confirms the revoke against its own directory view before deleting the range and compacting the span.
+- **No majority.** Placement freezes: nothing moves or is revoked, and nodes keep serving what they hold.
 
 For `global`, L2 holds the regional working set.
 
@@ -382,7 +394,7 @@ Regional L2 placement tracks:
 
 - Node availability.
 - Storage health.
-- Bucket ownership.
+- Range ownership and handoff state (the placement directory).
 - Available replica copies.
 - Applied namespace revisions.
 
@@ -392,17 +404,17 @@ Membership comes from the streams nodes hold to their cell relays: relays merge 
 replicated namespace, with a grace period so a relay failover is not seen as nodes leaving. A member is a node that is receiving
 updates; one cut off from every relay is not advertised as a source. Each node also keeps a local per-peer circuit breaker
 fed by the outcome of real requests, and routes around peers that are failing it. Views converge but can briefly disagree,
-so there is no global placement epoch: a node rejects requests for buckets it does not own, and the caller tries the next candidate.
+so there is no global placement epoch: a node rejects requests for ranges it neither owns nor is leaving, and the caller tries the next candidate.
 When every candidate looks unhealthy, requests are still attempted (fail open).
 
 ### Cells
 
-A cell is a self-contained cluster: its own membership, virtual buckets, L2 and relays. It is the unit of scaling and failure isolation.
+A cell is a self-contained cluster: its own membership, placement directory, L2 and relays. It is the unit of scaling and failure isolation.
 
-- A datacenter is one cell by default. A cell's maximum size is set by its bucket count (2²⁰ buckets balance well up to about
-  10,000 nodes). The actual size is chosen for blast radius, since a bad deploy or relay bug takes down one cell. Large sites split into several cells.
+- A datacenter is one cell by default. No fixed bucket count caps a cell; its size is chosen for blast radius, since a bad
+  deploy or relay bug takes down one cell. Large sites split into several cells.
 - Relays per cell grow with the node count (minimum 3, since membership publication needs a majority; B-12), so connections and egress never sit on one machine.
-- Each cell has its own bucket ownership table. Cells do not know each other's buckets.
+- Each cell has its own placement directory. Cells do not know each other's ranges.
 - Reads stay inside the cell, except customer KV misses (below).
 - Cells apply revisions independently. A client moved between cells uses minimum-revision reads so it never sees an older value.
 - Losing a cell moves its traffic to cold caches elsewhere. Misses are coalesced at every tier and origin cells rate-limit per cell to absorb it.
@@ -441,7 +453,7 @@ Customer KV follows the Cloudflare Workers KV model: one store holds each namesp
 cell-a relays  cell-b relays   L1/L2
     |              |
  L1 + L2        L1 + L2
- (own buckets)  (own buckets)
+ (own ranges)   (own ranges)
 ```
 
 ## 10. Regional Relays
@@ -453,7 +465,7 @@ Responsibilities:
 - Persistent upstream connections.
 - Downstream replication fan-out.
 - Namespace subscription tracking.
-- L2 bucket discovery.
+- L2 range assignment, handoffs and the placement directory.
 - Node health and replica revisions.
 - Recent event replay.
 - Cache-miss coordination.
@@ -474,8 +486,9 @@ The writer sends each event once per region; each cell receives it over a short 
 - Every node and every CDN process holds one long-lived connection to a relay in its cell, with one logical stream per channel.
 - Failover walks the upstream list and resumes from the cursor. Duplicates and gaps are handled by the ordered applier.
 - Subscriptions propagate up the tree with counts, so a tier only receives namespaces that someone below it wants.
-- Fan-out is routed by `(namespace, bucket)`: L2 events go to the bucket's owners, not to every node. This includes `global` data and
-  `full_replica` data such as Quicksilver, which is spread across each cell's L2 buckets (§3), never held whole on one node.
+- Fan-out is routed by `(namespace, hash range)`: L2 events go to the range's owners, not to every node. Cell relays push each
+  subscriber the interests the placement directory gives it. This includes `global` data and `full_replica` data such as
+  Quicksilver, which is spread across each cell's L2 ranges (§3), never held whole on one node.
 - Each event is encoded once and shared by all subscribers. A subscriber whose bounded queue fills is disconnected and catches up from replay.
 
 ### Two Independent Relay Channels
@@ -663,7 +676,7 @@ The health manager tracks:
 
 - Dataset and engine instance.
 - Affected cache layer.
-- Affected bucket or key range, if identifiable.
+- Affected hash range or key, if identifiable.
 - Error frequency.
 - Current health state.
 - Recovery attempts.
@@ -721,18 +734,17 @@ When a leaf or L2 holder becomes unavailable:
 
 Directory entries use health information to avoid routing to failed holders. A request that still reaches an outdated owner is rejected by that owner and retried elsewhere.
 
-### 15.5 L2 Bucket Redistribution
+### 15.5 L2 Range Redistribution
 
-If an L2 node fails:
+If an L2 node fails (removed from membership after the grace period), joins or drains:
 
-1. Detect the failed holder.
-2. Select replacement nodes using regional placement rules.
-3. Assign the missing buckets to healthy nodes.
-4. Repopulate from existing replicas or authoritative storage.
-5. Verify integrity and required revisions.
-6. Mark the replacement buckets ready.
+1. The relays' assignment writes the affected ranges' new owners as `populating`.
+2. Each new owner's relay pushes the range and bootstraps it from authoritative materialized state plus tail.
+3. Verify integrity and required revisions.
+4. The publisher marks the owner `ready` once it has acknowledged the head.
+5. Any `leaving` owner keeps serving until every new owner is `ready`, then is revoked and deletes the range.
 
-For ordinary caches, missing buckets may temporarily fall through to L3.
+For ordinary caches, ranges without a ready owner may temporarily fall through to L3.
 
 For `full_replica`, loss of required coverage must be reported as degraded until rebuilding restores the configured redundancy and completeness.
 
@@ -744,7 +756,7 @@ Recovery may involve:
 
 - Reinitializing a corrupted storage instance.
 - Restoring individual keys.
-- Rebuilding individual L2 bucket ranges.
+- Rebuilding individual L2 hash ranges.
 - Replaying recent namespace revisions.
 - Restoring snapshots from S3.
 
@@ -760,7 +772,7 @@ Prefer recovery at the smallest practical logical level.
 |---|---|
 | Missing cached key | Fetch key from healthy source |
 | Corrupted cached entry | Quarantine and refetch if safely identifiable |
-| Failed L2 bucket | Reassign and repopulate bucket |
+| Failed L2 range | Reassign and repopulate the range |
 | Corrupted storage instance | Recreate instance and restore required cache state |
 | Failed local disk | Bypass disk and reconstruct on replacement storage |
 
@@ -870,7 +882,7 @@ Monitor:
 - Replication latency and revision lag.
 - L1/L2 cache hit rates.
 - Relay replay coverage.
-- L2 bucket placement and redundancy.
+- L2 range placement, handoff state and redundancy.
 - Engine-specific I/O errors.
 - Corruption detections.
 - Storage-instance health.
@@ -889,7 +901,8 @@ Rules:
 
 - Metrics use only low-cardinality labels (dataset, tier, cell, service, node). Per-namespace, per-key and per-subscriber state
   is exposed through introspection APIs (relays: per-namespace revision, sequence, subscribers and replay range), or as top-N metrics.
-- Relays expose an admin introspection API for upstream state, namespaces, subscribers and the published membership view.
+- Relays expose an admin introspection API for upstream state, namespaces, subscribers, the published membership view and
+  the placement directory with each range's handoff state.
 
 ## 19. Implementation Phases
 
@@ -917,7 +930,7 @@ Introduce regional relays, persistent update streams and bounded replay history.
 
 ### Phase 5 — Regional Caching
 
-Implement per-node L1, distributed L2 buckets, healthy-peer discovery, origin cells with tiered TTL caching, and automatic redistribution.
+Implement per-node L1, relay-assigned L2 hash ranges, healthy-peer discovery, origin cells with tiered TTL caching, and automatic redistribution.
 
 ### Phase 6 — Advanced Optimization
 
@@ -941,7 +954,7 @@ Add `full_replica` placement, adaptive cache promotion, regional load balancing,
 12. **S3 persists atomic namespace state and time-retained events in SlateDB.**
 13. **Local cache failures trigger automatic fallback and rebuilding.**
 14. **Unhealthy storage is isolated without unnecessarily disabling unrelated services.**
-15. **L2 bucket ownership is redistributed when cache nodes fail.**
+15. **Relays assign L2 hash ranges and hand them off when cache nodes join, fail or drain.**
 16. **Recovered data is validated against revisions, checksums, epochs, and snapshot boundaries.**
 17. **L1/L2 caches are disposable; authoritative durable history is not.**
 18. **Replication correctness and recovery guarantees remain independent of the storage adapter.**

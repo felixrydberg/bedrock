@@ -57,7 +57,7 @@ crates/
 │   └── storage  datasets  s3  transport                                              (decided in B-01, see §4)
 ├── api/          # bedrock/api — write API (B-09)                                         → binary `bedrock-api`
 ├── relay/        # bedrock/relay — relay process: tiers, fan-out, replay, membership      → binary `bedrock-relay`
-├── kv/           # bedrock/kv  — storage (keyspaces/eviction), namespaces, operations  → binary `bedrock-kv`
+├── kv/           # bedrock/kv  — storage (hash-range keyspaces/eviction), namespaces, operations → binary `bedrock-kv`
 └── cdn/          # bedrock/cdn — artifact_storage, artifact_transfer, manifests, retention → binary `bedrock-cdn`
 ```
 
@@ -65,14 +65,14 @@ crates/
 
 Each service ships as **its own binary** linking `lib`. Every machine runs `bedrock-kv` and `bedrock-cdn`, as separate
 processes (containers) with their own resource limits, deploys and failure domains. `bedrock-relay` runs on a few machines
-per cell (minimum 2, more as the cell grows) and per upper tier, and `bedrock-api` in the core region. This matches the public Cloudflare model: every
+per cell (minimum 3, since membership and placement publication need a majority; more as the cell grows) and per upper tier, and `bedrock-api` in the core region. This matches the public Cloudflare model: every
 server runs every service, each service is its own process, and code is shared as libraries.
 
 | Binary | Hosts | Roles |
 |---|---|---|
 | `bedrock-api` | Authoritative writes and revisions; generic per-namespace materialized state across datasets (B-09, B-11) | — |
-| `bedrock-relay` | Relay tree, fan-out, replay log, cell membership, regional directory | — (`tier` and `upstreams` in config) |
-| `bedrock-kv` | Pushed `quicksilver` and `auth`; S3-backed customer `kv` readers and caches | `l1`, `l2` |
+| `bedrock-relay` | Relay tree, fan-out, replay log, cell membership, L2 placement directory and handoffs (§4 decision 13), regional directory | — (`tier` and `upstreams` in config) |
+| `bedrock-kv` | Pushed `quicksilver` and `auth` over relay-assigned hash ranges (§4 decision 13); S3-backed customer `kv` readers and caches | `l1`, `l2` |
 | `bedrock-cdn` | Dataset `cdn` (retention metadata) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
 
 Rules this implies:
@@ -89,13 +89,14 @@ Rules this implies:
   and only `bedrock-cdn` interprets them when it applies them (manifest expansion, reference counts).
 - **The CDN serves by hash and knows nothing about deployments.** Workers, Pages, deployments, revisions and which version is live
   belong to the Compute and deploy control plane (track L), a client of KV and the CDN (B-50, B-51).
-- **Each binary has its own service view.** Membership, health, placement, buckets and the regional directory run
-  inside each binary for that service's nodes. A node with a broken CDN cache disk is still a healthy KV node, and the reverse.
+- **Each binary has its own service view.** Membership, health, the placement directory and the regional directory are
+  per service, and each binary reads only its own service's views. Relays assign L2 ranges per service (§4 decision 13). A node with a broken CDN cache disk is still a healthy KV node, and the reverse.
 - **Shared storage implementations live in `lib/storage`.** Keep the existing synchronous local `StorageEngine` contract
   for pushed datasets. B-11 adds a separate asynchronous namespace persistence/recovery contract; B-39 adds customer-KV readers. Do not block on S3 inside
   the local trait or pretend a read-only handle can write/restore. Dataset identity and permissions remain independent of
   whether a dataset has a relay-fed local engine. API materialization spans datasets; B-39 replaces the KV-reader
-  one-local-engine-per-dataset assumption only for customer KV. `kv/storage` owns handle retention, memory/disk budgets and cache eviction; CDN keeps `CacheStorage`.
+  one-local-engine-per-dataset assumption only for customer KV. `kv/storage` owns handle retention, memory/disk budgets and cache eviction,
+  plus the pushed-data L1/L2 hash-range keyspaces; CDN keeps `CacheStorage`.
 
 ---
 
@@ -129,12 +130,12 @@ Rules this implies:
 | [B-18](https://github.com/felixrydberg/bedrock/issues/16) | Relay replay log | Shared core | `lib/relays` | B-17, B-05 |
 | [B-18b](https://github.com/felixrydberg/bedrock/issues/17) | Relay introspection and metrics | Shared core | `lib/relays` + `relay` bin | B-17, B-18, B-12 |
 | **E — Shared core: regional distribution** |||||
-| [B-15](https://github.com/felixrydberg/bedrock/issues/18) | Placement: rendezvous hashing and replica selection | Shared core | `lib/placement` | B-12, B-13 |
-| [B-16](https://github.com/felixrydberg/bedrock/issues/19) | Virtual buckets and ownership | Shared core | `lib/buckets` | B-15 |
+| [B-15](https://github.com/felixrydberg/bedrock/issues/18) | Placement: relay range assignment, replica selection and customer-KV rendezvous | Shared core | `lib/placement` | B-12, B-13 |
+| [B-16](https://github.com/felixrydberg/bedrock/issues/19) | Hash ranges, placement directory and owner checks | Shared core | `lib/buckets` + `lib/membership` | B-15 |
 | [B-19](https://github.com/felixrydberg/bedrock/issues/20) | Regional directory and source selection | Shared core | `lib/relays` | B-16, B-12 |
 | **G — Shared core: reconciliation, recovery, hardening** |||||
 | [B-20](https://github.com/felixrydberg/bedrock/issues/21) | Reconciliation framework | Shared core | `lib/reconciliation` | B-16 |
-| [B-21](https://github.com/felixrydberg/bedrock/issues/22) | L2 bucket redistribution on node failure | Shared core | `lib/buckets` + `lib/reconciliation` | B-19, B-20 |
+| [B-21](https://github.com/felixrydberg/bedrock/issues/22) | Relay-driven L2 range handoff: assign, bootstrap, ready, revoke | Shared core | `lib/relays` + `lib/buckets` + `lib/reconciliation` | B-19, B-20 |
 | B-21b | Drain nodes, cells and namespaces for every dataset | Shared core | `lib/reconciliation` + `lib/placement` | B-15, B-20, B-21 |
 | [B-22](https://github.com/felixrydberg/bedrock/issues/23) | Tiered read fallback and cache rebuild | Shared core | `lib/health` + `lib/reconciliation` | B-14, B-19, B-11 |
 | [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Read protection: coalescing and per-cell limits (amendment pending, §5) | Shared core | `lib/reconciliation` + callers | B-22 |
@@ -163,7 +164,7 @@ Rules this implies:
 | B-42 | Auth dataset | KV | `kv/namespaces` | B-29 |
 | B-53 | Namespace residency fairness and cold-open tuning at scale | KV | `kv/storage`, `kv/namespaces` | B-29 |
 | **K — CDN refinements** (parallel with J) |||||
-| B-43 | Artifact replica repair and bucket migration | CDN | `cdn/retention` | B-36 |
+| B-43 | Artifact replica repair and range migration | CDN | `cdn/retention` | B-36 |
 | B-44 | Coordinated eviction, GC and failure recovery | CDN | `cdn/retention` | B-43 |
 | B-45 | Prewarming and manifest readiness | CDN | `cdn/manifests` | B-36 |
 | B-46 | Optional unreplicated L1 and popularity-based retention | CDN | `cdn/artifact_storage`, `cdn/retention` | B-44 |
@@ -424,11 +425,17 @@ Created: [#13](https://github.com/felixrydberg/bedrock/issues/13) — Feature �
 
 Created: [#18](https://github.com/felixrydberg/bedrock/issues/18) — Feature 🚀: Rendezvous-hash placement with health-aware replica selection and failure domains
 
+Amended 2026-10-31 by §4 decision 13: L2 placement becomes the relays' range-assignment function. Rendezvous over
+`(namespace, key)` remains only for customer-KV cache affinity.
+
 ---
 
 #### B-16 — Virtual buckets and ownership
 
 Created: [#19](https://github.com/felixrydberg/bedrock/issues/19) — Feature 🚀: Virtual bucket mapping and per-cell ownership table with owner-side checks
+
+Amended 2026-10-31 by §4 decision 13: 64-bit hash-space ranges replace the 2²⁰ buckets, and the relay-published placement
+directory in the membership namespace replaces the per-node ownership table.
 
 ---
 
@@ -464,6 +471,8 @@ Created: [#17](https://github.com/felixrydberg/bedrock/issues/17) — Feature �
 
 Created: [#20](https://github.com/felixrydberg/bedrock/issues/20) — Feature 🚀: Regional directory for bucket discovery, replica revisions and locality-aware source selection
 
+Amended 2026-10-31 by §4 decision 13: L2 owners and their readiness come from the placement directory.
+
 ---
 
 ### G — Shared core: reconciliation, recovery and hardening
@@ -479,6 +488,9 @@ Created: [#21](https://github.com/felixrydberg/bedrock/issues/21) — Feature �
 #### B-21 — L2 bucket redistribution on node failure
 
 Created: [#22](https://github.com/felixrydberg/bedrock/issues/22) — Feature 🚀: Automatic L2 bucket reassignment and repopulation after node failure
+
+Amended 2026-10-31 by §4 decision 13: relays carry out range handoffs (push interests, bootstrap, mark ready, revoke), and
+nodes confirm a revoke against their directory view before deleting.
 
 ---
 
@@ -499,8 +511,9 @@ Quicksilver is retained in every cell, while CDN artifacts have their own holder
   - `scope` is a node or a cell. `datasets` is all of them (the default) or a list. `namespace` narrows the drain to one namespace.
   - The drain is a record in Quicksilver (`topology/drains/{id}`: scope, datasets, namespace, state, rate), changed by
     ordinary ordered writes. Deleting the record cancels the drain; it does not introduce a membership/placement epoch.
-- **Placement:** B-15 and B-16 exclude draining targets from replicated bucket assignments and customer-KV cache affinity.
-  Existing replicated assignments hand off; customer-KV cache traffic reroutes without moving an authoritative dataset.
+- **Placement:** relay range assignment (B-15, decision 13) gives draining members nothing new, and customer-KV cache
+  affinity skips them. Their existing L2 ranges hand off through B-21; customer-KV cache traffic reroutes without moving an
+  authoritative dataset.
 - **Execution** runs in each binary's B-20 reconciliation: the desired state excludes the draining target, and the dataset's
   drain hook says what that means for each unit it holds. Moves are rate-limited and limited in concurrency per drain.
 - **Per-dataset drain hook:** for a scope and optional namespace, return the moves needed, "nothing to move", or `Unsupported`
@@ -508,9 +521,9 @@ Quicksilver is retained in every cell, while CDN artifacts have their own holder
 
   | Dataset | Drain a node | Drain a cell | Drain one namespace from a cell |
   |---|---|---|---|
-  | `quicksilver` (`full_replica`) | Buckets move to other nodes in the cell (B-21) | Nothing to move: every cell holds it | `Unsupported`: it must be in every cell |
+  | `quicksilver` (`full_replica`) | Ranges move to other nodes in the cell (B-21) | Nothing to move: every cell holds it | `Unsupported`: it must be in every cell |
   | `kv` | Stop new reads, finish in-flight reads, close readers and release caches | Apply the same reader/cache drain on its nodes; S3 data stays in place | Close that namespace's readers and release its local cache |
-  | `auth` (`on_demand`) | Buckets move to other nodes | Nothing to move: each cell subscribes on its own | `Unsupported` |
+  | `auth` (`on_demand`) | Ranges move to other nodes | Nothing to move: each cell subscribes on its own | `Unsupported` |
   | `cdn` | Artifact holders move within the cell (B-21, B-43) | Nothing to move: each cell keeps its own holders; the cells taking its traffic can prewarm (B-45) | `Unsupported` until the CDN defines one |
 
 - **Progress and completion:** each dataset reports the units left on the target. The drain is complete when every selected
@@ -591,7 +604,7 @@ Quicksilver is a KV dataset only: the CDN never reads it.
 - Generic metadata keys and values. Typed schemas for specific consumers (for example Worker deployment config) belong to
   those consumers, not to this dataset.
 - Ownership transitions use fencing epochs (B-09).
-- Drain hook (B-21b): a node drain moves its buckets; a cell drain has nothing to move; a namespace drain is `Unsupported`.
+- Drain hook (B-21b): a node drain moves its ranges; a cell drain has nothing to move; a namespace drain is `Unsupported`.
 
 **Additional context**
 - **Implementation:** KV.
@@ -1026,23 +1039,24 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Retained artifacts must be held by two verified nodes per cell, chosen with the shared bucket and placement system.
-Local availability must be tracked separately from bucket ownership.
+Retained artifacts must be held by two verified nodes per cell, chosen with the shared range placement (decision 13).
+Local availability must be tracked separately from range ownership.
 Applying `RETAIN_MANIFEST` must not make both cold holders independently download the same artifact from S3.
 
 **Describe the solution you'd like**
-- Map artifact hash → bucket (B-16). Pick 2 holders within the cell in deterministic placement order with B-15.
+- The artifact hash falls in one hash range (B-16); that range's two owners in the placement directory (B-15) are the holders.
+  Relays deliver its retention metadata only to them.
 - Only the selected holders initiate prewarming for their artifacts when retention is applied.
 - Reuse verified local or peer copies first. On a completely cold miss, the first holder fetches from S3.
   The second requests the artifact from the first through B-31, starting or joining its coalesced fetch.
 - If the first holder fails or times out, the second falls back to S3 using B-31's retries and timeouts.
   Artifact bytes use the existing bulk channel; relays continue carrying metadata.
 - A reconciler (B-20):
-  - desired = retained artifacts in my buckets only when read within the idle window (B-44); initial retention prewarming remains separate
+  - desired = retained artifacts in my ranges only when read within the idle window (B-44); initial retention prewarming remains separate
   - actual = local inventory
   - repair = fetch via B-31
 - Publish local artifact availability to the regional directory (B-19), separate from ownership.
-- Bucket repopulation hook for B-21.
+- Range repopulation hook for B-21.
 
 **Additional context**
 - **Implementation:** CDN.
@@ -1165,11 +1179,12 @@ Some namespaces, starting with Quicksilver (B-24), must be retained in full in e
 keeps what arrived, but nothing yet guarantees coverage or rebuilds it after a node is lost.
 
 **Describe the solution you'd like**
-- `full_replica` placement so that every key of the namespace is held across the L2 nodes in each DC.
+- `full_replica` placement so that every key of the namespace is held across the L2 nodes in each DC: every hash range in
+  the placement directory has a ready owner (decision 13).
 - Eviction of covered keys is forbidden.
 - Completeness tracking, with degraded status until redundancy and completeness are restored.
 - This applies to pushed namespaces such as Quicksilver, not customer-KV cache readers. No customer-KV replica-completeness
-  or bucket-rebuild requirement is reintroduced. Metrics cover retained-data coverage/degradation with low-cardinality labels.
+  or range-rebuild requirement is reintroduced. Metrics cover retained-data coverage/degradation with low-cardinality labels.
 
 **Additional context**
 - **Implementation:** KV refinement (KV Phase 6).
@@ -1218,7 +1233,7 @@ Labels: enhancement
 **Describe the solution you'd like**
 - An `auth` dataset using the `on_demand` policy (push on first read). It never uses the `cached` TTL model: a revocation must not wait for a TTL.
 - Fail-closed behaviour for revocations: revocation must be enforced authoritatively, not only eventually.
-- Drain hook (B-21b): a node drain moves its buckets; a cell drain has nothing to move; a namespace drain is `Unsupported`.
+- Drain hook (B-21b): a node drain moves its ranges; a cell drain has nothing to move; a namespace drain is `Unsupported`.
 
 **Additional context**
 - **Implementation:** KV refinement (new dataset). Needs scoping before work starts.
@@ -1273,10 +1288,10 @@ uneven cache use need measured tuning without introducing a global namespace dor
 
 ---
 
-#### B-43 — Artifact replica repair and bucket migration
+#### B-43 — Artifact replica repair and range migration
 
 ```
-Title:  Feature 🚀: Automatic artifact replica repair and bucket migration
+Title:  Feature 🚀: Automatic artifact replica repair and range migration
 Labels: enhancement
 ```
 
@@ -1286,7 +1301,7 @@ CDN-specific repair is needed: verified copies, peer-first sourcing, throttling.
 
 **Describe the solution you'd like**
 - Replica repair: restore 2 verified holders after a holder is lost, sourcing from peers first and S3 second.
-- Bucket migration during rebalance, with handoff and no gap in availability.
+- Range migration during rebalance through the relay-driven handoff (B-21), with no gap in availability.
 - Repair throttling that respects transfer backpressure.
 - Drain hook (B-21b): a node drain moves its artifact holders within the cell; a cell drain has nothing to move, and the cells
   taking its traffic can prewarm (B-45).
@@ -1566,14 +1581,14 @@ Labels: enhancement
 4. **No heartbeat or gossip protocol.** Membership comes from the subscriber streams nodes already hold to their cell relays (B-12):
    relays merge their connected lists and publish them as a replicated namespace, with a grace period on disconnect.
    A member is a node that is receiving updates. Routing decisions use a local per-peer circuit breaker fed by real traffic (B-13).
-   There is no separate membership or placement epoch; owners reject requests for replicated buckets they don't own (B-16).
+   There is no separate membership or placement epoch; owners reject requests for L2 ranges they don't own (B-16, decision 13).
    Customer-KV hash routing only selects a preferred cache; another eligible reader can serve without owning persistent data.
-5. **Cells.** A cell (one DC by default) has its own membership, buckets, L2 and relays. Its maximum size is set by the
-   bucket count (about 10,000 nodes with 2²⁰ buckets); the actual size is chosen for blast radius. Large sites run several cells.
+5. **Cells.** A cell (one DC by default) has its own membership, placement directory, L2 and relays. No fixed bucket count
+   caps its size (decision 13); the actual size is chosen for blast radius. Large sites run several cells.
    Customer-KV misses read shared S3 namespace state; minimum-revision reads can use the home writer's recent-state path.
    There is no mandatory regional KV tier or origin cell. Moving client traffic between cells is out of scope for now.
 6. **Relay tree.** Relays form tiers in static config (region top → optional DC → cell). The downstream dials and the upstream
-   pushes; gaps are pulled from the replay log. Fan-out for pushed datasets is routed by `(namespace, bucket)`.
+   pushes; gaps are pulled from the replay log. Fan-out for pushed datasets is routed by `(namespace, hash range)`.
    `quicksilver`, `auth` and `cdn` continue using this path; customer-KV values/revisions are not published through it.
 7. **KV and CDN are backing services.** Nothing in their tracks knows about Workers, Pages or deployments. That lives in
    track L (Compute and deploy control plane), which uses KV and the CDN as clients and owns the publish/activate/rollback order.
@@ -1606,7 +1621,7 @@ Labels: enhancement
       in the prefix plus cutoff index/term/membership; a progress record alone is insufficient. Keep committed, buffered,
       durable and reader-visible positions distinct. Fence stale engine publishers. Portable live-key export is optional.
     - **Readers and routing:** ordinary `bedrock-kv` nodes read the same namespace databases and cache hot blocks/entries.
-      HRW/virtual buckets may select a preferred reader for `(namespace, key)` to reuse cache; they do not shard persistent
+      HRW over `(namespace, key)` selects a preferred reader to reuse cache (no virtual buckets, decision 13); it does not shard persistent
       data or impose durable ownership. Another eligible reader may serve. Adding/removing a cache node needs no namespace
       move, replica rebuild or customer-KV relay subscription. Membership still comes from the Quicksilver/Auth connection.
       One logical writer remains a write-throughput limit even when readers scale out.
@@ -1637,6 +1652,48 @@ Labels: enhancement
     - **Push remains separate:** Quicksilver, Auth and CDN retention continue their agreed relay policies. Customer KV has
       no `global`, `full_replica` or `on_demand` push override. B-37 stays dropped. Source WAL replay from S3, when used, is
       a storage recovery/reader mechanism, not a customer-KV relay stream. This does not change CDN byte placement or Auth policy.
+13. **L2 placement: relays assign hash-space ranges; nodes subscribe to the directory.** Decided 2026-10-31. Numbered 13
+    because decision 12 (separate Quicksilver/Auth and customer-KV binaries) is pending on `feature/split-kv-binary`.
+    Replaces the fixed 2²⁰ virtual buckets and per-node rendezvous ownership (B-15, B-16) for the pushed `quicksilver` and
+    `auth` datasets and the CDN. Customer-KV cache affinity hashes `(namespace, key)` with rendezvous directly and uses no
+    ranges (decision 11's readers own no persistent data). Chosen over a hash ring and over simplified buckets.
+    - **Key space:** an L2 key maps to a 64-bit hash of `(dataset, namespace, key)`; CDN artifacts use their content hash.
+      Ownership is assigned in contiguous ranges of that hash space, not raw key order, so sequential keys do not concentrate.
+      L2 storage keys start with the big-endian hash: a range is one contiguous scan, and dropping it is one `delete_range`
+      followed by compaction of that span (RocksDB reclaims range tombstones only on compaction). No bucket count caps a cell.
+    - **Directory:** the cell relays' membership publisher (B-12) also writes the placement directory into the same
+      `membership/{service}.{cell}` namespace, under `range/{start}` keys (node IDs cannot contain `/`). Membership,
+      assignment and readiness therefore share one revision order. An entry holds the range bounds and its owners, each
+      `populating`, `ready` or `leaving`. Every node subscribes to it, as it already does to membership; it stays small
+      (a few ranges per node). Nodes route locally from that view; relays are never on the read path.
+    - **Assignment (B-15):** a pure, deterministic function of the published directory and membership, run only by the
+      majority publisher, which waits until its subscription applies each write before planning again. A joining member takes
+      ranges, splitting the largest where needed, until its share matches its capacity weight. A member removed after the
+      grace period has its ranges reassigned. Each range has R owners in distinct failure domains when possible. Draining
+      members get nothing new. A bounded number of ranges move at once. Load-based splitting waits for measurements.
+    - **Handoff (B-21):** relays push interests to their own leaf subscribers instead of nodes choosing what to `Follow`.
+      When the directory names a subscriber as a new owner, its relay starts the range, bootstrapping where needed. The relay
+      derives readiness from its completed bootstrap plus the subscriber's acknowledgement through the head, and the
+      publisher marks the owner `ready`. A `leaving` owner keeps following and serving until every new owner is `ready`;
+      then its relay sends a revoke. The node confirms the revoke against its own directory view, stops serving and following
+      the range, deletes it and compacts the span. Relays act only on published state, never on a sibling's local view.
+    - **Owner checks:** a node rejects requests for a range it neither owns nor is leaving, and the caller retries the next
+      owner. Directory revisions are ordinary dataset revisions, not a placement epoch.
+    - **Failure behavior:** L2 is never the only copy (B-11 materialized state rebuilds Quicksilver/Auth; S3 holds artifact
+      bytes), so an early drop costs availability, not data. A leaving owner keeps its copy until the new owners are ready
+      and drops early only under disk pressure. Without a relay majority, placement freezes: nothing moves or is revoked, and
+      nodes keep serving what they hold.
+    - **Why:** a ring or per-bucket rendezvous makes every node derive ownership from membership (about 16 MB of ring tokens
+      or a 12 MB bucket table at 10,000 nodes, plus incremental-update logic). Relay assignment gives exact balance, a few
+      ranges per node and one component that decides and executes moves, reusing the existing majority publisher and the
+      #41 / B-12b sibling stream.
+    - **Cost:** relays become the most critical cell component; a wrong assignment affects the whole cell; placement freezes
+      without a majority; asymmetric relay partitions can flap assignments as they can flap membership. Relay-pushed interests
+      and revokes change `Relay.Session`. Estimated 2026-10-31 at about 10–14 weeks for one developer including
+      specification and simulation; load-based splitting adds 3–4 weeks.
+    - **Specification first:** `membership.tla` gains the directory writes and a single assigner; a handoff model checks that
+      a range is never dropped before its new owners are ready and that no node serves a range it neither owns nor is leaving;
+      `relays.tla` covers relay-pushed interests and revokes. Update them before implementation.
 
 ### Still open
 
@@ -1735,3 +1792,25 @@ customer-KV amendments. This records the changed scope and acceptance checks; it
 | #22 / B-21 | [Verified materialized-state recovery sources](https://github.com/felixrydberg/bedrock/issues/22#issuecomment-6507619378) |
 | #23 / B-22 | [Materialized recovery and reader integration](https://github.com/felixrydberg/bedrock/issues/23#issuecomment-6507620366) |
 | #25 / B-23 | [Real B-11 engine before the initial hardening gate](https://github.com/felixrydberg/bedrock/issues/25#issuecomment-6507621085) |
+
+### L2 placement amendments recorded in comments — 2026-10-31
+
+§4 decision 13 (relay-assigned hash-space ranges, placement directory in the membership namespace, relay-driven handoffs)
+was posted to the affected open issues; closed issues keep their history. Each comment was read back and matched the posted
+text. Original descriptions and earlier amendments are preserved. #44 is unaffected. The comments name
+`bedrock-quicksilver` and decision 12 from the pending binary split; until that merges, read them as the Quicksilver/Auth
+part of `bedrock-kv`.
+
+| Issue / plan ID | Amendment comment |
+|---|---|
+| #13 / B-14 | [Storage health reaches relay assignment](https://github.com/felixrydberg/bedrock/issues/13#issuecomment-6546264337) |
+| #17 / B-18b | [Placement and handoff introspection](https://github.com/felixrydberg/bedrock/issues/17#issuecomment-6546264612) |
+| #18 / B-15 | [Relay range assignment](https://github.com/felixrydberg/bedrock/issues/18#issuecomment-6546264830) |
+| #19 / B-16 | [Hash ranges and the placement directory](https://github.com/felixrydberg/bedrock/issues/19#issuecomment-6546265100) |
+| #20 / B-19 | [Sources from the placement directory](https://github.com/felixrydberg/bedrock/issues/20#issuecomment-6546265354) |
+| #21 / B-20 | [Handoff reconciliation in the relays](https://github.com/felixrydberg/bedrock/issues/21#issuecomment-6546265598) |
+| #22 / B-21 | [Relay-driven range handoff](https://github.com/felixrydberg/bedrock/issues/22#issuecomment-6546265819) |
+| #23 / B-22 | [Range-level rebuilds](https://github.com/felixrydberg/bedrock/issues/23#issuecomment-6546266055) |
+| #24 / B-22b | [Bounded range moves](https://github.com/felixrydberg/bedrock/issues/24#issuecomment-6546266248) |
+| #25 / B-23 | [Placement and handoff invariants](https://github.com/felixrydberg/bedrock/issues/25#issuecomment-6546266463) |
+| #41 / B-12b | [Hash-range interest selectors](https://github.com/felixrydberg/bedrock/issues/41#issuecomment-6546266677) |

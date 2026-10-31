@@ -9,11 +9,11 @@ The following KV implementation phases must be completed before the correspondin
 - **KV Phase 1:** Dataset model, replication sequences, S3 integration, and service infrastructure.
 - **KV Phase 2:** Storage health, failure detection, and recovery infrastructure.
 - **KV Phase 4:** Regional relays, replication streams, subscriptions, and replay.
-- **KV Phase 5:** Regional bucket distribution, node discovery, placement, and redistribution.
+- **KV Phase 5:** Relay-assigned L2 hash ranges, node discovery, placement, and redistribution.
 
 KV Phase 3 (SurrealKV) and Phase 6 (advanced optimization) are not prerequisites.
 
-The CDN will reuse KV's distributed functionality under `bedrock/lib/distributed/`, including membership, health, buckets, placement, replication, relays, and reconciliation.
+The CDN will reuse KV's distributed functionality under `bedrock/lib/distributed/`, including membership, health, hash ranges, placement, replication, relays, and reconciliation.
 
 ## 2. Code Structure
 
@@ -49,14 +49,15 @@ bedrock/
 
 ### Regional L2
 
-Reuse KV's regional buckets and placement system (§9–10).
+Reuse the shared L2 range placement (`kv.md` §9–10, `feature-drafts.md` §4 decision 13).
 
-- Map artifact hashes to virtual buckets.
+- An artifact's content hash places it in one hash range; that range's two owners in the relay-published placement
+  directory hold it, and relays deliver its retention metadata only to them.
 - Maintain two verified replicas per retained artifact while it is in use. Artifacts not read within a configurable idle
   window are evicted from L2 and fetched from S3 again on the next miss.
-- Use existing placement and health infrastructure to select replica holders.
-- Track local artifact availability independently of bucket ownership.
-- Implement CDN-specific replica repair and bucket migration.
+- Health reaches the relays' range assignment, so unhealthy nodes get no new ranges.
+- Track local artifact availability independently of range ownership.
+- Implement CDN-specific replica repair and range migration on top of the relay-driven handoff.
 - Allow L1 to cache requests independently, with automatic eviction.
 
 ### Declarative Retention
@@ -101,7 +102,7 @@ Quicksilver. It publishes before it activates, and resolves which manifest is li
 
 - Register CDN with shared relays.
 - Implement global retention streams.
-- Reuse bucket placement for artifact distribution.
+- Reuse range placement for artifact distribution.
 - Implement two-replica L2 storage.
 - Implement peer-to-peer transfers and fallback.
 - Track replica availability.
@@ -112,7 +113,7 @@ Quicksilver. It publishes before it activates, and resolves which manifest is li
 
 - Manifest-based retention.
 - Automatic replica repair.
-- Bucket migration and rebalancing.
+- Range migration and rebalancing.
 - Coordinated eviction.
 - Recovery after node and relay failures.
 - Reconciliation without per-artifact global metadata.
