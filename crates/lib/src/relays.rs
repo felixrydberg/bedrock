@@ -192,7 +192,7 @@ impl Hub {
         })
     }
     async fn persist_replay(&self, mut pending: mpsc::Receiver<ReplayItem>) {
-        let mut rebuild_after = tokio::time::Instant::now();
+        let mut rebuild_after = crate::monotonic_now();
         while let Some((event, mut now, size)) = pending.recv().await {
             self.0.replay_bytes.fetch_sub(size, Ordering::Relaxed);
             let mut events = vec![event];
@@ -207,7 +207,7 @@ impl Hub {
             let Some(replay) = self.0.replay.clone() else {
                 continue;
             };
-            let can_rebuild = tokio::time::Instant::now() >= rebuild_after;
+            let can_rebuild = crate::monotonic_now() >= rebuild_after;
             let operation = move || {
                 if !replay.healthy() {
                     if !can_rebuild {
@@ -225,7 +225,7 @@ impl Hub {
             #[cfg(madsim)]
             let result = operation().map_err(|e| e.to_string());
             if let Err(error) = result {
-                rebuild_after = tokio::time::Instant::now() + Duration::from_secs(1);
+                rebuild_after = crate::monotonic_now() + Duration::from_secs(1);
                 tracing::warn!(%error,"replay persistence disabled; forwarding continues");
             }
         }
@@ -1226,7 +1226,7 @@ impl Hub {
         }
         let mut sent = BTreeMap::<Key, u64>::new();
         let mut progress = tokio::time::interval(PROGRESS);
-        let mut received = tokio::time::Instant::now();
+        let mut received = crate::monotonic_now();
         loop {
             let version = self.0.changed.get();
             let desired = self.desired();
@@ -1274,7 +1274,7 @@ impl Hub {
             let Some(frame) = message else {
                 return Err(Status::unavailable("upstream closed"));
             };
-            received = tokio::time::Instant::now();
+            received = crate::monotonic_now();
             match frame.kind {
                 Some(pb::relay_frame::Kind::Range(range)) => {
                     self.observe_head(&(range.dataset, range.namespace), range.head);
@@ -1391,14 +1391,14 @@ impl pb::relay_server::Relay for Hub {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(PROGRESS);
             tick.tick().await;
-            let mut received = tokio::time::Instant::now();
+            let mut received = crate::monotonic_now();
             loop {
                 tokio::select! {biased;
                     _=closed.wait_until(|v|*v)=>break,
                     _=tokio::time::sleep_until(received+IDLE)=>break,
                     _=tick.tick()=>{if !hub.send(id,pb::relay_frame::Kind::Tick(true)){break}},
                     request=requests.message()=>match request {
-                        Ok(Some(request))=>{received=tokio::time::Instant::now();match request.kind {
+                        Ok(Some(request))=>{received=crate::monotonic_now();match request.kind {
                             Some(pb::relay_request::Kind::Follow(f))=>hub.follow(id,f,Vec::new(),false).await,
                             Some(pb::relay_request::Kind::Recover(r))=>{
                                 if tier!=0 {break}

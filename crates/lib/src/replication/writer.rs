@@ -143,7 +143,7 @@ pub struct RecoveryLease {
 
 impl RecoveryLease {
     pub fn valid(&self) -> bool {
-        tokio::time::Instant::now() < self.expires
+        crate::monotonic_now() < self.expires
     }
 }
 
@@ -278,7 +278,7 @@ impl Writer {
             dataset: dataset.into(),
             namespace: namespace.into(),
             boundary: view.sequence,
-            expires: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            expires: crate::monotonic_now() + std::time::Duration::from_secs(60),
         });
         state.recovery.push(Arc::downgrade(&lease));
         Ok((view, lease))
