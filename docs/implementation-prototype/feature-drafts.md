@@ -7,7 +7,7 @@ which module it lives in, which doc section it comes from, what it depends on, a
 
 Sources: `docs/implementation-prototype/kv.md`, `cdn.md`, `code-structure.md`, `notes.md`.
 
-> Status: B-01 to B-23 (including B-18b, B-22b and B-23a, but not B-09b or B-21b) are created as GitHub issues (linked below, the issue is the source of truth). Later drafts are still drafts. When a draft is created, replace its body here with a link to the issue.
+> Status: B-01 to B-23 (including B-12b, B-18b, B-22b and B-23a, but not B-09b or B-21b) are created as GitHub issues (linked below, the issue is the source of truth). Later drafts are still drafts. When a draft is created, replace its body here with a link to the issue.
 
 > Architecture update, 2026-10-29: decision 11 replaces customer-KV origin cells with per-namespace S3 databases,
 > an API writer and read-only KV caches. This document records the new decision; the older customer-KV origin text in
@@ -125,6 +125,7 @@ Rules this implies:
 | **F — Shared core: relays** (before E: membership comes from relay streams) |||||
 | [B-17](https://github.com/felixrydberg/bedrock/issues/14) | `bedrock-relay` binary: tiers, subscriber-initiated streams, bucket-routed fan-out | Shared core | `lib/relays` + `relay` bin | B-10, B-13 |
 | [B-12](https://github.com/felixrydberg/bedrock/issues/15) | Membership from relay streams, published as a dataset | Shared core | `lib/membership` + `lib/relays` | B-10, B-17 |
+| [B-12b](https://github.com/felixrydberg/bedrock/issues/41) | Warm relay failover: sibling relays share subscriber interests | Shared core | `lib/relays` | B-12, B-17, B-18 |
 | [B-18](https://github.com/felixrydberg/bedrock/issues/16) | Relay replay log | Shared core | `lib/relays` | B-17, B-05 |
 | [B-18b](https://github.com/felixrydberg/bedrock/issues/17) | Relay introspection and metrics | Shared core | `lib/relays` + `relay` bin | B-17, B-18, B-12 |
 | **E — Shared core: regional distribution** |||||
@@ -394,6 +395,12 @@ update TLA+ before implementation. The bounded standalone model does not establi
 #### B-12 — Membership from relay streams, published as a dataset
 
 Created: [#15](https://github.com/felixrydberg/bedrock/issues/15) — Feature 🚀: Cell membership derived from relay subscriber streams and published as a replicated namespace
+
+---
+
+#### B-12b — Warm relay failover: sibling relays share subscriber interests
+
+Created: [#41](https://github.com/felixrydberg/bedrock/issues/41) — Feature 🚀: Warm relay failover by sharing subscriber interests between sibling relays
 
 ---
 
