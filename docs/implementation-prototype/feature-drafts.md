@@ -164,9 +164,9 @@ Rules this implies:
 | **J — KV refinements** |||||
 | ~~B-37~~ | ~~Cache-fill broadcast queue~~ (dropped, decision 11) | — | — | — |
 | B-38 | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
-| B-40 | `full_replica` placement and completeness | KV | `quicksilver/storage`, `lib/buckets` | B-29 |
+| B-40 | `full_replica` placement and completeness | KV | `quicksilver/storage`, `lib/buckets` | B-24, B-21 |
 | B-41 | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
-| B-42 | Auth dataset | KV | `quicksilver/namespaces` | B-29 |
+| B-42 | Auth dataset | KV | `quicksilver/namespaces` | B-24, B-21b |
 | B-53 | Namespace residency fairness and cold-open tuning at scale | KV | `kv/storage`, `kv/namespaces` | B-29 |
 | **K — CDN refinements** (parallel with J) |||||
 | B-43 | Artifact replica repair and bucket migration | CDN | `cdn/retention` | B-36 |
@@ -1181,7 +1181,7 @@ keeps what arrived, but nothing yet guarantees coverage or rebuilds it after a n
 - **Implementation:** KV refinement (KV Phase 6).
 - **Module:** `quicksilver/storage`, `lib/buckets`.
 - **Doc reference:** `kv.md` §3, §9, §15.5, §16.
-- **Depends on:** B-29.
+- **Depends on:** B-24, B-21.
 - **Acceptance criteria:** Killing a node reports degraded until it is rebuilt. Coverage reaches 100% again afterwards.
 
 ---
@@ -1230,7 +1230,7 @@ Labels: enhancement
 - **Implementation:** KV refinement (new dataset). Needs scoping before work starts.
 - **Module:** `quicksilver/namespaces` (binary `bedrock-quicksilver`, decision 12).
 - **Doc reference:** `notes.md`; `kv.md` §17 Freshness Guarantees ("access revocations require fencing… or fail-closed").
-- **Depends on:** B-29.
+- **Depends on:** B-24, B-21b.
 - **Acceptance criteria:** A revoked key is rejected in every region within the agreed bound, or the check fails closed.
 
 ---

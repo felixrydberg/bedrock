@@ -9,9 +9,10 @@ The platform initially supports two datasets:
 - **Quicksilver:** Critical infrastructure metadata, including deployment routing, D1 ownership, Durable Object placement, KV namespace ownership, and system configuration.
 - **KV:** Customer key-value stores with home-region writes, one S3 database per namespace, and read-only caches in every cell.
 
-Both datasets share the **write API, sequence system and regional relays**, but run as separate binaries:
-`bedrock-quicksilver` (Quicksilver and Auth, pushed through relays into L1/L2 buckets) and `bedrock-kv` (customer KV,
-read from S3 by cache readers with no virtual buckets). See `feature-drafts.md` §4 decisions 11 and 12, and §9
+Both datasets share the **write API and sequence system**, but run as separate binaries:
+`bedrock-quicksilver` (Quicksilver and Auth, subscribed through regional relays into L1/L2 buckets) and `bedrock-kv`
+(customer KV, read from S3 by cache readers with no virtual buckets or dataset subscriptions; it uses the cell's relays
+only for membership). See `feature-drafts.md` §4 decisions 11 and 12, and §9
 "Customer KV: S3 Namespace Readers". Where this document still describes customer-KV origin cells, those decisions win.
 
 Storage engines are interchangeable through a common Rust abstraction.
@@ -884,7 +885,7 @@ Rules:
 
 ### Phase 1 — Shared Engine and Storage Abstraction
 
-Build the single Rust binary, datasets, namespaces, policy resolution, Docker deployment, RocksDB adapter, authoritative writes, ordered replication, and S3-backed durability.
+Build the separate `bedrock-quicksilver` and `bedrock-kv` binaries on the shared `lib` crate, datasets, namespaces, policy resolution, Docker deployment, RocksDB adapter, authoritative writes, ordered replication, and S3-backed durability.
 
 Define structured storage errors and atomic replication revision updates.
 
