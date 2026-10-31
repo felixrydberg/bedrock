@@ -699,6 +699,7 @@ impl Hub {
         let mut announced = false;
         let mut forced = force;
         let mut lease: Option<Arc<RecoveryLease>> = None;
+        let mut renewed_through = 0;
         let mut recovery_permit = None;
         loop {
             let version = self.0.changed.get();
@@ -740,6 +741,10 @@ impl Hub {
                     return Err(Status::deadline_exceeded(
                         "bootstrap recovery lease expired",
                     ));
+                }
+                if acked > renewed_through {
+                    pin.renew();
+                    renewed_through = acked;
                 }
                 if acked >= h.unwrap_or(u64::MAX) {
                     self.send_scoped(
@@ -923,6 +928,7 @@ impl Hub {
                                     {
                                         return Ok(());
                                     }
+                                    pin.renew();
                                     bytes = 0;
                                     tokio::task::yield_now().await;
                                 }

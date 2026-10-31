@@ -393,6 +393,34 @@ async fn recovery_leases_are_bounded_and_release_capacity_on_drop() {
     writer.close().await.unwrap();
 }
 
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn recovery_lease_renews_on_progress_up_to_its_deadline() {
+    let writer = writer().await;
+    commit(&writer, "auth", "accounts", Operation::Set(b"a".to_vec())).await;
+    let (_, lease) = writer.begin_recovery("auth", "accounts").await.unwrap();
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        lease.renew();
+    }
+    // 150s exceeds the 60s base lease; progress kept it alive.
+    commit(&writer, "auth", "accounts", Operation::Set(b"b".to_vec())).await;
+    assert_eq!(
+        writer
+            .recovery_events("auth", "accounts", 2, &lease)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        lease.renew();
+    }
+    assert!(!lease.valid(), "renewal must stop at the absolute deadline");
+    writer.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn pruned_authoritative_cursor_bootstraps_through_two_tiers_then_applies_delete() {
     use std::sync::atomic::{AtomicU64, Ordering};

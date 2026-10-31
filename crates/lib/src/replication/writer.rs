@@ -24,6 +24,10 @@ use crate::storage::{ErrorContext, StorageError, StorageResult};
 use crate::transport::admin::Admin;
 
 pub const EPOCH: u64 = 1;
+/// A recovery lease lapses after this long without transfer progress.
+const RECOVERY_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Renewal never extends a recovery lease past this age.
+const RECOVERY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
 /// Maximum writes waiting for the next namespace batch.
 pub const MAX_QUEUED: usize = 1024;
 
@@ -138,12 +142,22 @@ pub struct RecoveryLease {
     dataset: String,
     namespace: String,
     boundary: u64,
-    expires: tokio::time::Instant,
+    expires: Mutex<tokio::time::Instant>,
+    deadline: tokio::time::Instant,
 }
 
 impl RecoveryLease {
     pub fn valid(&self) -> bool {
-        crate::monotonic_now() < self.expires
+        crate::monotonic_now() < *self.expires.lock().unwrap()
+    }
+
+    /// Transfer progress extends a still-valid lease, never past its absolute deadline.
+    pub fn renew(&self) {
+        let now = crate::monotonic_now();
+        let mut expires = self.expires.lock().unwrap();
+        if now < *expires {
+            *expires = (now + RECOVERY_LEASE).min(self.deadline);
+        }
     }
 }
 
@@ -274,11 +288,13 @@ impl Writer {
             .await?
             .view()
             .await?;
+        let now = crate::monotonic_now();
         let lease = Arc::new(RecoveryLease {
             dataset: dataset.into(),
             namespace: namespace.into(),
             boundary: view.sequence,
-            expires: crate::monotonic_now() + std::time::Duration::from_secs(60),
+            expires: Mutex::new(now + RECOVERY_LEASE),
+            deadline: now + RECOVERY_MAX,
         });
         state.recovery.push(Arc::downgrade(&lease));
         Ok((view, lease))

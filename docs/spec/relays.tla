@@ -18,7 +18,8 @@ Init == /\ head = 0 /\ applied = 0 /\ queued = <<>> /\ connected = TRUE
 Commit == /\ head < MaxRevision /\ head' = head + 1
           /\ cached' = cached \cup {head + 1}
           /\ retained' = retained \cup {head + 1}
-          /\ UNCHANGED <<applied, queued, connected, boundary, pinned, staging, projected, pending, ready>>
+          /\ ready' = FALSE
+          /\ UNCHANGED <<applied, queued, connected, boundary, pinned, staging, projected, pending>>
 Send == /\ connected /\ ~staging /\ applied + Len(queued) < head
         /\ Len(queued) < QueueLimit
         /\ applied + Len(queued) + 1 \in cached \cup retained
@@ -67,5 +68,5 @@ OrderedCoverage == \A i \in 1..Len(queued): queued[i] = applied + i
 ProtectedBootstrap == staging => pinned
 ProtectedTail == pinned => (boundary+1..head) \subseteq retained
 FilteredCoverage == projected = {r \in 1..applied : Selected(r)}
-ReadyAfterConfirmation == ready => (connected /\ ~staging /\ ~pending)
+ReadyAfterConfirmation == ready => (connected /\ ~staging /\ ~pending /\ applied = head)
 =============================================================================

@@ -108,7 +108,9 @@ lease registration share the writer namespace gate; GC cannot prune the protecte
 tail. Bootstrap End permits atomic installation and acknowledgement, but readiness
 also requires a recovered Range confirmation from the source after the installed
 boundary and catch-up were acknowledged under a valid lease. A proxy preserves that
-confirmation; it cannot invent one. Leases expire after 60 seconds and are scoped
+confirmation; it cannot invent one. Leases expire after 60 seconds without progress;
+sent bootstrap chunks and advancing acknowledgements renew them, never beyond
+10 minutes from acquisition. They are scoped
 to dataset/namespace. There are at most four per namespace and four concurrent
 generated/proxied recoveries per source Hub. Pending confirmation is persisted with
 the installed state, so a restart cannot treat an unconfirmed baseline as ready.
@@ -139,15 +141,17 @@ For cleanup validation, native lint reused a cached RocksDB archive through the
 dependency's supported `ROCKSDB_LIB_DIR` / `ROCKSDB_STATIC` settings; native tests
 built RocksDB normally. This avoids rebuilding C++ for the Rust-only lint step.
 
-TLC 1.8.0 checked `MaxRevision=4`, `QueueLimit=2` on 2026-10-31: 494,060 generated
-states, 67,430 distinct states, depth 24, no invariant violation. The model separates
+TLC 1.8.0 checked `MaxRevision=4`, `QueueLimit=2` on 2026-10-31: 436,101 generated
+states, 59,694 distinct states, depth 24, no invariant violation. The model separates
 validated installation from the source's recovered confirmation, keeps pending
-confirmation across disconnects and lease expiry, and checks `ReadyAfterConfirmation`.
+confirmation across disconnects and lease expiry, and checks `ReadyAfterConfirmation`:
+readiness requires confirmation and coverage through head, and a new commit clears it.
 This is the bounded safety model above, not a proof of the Rust implementation or a
 liveness proof. As negative checks in ignored temporary copies, replacing
 selected-payload application with a no-op makes `FilteredCoverage` fail at covered
 revision 2 (2026-10-30), and dropping `~pending` from `BecomeReady` makes
-`ReadyAfterConfirmation` fail at depth 4 (2026-10-31).
+`ReadyAfterConfirmation` fail at depth 4 (2026-10-31), as does letting `Commit` keep
+readiness, at depth 3 (2026-10-31).
 
 With the [official TLA+ release](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0)
 jar saved as `.codex-tmp/tla2tools.jar`, run from `docs/spec`:
