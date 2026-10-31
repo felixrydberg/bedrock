@@ -5,7 +5,7 @@ advertise = "eu-1a-m1:7100"
 admin_listen = "0.0.0.0:7101"
 data_dir = "/data"
 roles = ["l1", "l2"]
-datasets = ["quicksilver", "kv", "auth"]
+# Customer KV has no relay-fed datasets or subscriptions; the relays carry only its membership.
 relays = ["relay-eu-1a-1:7300", "relay-eu-1a-2:7300", "relay-eu-1a-3:7300"]
 api = "api.core:7002"
 s3_endpoint = "https://s3.example.internal"
@@ -19,9 +19,3 @@ cell = "eu-1a"
 cpus = 2.0
 memory_mb = 4096
 disk_mb = 102400
-
-[[subscriptions]]
-dataset = "quicksilver"
-namespace = "infrastructure"
-# Omitted buckets follows the namespace. L2-only consumers list owned bucket IDs.
-# Customer kv never appears here; Auth namespaces are followed explicitly when needed.

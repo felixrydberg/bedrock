@@ -198,10 +198,10 @@ async fn scenario() -> u64 {
         relay("cell", 1, &[TOP, OTHER_TOP], first_cell_peers),
         true,
     );
-    let kv = cell.spawn(async {
-        bedrock_kv::run(ServiceConfig {
+    let quicksilver = cell.spawn(async {
+        bedrock_quicksilver::run(ServiceConfig {
             node: NodeConfig {
-                node_id: "kv-neighbor".into(),
+                node_id: "quicksilver-neighbor".into(),
                 location: Location {
                     region: "eu".into(),
                     dc: "eu-1".into(),
@@ -211,7 +211,7 @@ async fn scenario() -> u64 {
                 listen: "10.0.0.4:7100".parse().unwrap(),
                 advertise: None,
                 admin_listen: "10.0.0.4:7101".parse().unwrap(),
-                data_dir: "/data/kv-neighbor".into(),
+                data_dir: "/data/quicksilver-neighbor".into(),
                 budget: Budget::default(),
             },
             roles: vec![Role::L1],
@@ -259,9 +259,12 @@ async fn scenario() -> u64 {
             )
             .unwrap();
             phase(&writer, &session, 1, 6).await;
-            assert!(!kv.is_finished(), "co-located KV entry point did not start");
-            kv.abort();
-            assert!(kv.await.unwrap_err().is_cancelled());
+            assert!(
+                !quicksilver.is_finished(),
+                "co-located Quicksilver entry point did not start"
+            );
+            quicksilver.abort();
+            assert!(quicksilver.await.unwrap_err().is_cancelled());
             let expected = phase(&writer, &session, 7, 12).await;
             assert_eq!(engine.get(b"accounts\0key").unwrap(), expected);
             sleep(Duration::from_secs(35)).await;

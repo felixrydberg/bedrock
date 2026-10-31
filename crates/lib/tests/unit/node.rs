@@ -1,13 +1,13 @@
 use super::*;
 use figment::Jail;
 
-const KV_TOML: &str = r#"
-        node_id = "kv-1"
+const NODE_TOML: &str = r#"
+        node_id = "quicksilver-1"
         listen = "0.0.0.0:7100"
         admin_listen = "0.0.0.0:7101"
         data_dir = "data"
         roles = ["l1"]
-        datasets = ["quicksilver", "kv"]
+        datasets = ["quicksilver", "auth"]
         relays = ["relay-1:7300"]
         api = "api:7000"
         s3_endpoint = "http://s3:8333"
@@ -22,8 +22,8 @@ const KV_TOML: &str = r#"
 #[allow(clippy::disallowed_methods)] // checks that `load` created the data directory
 fn file_then_env_overrides() {
     Jail::expect_with(|jail| {
-        jail.create_file("kv.toml", KV_TOML)?;
-        jail.set_env("BEDROCK_CONFIG", "kv.toml");
+        jail.create_file("node.toml", NODE_TOML)?;
+        jail.set_env("BEDROCK_CONFIG", "node.toml");
         jail.set_env("BEDROCK_ROLES", "[l1, l2]");
         jail.set_env("BEDROCK_LOCATION__CELL", "eu-1b");
         jail.set_env("BEDROCK_BUDGET__MEMORY_MB", "512");
@@ -41,7 +41,7 @@ fn file_then_env_overrides() {
 #[test]
 fn rejects_empty_roles() {
     Jail::expect_with(|jail| {
-        jail.create_file("bedrock.toml", KV_TOML)?;
+        jail.create_file("bedrock.toml", NODE_TOML)?;
         let mut c: ServiceConfig = load().map_err(|e| e.0)?;
         c.roles.clear();
         assert!(c.validate().is_err());
@@ -72,7 +72,7 @@ fn relay_tier_and_upstreams() {
 #[test]
 fn api_requires_write_token_and_redacts_it() {
     let config = Figment::new()
-        .merge(Toml::string(KV_TOML))
+        .merge(Toml::string(NODE_TOML))
         .merge(("write_listen", "127.0.0.1:7002"))
         .merge(("s3.endpoint", "http://s3:8333"))
         .merge(("s3.bucket", "bedrock"))
@@ -99,7 +99,7 @@ fn api_write_token_env_is_literal() {
     Jail::expect_with(|jail| {
         jail.create_file(
             "bedrock.toml",
-            &format!("write_token = 9274512836401927\n{KV_TOML}"),
+            &format!("write_token = 9274512836401927\n{NODE_TOML}"),
         )?;
         jail.set_env("BEDROCK_WRITE_LISTEN", "127.0.0.1:7002");
         jail.set_env("BEDROCK_S3__ENDPOINT", "http://s3:8333");

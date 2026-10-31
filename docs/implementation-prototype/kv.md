@@ -7,10 +7,12 @@ A globally distributed, S3-backed key-value platform inspired by Cloudflare Quic
 The platform initially supports two datasets:
 
 - **Quicksilver:** Critical infrastructure metadata, including deployment routing, D1 ownership, Durable Object placement, KV namespace ownership, and system configuration.
-- **KV:** Customer key-value stores with home-region writes, one origin cell per namespace, and TTL caching everywhere else.
+- **KV:** Customer key-value stores with home-region writes, one S3 database per namespace, and read-only caches in every cell.
 
-Both datasets run on the **same Rust binary, replication protocol, sequence system, regional relays, and L1/L2 caching architecture**.
-Quicksilver is pushed to every cell; a customer KV namespace is pushed only to its origin cell and pulled into other cells' caches (§3, §9 Cells).
+Both datasets share the **write API, sequence system and regional relays**, but run as separate binaries:
+`bedrock-quicksilver` (Quicksilver and Auth, pushed through relays into L1/L2 buckets) and `bedrock-kv` (customer KV,
+read from S3 by cache readers with no virtual buckets). See `feature-drafts.md` §4 decisions 11 and 12, and §9
+"Customer KV: S3 Namespace Readers". Where this document still describes customer-KV origin cells, those decisions win.
 
 Storage engines are interchangeable through a common Rust abstraction.
 
@@ -92,21 +94,17 @@ There are no exposed application-level shards. Regional L2 bucket partitioning r
 
 | Policy | Propagation | Regional L2 storage |
 |---|---|---|
-| `cached` | Origin cell only; other cells pull on a miss | Origin: complete namespace. Elsewhere: entries younger than `cache_ttl` |
 | `global` | All eligible datacenters | Working set + recent changes |
 | `on_demand` | Active subscribers only | Requested data |
-| `home_only` | Origin cell only | No remote copies |
 | `full_replica` | All eligible datacenters | Complete namespace |
 
-**Cached** is the default for customer KV. The namespace's origin cell holds it in full; every other cell caches what it reads
-for `cache_ttl` (default 60 seconds) and refreshes hot keys before they expire. Nothing is pushed outside the origin, so a
-namespace nobody reads in a cell costs that cell nothing.
+These push policies apply to Quicksilver and Auth. Customer KV has no push policy: it is read from its S3 namespace
+database by `bedrock-kv` cache readers (§9 "Customer KV: S3 Namespace Readers"). The earlier `cached` and `home_only`
+policies described an origin cell and are superseded.
 
 **Global** means all eligible datacenters receive updates, but older, unpinned data may be evicted.
 
 **On-demand** means only active subscribers receive updates, starting from their first read. Auth uses it, because a revocation must not wait for a TTL.
-
-**Home-only** sends every read to the origin cell.
 
 **Full-replica** requires every eligible datacenter to retain the entire namespace distributed across L2 nodes.
 
@@ -151,10 +149,13 @@ Each component is its own binary, all built on the shared `lib` crate.
 |---|---|
 | `bedrock-api` | Authoritative writes and sequence ordering |
 | `bedrock-relay` | Replication fan-out, replay and cell membership |
-| `bedrock-kv`, role `l1` | Per-node local cache |
-| `bedrock-kv`, role `l2` | Cell-wide distributed cache |
+| `bedrock-quicksilver`, role `l1` | Per-node local cache of Quicksilver/Auth |
+| `bedrock-quicksilver`, role `l2` | Cell-wide Quicksilver/Auth spread over virtual buckets |
+| `bedrock-kv` | Customer KV: S3-backed namespace readers and caches, no virtual buckets |
 
-`l1` and `l2` can coexist in one `bedrock-kv` process. Relays run as their own process on a few machines per cell.
+`l1` and `l2` can coexist in one `bedrock-quicksilver` process. Relays run as their own process on a few machines per cell.
+Customer KV runs in its own `bedrock-kv` process so tenant load cannot take down Quicksilver/Auth
+(`feature-drafts.md` §4 decision 12); the L1/L2 bucket model in this document applies to Quicksilver/Auth, not customer KV.
 
 ### Requirements
 
@@ -405,31 +406,25 @@ A cell is a self-contained cluster: its own membership, virtual buckets, L2 and 
 - Each cell has its own bucket ownership table. Cells do not know each other's buckets.
 - Reads stay inside the cell, except customer KV misses (below).
 - Cells apply revisions independently. A client moved between cells uses minimum-revision reads so it never sees an older value.
-- Losing a cell moves its traffic to cold caches elsewhere. Misses are coalesced at every tier and origin cells rate-limit per cell to absorb it.
+- Losing a cell moves its traffic to cold caches elsewhere. Misses are coalesced at every tier and shared read capacity (S3, recent-state reads) is rate-limited per cell to absorb it.
 - Moving client traffic between cells is out of scope for now.
 
-### Customer KV: Origin Cells and Tiered Caching
+### Customer KV: S3 Namespace Readers
 
-Customer KV follows the Cloudflare Workers KV model: one store holds each namespace in full, and every other location only caches.
+The earlier origin-cell and regional-tier design is superseded by `feature-drafts.md` §4 decisions 11 (2026-10-29) and
+12 (2026-10-31). In short:
 
-- **Origin cell.** Each namespace has one origin cell in its home DC. It holds the namespace in L2 like `full_replica`, with
-  2–3 bucket replicas, fed by the relay subscription. The Quicksilver namespace directory assigns it explicitly
-  (`writer`, `origin_cell`, `epoch`): new namespaces go to the least-loaded cell, and adding a cell moves nothing.
-- **Regional tier.** In each region, the cell chosen by rendezvous hash of `(namespace, bucket)` over the region's cells
-  fetches from the origin for the whole region. The cell list and entry addresses live in Quicksilver.
-- **Edge.** Every other cell caches entries (`value`, `revision`, `fetched_at`) for `cache_ttl`. A miss walks
-  L1 → cell L2 → regional tier → origin cell. Concurrent misses for a key are coalesced at each tier.
-- **Bucket.** Holds per-namespace materialized SlateDB state and retained events for validated cell recovery (§14).
-- **Adding capacity.** A new node joins its cell through its relay stream, takes over buckets and loads them from peers or the
-  bucket before serving them. A new cell needs its nodes and relays plus one Quicksilver write adding it to the region's cell
-  list. No existing origin assignment changes, so adding capacity never moves data on its own.
-- **Moving an origin** is one operation on one namespace, run on the fly: the directory records the target, the target cell
-  rebuilds the namespace from validated current materialized state and its represented revision, then uses retained events for any
-  required catchup while the old cell keeps serving; the directory flips with an epoch bump, and after a
-  grace period the old cell stops serving, unsubscribes and deletes the namespace's range with its applied revision. Every step
-  is a reconciliation repair, so an interrupted move finishes after a restart. Draining a cell or a single namespace uses the
-  generic drain (feature-drafts B-21b), which calls this operation for each origin namespace involved, at a set rate. Draining
-  works the same way for every dataset; each dataset decides what has to move.
+- **Storage.** Each namespace is its own database in S3, written by one logical `bedrock-api` writer. No cell or node owns it.
+- **Readers.** `bedrock-kv`, a separate binary from `bedrock-quicksilver`, runs read-only namespace readers that cache hot
+  blocks/entries. A miss walks optional L1 → preferred healthy reader in the cell → its local blocks → S3.
+- **Routing.** The preferred reader is the rendezvous-hash winner of `(namespace, key)` over the cell's healthy `bedrock-kv`
+  members. There are no virtual buckets, ownership table, owner checks or bucket moves for customer KV; any eligible reader
+  may serve, and losing one only cools caches.
+- **Freshness.** Minimum-revision reads need a sufficiently new namespace view, including for absence and `LIST`; a lagging
+  S3 view waits or uses the writer's recent committed state.
+- **Adding capacity** adds readers; nothing moves. A drain closes readers and releases caches, never S3 data.
+
+The L1/L2 bucket model in the rest of this document applies to pushed datasets (Quicksilver, Auth) and CDN.
 
 ```text
             Home writer
@@ -514,8 +509,8 @@ Relays must accurately advertise which contiguous revision ranges are available.
 
 #### B. Cache Fills
 
-There is no separate cache-fill broadcast channel. Customer KV fills travel down the tier chain (origin → regional tier →
-cell L2 → L1, §9), which already shares a resolved miss with the whole region. Fills never travel up the relay tree.
+There is no separate cache-fill broadcast channel. Customer KV fills come from S3 into the preferred `bedrock-kv` reader
+and from it into the requester's L1 (§9). Fills never travel up the relay tree.
 
 An older cache fill must never overwrite a newer value or an applied delete. A fill carries the sequence its source
 had applied, which must be at least the receiver's own applied sequence for the namespace. The receiver inserts it
@@ -561,30 +556,24 @@ Example: a namespace homed in Europe is cached in America.
 1. The request reaches any API node.
 2. The namespace directory identifies its home writer.
 3. The request is forwarded to the authoritative region.
-4. The writer durably commits the operation.
-5. A namespace revision is assigned.
-6. The event enters the KV stream.
-7. The namespace's origin cell receives the update through its relays.
-8. Its L2 bucket owners atomically apply the update and revision.
-9. Other cells see it when their cached entry expires, or immediately for a minimum-revision read.
+4. The writer assigns a namespace revision and commits the operation to the namespace's S3 database (B-11).
+5. Readers see it once they refresh to a namespace view that includes it, or immediately for a minimum-revision read,
+   which waits for that view or uses the writer's recent committed state.
 
-Only the origin cell receives events for a `cached` namespace.
+No relay carries customer-KV events.
 
 ## 13. Customer KV Read Sequence
 
 Example: a US node requests a European customer's key.
 
-1. Check local L1; serve the entry if it is younger than `cache_ttl`.
-2. On a miss, ask the cell's L2 bucket owner.
-3. On a miss there, ask the region's regional-tier cell for `(namespace, bucket)`.
-4. On a miss there, ask the namespace's origin cell, which holds the namespace in full.
-5. While the origin cell is unavailable, the last resort is a single-key read from the S3 materialized state (§14).
-6. Validate the returned value and revision.
-7. Fill each tier on the way back with its TTL.
+1. Check the optional local L1.
+2. On a miss, ask the cell's preferred reader: the rendezvous-hash winner of `(namespace, key)` over the cell's healthy
+   `bedrock-kv` members. If it fails, try the next-ranked reader.
+3. The reader serves from its cached blocks, or opens the namespace database and reads the needed blocks from S3.
+4. Validate the returned value, expiration and namespace-view revision.
 
-A minimum-revision read skips any cached entry older than the requested revision and waits at the origin until it has
-applied it. No subscription is created on read; subscriptions and snapshot reads keep a consistent revision boundary where
-they are used (the origin cell and push policies).
+A minimum-revision read requires a namespace view at least that new, including for an absence or `LIST`. No subscription
+is created on read.
 
 ## 14. L3 — Atomic Materialized State and Retained Events
 
@@ -917,7 +906,7 @@ Introduce regional relays, persistent update streams and bounded replay history.
 
 ### Phase 5 — Regional Caching
 
-Implement per-node L1, distributed L2 buckets, healthy-peer discovery, origin cells with tiered TTL caching, and automatic redistribution.
+Implement per-node L1, distributed L2 buckets for Quicksilver/Auth, healthy-peer discovery, customer-KV S3 readers with cache-affinity routing, and automatic redistribution.
 
 ### Phase 6 — Advanced Optimization
 
@@ -927,17 +916,17 @@ Add `full_replica` placement, adaptive cache promotion, regional load balancing,
 
 ## Core Architectural Principles
 
-1. **One Rust binary** runs Quicksilver and customer KV.
+1. **Separate binaries** run Quicksilver/Auth (`bedrock-quicksilver`) and customer KV (`bedrock-kv`).
 2. **Dataset → Namespace** is the logical data hierarchy.
 3. **RocksDB and SurrealKV** implement a shared storage abstraction.
 4. **Each dataset has its own storage-engine instance** on applicable nodes.
 5. **L1 and L2 share a dataset's local engine instance** but use separate logical keyspaces.
 6. **Regional relays use separate storage** for bounded replay history.
 7. **Docker with host networking and NVMe bind mounts** is the default deployment.
-8. **Cached, global, on-demand, home-only, and full-replica policies** control replication and retention.
+8. **Global, on-demand and full-replica policies** control replication and retention of pushed datasets.
 9. **Every cell independently operates an L1/L2 cluster.** A datacenter is one or more cells.
 10. **A tree of relays coordinates replication, cache discovery, and recent event replay.**
-11. **Customer KV is pushed only to its origin cell and cached by TTL everywhere else.**
+11. **Customer KV is read from S3 by cache readers routed by `(namespace, key)`, with no virtual buckets.**
 12. **S3 persists atomic namespace state and time-retained events in SlateDB.**
 13. **Local cache failures trigger automatic fallback and rebuilding.**
 14. **Unhealthy storage is isolated without unnecessarily disabling unrelated services.**

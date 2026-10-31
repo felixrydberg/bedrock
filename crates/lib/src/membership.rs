@@ -1,6 +1,6 @@
 //! Cell membership from relay subscriber streams (#15 / B-12, `docs/spec/membership.md`).
 //!
-//! A `bedrock-kv` or `bedrock-cdn` process announces a [`pb::Member`] on its leaf relay session. Cell relays watch
+//! A `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process announces a [`pb::Member`] on its leaf relay session. Cell relays watch
 //! each other's connected lists over the sibling stream ([`crate::relays::siblings`]), and the lowest relay of a
 //! majority writes the union to dataset [`DATASET`], namespace `{service}.{cell}`, through `bedrock-api`. Nodes subscribe to that namespace
 //! like any other ([`View`]). A disconnected node stays a member for the grace period, so failover to another cell
@@ -30,8 +30,8 @@ use crate::storage::{KeyRange, StorageEngine};
 use crate::transport::Peers;
 
 pub const DATASET: &str = "membership";
-/// Each service has its own namespace per cell; KV and CDN members never mix.
-pub const SERVICES: [&str; 2] = ["kv", "cdn"];
+/// Each service has its own namespace per cell; members of different services never mix.
+pub const SERVICES: [&str; 3] = ["quicksilver", "kv", "cdn"];
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-plans at least this often, which is what expires grace periods.
 const RECONCILE: Duration = Duration::from_secs(1);
@@ -68,7 +68,7 @@ pub fn validate(member: &pb::Member) -> Result<(), Status> {
     Ok(())
 }
 
-/// The entry a `bedrock-kv` or `bedrock-cdn` process announces.
+/// The entry a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process announces.
 pub fn member(config: &ServiceConfig, service: &str) -> pb::Member {
     let node = &config.node;
     pb::Member {

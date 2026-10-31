@@ -29,11 +29,11 @@ reviews:
         - No heartbeat/gossip protocol or membership/placement epochs.
         - Metrics labels stay low-cardinality (no namespace/key/hash/subscriber labels). committed_at is preserved through every hop.
         - StorageEngine and adapters live in lib/storage.
-    - path: "crates/{kv,cdn,relay,api}/**"
+    - path: "crates/{quicksilver,kv,cdn,relay,api}/**"
       instructions: |
         Binaries depend only on bedrock-lib, never on each other — flag any cross-binary dependency or import.
-        kv hosts quicksilver/kv/auth datasets; cdn hosts cdn retention metadata and artifact bytes; each subscribes only to its own datasets.
-        KV keyspaces and eviction belong in kv/storage. CDN artifact caching stays behind CacheStorage.
+        quicksilver hosts quicksilver/auth datasets; kv hosts customer kv only (no virtual buckets, no dataset subscriptions); cdn hosts cdn retention metadata and artifact bytes; each subscribes only to its own datasets.
+        Quicksilver/Auth keyspaces and eviction belong in quicksilver/storage, customer-KV reader residency in kv/storage. CDN artifact caching stays behind CacheStorage.
         Retention is ordinary SET/DELETE replication interpreted only by CDN apply hooks. Workers/Pages/deploy logic does not belong here.
     - path: "crates/*/Cargo.toml"
       instructions: "Binary crates must not depend on other binary crates. New dependencies need a justification; prefer workspace.dependencies. RocksDB must be excluded under cfg(madsim)."
@@ -56,7 +56,7 @@ reviews:
     custom_checks:
       - name: Crate boundaries
         mode: error
-        instructions: "Fail if any of crates/kv, crates/cdn, crates/relay or crates/api depends on or imports another of those crates. They may depend only on bedrock-lib."
+        instructions: "Fail if any of crates/quicksilver, crates/kv, crates/cdn, crates/relay or crates/api depends on or imports another of those crates. They may depend only on bedrock-lib."
       - name: Protocol spec first
         mode: warning
         instructions: "If the PR changes the replication/write/relay protocol or its message types, warn unless the TLA+ specification is updated in the same PR or the description links where it was updated."

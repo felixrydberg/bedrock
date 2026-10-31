@@ -205,9 +205,16 @@ async fn status_changes_publish_and_foreign_entries_are_ignored() {
 fn announced_entries_are_validated() {
     assert!(validate(&ready("kv-1")).is_ok());
     assert!(validate(&entry("kv-1", pb::member::Status::Left)).is_err());
+    for service in ["quicksilver", "cdn"] {
+        let member = pb::Member {
+            service: service.into(),
+            ..ready("kv-1")
+        };
+        assert!(validate(&member).is_ok());
+    }
     assert!(
         validate(&pb::Member {
-            service: "quicksilver".into(),
+            service: "auth".into(),
             ..ready("kv-1")
         })
         .is_err()

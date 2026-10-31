@@ -9,6 +9,7 @@ description = "Deterministic simulation tests for the shared core (B-23a); most 
 [target.'cfg(madsim)'.dev-dependencies]
 bedrock-cdn = { path = "../../crates/cdn" }
 bedrock-kv = { path = "../../crates/kv" }
+bedrock-quicksilver = { path = "../../crates/quicksilver" }
 bedrock-relay = { path = "../../crates/relay" }
 aws-sdk-s3.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1"] }
