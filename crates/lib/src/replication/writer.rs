@@ -300,16 +300,16 @@ impl Writer {
                 "recovery lease expired or invalid scope/cursor",
             ));
         }
-        let ns = self.namespace(dataset, namespace);
-        let mut state = ns.state.lock().await;
-        Ok(self
-            .source(&mut state, dataset, namespace)
-            .await?
-            .events()
+        let source = {
+            let ns = self.namespace(dataset, namespace);
+            let mut state = ns.state.lock().await;
+            self.source(&mut state, dataset, namespace).await?
+        };
+        // The namespace gate is released so commits continue during the bounded read.
+        Ok(source
+            .events_from(from, 256)
             .await?
             .into_iter()
-            .filter(|entry| entry.event.sequence >= from)
-            .take(256)
             .map(|entry| entry.event)
             .collect())
     }

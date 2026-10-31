@@ -64,7 +64,10 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
                 prefix,
             }))
         })
-        .collect::<Result<Vec<_>, ConfigError>>()?.into_iter().flatten().collect();
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+    // ponytail: a skipped subscription keeps the node unready until restart; rebuild the Session if hot recovery matters.
+    let skipped = targets.iter().any(Option::is_none);
+    let targets = targets.into_iter().flatten().collect();
     let session = bedrock_lib::relays::client::Session::start(
         std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin)),
         config.relays.clone(),
@@ -76,7 +79,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     loop {
         tokio::select! {biased;
             ()=&mut shutdown=>break,
-            _=readiness.tick()=>admin.set_ready(datasets.is_healthy() && session.ready()),
+            _=readiness.tick()=>admin.set_ready(!skipped && datasets.is_healthy() && session.ready()),
         }
     }
     admin.set_ready(false);

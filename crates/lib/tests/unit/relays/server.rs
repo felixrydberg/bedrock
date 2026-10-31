@@ -64,6 +64,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
     let bytes = Arc::new(AtomicUsize::new(0));
     let events = Arc::new(AtomicUsize::new(0));
     let closed = Arc::new(Watched::new(false));
+    let changed = Arc::new(Watched::new(0));
     let follows = BTreeMap::from([(
         ("auth".into(), "users".into()),
         Interest {
@@ -81,7 +82,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             events: events.clone(),
             closed: closed.clone(),
             follows,
-            changed: Arc::new(Watched::new(0)),
+            changed: changed.clone(),
         },
     );
     (
@@ -89,6 +90,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             rx: ReceiverStream::new(rx),
             bytes,
             events,
+            changed,
             owner: Some((hub.clone(), id)),
         },
         closed,
@@ -215,8 +217,14 @@ async fn replaced_generation_cannot_enqueue_into_the_new_subscription() {
         .get_mut(&key)
         .unwrap()
         .generation = 2;
-    assert!(!hub.send_scoped(1, &key, 1, pb::relay_frame::Kind::Tick(true)));
-    assert!(hub.send_scoped(1, &key, 2, pb::relay_frame::Kind::Tick(true)));
+    assert!(
+        !hub.send_scoped(1, &key, 1, pb::relay_frame::Kind::Tick(true))
+            .await
+    );
+    assert!(
+        hub.send_scoped(1, &key, 2, pb::relay_frame::Kind::Tick(true))
+            .await
+    );
     assert!(
         tokio_stream::StreamExt::next(&mut frames)
             .await
@@ -277,4 +285,74 @@ async fn a_full_replay_persistence_queue_never_blocks_live_history() {
     let key = ("auth".into(), "users".into());
     assert_eq!(hub.source_head(&key), Some(2048));
     assert_eq!(hub.read(&key, 2048).await.unwrap()[0].0, 2048);
+}
+
+#[tokio::test]
+async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
+    use crate::replication::materialized::Retention;
+    use crate::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
+    const KEYS: u64 = 1500;
+    let writer = Writer::open(
+        || 1_700_000_000_000,
+        Persistence {
+            factory: Arc::new(crate::storage::namespace::memory::MemoryFactory::default()),
+            retention: Retention::default(),
+            metrics: PersistenceMetrics::default(),
+        },
+    )
+    .await
+    .unwrap();
+    for key in 0..KEYS {
+        writer
+            .commit(Write {
+                dataset: "auth".into(),
+                namespace: "users".into(),
+                key: key.to_be_bytes().to_vec(),
+                operation: crate::replication::Operation::Set(vec![42]),
+                idempotency_key: None,
+            })
+            .await
+            .unwrap();
+    }
+    let hub = Hub::writer(
+        "writer".into(),
+        writer.clone(),
+        Arc::new(Peers::new(&Admin::new())),
+    );
+    let (mut frames, closed) = subscriber(&hub, 1, MAX_EVENTS);
+    let pumping = hub.clone();
+    let task = tokio::spawn(async move {
+        let follow = pb::Follow {
+            dataset: "auth".into(),
+            namespace: "users".into(),
+            from: 0,
+            buckets: Vec::new(),
+        };
+        pumping.pump(1, follow, 1, Vec::new(), true).await
+    });
+    // The reader stalls while the queue holds more than MAX_EVENTS worth of entries.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!closed.get());
+    let mut entries = 0;
+    loop {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio_stream::StreamExt::next(&mut frames),
+        )
+        .await
+        .unwrap()
+        .expect("subscriber stayed connected")
+        .unwrap();
+        if let Some(pb::relay_frame::Kind::Bootstrap(b)) = frame.kind {
+            entries += b.entries.len() as u64;
+            if b.end {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert_eq!(entries, KEYS);
+    assert!(!closed.get());
+    task.abort();
+    writer.close().await.unwrap();
 }

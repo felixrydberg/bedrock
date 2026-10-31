@@ -582,6 +582,32 @@ impl Materialized {
         self.events_locked(&self.read_progress().await?).await
     }
 
+    /// Reads at most `limit` retained events from `from` by sequence key, never the whole history.
+    pub async fn events_from(&self, from: u64, limit: u64) -> StorageResult<Vec<Committed>> {
+        let _guard = self.lock.lock().await;
+        let view = self.read_progress().await?;
+        if from <= view.pruned_through {
+            return Err(StorageError::Unavailable(context(
+                &format!("{}/{}", self.dataset, self.namespace),
+                "requested events were pruned",
+            )));
+        }
+        let through = view
+            .sequence
+            .min(from.saturating_add(limit).saturating_sub(1));
+        let mut events = Vec::new();
+        for sequence in from..=through {
+            let encoded = key(b'e', &sequence.to_be_bytes());
+            let stored = self
+                .db
+                .get(&encoded)
+                .await?
+                .ok_or_else(|| self.corrupt("retained event is missing"))?;
+            events.push(self.decode_event(&encoded, &stored)?);
+        }
+        Ok(events)
+    }
+
     /// Event-triggered expiry cleanup. Progress and event removals are atomic;
     /// pinned native views remain protected by the engine's own MVCC/checkpoint GC.
     pub async fn cleanup(&self, now: u64, retention: &Retention) -> StorageResult<u64> {

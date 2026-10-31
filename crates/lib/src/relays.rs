@@ -99,6 +99,7 @@ pub struct Frames {
     rx: ReceiverStream<Result<pb::RelayFrame, Status>>,
     bytes: Arc<AtomicUsize>,
     events: Arc<AtomicUsize>,
+    changed: Arc<Watched<u64>>,
     owner: Option<(Hub, u64)>,
 }
 impl Drop for Frames {
@@ -116,6 +117,7 @@ impl Stream for Frames {
             self.bytes.fetch_sub(frame.encoded_len(), Ordering::Relaxed);
             self.events
                 .fetch_sub(queued_events(frame), Ordering::Relaxed);
+            self.changed.update(|v| *v = v.wrapping_add(1));
         }
         item
     }
@@ -312,70 +314,113 @@ impl Hub {
         }
         self.changed();
     }
+    /// Immediate send for control frames: a full queue disconnects the subscriber.
     fn send(&self, id: u64, kind: pb::relay_frame::Kind) -> bool {
-        self.send_for(id, kind, None)
+        match self.enqueue(id, pb::RelayFrame { kind: Some(kind) }, None) {
+            Ok(sent) => sent,
+            Err(_) => {
+                self.remove(id);
+                false
+            }
+        }
     }
-    fn send_scoped(
+    /// Waits for queue budget; a subscriber that drains nothing for IDLE is disconnected.
+    async fn send_scoped(
         &self,
         id: u64,
         key: &Key,
         generation: u64,
         kind: pb::relay_frame::Kind,
     ) -> bool {
-        self.send_for(id, kind, Some((key, generation)))
+        let Some(changes) = self
+            .0
+            .subscribers
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|s| s.changed.clone())
+        else {
+            return false;
+        };
+        let mut frame = pb::RelayFrame { kind: Some(kind) };
+        let queued = tokio::time::timeout(IDLE, async move {
+            loop {
+                let version = changes.get();
+                match self.enqueue(id, frame, Some((key, generation))) {
+                    Ok(sent) => return sent,
+                    Err(rejected) => frame = rejected,
+                }
+                changes.wait_until(|v| *v != version).await;
+            }
+        })
+        .await;
+        queued.unwrap_or_else(|_| {
+            self.remove(id);
+            false
+        })
     }
-    fn send_for(&self, id: u64, kind: pb::relay_frame::Kind, scope: Option<(&Key, u64)>) -> bool {
-        let frame = pb::RelayFrame { kind: Some(kind) };
+    /// `Ok(false)`: subscriber or scope is gone. `Err`: the frame does not fit the queue budget yet.
+    fn enqueue(
+        &self,
+        id: u64,
+        frame: pb::RelayFrame,
+        scope: Option<(&Key, u64)>,
+    ) -> Result<bool, pb::RelayFrame> {
         let len = frame.encoded_len();
         let events = queued_events(&frame);
-        let failed = {
-            let mut subscribers = self.0.subscribers.lock().unwrap();
-            let Some(sub) = subscribers.get_mut(&id) else {
-                return false;
-            };
-            if let Some((key, generation)) = scope
-                && sub
-                    .follows
-                    .get(key)
-                    .is_none_or(|f| f.generation != generation)
-            {
-                return false;
+        let mut subscribers = self.0.subscribers.lock().unwrap();
+        let Some(sub) = subscribers.get_mut(&id) else {
+            return Ok(false);
+        };
+        if let Some((key, generation)) = scope
+            && sub
+                .follows
+                .get(key)
+                .is_none_or(|f| f.generation != generation)
+        {
+            return Ok(false);
+        }
+        if sub.bytes.load(Ordering::Relaxed).saturating_add(len) > MAX_BYTES
+            || sub.events.load(Ordering::Relaxed).saturating_add(events) > MAX_EVENTS
+        {
+            return Err(frame);
+        }
+        let position = match &frame.kind {
+            Some(pb::relay_frame::Kind::Delivery(d)) => Some((d.through.saturating_add(1), None)),
+            Some(pb::relay_frame::Kind::Bootstrap(b)) if b.end => {
+                Some((b.boundary.saturating_add(1), Some(b.boundary)))
             }
-            if sub.bytes.load(Ordering::Relaxed).saturating_add(len) > MAX_BYTES
-                || sub.events.load(Ordering::Relaxed).saturating_add(events) > MAX_EVENTS
-            {
-                true
-            } else {
-                // Publish the sent position before another runtime thread can acknowledge the frame.
+            _ => None,
+        };
+        sub.bytes.fetch_add(len, Ordering::Relaxed);
+        sub.events.fetch_add(events, Ordering::Relaxed);
+        match sub.tx.try_send(Ok(frame)) {
+            Ok(()) => {
+                // Published under the lock, so no acknowledgement can observe the frame first.
                 if let Some((key, _)) = scope
                     && let Some(interest) = sub.follows.get_mut(key)
+                    && let Some((from, baseline)) = position
                 {
-                    match &frame.kind {
-                        Some(pb::relay_frame::Kind::Delivery(d)) => {
-                            interest.from = d.through.saturating_add(1)
-                        }
-                        Some(pb::relay_frame::Kind::Bootstrap(b)) if b.end => {
-                            interest.from = b.boundary.saturating_add(1);
-                            interest.baseline = b.boundary;
-                        }
-                        _ => {}
+                    interest.from = from;
+                    if let Some(baseline) = baseline {
+                        interest.baseline = baseline;
                     }
                 }
-                sub.bytes.fetch_add(len, Ordering::Relaxed);
-                sub.events.fetch_add(events, Ordering::Relaxed);
-                if sub.tx.try_send(Ok(frame)).is_err() {
-                    sub.bytes.fetch_sub(len, Ordering::Relaxed);
-                    sub.events.fetch_sub(events, Ordering::Relaxed);
-                    true
-                } else {
-                    false
+                Ok(true)
+            }
+            Err(error) => {
+                sub.bytes.fetch_sub(len, Ordering::Relaxed);
+                sub.events.fetch_sub(events, Ordering::Relaxed);
+                drop(subscribers);
+                match error {
+                    mpsc::error::TrySendError::Full(Ok(frame)) => Err(frame),
+                    _ => {
+                        self.remove(id);
+                        Ok(false)
+                    }
                 }
             }
-        };
-        if failed {
-            self.remove(id);
         }
-        !failed
     }
     fn current(&self, id: u64, key: &Key, generation: u64) -> Option<(u64, u64)> {
         self.0
@@ -670,19 +715,22 @@ impl Hub {
                     .map(|r| r.ranges(&key.0, &key.1))
                     .unwrap_or_default();
                 let (first, last) = ranges.first().copied().unwrap_or((0, 0));
-                if !self.send_scoped(
-                    id,
-                    &key,
-                    generation,
-                    pb::relay_frame::Kind::Range(pb::ReplayRange {
-                        dataset: key.0.clone(),
-                        namespace: key.1.clone(),
-                        first,
-                        last,
-                        head,
-                        recovered: false,
-                    }),
-                ) {
+                if !self
+                    .send_scoped(
+                        id,
+                        &key,
+                        generation,
+                        pb::relay_frame::Kind::Range(pb::ReplayRange {
+                            dataset: key.0.clone(),
+                            namespace: key.1.clone(),
+                            first,
+                            last,
+                            head,
+                            recovered: false,
+                        }),
+                    )
+                    .await
+                {
                     return Ok(());
                 }
                 announced = true;
@@ -706,7 +754,8 @@ impl Hub {
                             head: h.unwrap_or(0),
                             recovered: true,
                         }),
-                    );
+                    )
+                    .await;
                     lease = None;
                     drop(recovery_permit.take());
                 }
@@ -777,18 +826,21 @@ impl Hub {
                                 .then_some(event.bytes)
                             })
                             .collect();
-                        if !self.send_scoped(
-                            id,
-                            &key,
-                            generation,
-                            pb::relay_frame::Kind::Delivery(pb::Delivery {
-                                dataset: key.0.clone(),
-                                namespace: key.1.clone(),
-                                from,
-                                through,
-                                events: selected,
-                            }),
-                        ) {
+                        if !self
+                            .send_scoped(
+                                id,
+                                &key,
+                                generation,
+                                pb::relay_frame::Kind::Delivery(pb::Delivery {
+                                    dataset: key.0.clone(),
+                                    namespace: key.1.clone(),
+                                    from,
+                                    through,
+                                    events: selected,
+                                }),
+                            )
+                            .await
+                        {
                             return Ok(());
                         }
                         self.advance(id, &key, generation, through);
@@ -820,15 +872,18 @@ impl Hub {
                                 entries: Vec::new(),
                                 checksum: Vec::new(),
                             };
-                            if !self.send_scoped(
-                                id,
-                                &key,
-                                generation,
-                                pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
-                                    begin: true,
-                                    ..base.clone()
-                                }),
-                            ) {
+                            if !self
+                                .send_scoped(
+                                    id,
+                                    &key,
+                                    generation,
+                                    pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                                        begin: true,
+                                        ..base.clone()
+                                    }),
+                                )
+                                .await
+                            {
                                 return Ok(());
                             }
                             let mut entries = Vec::new();
@@ -854,15 +909,18 @@ impl Hub {
                                 bytes += k.len() + v.len();
                                 entries.push(pb::StateEntry { key: k, value: v });
                                 if entries.len() >= 256 || bytes >= 64 * 1024 {
-                                    if !self.send_scoped(
-                                        id,
-                                        &key,
-                                        generation,
-                                        pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
-                                            entries: std::mem::take(&mut entries),
-                                            ..base.clone()
-                                        }),
-                                    ) {
+                                    if !self
+                                        .send_scoped(
+                                            id,
+                                            &key,
+                                            generation,
+                                            pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                                                entries: std::mem::take(&mut entries),
+                                                ..base.clone()
+                                            }),
+                                        )
+                                        .await
+                                    {
                                         return Ok(());
                                     }
                                     bytes = 0;
@@ -870,15 +928,17 @@ impl Hub {
                                 }
                             }
                             if !entries.is_empty()
-                                && !self.send_scoped(
-                                    id,
-                                    &key,
-                                    generation,
-                                    pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
-                                        entries,
-                                        ..base.clone()
-                                    }),
-                                )
+                                && !self
+                                    .send_scoped(
+                                        id,
+                                        &key,
+                                        generation,
+                                        pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                                            entries,
+                                            ..base.clone()
+                                        }),
+                                    )
+                                    .await
                             {
                                 return Ok(());
                             }
@@ -887,16 +947,19 @@ impl Hub {
                                     "bootstrap lease expired during transfer",
                                 ));
                             }
-                            if !self.send_scoped(
-                                id,
-                                &key,
-                                generation,
-                                pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
-                                    end: true,
-                                    checksum: hash.finalize().to_vec(),
-                                    ..base
-                                }),
-                            ) {
+                            if !self
+                                .send_scoped(
+                                    id,
+                                    &key,
+                                    generation,
+                                    pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                                        end: true,
+                                        checksum: hash.finalize().to_vec(),
+                                        ..base
+                                    }),
+                                )
+                                .await
+                            {
                                 return Ok(());
                             }
                             self.send_scoped(
@@ -911,7 +974,8 @@ impl Hub {
                                     head: self.source_head(&key).unwrap_or(view.sequence),
                                     recovered: false,
                                 }),
-                            );
+                            )
+                            .await;
                             self.advance(id, &key, generation, view.sequence);
                             self.baseline(id, &key, generation, view.sequence);
                             lease = Some(pin);
@@ -1048,7 +1112,7 @@ impl Hub {
                             target = Some(range.head);
                             if range.recovered {
                                 recovering=false;
-                                if !self.send_scoped(id,&key,generation,pb::relay_frame::Kind::Range(range.clone())){return Ok(())}
+                                if !self.send_scoped(id,&key,generation,pb::relay_frame::Kind::Range(range.clone())).await{return Ok(())}
                             }
                             if !recovering && self
                                 .current(id, &key, generation)
@@ -1061,7 +1125,7 @@ impl Hub {
                         }
                         Some(pb::relay_frame::Kind::Delivery(ref d)) => {
                             let through = d.through;
-                            if !self.send_scoped(id, &key, generation, frame.kind.unwrap()) {
+                            if !self.send_scoped(id, &key, generation, frame.kind.unwrap()).await {
                                 return Ok(());
                             }
                             self.advance(id, &key, generation, through);
@@ -1101,7 +1165,7 @@ impl Hub {
                             recovering=true;
                             let end = b.end;
                             let boundary = b.boundary;
-                            if !self.send_scoped(id, &key, generation, frame.kind.unwrap()) {
+                            if !self.send_scoped(id, &key, generation, frame.kind.unwrap()).await {
                                 return Ok(());
                             }
                             if end {
@@ -1368,6 +1432,7 @@ impl pb::relay_server::Relay for Hub {
         let bytes = Arc::new(AtomicUsize::new(0));
         let events = Arc::new(AtomicUsize::new(0));
         let closed = Arc::new(Watched::new(false));
+        let changed = Arc::new(Watched::new(0));
         let id = self.0.ids.fetch_add(1, Ordering::Relaxed);
         self.0.subscribers.lock().unwrap().insert(
             id,
@@ -1377,7 +1442,7 @@ impl pb::relay_server::Relay for Hub {
                 events: events.clone(),
                 closed: closed.clone(),
                 follows: BTreeMap::new(),
-                changed: Arc::new(Watched::new(0)),
+                changed: changed.clone(),
             },
         );
         self.send(
@@ -1396,7 +1461,8 @@ impl pb::relay_server::Relay for Hub {
                 tokio::select! {biased;
                     _=closed.wait_until(|v|*v)=>break,
                     _=tokio::time::sleep_until(received+IDLE)=>break,
-                    _=tick.tick()=>{if !hub.send(id,pb::relay_frame::Kind::Tick(true)){break}},
+                    // A full queue skips the tick; stalled readers are disconnected by scoped sends after IDLE.
+                    _=tick.tick()=>if matches!(hub.enqueue(id,pb::RelayFrame{kind:Some(pb::relay_frame::Kind::Tick(true))},None),Ok(false)){break},
                     request=requests.message()=>match request {
                         Ok(Some(request))=>{received=crate::monotonic_now();match request.kind {
                             Some(pb::relay_request::Kind::Follow(f))=>hub.follow(id,f,Vec::new(),false).await,
@@ -1423,6 +1489,7 @@ impl pb::relay_server::Relay for Hub {
             rx: ReceiverStream::new(rx),
             bytes,
             events,
+            changed,
             owner: Some((self.clone(), id)),
         }))
     }

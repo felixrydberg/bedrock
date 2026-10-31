@@ -217,6 +217,8 @@ struct RebuildFault {
     fail_write: std::sync::atomic::AtomicBool,
     fail_health: std::sync::atomic::AtomicBool,
     writes: std::sync::atomic::AtomicUsize,
+    /// Reported physical bytes; zero delegates to the in-memory engine.
+    disk: std::sync::atomic::AtomicU64,
 }
 
 impl StorageEngine for RebuildFault {
@@ -249,7 +251,10 @@ impl StorageEngine for RebuildFault {
         self.inner.stats()
     }
     fn disk_usage(&self) -> StorageResult<u64> {
-        self.inner.disk_usage()
+        match self.disk.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => self.inner.disk_usage(),
+            bytes => Ok(bytes),
+        }
     }
     fn health(&self) -> StorageResult<()> {
         if self.fail_health.load(std::sync::atomic::Ordering::Relaxed) {
@@ -269,6 +274,7 @@ fn failed_rebuild_write_or_health_keeps_cache_disabled_until_success() {
         fail_write: AtomicBool::new(false),
         fail_health: AtomicBool::new(false),
         writes: std::sync::atomic::AtomicUsize::new(0),
+        disk: std::sync::atomic::AtomicU64::new(0),
     });
     let replay = Replay::open(engine.clone(), ReplayConfig::default()).unwrap();
     replay.append(&event("auth", "n", 1), 0).unwrap();
@@ -298,6 +304,7 @@ fn batch_engine() -> Arc<RebuildFault> {
         fail_write: std::sync::atomic::AtomicBool::new(false),
         fail_health: std::sync::atomic::AtomicBool::new(false),
         writes: std::sync::atomic::AtomicUsize::new(0),
+        disk: std::sync::atomic::AtomicU64::new(0),
     })
 }
 
@@ -412,4 +419,22 @@ fn batch_eviction_merges_candidate_and_existing_priority_and_age_indexes() {
     assert_eq!(replay.ranges("hi", "n"), [(2, 2)]);
     assert!(replay.ranges("lo", "n").is_empty());
     assert_eq!(replay.bytes(), size);
+}
+
+#[test]
+fn physical_overhead_within_headroom_keeps_replay_enabled() {
+    use std::sync::atomic::Ordering;
+    let engine = batch_engine();
+    let replay = Replay::open(
+        engine.clone(),
+        ReplayConfig {
+            max_bytes: 1000,
+            ..ReplayConfig::default()
+        },
+    )
+    .unwrap();
+    engine.disk.store(2000, Ordering::Relaxed);
+    assert!(replay.healthy());
+    engine.disk.store(2001, Ordering::Relaxed);
+    assert!(!replay.healthy());
 }

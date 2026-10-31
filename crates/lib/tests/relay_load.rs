@@ -436,5 +436,6 @@ async fn thousand_bucket_subscribers_at_ten_thousand_events_per_second() {
     }
     upstream.abort();
     writer.close().await.unwrap();
+    assert!(replay.healthy(), "replay persistence was disabled");
     assert!(replay.bytes() <= REPLAY_BYTES);
 }

@@ -13,6 +13,8 @@ use crate::storage::{
 };
 
 const PREFIX: &[u8] = b"bedrock/replay/v1/";
+/// Physical usage carries WAL/SST overhead, so the disk limit leaves headroom over the logical budget.
+const DISK_HEADROOM: u64 = 2;
 type Identity = (String, String, u64);
 type Candidates = BTreeMap<Identity, (Record, Vec<u8>)>;
 
@@ -322,9 +324,9 @@ impl Replay {
 
     fn check_disk(&self) -> StorageResult<()> {
         match self.engine.disk_usage() {
-            Ok(bytes) if bytes > self.config.max_bytes => Err(StorageError::Unavailable(context(
-                "physical replay storage exceeds byte budget",
-            ))),
+            Ok(bytes) if bytes > self.config.max_bytes.saturating_mul(DISK_HEADROOM) => Err(
+                StorageError::Unavailable(context("physical replay storage exceeds disk budget")),
+            ),
             Ok(_) | Err(StorageError::Unsupported(_)) => Ok(()),
             Err(error) => Err(error),
         }

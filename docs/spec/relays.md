@@ -95,7 +95,8 @@ After a successfully opened cache fails, future events retry rebuilding its
 disposable prefix at most once per second. If initial open/validation fails, the
 node runs without disk replay until the cache is repaired or cleared and restarted.
 The logical byte budget is strict; physical RocksDB usage includes WAL/SST overhead
-and is checked where supported. Exceeding it disables caching. The storage contract
+and is checked, where supported, against twice the logical budget. Exceeding that
+disables caching. The storage contract
 cannot guarantee filesystem compaction or prevent temporary physical overshoot;
 deployment disk quotas remain an adapter/host responsibility.
 
@@ -138,11 +139,15 @@ For cleanup validation, native lint reused a cached RocksDB archive through the
 dependency's supported `ROCKSDB_LIB_DIR` / `ROCKSDB_STATIC` settings; native tests
 built RocksDB normally. This avoids rebuilding C++ for the Rust-only lint step.
 
-TLC 1.8.0 checked `MaxRevision=4`, `QueueLimit=2` on 2026-10-30: 214,167 generated
-states, 30,004 distinct states, depth 22, no invariant violation. This is the bounded
-safety model above, not a proof of the Rust implementation or a liveness proof.
-As a negative check, replacing selected-payload application with a no-op in an
-ignored temporary copy makes `FilteredCoverage` fail at covered revision 2.
+TLC 1.8.0 checked `MaxRevision=4`, `QueueLimit=2` on 2026-10-31: 494,060 generated
+states, 67,430 distinct states, depth 24, no invariant violation. The model separates
+validated installation from the source's recovered confirmation, keeps pending
+confirmation across disconnects and lease expiry, and checks `ReadyAfterConfirmation`.
+This is the bounded safety model above, not a proof of the Rust implementation or a
+liveness proof. As negative checks in ignored temporary copies, replacing
+selected-payload application with a no-op makes `FilteredCoverage` fail at covered
+revision 2 (2026-10-30), and dropping `~pending` from `BecomeReady` makes
+`ReadyAfterConfirmation` fail at depth 4 (2026-10-31).
 
 With the [official TLA+ release](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0)
 jar saved as `.codex-tmp/tla2tools.jar`, run from `docs/spec`:

@@ -190,9 +190,9 @@ Rules this implies:
 | KV Phase 4 (relays, streams, replay) | B-17 … B-19 (cache-fill broadcast dropped, decision 11) |
 | KV Phase 5 (cache routing and residency; pushed-data redistribution stays shared) | B-15, B-16, B-19, B-27, B-28 |
 | KV Phase 6 (optimisation) | B-38, B-40, B-41, B-53 |
-| CDN Phase 1 (storage, retention metadata + publish) | B-30, B-31, B-32, B-33 |
-| CDN Phase 2 (regional placement + retrieval) | B-34, B-35 |
-| CDN Phase 3 (retention and recovery) | B-43, B-44 |
+| CDN Phase 1 (artifact storage, transfer, manifests + publish, hash-addressed retrieval) | B-30, B-31, B-33, B-35 (dependency order still applies: B-33 needs B-32's manifest codec, B-35 needs B-34's L2) |
+| CDN Phase 2 (global retention streams, regional placement) | B-32, B-34 |
+| CDN Phase 3 (manifest-based retention and recovery) | B-32 (manifest refcounts), B-43, B-44 |
 | CDN Phase 4 (optimisation) | B-45, B-46, B-47, B-49 (compiled Worker caching moved to B-48 in track L) |
 | Deployment parts of the CDN doc (activation, rollbacks, Worker/Pages retrieval) | B-50, B-51, B-48, B-52 |
 
