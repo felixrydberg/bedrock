@@ -6,6 +6,10 @@
 //! like any other ([`View`]). A disconnected node stays a member for the grace period, so failover to another cell
 //! relay changes nothing; a drained node leaves at once. Without a majority, or before the relay has caught up with
 //! the published view, nothing is written and the view freezes.
+//!
+//! The publisher also writes each ranged service's L2 placement directory into the same namespace (#19 / B-16, §4
+//! decision 13), so membership and placement share one revision order. It plans placement only once membership has
+//! nothing left to write.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -20,6 +24,7 @@ use tokio::time::Instant;
 use tonic::Status;
 
 use crate::node::{MembershipSettings, ServiceConfig};
+use crate::placement::{self, Directory, Owner, State};
 use crate::relays::client::{Selection, Session, Target};
 pub use crate::relays::siblings::Members;
 use crate::relays::siblings::Siblings;
@@ -35,6 +40,13 @@ pub const SERVICES: [&str; 3] = ["quicksilver", "kv", "cdn"];
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-plans at least this often, which is what expires grace periods.
 const RECONCILE: Duration = Duration::from_secs(1);
+/// Services whose L2 is placed in hash ranges; customer KV ranks its readers instead (#18 / B-15).
+const RANGED: [&str; 2] = ["quicksilver", "cdn"];
+/// Directory keys are `range/{start:016x}`; node IDs cannot contain `/`.
+const RANGE: &str = "range/";
+// ponytail: fixed until B-34 makes them per-service settings read at relay startup (CDN artifacts want 2 replicas).
+const REPLICAS: usize = 3;
+const MAX_MOVING: usize = 16;
 
 pub fn namespace(service: &str, cell: &str) -> String {
     format!("{service}.{cell}")
@@ -116,23 +128,95 @@ impl Published {
         (Self { engine, prefix }, target)
     }
 
-    /// Node ID → entry. An undecodable entry is corruption, never a missing member.
-    fn read(&self) -> Result<BTreeMap<String, pb::Member>, Status> {
+    /// Node ID → entry, and the placement directory. An undecodable entry is corruption, never a missing one.
+    fn read(&self) -> Result<(BTreeMap<String, pb::Member>, Directory), Status> {
         let mut members = BTreeMap::new();
+        let mut directory = Directory::new();
         let scan = self
             .engine
             .scan(&KeyRange::prefix(self.prefix.clone()))
             .map_err(|e| Status::internal(e.to_string()))?;
         for entry in scan {
             let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
-            let node_id = String::from_utf8(key[self.prefix.len()..].to_vec())
+            let key = String::from_utf8(key[self.prefix.len()..].to_vec())
+                .map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
+            if let Some(start) = key.strip_prefix(RANGE) {
+                if start.len() != 16
+                    || !start
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(Status::data_loss("invalid range key"));
+                }
+                let start = u64::from_str_radix(start, 16)
+                    .map_err(|_| Status::data_loss("invalid range key"))?;
+                directory.insert(start, decode(&value)?);
+                continue;
+            }
+            let member = pb::Member::decode(value.as_slice())
+                .map_err(|e| Status::data_loss(e.to_string()))?;
+            members.insert(key, member);
+        }
+        Ok((members, directory))
+    }
+
+    fn members(&self) -> Result<BTreeMap<String, pb::Member>, Status> {
+        let scan = self
+            .engine
+            .scan(&KeyRange::prefix(self.prefix.clone()))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut members = BTreeMap::new();
+        for entry in scan {
+            let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
+            let key = &key[self.prefix.len()..];
+            if key.starts_with(RANGE.as_bytes()) {
+                continue;
+            }
+            let key = String::from_utf8(key.to_vec())
                 .map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
             let member = pb::Member::decode(value.as_slice())
                 .map_err(|e| Status::data_loss(e.to_string()))?;
-            members.insert(node_id, member);
+            members.insert(key, member);
         }
         Ok(members)
     }
+}
+
+fn decode(value: &[u8]) -> Result<Vec<Owner>, Status> {
+    use pb::range::owner::State as Pb;
+    let range = pb::Range::decode(value).map_err(|e| Status::data_loss(e.to_string()))?;
+    range
+        .owners
+        .into_iter()
+        .map(|owner| {
+            let state = match Pb::try_from(owner.state) {
+                Ok(Pb::Populating) => State::Populating,
+                Ok(Pb::Ready) => State::Ready,
+                Ok(Pb::Leaving) => State::Leaving,
+                Err(_) => return Err(Status::data_loss("unknown range owner state")),
+            };
+            Ok(Owner {
+                node: owner.node_id,
+                state,
+            })
+        })
+        .collect()
+}
+
+fn encode(owners: &[Owner]) -> Vec<u8> {
+    use pb::range::owner::State as Pb;
+    let owners = owners.iter().map(|owner| pb::range::Owner {
+        node_id: owner.node.clone(),
+        state: match owner.state {
+            State::Populating => Pb::Populating,
+            State::Ready => Pb::Ready,
+            State::Leaving => Pb::Leaving,
+        } as i32,
+    });
+    pb::Range {
+        owners: owners.collect(),
+    }
+    .encode_to_vec()
 }
 
 /// A node's replicated view of its own service's members in its cell.
@@ -156,7 +240,13 @@ impl View {
 
     /// Node ID → entry, as of the last applied revision. Without relays the last view stays.
     pub fn members(&self) -> Result<BTreeMap<String, pb::Member>, Status> {
-        self.published.read()
+        self.published.members()
+    }
+
+    /// The service's L2 placement directory in this cell: route with [`placement::owners`], and serve only what
+    /// [`placement::serves`] allows. Empty for customer KV.
+    pub fn directory(&self) -> Result<Directory, Status> {
+        Ok(self.published.read()?.1)
     }
 
     /// When the view has advanced, drops connections and breakers of members that left.
@@ -181,6 +271,11 @@ impl View {
 pub enum Change {
     Set(pb::Member),
     Delete(MemberKey),
+    Range {
+        service: String,
+        start: u64,
+        owners: Vec<Owner>,
+    },
 }
 
 /// What one cell relay sees: its own leaf members and each sibling's synced list, `None` while unreachable.
@@ -249,6 +344,29 @@ pub fn plan(
     Some(changes)
 }
 
+/// One ranged service's directory writes from the published `actual` members: promote what the last pass assigned,
+/// otherwise assign (`docs/spec/membership.tla`, `Write`).
+pub fn place(service: &str, actual: &Members, directory: &Directory) -> Vec<Change> {
+    let members: BTreeMap<_, _> = actual
+        .iter()
+        .filter(|((s, _), _)| s == service)
+        .map(|((_, id), member)| (id.clone(), member.clone()))
+        .collect();
+    let mut entries = placement::promote(directory, &members);
+    if entries.is_empty() {
+        // ponytail: no health input until #13 / B-14 reports it in member updates.
+        entries = placement::assign(directory, &members, &BTreeSet::new(), REPLICAS, MAX_MOVING);
+    }
+    entries
+        .into_iter()
+        .map(|(start, owners)| Change::Range {
+            service: service.into(),
+            start,
+            owners,
+        })
+        .collect()
+}
+
 /// A cell relay's membership publisher.
 pub struct Cell {
     hub: Hub,
@@ -305,22 +423,29 @@ impl Cell {
     async fn publish(&self, session: Session, published: Vec<(&'static str, Published)>) {
         let version = self.hub.member_version();
         let mut absent = BTreeMap::new();
+        // After a successful write, plan again at once: placement takes a pass per step.
+        let mut again = false;
         loop {
             let (members_at, siblings_at) = (version.get(), self.siblings.version());
-            tokio::select! {
-                _ = version.wait_until(|v| *v != members_at) => {},
-                _ = self.siblings.changed(siblings_at) => {},
-                _ = tokio::time::sleep(RECONCILE) => {},
+            if !std::mem::take(&mut again) {
+                tokio::select! {
+                    _ = version.wait_until(|v| *v != members_at) => {},
+                    _ = self.siblings.changed(siblings_at) => {},
+                    _ = tokio::time::sleep(RECONCILE) => {},
+                }
             }
             // Writing from a stale view could resurrect or remove the wrong entries; freeze instead.
             if !session.ready() {
                 continue;
             }
             let mut actual = Members::new();
+            let mut directories = Vec::new();
             let read: Result<(), Status> = published.iter().try_for_each(|(service, view)| {
-                for (id, member) in view.read()? {
+                let (members, directory) = view.read()?;
+                for (id, member) in members {
                     actual.insert(((*service).into(), id), member);
                 }
+                directories.push((*service, directory));
                 Ok(())
             });
             if let Err(error) = read {
@@ -341,7 +466,7 @@ impl Cell {
                 local: &local,
                 remote: &remote,
             };
-            let Some(changes) = plan(
+            let Some(mut changes) = plan(
                 &seen,
                 &actual,
                 &mut absent,
@@ -350,11 +475,19 @@ impl Cell {
             ) else {
                 continue;
             };
+            // Placement plans only from applied membership.
+            if changes.is_empty() {
+                for (service, directory) in &directories {
+                    if RANGED.contains(service) {
+                        changes.extend(place(service, &actual, directory));
+                    }
+                }
+            }
             let mut written = BTreeMap::new();
             for change in changes {
                 let service = match &change {
                     Change::Set(member) => member.service.clone(),
-                    Change::Delete((service, _)) => service.clone(),
+                    Change::Delete((service, _)) | Change::Range { service, .. } => service.clone(),
                 };
                 match tokio::time::timeout(TIMEOUT, self.write(&change)).await {
                     Ok(Ok(revision)) => {
@@ -366,6 +499,7 @@ impl Cell {
                 }
             }
             // The next plan must see these writes, or it would repeat them.
+            again = !written.is_empty();
             for (service, revision) in written {
                 let namespace = namespace(&service, &self.cell);
                 let _ = tokio::time::timeout(IDLE, session.wait_for(DATASET, &namespace, revision))
@@ -376,14 +510,20 @@ impl Cell {
 
     /// One write through `bedrock-api`; returns the committed revision.
     async fn write(&self, change: &Change) -> Result<u64, String> {
-        let (method, (service, node_id), body) = match change {
+        let (method, (service, key), body) = match change {
             Change::Set(member) => (hyper::Method::PUT, key(member), member.encode_to_vec()),
             Change::Delete(key) => (hyper::Method::DELETE, key.clone(), Vec::new()),
+            Change::Range {
+                service,
+                start,
+                owners,
+            } => (
+                hyper::Method::PUT,
+                (service.clone(), format!("{RANGE}{start:016x}")),
+                encode(owners),
+            ),
         };
-        let uri = format!(
-            "/v1/{DATASET}/{}/{node_id}",
-            namespace(&service, &self.cell)
-        );
+        let uri = format!("/v1/{DATASET}/{}/{key}", namespace(&service, &self.cell));
         let stream = tokio::net::TcpStream::connect(self.api.as_str())
             .await
             .map_err(|e| e.to_string())?;

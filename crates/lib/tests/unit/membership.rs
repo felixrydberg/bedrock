@@ -228,3 +228,113 @@ fn announced_entries_are_validated() {
         .is_err()
     );
 }
+
+#[test]
+fn directory_entries_sit_beside_members_in_one_namespace() {
+    let (view, _) = View::new("cdn", "eu-1a");
+    let engine = &view.published.engine;
+    let at = |key: &str| [b"cdn.eu-1a\0".as_slice(), key.as_bytes()].concat();
+    let member = pb::Member {
+        service: "cdn".into(),
+        ..ready("cdn-1")
+    };
+    engine.put(&at("cdn-1"), &member.encode_to_vec()).unwrap();
+    let owners = vec![
+        Owner {
+            node: "cdn-1".into(),
+            state: State::Ready,
+        },
+        Owner {
+            node: "cdn-2".into(),
+            state: State::Leaving,
+        },
+    ];
+    engine
+        .put(&at("range/0000000000000000"), &encode(&owners[..1]))
+        .unwrap();
+    engine
+        .put(&at("range/8000000000000000"), &encode(&owners))
+        .unwrap();
+    assert_eq!(
+        view.members().unwrap().into_keys().collect::<Vec<_>>(),
+        ["cdn-1"]
+    );
+    let directory = view.directory().unwrap();
+    assert_eq!(directory[&0], owners[..1]);
+    assert_eq!(directory[&(1 << 63)], owners);
+    engine
+        .put(&at("range/000000000000000A"), &encode(&owners[..1]))
+        .unwrap();
+    assert_eq!(view.members().unwrap().len(), 1);
+    assert_eq!(view.directory().unwrap_err().code(), tonic::Code::DataLoss);
+    engine.delete(&at("range/000000000000000A")).unwrap();
+    // An owner state this build does not know is corruption, not an empty range.
+    let unknown = pb::Range {
+        owners: vec![pb::range::Owner {
+            node_id: "cdn-1".into(),
+            state: 7,
+        }],
+    };
+    engine
+        .put(&at("range/0000000000000000"), &unknown.encode_to_vec())
+        .unwrap();
+    assert_eq!(view.directory().unwrap_err().code(), tonic::Code::DataLoss);
+}
+
+/// The publisher's directory passes for `service` until nothing changes; returns the number of passes.
+fn settle(service: &str, actual: &Members, directory: &mut Directory) -> usize {
+    for pass in 0..100 {
+        let changes = place(service, actual, directory);
+        if changes.is_empty() {
+            return pass;
+        }
+        for change in changes {
+            let Change::Range { start, owners, .. } = change else {
+                panic!("placement wrote {change:?}");
+            };
+            directory.insert(start, owners);
+        }
+    }
+    panic!("placement did not settle");
+}
+
+#[test]
+fn placement_promotes_then_assigns_only_its_own_service() {
+    let node = |id: &str, service: &str, domain: &str| pb::Member {
+        service: service.into(),
+        roles: vec!["l2".into()],
+        failure_domain: domain.into(),
+        ..ready(id)
+    };
+    let actual = members(&[
+        node("cdn-1", "cdn", "a"),
+        node("cdn-2", "cdn", "b"),
+        node("cdn-3", "cdn", "c"),
+        node("cdn-4", "cdn", "a"),
+        node("qs-1", "quicksilver", "d"),
+    ]);
+    let mut directory = Directory::new();
+    let first = place("cdn", &actual, &directory);
+    let Some(Change::Range { owners, .. }) = first.first() else {
+        panic!("nothing assigned: {first:?}");
+    };
+    assert!(owners.iter().all(|o| o.state == State::Populating));
+    assert!(settle("cdn", &actual, &mut directory) >= 2);
+    for owners in directory.values() {
+        assert_eq!(owners.len(), REPLICAS);
+        assert!(owners.iter().all(|o| o.state == State::Ready));
+        assert!(owners.iter().all(|o| o.node.starts_with("cdn-")));
+    }
+    // A removed member's ranges are reassigned, still within the service.
+    let mut removed = actual.clone();
+    removed.remove(&("cdn".to_string(), "cdn-2".to_string()));
+    settle("cdn", &removed, &mut directory);
+    for owners in directory.values() {
+        assert_eq!(owners.len(), REPLICAS);
+        assert!(
+            owners
+                .iter()
+                .all(|o| o.node != "cdn-2" && o.state == State::Ready)
+        );
+    }
+}

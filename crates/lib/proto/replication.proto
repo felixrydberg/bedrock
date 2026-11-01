@@ -44,6 +44,16 @@ message Member {
   Status status = 12;
   string address = 13;
 }
+// B-16 L2 placement directory entry, under key `range/{start}` (16 lowercase hex digits) in the same namespace as
+// `Member`. The range ends where the next starts, or at 2^64.
+message Range {
+  message Owner {
+    enum State { POPULATING = 0; READY = 1; LEAVING = 2; }
+    string node_id = 1;
+    State state = 2;
+  }
+  repeated Owner owners = 1;
+}
 message Follow {
   string dataset = 1;
   string namespace = 2;
