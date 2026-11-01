@@ -152,7 +152,7 @@ fn a_join_moves_only_ranges_the_joiner_takes() {
         );
     }
     directory.extend(changes);
-    settle(&mut directory);
+    settle(&mut directory, &joined);
     converge(&mut directory, &joined, &BTreeSet::new());
     assert_placed(&directory, &joined);
 }
@@ -179,7 +179,7 @@ fn a_removal_moves_only_the_removed_members_ranges() {
         );
     }
     directory.extend(changes);
-    settle(&mut directory);
+    settle(&mut directory, &removed);
     converge(&mut directory, &removed, &BTreeSet::new());
     assert_placed(&directory, &removed);
 }
@@ -202,7 +202,7 @@ fn draining_unhealthy_and_l1_members_get_nothing_new() {
             }
         }
         directory.extend(changes);
-        settle(&mut directory);
+        settle(&mut directory, &members);
     }
     // They keep what they held: moving it away is draining (B-21b), not assignment.
     assert!(loads(&directory)["n00001"] > 0);
@@ -287,7 +287,7 @@ fn scales_down_with_a_bounded_leaving_handoff() {
     );
     assert_eq!(moving(&changes), 1);
     let mut settled = changes;
-    settle(&mut settled);
+    settle(&mut settled, &members);
     assert_eq!(settled[&0].len(), R);
 }
 
