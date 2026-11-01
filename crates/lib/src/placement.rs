@@ -121,11 +121,12 @@ impl<'a> Plan<'a> {
             })
             .map(|(id, m)| (id.as_str(), m))
             .collect();
+        let eligible_ids: BTreeSet<&str> = eligible.iter().map(|(id, _)| *id).collect();
         // Ineligible members keep what they hold; the eligible ones share the rest.
         let kept: u128 = plan
             .load
             .iter()
-            .filter(|(n, _)| !eligible.iter().any(|(e, _)| e == *n))
+            .filter(|(n, _)| !eligible_ids.contains(*n))
             .map(|(_, l)| l)
             .sum();
         let demand = replicas as f64 * SPACE as f64 - kept as f64;
