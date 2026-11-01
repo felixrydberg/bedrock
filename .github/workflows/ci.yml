@@ -17,15 +17,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # Keep native build artifacts from consuming runner disk before S3 test service setup.
-          cache-targets: false
-      # librocksdb-sys (B-05) generates its bindings with bindgen, which needs libclang.
-      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
-      # S3 client contract tests (B-07) run against SeaweedFS, as in deploy/docker-compose.local.yml. Service containers
-      # cannot pass the `server -s3` command, so it starts here.
-      - run: docker run -d --name bedrock-s3 -p 8333:8333 chrislusf/seaweedfs:4.01 server -s3 -dir=/data -volume.max=16
+      # Start SeaweedFS while libclang installs; RocksDB's bindgen needs libclang (B-05), and S3 contract tests use this
+      # local service (B-07). Service containers cannot pass the `server -s3` command, so it starts here.
+      - name: Prepare native build and S3 service
+        run: |
+          sudo apt-get update && sudo apt-get install -y libclang-dev &
+          apt_pid=$!
+          docker run -d --name bedrock-s3 -p 8333:8333 chrislusf/seaweedfs:4.01 server -s3 -dir=/data -volume.max=16
+          wait "$apt_pid"
       - name: Prepare S3 contract test bucket
         run: |
           deadline=$((SECONDS + 90))
@@ -46,6 +45,8 @@ jobs:
             fi
             sleep 1
           done
+      # Restore compiled native artifacts after SeaweedFS is in place so its image has room on the runner disk.
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
