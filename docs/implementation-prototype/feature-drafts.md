@@ -478,6 +478,12 @@ Created: [#20](https://github.com/felixrydberg/bedrock/issues/20) — Feature �
 
 Amended 2026-10-31 by §4 decision 13: L2 owners and their readiness come from the placement directory.
 
+Decided 2026-11-01 while implementing #20: each node selects sources itself (`lib/relays/sources`) from its
+`membership::View`, its breakers and holders' rejections. A holder checks the minimum revision when it serves and rejects
+a read it is behind on with its applied revision; callers skip it for newer reads for one second. Relay acknowledgements
+stay relay-local for B-21 readiness. "Nearby" means the caller's failure domain within its cell; there is no cross-cell
+peer discovery. Customer-KV home-writer resolution moves to B-27 (it needs B-25), and CDN availability filtering to B-34.
+
 ---
 
 ### G — Shared core: reconciliation, recovery and hardening
@@ -782,9 +788,12 @@ Every eligible KV reader can reach the same S3 state; hashing chooses cache affi
 - `GET`, metadata-aware get and bulk reads: optional local L1 → preferred healthy KV cache reader in the cell → that reader's
   B-39 namespace view and block cache → S3 range reads. Coalesce identical misses and namespace opens. No mandatory regional
   cache tier, origin cell or cold namespace restore. B-22's generic freshness/fallback helpers remain reusable after §5 amendments.
-- Reuse B-15/B-16 hashing over `(namespace, original key)` for cache affinity if useful. A routing change only changes the
+- Pick the preferred reader with `relays::sources::readers` (#20 / B-19), which ranks over `(namespace, original key)`. A routing change only changes the
   preferred cache: another eligible reader may serve, and no bucket copy, replica-completeness check or relay handoff is needed.
   Keep original keys in the namespace database; hashes must not replace the index needed for prefix listing.
+- Resolve the namespace's home writer/storage identity from the Quicksilver namespace directory (B-25) for S3 access and
+  the recent-committed-state path. Deferred here from #20 / B-19, with its test: another reader serves through S3, or
+  waits or uses recent committed state when the S3 view lags.
 - `LIST` scans the namespace database's complete ordered view, never the incomplete entry/block caches. One reader can
   execute a list without scattering to cache holders. Use an opaque cursor bound to namespace, prefix and last returned
   original key; it must not encode a physical node. Default pages do not promise a snapshot spanning multiple requests.
@@ -1078,7 +1087,7 @@ Applying `RETAIN_MANIFEST` must not make both cold holders independently downloa
   - desired = retained artifacts in my ranges only when read within the idle window (B-44); initial retention prewarming remains separate
   - actual = local inventory
   - repair = fetch via B-31
-- Publish local artifact availability to the regional directory (B-19), separate from ownership.
+- Track artifact availability separately from ownership and filter `relays::sources::Sources::select` by it (deferred from #20 / B-19, which returns range owners only).
 - Range repopulation hook for B-21.
 - Per-service owner count: B-16 made the owners per range (`REPLICAS = 3`) and the ranges moving at once
   (`MAX_MOVING = 16`) constants in `crates/lib/src/membership.rs`. Make them per-service settings that the relay reads

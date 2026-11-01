@@ -10,7 +10,7 @@ A member is a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process that 
   `RelayRequest.member` messages may change only the status of the same `(service, node_id)`. Relay-to-relay
   and recovery sessions carry no member. Identities are ASCII letters, digits, `-`, `_` and `.`.
 - **Relay view.** Each relay lists the members on its leaf sessions, the newest session winning a duplicate
-  identity, with each subscription's acknowledged revision for the regional directory (#20 / B-19). When a
+  identity, with each subscription's acknowledged revision for range readiness (#22 / B-21). When a
   draining member's stream closes, the relay keeps it as relay-local `LEFT` for 30 seconds.
 - **Siblings.** A cell's relays are each relay plus its `replay_peers`, listed by advertised address. Every relay
   serves `Siblings.Watch`, and a cell relay with `[membership]` watches each sibling: a snapshot completed by

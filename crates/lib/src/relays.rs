@@ -2,6 +2,7 @@
 pub mod client;
 pub mod replay;
 pub mod siblings;
+pub mod sources;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
@@ -82,7 +83,7 @@ struct Inner {
 /// `(service, node_id)`.
 pub type MemberKey = (String, String);
 
-/// A member connected to this relay and its acknowledged revisions, for the regional directory (B-19).
+/// A member connected to this relay and its acknowledged revisions, for range readiness (#22 / B-21).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Connected {
     pub member: pb::Member,
