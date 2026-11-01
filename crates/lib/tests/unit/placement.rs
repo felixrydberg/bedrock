@@ -28,12 +28,10 @@ fn cell(n: usize, domains: usize) -> BTreeMap<String, pb::Member> {
         .collect()
 }
 
-/// What the relays' handoff does once every new owner has caught up.
+/// Completes every handoff, as the publisher's next pass does.
 fn settle(directory: &mut Directory) {
-    for owners in directory.values_mut() {
-        owners.retain(|o| o.state != State::Leaving);
-        owners.iter_mut().for_each(|o| o.state = State::Ready);
-    }
+    let promoted = promote(directory);
+    directory.extend(promoted);
 }
 
 /// Plans, writes and completes handoffs until nothing changes.
@@ -264,6 +262,59 @@ fn balances_ten_thousand_weighted_members() {
         "{} ranges",
         directory.len()
     );
+}
+
+#[test]
+fn promotion_never_leaves_a_range_without_a_holder() {
+    let owner = |node: &str, state| Owner {
+        node: node.into(),
+        state,
+    };
+    let directory = Directory::from([
+        (0, vec![owner("a", State::Ready)]),
+        (
+            10,
+            vec![owner("a", State::Leaving), owner("b", State::Populating)],
+        ),
+        (20, vec![owner("a", State::Leaving)]),
+    ]);
+    assert_eq!(
+        promote(&directory),
+        Directory::from([(10, vec![owner("b", State::Ready)])])
+    );
+}
+
+#[test]
+fn a_stale_route_is_rejected_and_the_retry_succeeds() {
+    let members = cell(40, 5);
+    let mut stale = Directory::new();
+    converge(&mut stale, &members, &BTreeSet::new());
+    let mut joined = members.clone();
+    joined.insert("new".into(), node("new", "d2", 4.0, 1000));
+    let mut current = stale.clone();
+    converge(&mut current, &joined, &BTreeSet::new());
+    let (start, _) = current
+        .iter()
+        .find(|(_, owners)| owners.iter().any(|o| o.node == "new"))
+        .unwrap();
+    let hash = *start;
+    // During the handoff the leaving owner still serves.
+    let moving = assign(&stale, &joined, &BTreeSet::new(), R, usize::MAX);
+    for (start, owners) in &moving {
+        for owner in owners {
+            assert!(serves(&moving, &owner.node, *start));
+        }
+    }
+    // Routed by the old view to the owner `new` replaced, the request is rejected; the next old owner serves it.
+    let old = owners(&stale, hash);
+    let gone = old
+        .iter()
+        .position(|o| !serves(&current, &o.node, hash))
+        .expect("the join moved an owner");
+    let retry = old.iter().skip(gone + 1).chain(&old[..gone]);
+    assert!(retry.take(1).all(|o| serves(&current, &o.node, hash)));
+    assert!(!serves(&current, "nobody", hash));
+    assert!(owners(&Directory::new(), hash).is_empty());
 }
 
 fn kv(n: usize) -> Vec<pb::Member> {

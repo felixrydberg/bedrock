@@ -1,4 +1,5 @@
-//! Stable bucket identity; ownership and placement are separate (#19 / B-16).
+//! Stable key hashing. L2 ownership is relay-assigned ranges of [`hash_of`] (#19 / B-16, `placement`); relay
+//! selectors still filter by [`bucket_of`] until #22 / B-21 and #41 / B-12b change them.
 use sha2::{Digest, Sha256};
 
 pub const COUNT: u32 = 1 << 20;

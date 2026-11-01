@@ -1,5 +1,6 @@
-//! #15 / B-12 acceptance: cell membership from relay streams, through the real `bedrock-api` and `bedrock-relay`
-//! entry points. Replay one seed with `BEDROCK_MEMBERSHIP_SEED=42` and the documented simulation flags.
+//! #15 / B-12 acceptance: cell membership from relay streams, and #19 / B-16: the L2 placement directory published
+//! beside it, through the real `bedrock-api` and `bedrock-relay` entry points. Replay one seed with
+//! `BEDROCK_MEMBERSHIP_SEED=42` and the documented simulation flags.
 #![cfg(madsim)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +11,7 @@ use bedrock_lib::membership::{self, View};
 use bedrock_lib::node::{
     ApiConfig, Budget, Location, MembershipSettings, NodeConfig, RelayConfig, Tier,
 };
+use bedrock_lib::placement::{Directory, State};
 use bedrock_lib::relays::client::Session;
 use bedrock_lib::replication::pb;
 use bedrock_lib::s3::S3Config;
@@ -98,6 +100,26 @@ impl Leaf {
             .map(|view| view.members().unwrap().into_keys().collect())
             .unwrap_or_default()
     }
+
+    fn directory(&self) -> Directory {
+        self.view
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|view| view.directory().unwrap())
+            .unwrap_or_default()
+    }
+}
+
+/// Every range has three ready owners from `members`, or all of them when there are fewer.
+fn placed(directory: &Directory, members: &[&str]) -> bool {
+    directory.contains_key(&0)
+        && directory.values().all(|owners| {
+            owners.len() == members.len().min(3)
+                && owners
+                    .iter()
+                    .all(|o| o.state == State::Ready && members.contains(&o.node.as_str()))
+        })
 }
 
 fn spawn_leaf(
@@ -127,6 +149,7 @@ fn spawn_leaf(
                     region: "eu".into(),
                     dc: "eu-1".into(),
                     cell: cell.into(),
+                    roles: vec!["l2".into()],
                     status: pb::member::Status::Ready as i32,
                     address,
                     ..Default::default()
@@ -328,8 +351,69 @@ async fn scenario() -> Vec<String> {
     trace
 }
 
+/// Cell `eu-1a` places its CDN members' L2 ranges, and reassigns a killed member's after the grace period; `eu-1b`
+/// keeps its own directory.
+async fn placement() -> Vec<String> {
+    let handle = Handle::current();
+    let mut trace = Vec::new();
+    let started = bedrock_lib::monotonic_now();
+    spawn("api", API, || bedrock_api::run(api()));
+    for (i, ip) in CELL_RELAYS.iter().enumerate() {
+        let name = format!("relay-{}", i + 1);
+        let config = relay(&name, ip, "eu-1a", &CELL_RELAYS);
+        spawn(&name, ip, move || bedrock_relay::run(config.clone()));
+    }
+    let other = relay("relay-b", OTHER_RELAY, "eu-1b", &[OTHER_RELAY]);
+    spawn("relay-b", OTHER_RELAY, move || {
+        bedrock_relay::run(other.clone())
+    });
+    let relays: Vec<String> = CELL_RELAYS.iter().map(|ip| format!("{ip}:7000")).collect();
+    let names = ["cdn-1", "cdn-2", "cdn-3", "cdn-4"];
+    let leaves: Vec<(NodeHandle, Arc<Leaf>)> = names
+        .iter()
+        .zip(["10.0.2.31", "10.0.2.32", "10.0.2.33", "10.0.2.34"])
+        .map(|(name, ip)| spawn_leaf(name, ip, "cdn", "eu-1a", relays.clone()))
+        .collect();
+    let (_, other) = spawn_leaf(
+        "cdn-b",
+        "10.0.2.35",
+        "cdn",
+        "eu-1b",
+        vec![format!("{OTHER_RELAY}:7000")],
+    );
+    until("placed", Duration::from_secs(60), || {
+        leaves
+            .iter()
+            .all(|(_, leaf)| placed(&leaf.directory(), &names))
+            && placed(&other.directory(), &["cdn-b"])
+    })
+    .await;
+    let ranges = leaves[0].1.directory().len();
+    trace.push(format!(
+        "{} placed {ranges} ranges",
+        started.elapsed().as_millis()
+    ));
+
+    // A killed member keeps its ranges through the grace period, then they move to the others.
+    handle.kill(leaves[3].0.id());
+    sleep(GRACE - Duration::from_secs(1)).await;
+    assert!(
+        placed(&leaves[0].1.directory(), &names),
+        "moved before the grace period"
+    );
+    until("reassigned", IDLE + GRACE, || {
+        leaves[..3]
+            .iter()
+            .all(|(_, leaf)| placed(&leaf.directory(), &names[..3]))
+    })
+    .await;
+    trace.push(format!("{} reassigned", started.elapsed().as_millis()));
+    assert!(placed(&other.directory(), &["cdn-b"]));
+    trace
+}
+
 #[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
-fn run(seed: u64) -> Vec<String> {
+fn run<F: Future<Output = Vec<String>> + 'static>(seed: u64, scenario: fn() -> F) -> Vec<String> {
     std::thread::spawn(move || {
         Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(scenario())
     })
@@ -342,14 +426,26 @@ fn run(seed: u64) -> Vec<String> {
     })
 }
 
+fn seeds() -> Vec<u64> {
+    std::env::var("BEDROCK_MEMBERSHIP_SEED")
+        .map(|value| vec![value.parse::<u64>().unwrap()])
+        .unwrap_or_else(|_| vec![1, 2, 42])
+}
+
 #[test]
 fn membership_follows_relay_streams_and_replays_per_seed() {
-    let seeds = std::env::var("BEDROCK_MEMBERSHIP_SEED")
-        .map(|value| vec![value.parse::<u64>().unwrap()])
-        .unwrap_or_else(|_| vec![1, 2, 42]);
-    for seed in seeds {
-        let first = run(seed);
-        assert_eq!(first, run(seed), "seed {seed} changed its trace");
+    for seed in seeds() {
+        let first = run(seed, scenario);
+        assert_eq!(first, run(seed, scenario), "seed {seed} changed its trace");
         println!("membership seed {seed}: {first:?}");
+    }
+}
+
+#[test]
+fn placement_follows_membership_and_replays_per_seed() {
+    for seed in seeds() {
+        let first = run(seed, placement);
+        assert_eq!(first, run(seed, placement), "seed {seed} changed its trace");
+        println!("placement seed {seed}: {first:?}");
     }
 }

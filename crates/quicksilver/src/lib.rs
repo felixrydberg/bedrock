@@ -1,4 +1,4 @@
-//! `bedrock-quicksilver`: hosts the `quicksilver` and `auth` datasets (control-plane data with virtual buckets).
+//! `bedrock-quicksilver`: hosts the `quicksilver` and `auth` datasets (control-plane data in relay-assigned L2 hash ranges).
 
 mod namespaces {}
 mod operations {}

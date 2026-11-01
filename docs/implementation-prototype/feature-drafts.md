@@ -497,6 +497,24 @@ Created: [#22](https://github.com/felixrydberg/bedrock/issues/22) — Feature �
 Amended 2026-10-31 by §4 decision 13: relays carry out range handoffs (push interests, bootstrap, mark ready, revoke), and
 nodes confirm a revoke against their directory view before deleting.
 
+Full replication simulation, requested 2026-11-01 and deferred from #19 / B-16, where nodes do not yet follow their
+ranges. It is a madsim scenario through the real `bedrock-api`, `bedrock-relay`, `bedrock-quicksilver` and `bedrock-cdn`
+entry points, with writes running throughout. Each seed must replay to the same trace. It checks:
+- **Data follows ownership.** After joins, removals and rebalancing, every `ready` owner holds exactly the committed data
+  of its ranges, checked against the writer. No owner is `ready` before its bootstrap is verified.
+- **Disconnection.** Relay failover and a restart within the grace period move nothing. A node cut off from every relay
+  loses its ranges after the grace period and takes ranges again once healed. A killed node's ranges are rebuilt
+  elsewhere.
+- **Drain (B-21b).** A draining node gets nothing new, and its ranges hand off.
+- **Relay faults.** A sibling continues a handoff whose relay died, working from published state (#41 / B-12b). Without
+  a relay majority nothing moves or is revoked.
+- **Revoke.** A leaving owner serves until every new owner is `ready`. A revoke that does not match the node's view is
+  refused. After deletion, no keys remain in the range's span.
+- **One revision order.** No node sees a directory owner that its membership view has never listed.
+
+Membership-only cases that need no data (failover, restart, cut-off, drain and frozen directory) can go into
+`tests/sim/tests/membership.rs` earlier.
+
 ---
 
 #### B-21b — Drain nodes, cells and namespaces
@@ -1062,6 +1080,9 @@ Applying `RETAIN_MANIFEST` must not make both cold holders independently downloa
   - repair = fetch via B-31
 - Publish local artifact availability to the regional directory (B-19), separate from ownership.
 - Range repopulation hook for B-21.
+- Per-service owner count: B-16 made the owners per range (`REPLICAS = 3`) and the ranges moving at once
+  (`MAX_MOVING = 16`) constants in `crates/lib/src/membership.rs`. Make them per-service settings that the relay reads
+  at startup, from an environment variable or `[membership]`, with `cdn` set to 2.
 
 **Additional context**
 - **Implementation:** CDN.

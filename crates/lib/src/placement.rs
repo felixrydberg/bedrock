@@ -4,7 +4,8 @@
 //! - [`assign`] is run by the cell relays' majority membership publisher. From the published placement directory and
 //!   membership it returns the directory entries to write: ranges of removed members get new owners, and members far from
 //!   their capacity-weighted share take ranges from the most loaded, splitting where needed. Handoff (marking owners
-//!   `ready`, revoking `leaving` ones) belongs to the relays (#22 / B-21).
+//!   `ready`, revoking `leaving` ones) belongs to the relays (#22 / B-21); until then the publisher [`promote`]s.
+//! - [`owners`] and [`serves`] read the published directory (#19 / B-16, `docs/spec/membership.md`).
 //! - [`rank`] orders customer-KV readers by rendezvous hash. Customer KV has no ranges.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -373,6 +374,40 @@ impl<'a> Plan<'a> {
 
 fn ratio(load: u128, target: f64) -> u64 {
     (load as f64 / target).to_bits()
+}
+
+/// The entries to write so `populating` owners become `ready` and `leaving` ones go. A range whose owners are all
+/// leaving keeps them, so no range loses its last holder.
+// ponytail: claims readiness without a bootstrap, which is safe only while nothing reads L2 by range (quicksilver is
+// full_replica, auth on-demand); #22 / B-21 replaces it with the relays' bootstrap plus acknowledgement.
+pub fn promote(directory: &Directory) -> Directory {
+    directory
+        .iter()
+        .filter(|(_, owners)| {
+            owners.iter().any(|o| o.state != State::Ready) && owners.iter().any(Owner::holds)
+        })
+        .map(|(start, owners)| {
+            let ready = owners.iter().filter(|o| o.holds()).map(|o| Owner {
+                node: o.node.clone(),
+                state: State::Ready,
+            });
+            (*start, ready.collect())
+        })
+        .collect()
+}
+
+/// The owners of the range holding `hash`; none before the directory's first write.
+pub fn owners(directory: &Directory, hash: u64) -> &[Owner] {
+    directory
+        .range(..=hash)
+        .next_back()
+        .map_or(&[], |(_, owners)| owners)
+}
+
+/// The owner check: a node serves only ranges it owns or is leaving in its own view. A caller routed by a stale view
+/// is rejected and retries the next owner.
+pub fn serves(directory: &Directory, node: &str, hash: u64) -> bool {
+    owners(directory, hash).iter().any(|o| o.node == node)
 }
 
 /// Customer-KV readers for a key, most preferred first: rendezvous hashing of `hash`
