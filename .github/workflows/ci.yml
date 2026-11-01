@@ -18,6 +18,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Keep native build artifacts from consuming runner disk before S3 test service setup.
+          cache-targets: false
       # librocksdb-sys (B-05) generates its bindings with bindgen, which needs libclang.
       - run: sudo apt-get update && sudo apt-get install -y libclang-dev
       # S3 client contract tests (B-07) run against SeaweedFS, as in deploy/docker-compose.local.yml. Service containers
