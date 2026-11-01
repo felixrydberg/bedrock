@@ -349,13 +349,13 @@ impl<'a> Plan<'a> {
         let need = (1.0 + FILL) * self.target[u] - self.load[u] as f64;
         let spare = self.load[d] as f64 - (1.0 - FILL) * self.target[d];
         let at = self.split(start, need.min(spare).max(1.0) as u128);
-        let size = self.size(at);
         self.mark_leaving(at, d);
         self.add(at, u);
         self.moving += 1;
     }
 
     fn mark_leaving(&mut self, start: u64, node: &str) {
+        let node = self.members.get_key_value(node).unwrap().0.as_str();
         self.ranges
             .get_mut(&start)
             .unwrap()
