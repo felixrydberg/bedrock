@@ -267,6 +267,7 @@ fn directory_entries_sit_beside_members_in_one_namespace() {
         .unwrap();
     assert_eq!(view.members().unwrap().len(), 1);
     assert_eq!(view.directory().unwrap_err().code(), tonic::Code::DataLoss);
+    engine.delete(&at("range/000000000000000A")).unwrap();
     // An owner state this build does not know is corruption, not an empty range.
     let unknown = pb::Range {
         owners: vec![pb::range::Owner {
