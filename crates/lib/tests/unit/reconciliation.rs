@@ -88,6 +88,7 @@ fn config(burst: u32) -> Config {
     Config {
         burst,
         refill: Duration::from_secs(1),
+        repair_timeout: Duration::from_secs(5),
         base_backoff: Duration::from_secs(1),
         max_backoff: Duration::from_secs(4),
         seed: 7,
@@ -178,6 +179,33 @@ async fn failed_repairs_back_off_and_retry() {
             .render()
             .contains(r#"reconcile_failing{reconciler="test"} 0"#)
     );
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn timed_out_repairs_fail_and_retry_after_backoff() {
+    let fake = Fake::new(&[(1, 10)], &[]);
+    fake.hang.store(true, Ordering::SeqCst);
+    let (admin, mut reconciler) = reconciler(&fake, 10);
+    reconciler.config.repair_timeout = Duration::from_millis(100);
+
+    let pass = reconciler.pass().await.unwrap();
+    assert_eq!((pass.pending, pass.repaired, pass.failed), (1, 0, 1));
+    assert!(
+        admin
+            .render()
+            .contains(r#"reconcile_repairs_total{reconciler="test",outcome="failed"} 1"#)
+    );
+    assert!(
+        admin
+            .render()
+            .contains(r#"reconcile_failing{reconciler="test"} 1"#)
+    );
+
+    fake.hang.store(false, Ordering::SeqCst);
+    sleep(Duration::from_secs(1)).await;
+    assert_eq!(reconciler.pass().await.unwrap().repaired, 1);
+    assert!(fake.converged());
 }
 
 #[cfg_attr(not(madsim), tokio::test(start_paused = true))]

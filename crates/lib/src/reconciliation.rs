@@ -19,7 +19,7 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 
 use crate::monotonic_now;
 use crate::transport::admin::Admin;
@@ -54,6 +54,8 @@ pub struct Config {
     pub burst: u32,
     /// One more repair is allowed every `refill`.
     pub refill: Duration,
+    /// Maximum time spent waiting for one repair.
+    pub repair_timeout: Duration,
     pub base_backoff: Duration,
     pub max_backoff: Duration,
     /// Seeds backoff jitter, so a simulation seed replays the same schedule (B-23a).
@@ -194,26 +196,34 @@ impl<R: Reconcile> Reconciler<R> {
             if !self.take_token(now) {
                 break;
             }
-            let ok = match self.source.repair(key, repair).await {
-                Ok(()) => {
-                    self.retries.remove(key);
-                    pass.repaired += 1;
-                    true
-                }
-                Err(error) => {
-                    tracing::warn!(reconciler = self.name, ?key, %error, "repair failed");
-                    let attempts = self.retries.get(key).map_or(1, |r| r.attempts + 1);
-                    let not_before = monotonic_now() + self.backoff(attempts);
-                    self.retries.insert(
-                        key.clone(),
-                        Retry {
-                            attempts,
-                            not_before,
-                        },
-                    );
-                    pass.failed += 1;
-                    false
-                }
+            let failed =
+                match timeout(self.config.repair_timeout, self.source.repair(key, repair)).await {
+                    Ok(Ok(())) => false,
+                    Ok(Err(error)) => {
+                        tracing::warn!(reconciler = self.name, ?key, %error, "repair failed");
+                        true
+                    }
+                    Err(_) => {
+                        tracing::warn!(reconciler = self.name, ?key, "repair timed out");
+                        true
+                    }
+                };
+            let ok = if failed {
+                let attempts = self.retries.get(key).map_or(1, |r| r.attempts + 1);
+                let not_before = monotonic_now() + self.backoff(attempts);
+                self.retries.insert(
+                    key.clone(),
+                    Retry {
+                        attempts,
+                        not_before,
+                    },
+                );
+                pass.failed += 1;
+                false
+            } else {
+                self.retries.remove(key);
+                pass.repaired += 1;
+                true
             };
             self.metrics
                 .repairs
