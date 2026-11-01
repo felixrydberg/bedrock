@@ -3,14 +3,18 @@ use sha2::{Digest, Sha256};
 
 pub const COUNT: u32 = 1 << 20;
 
-pub fn bucket_of(dataset: &str, namespace: &str, key: &[u8]) -> u32 {
+/// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.
+pub fn hash_of(dataset: &str, namespace: &str, key: &[u8]) -> u64 {
     let mut hash = Sha256::new();
     for part in [dataset.as_bytes(), namespace.as_bytes(), key] {
         hash.update((part.len() as u64).to_be_bytes());
         hash.update(part);
     }
-    let digest = hash.finalize();
-    u32::from_be_bytes(digest[..4].try_into().unwrap()) & (COUNT - 1)
+    u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap())
+}
+
+pub fn bucket_of(dataset: &str, namespace: &str, key: &[u8]) -> u32 {
+    (hash_of(dataset, namespace, key) >> 32) as u32 & (COUNT - 1)
 }
 
 #[cfg(test)]
