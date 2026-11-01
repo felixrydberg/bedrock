@@ -29,8 +29,8 @@ fn cell(n: usize, domains: usize) -> BTreeMap<String, pb::Member> {
 }
 
 /// Completes every handoff, as the publisher's next pass does.
-fn settle(directory: &mut Directory) {
-    let promoted = promote(directory);
+fn settle(directory: &mut Directory, members: &BTreeMap<String, pb::Member>) {
+    let promoted = promote(directory, members);
     directory.extend(promoted);
 }
 
@@ -46,7 +46,7 @@ fn converge(
             return;
         }
         directory.extend(changes);
-        settle(directory);
+        settle(directory, members);
     }
     panic!("placement did not converge");
 }
@@ -346,10 +346,16 @@ fn promotion_never_leaves_a_range_without_a_holder() {
         ),
         (20, vec![owner("a", State::Leaving)]),
     ]);
+    let members = BTreeMap::from([
+        ("a".into(), node("a", "a", 4.0, 1000)),
+        ("b".into(), node("b", "b", 4.0, 1000)),
+    ]);
     assert_eq!(
-        promote(&directory),
+        promote(&directory, &members),
         Directory::from([(10, vec![owner("b", State::Ready)])])
     );
+    let no_populating_member = BTreeMap::from([("a".into(), members["a"].clone())]);
+    assert!(promote(&directory, &no_populating_member).is_empty());
 }
 
 #[test]
@@ -368,9 +374,11 @@ fn a_stale_route_is_rejected_and_the_retry_succeeds() {
     let hash = *start;
     // During the handoff the leaving owner still serves.
     let moving = assign(&stale, &joined, &BTreeSet::new(), R, usize::MAX);
-    for (start, owners) in &moving {
-        for owner in owners {
-            assert!(serves(&moving, &owner.node, *start));
+    let mut during_handoff = stale.clone();
+    during_handoff.extend(moving.clone());
+    for start in moving.keys() {
+        for owner in owners(&stale, *start) {
+            assert!(serves(&during_handoff, &owner.node, *start));
         }
     }
     // Routed by the old view to the owner `new` replaced, the request is rejected; the next old owner serves it.

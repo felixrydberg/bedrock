@@ -437,17 +437,25 @@ fn ratio(load: u128, target: f64) -> u64 {
 /// leaving keeps them, so no range loses its last holder.
 // ponytail: claims readiness without a bootstrap, which is safe only while nothing reads L2 by range (quicksilver is
 // full_replica, auth on-demand); #22 / B-21 replaces it with the relays' bootstrap plus acknowledgement.
-pub fn promote(directory: &Directory) -> Directory {
+pub fn promote(directory: &Directory, members: &BTreeMap<String, pb::Member>) -> Directory {
     directory
         .iter()
         .filter(|(_, owners)| {
-            owners.iter().any(|o| o.state != State::Ready) && owners.iter().any(Owner::holds)
+            owners
+                .iter()
+                .any(|o| o.state != State::Ready && members.contains_key(&o.node))
+                && owners
+                    .iter()
+                    .any(|o| o.holds() && members.contains_key(&o.node))
         })
         .map(|(start, owners)| {
-            let ready = owners.iter().filter(|o| o.holds()).map(|o| Owner {
-                node: o.node.clone(),
-                state: State::Ready,
-            });
+            let ready = owners
+                .iter()
+                .filter(|o| o.holds() && members.contains_key(&o.node))
+                .map(|o| Owner {
+                    node: o.node.clone(),
+                    state: State::Ready,
+                });
             (*start, ready.collect())
         })
         .collect()

@@ -8,7 +8,7 @@
 pub enum Keyspace {
     /// `l1/{ns}\0{key}`
     L1,
-    /// `l2/{bucket}/{ns}\0{key}`
+    /// `l2/{8-byte big-endian hash}/{ns}\0{key}`
     L2 { hash: u64 },
     /// `meta/{ns}\0...`
     Meta,

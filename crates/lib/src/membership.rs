@@ -141,6 +141,13 @@ impl Published {
             let key = String::from_utf8(key[self.prefix.len()..].to_vec())
                 .map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
             if let Some(start) = key.strip_prefix(RANGE) {
+                if start.len() != 16
+                    || !start
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err(Status::data_loss("invalid range key"));
+                }
                 let start = u64::from_str_radix(start, 16)
                     .map_err(|_| Status::data_loss("invalid range key"))?;
                 directory.insert(start, decode(&value)?);
@@ -151,6 +158,27 @@ impl Published {
             members.insert(key, member);
         }
         Ok((members, directory))
+    }
+
+    fn members(&self) -> Result<BTreeMap<String, pb::Member>, Status> {
+        let scan = self
+            .engine
+            .scan(&KeyRange::prefix(self.prefix.clone()))
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let mut members = BTreeMap::new();
+        for entry in scan {
+            let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
+            let key = &key[self.prefix.len()..];
+            if key.starts_with(RANGE.as_bytes()) {
+                continue;
+            }
+            let key = String::from_utf8(key.to_vec())
+                .map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
+            let member = pb::Member::decode(value.as_slice())
+                .map_err(|e| Status::data_loss(e.to_string()))?;
+            members.insert(key, member);
+        }
+        Ok(members)
     }
 }
 
@@ -212,7 +240,7 @@ impl View {
 
     /// Node ID → entry, as of the last applied revision. Without relays the last view stays.
     pub fn members(&self) -> Result<BTreeMap<String, pb::Member>, Status> {
-        Ok(self.published.read()?.0)
+        self.published.members()
     }
 
     /// The service's L2 placement directory in this cell: route with [`placement::owners`], and serve only what
@@ -319,13 +347,13 @@ pub fn plan(
 /// One ranged service's directory writes from the published `actual` members: promote what the last pass assigned,
 /// otherwise assign (`docs/spec/membership.tla`, `Write`).
 pub fn place(service: &str, actual: &Members, directory: &Directory) -> Vec<Change> {
-    let mut entries = placement::promote(directory);
+    let members: BTreeMap<_, _> = actual
+        .iter()
+        .filter(|((s, _), _)| s == service)
+        .map(|((_, id), member)| (id.clone(), member.clone()))
+        .collect();
+    let mut entries = placement::promote(directory, &members);
     if entries.is_empty() {
-        let members = actual
-            .iter()
-            .filter(|((s, _), _)| s == service)
-            .map(|((_, id), member)| (id.clone(), member.clone()))
-            .collect();
         // ponytail: no health input until #13 / B-14 reports it in member updates.
         entries = placement::assign(directory, &members, &BTreeSet::new(), REPLICAS, MAX_MOVING);
     }
