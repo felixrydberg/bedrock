@@ -226,6 +226,74 @@ fn shares_a_failure_domain_only_when_there_are_too_few() {
 }
 
 #[test]
+fn replaces_a_co_located_owner_when_another_domain_is_available() {
+    let members = (0..4)
+        .map(|i| {
+            let id = format!("n{i:05}");
+            let domain = if i < 3 { "d0" } else { "d1" };
+            (id.clone(), node(&id, domain, 4.0, 1000))
+        })
+        .collect();
+    let directory = Directory::from([(
+        0,
+        (0..3)
+            .map(|i| Owner {
+                node: format!("n{i:05}"),
+                state: State::Ready,
+            })
+            .collect(),
+    )]);
+
+    let changes = assign(&directory, &members, &BTreeSet::new(), R, 1);
+    let owners = &changes[&0];
+    let held: Vec<_> = owners.iter().filter(|o| o.holds()).collect();
+    let domains: BTreeSet<_> = held
+        .iter()
+        .map(|o| members[&o.node].failure_domain.as_str())
+        .collect();
+    assert_eq!(held.len(), R);
+    assert_eq!(domains.len(), 2);
+    assert_eq!(moving(&changes), 1);
+    assert_eq!(
+        owners.iter().filter(|o| o.state == State::Leaving).count(),
+        1
+    );
+    assert_eq!(
+        owners
+            .iter()
+            .filter(|o| o.state == State::Populating)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn scales_down_with_a_bounded_leaving_handoff() {
+    let members = cell(4, 2);
+    let directory = Directory::from([(
+        0,
+        (0..4)
+            .map(|i| Owner {
+                node: format!("n{i:05}"),
+                state: State::Ready,
+            })
+            .collect(),
+    )]);
+
+    let changes = assign(&directory, &members, &BTreeSet::new(), R, 1);
+    let owners = &changes[&0];
+    assert_eq!(owners.iter().filter(|o| o.holds()).count(), R);
+    assert_eq!(
+        owners.iter().filter(|o| o.state == State::Leaving).count(),
+        1
+    );
+    assert_eq!(moving(&changes), 1);
+    let mut settled = changes;
+    settle(&mut settled);
+    assert_eq!(settled[&0].len(), R);
+}
+
+#[test]
 fn bounds_the_ranges_moving_at_once() {
     let members = cell(40, 5);
     let mut directory = Directory::new();

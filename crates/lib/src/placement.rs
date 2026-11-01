@@ -47,7 +47,7 @@ pub type Directory = BTreeMap<u64, Vec<Owner>>;
 /// The entries to write so every range has `replicas` owners, in distinct failure domains when possible, and members
 /// hold their capacity-weighted share. At most `max_moving` ranges are in handoff at once, counting those already moving.
 /// Ranges of members missing from `members` (removed after the grace period) are reassigned; draining, unhealthy and
-/// non-`l2` members get nothing new.
+/// non-`l2` members get nothing new. Decreasing `replicas` removes excess owners through bounded leaving handoffs.
 pub fn assign(
     directory: &Directory,
     members: &BTreeMap<String, pb::Member>,
@@ -202,6 +202,56 @@ impl<'a> Plan<'a> {
                 }
             }
         }
+
+        for start in self.ranges.keys().copied().collect::<Vec<_>>() {
+            if self.moving >= max_moving {
+                break;
+            }
+            let owners = &self.ranges[&start];
+            if owners.iter().any(|o| o.state != State::Ready) {
+                continue;
+            }
+            let held: Vec<_> = owners.iter().filter(|o| o.holds()).collect();
+            if held.len() > replicas {
+                let old = held[0].node.clone();
+                self.mark_leaving(start, &old);
+                self.moving += 1;
+                continue;
+            }
+            if held.len() != replicas {
+                continue;
+            }
+
+            let mut domain_counts = BTreeMap::<&str, usize>::new();
+            for owner in &held {
+                if let Some(domain) = self.domain(&owner.node) {
+                    *domain_counts.entry(domain).or_default() += 1;
+                }
+            }
+            let Some(old) = held
+                .iter()
+                .find(|o| {
+                    self.domain(&o.node)
+                        .is_some_and(|domain| domain_counts[domain] > 1)
+                })
+                .map(|o| o.node.clone())
+            else {
+                continue;
+            };
+            let Some(new) = self.pick(start, 1).first().copied() else {
+                continue;
+            };
+            let Some(domain) = self.domain(new) else {
+                continue;
+            };
+            if domain_counts.contains_key(domain) {
+                continue;
+            }
+
+            self.mark_leaving(start, &old);
+            self.add(start, new);
+            self.moving += 1;
+        }
     }
 
     /// The `missing` least-loaded eligible members to add to a range, in failure domains its owners lack when possible.
@@ -300,14 +350,20 @@ impl<'a> Plan<'a> {
         let spare = self.load[d] as f64 - (1.0 - FILL) * self.target[d];
         let at = self.split(start, need.min(spare).max(1.0) as u128);
         let size = self.size(at);
-        let owner = self.ranges.get_mut(&at).unwrap().iter_mut();
-        owner
-            .filter(|o| o.node == d)
-            .for_each(|o| o.state = State::Leaving);
-        self.held.get_mut(d).unwrap().remove(&at);
-        self.set_load(d, self.load[d] - size);
+        self.mark_leaving(at, d);
         self.add(at, u);
         self.moving += 1;
+    }
+
+    fn mark_leaving(&mut self, start: u64, node: &str) {
+        self.ranges
+            .get_mut(&start)
+            .unwrap()
+            .iter_mut()
+            .filter(|o| o.node == node)
+            .for_each(|o| o.state = State::Leaving);
+        self.held.get_mut(node).unwrap().remove(&start);
+        self.set_load(node, self.load[node] - self.size(start));
     }
 
     /// Splits off the last `piece` hashes of a range and returns where they start; the whole range if it is no larger.
