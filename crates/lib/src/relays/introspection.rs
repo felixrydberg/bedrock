@@ -379,6 +379,8 @@ impl prometheus_client::collector::Collector for Collector {
         let now = crate::monotonic_now();
         let (mut behind, mut rate, mut lagging) =
             (BTreeMap::<&str, Vec<u64>>::new(), Vec::new(), Vec::new());
+        // ponytail: one O(namespaces) pass per scrape under the stats lock; keep running aggregates if scrapes
+        // ever show up in hot-path lock contention.
         let namespaces = hub.0.stats.namespaces.lock().unwrap();
         for (key, ns) in namespaces.iter() {
             behind.entry(key.0.as_str()).or_default().push(ns.behind());
@@ -614,6 +616,61 @@ fn namespace_cursor(key: &Key) -> String {
     format!("{}/{}", key.0, key.1)
 }
 
+/// Up to `limit` keys of `map` after the query's cursor that match its dataset and prefix. It seeks past
+/// non-matching ranges instead of scanning, so a page costs O((datasets + limit) log n) however many namespaces exist.
+fn seek<V>(map: &BTreeMap<Key, V>, query: &Query, limit: usize) -> Vec<Key> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    let mut from = query.after_key().map_or(Unbounded, Excluded);
+    let mut out = Vec::new();
+    while out.len() < limit
+        && let Some((key, _)) = map.range((from.clone(), Unbounded)).next()
+    {
+        from = match &query.dataset {
+            Some(dataset) if key.0 < *dataset => Included((dataset.clone(), query.prefix.clone())),
+            Some(dataset) if key.0 > *dataset => break,
+            _ if key.1 < query.prefix => Included((key.0.clone(), query.prefix.clone())),
+            // The smallest dataset after `key.0`: nothing sorts between a string and itself plus NUL.
+            _ if !key.1.starts_with(&query.prefix) => {
+                Included((format!("{} ", key.0), String::new()))
+            }
+            _ => {
+                out.push(key.clone());
+                Excluded(key.clone())
+            }
+        };
+    }
+    out
+}
+
+/// The namespaces of one page plus one, to tell whether another follows. With a service filter they come from
+/// that service's follows; otherwise from the namespaces this relay carried and `followed`.
+fn candidates(
+    hub: &Hub,
+    query: &Query,
+    served: Option<BTreeSet<Key>>,
+    followed: &BTreeMap<Key, u64>,
+) -> Vec<Key> {
+    let limit = query.limit + 1;
+    let namespaces = hub.0.stats.namespaces.lock().unwrap();
+    let after = query.after_key();
+    if let Some(served) = served {
+        return served
+            .into_iter()
+            .filter(|k| {
+                query.matches(k)
+                    && after.as_ref().is_none_or(|a| k > a)
+                    && (namespaces.contains_key(k) || followed.contains_key(k))
+            })
+            .take(limit)
+            .collect();
+    }
+    let keys: BTreeSet<Key> = seek(&namespaces, query, limit)
+        .into_iter()
+        .chain(seek(followed, query, limit))
+        .collect();
+    keys.into_iter().take(limit).collect()
+}
+
 /// Namespaces followed by a subscriber of `service`, when filtered by service.
 fn served(subs: &[Subscription], query: &Query) -> Option<BTreeSet<Key>> {
     let service = query.service.as_ref()?;
@@ -628,23 +685,23 @@ fn served(subs: &[Subscription], query: &Query) -> Option<BTreeSet<Key>> {
 /// The connected upstream, and per namespace the cursor received through, the upstream's announced head and lag.
 fn upstream(hub: &Hub, query: &Query) -> Value {
     let served = served(&hub.snapshot(), query);
+    let keys = candidates(hub, query, served, &BTreeMap::new());
     let namespaces = hub.0.stats.namespaces.lock().unwrap();
-    let items = namespaces
-        .iter()
-        .filter(|(k, _)| query.matches(k) && served.as_ref().is_none_or(|s| s.contains(*k)))
-        .map(|(key, ns)| {
-            let value = json!({
-                "dataset": key.0,
-                "namespace": key.1,
-                "cursor": ns.latest,
-                "upstream_head": ns.upstream_head,
-                "behind": ns.behind(),
-                "committed_at": ns.committed_at,
-                "lag_ms": ns.lag_ms,
-            });
-            (key.clone(), value)
+    let items = keys.into_iter().filter_map(|key| {
+        let ns = namespaces.get(&key)?;
+        let value = json!({
+            "dataset": key.0,
+            "namespace": key.1,
+            "cursor": ns.latest,
+            "upstream_head": ns.upstream_head,
+            "behind": ns.behind(),
+            "committed_at": ns.committed_at,
+            "lag_ms": ns.lag_ms,
         });
+        Some((key, value))
+    });
     let mut value = page(items, query.after_key(), query.limit, namespace_cursor);
+    drop(namespaces);
     value["connected"] = json!(*hub.0.stats.upstream.lock().unwrap());
     value
 }
@@ -659,21 +716,17 @@ fn namespaces(hub: &Hub, query: &Query) -> Value {
             *subscribers.entry(key.clone()).or_default() += 1;
         }
     }
+    let keys = candidates(hub, query, served, &subscribers);
     let stats: BTreeMap<Key, _> = {
         let now = crate::monotonic_now();
         let namespaces = hub.0.stats.namespaces.lock().unwrap();
-        namespaces
-            .iter()
-            .filter(|(k, _)| query.matches(k))
-            .map(|(k, ns)| (k.clone(), (ns.latest, ns.rates(now), ns.lag_ms)))
+        keys.iter()
+            .filter_map(|k| {
+                let ns = namespaces.get(k)?;
+                Some((k.clone(), (ns.latest, ns.rates(now), ns.lag_ms)))
+            })
             .collect()
     };
-    let keys: BTreeSet<Key> = stats
-        .keys()
-        .chain(subscribers.keys().filter(|k| query.matches(k)))
-        .filter(|k| served.as_ref().is_none_or(|s| s.contains(*k)))
-        .cloned()
-        .collect();
     let items = keys.into_iter().map(|key| {
         let (latest, (events, bytes), lag_ms) = stats.get(&key).copied().unwrap_or_default();
         let replay = hub

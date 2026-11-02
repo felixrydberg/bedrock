@@ -132,7 +132,10 @@ by `dataset`, namespace `prefix` and `service`, so one namespace can be inspecte
 | `subscribers` | per session: service, node and address of its member, follows with acknowledged revision and lag (head minus acknowledged), queued events and bytes, the member's disconnect count |
 | `membership` | the published members of each service with their status, the placement directory with every owner's state, and how long publication has been frozen |
 
-Sessions without a member (downstream relays, recovery sessions, member-less clients) report service `none`.
+The admin listener is unauthenticated and these views expose node IDs, addresses and namespace names, so
+`admin_listen` belongs on a trusted management network. A page seeks through the sorted namespace map, so its cost
+does not grow with namespaces the filter excludes. Sessions without a member (downstream relays, recovery
+sessions, member-less clients) report service `none`.
 Events carry one counter, so "revision" and "sequence" are the same number.
 
 Metrics carry the process's `tier` and `cell` plus at most `dataset`, `service` or placement `state`:
@@ -148,7 +151,9 @@ not grow with namespaces. Gauges are computed from the hub at scrape time.
   `Range` frames, which it sends at follow and recovery. It shows catch-up, not a parent that stops mid-stream;
   the arrival lag and `committed_at` in `upstream` show that staleness.
 - **Replay coverage** counts a subscribed namespace as covered when the cache is healthy, holds one contiguous
-  range, and evicted nothing for capacity that arrived within the window. Age pruning is not a loss.
+  range, and lost nothing that arrived within the window to capacity eviction or a rebuild. Age pruning is not a
+  loss. Losses are tracked in memory: after a restart, a namespace whose cache evicted window records before the
+  restart can count as covered until those records would have aged out.
 - **Placement:** a range is `leaving` if any owner is, else `populating` if any owner is, else `ready`.
   Pushed interests, handoff and revoke counts wait for #22 / B-21's relay-driven handoffs.
 

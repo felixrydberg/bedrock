@@ -4,6 +4,9 @@
 //! - `/health`: the process is up.
 //! - `/ready`: 200 once the node has validated its state and serves traffic, 503 otherwise.
 //! - `/introspect/{view}?{query}`: read-only JSON from the handler a binary [`Admin::introspect`]s, e.g. relays (B-18b).
+//!
+//! The endpoint has no authentication. Introspection exposes topology (node IDs, addresses, namespace names), so
+//! bind `admin_listen` to a trusted management network only.
 
 use std::convert::Infallible;
 use std::pin::Pin;

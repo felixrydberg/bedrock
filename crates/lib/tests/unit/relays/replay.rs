@@ -119,6 +119,30 @@ fn window_coverage_is_lost_only_to_capacity_eviction_or_gaps() {
 }
 
 #[test]
+fn rebuild_counts_discarded_records_against_window_coverage() {
+    let replay = Replay::open(
+        Arc::new(MemoryEngine::new("replay")),
+        ReplayConfig {
+            window_ms: 10,
+            ..ReplayConfig::default()
+        },
+    )
+    .unwrap();
+    replay.append(&event("kv", "n", 1), 5).unwrap();
+    replay.rebuild().unwrap();
+    replay.append(&event("kv", "n", 2), 6).unwrap();
+    assert_eq!(replay.ranges("kv", "n"), [(2, 2)]);
+    assert!(
+        !replay.covers_window("kv", "n", 6),
+        "revision 1 was discarded at 5"
+    );
+    assert!(
+        replay.covers_window("kv", "n", 16),
+        "the discarded record left the window"
+    );
+}
+
+#[test]
 fn checksum_and_identity_are_verified_before_recovery_or_delivery() {
     let engine = Arc::new(MemoryEngine::new("replay"));
     let original = event("kv", "n", 1);

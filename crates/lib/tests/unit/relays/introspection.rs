@@ -197,3 +197,30 @@ async fn namespaces_page_by_cursor() {
     assert_eq!(rest["items"][0]["lag_ms"], 250);
     assert_eq!(rest["next"], Value::Null);
 }
+
+#[test]
+fn seek_matches_a_filtered_scan_across_datasets() {
+    let map: BTreeMap<Key, ()> = ["auth", "cdn", "quicksilver"]
+        .into_iter()
+        .flat_map(|d| ["a", "b/1", "b/2", "c"].map(|n| ((d.to_owned(), n.to_owned()), ())))
+        .collect();
+    for query in [
+        "prefix=b",
+        "prefix=b&after=auth%2Fb%2F2",
+        "dataset=cdn&prefix=b",
+        "dataset=cdn",
+        "prefix=z",
+        "dataset=zzz",
+        "",
+    ] {
+        let query = Query::parse(query);
+        let after = query.after_key();
+        let scanned: Vec<Key> = map
+            .keys()
+            .filter(|k| query.matches(k) && after.as_ref().is_none_or(|a| *k > a))
+            .take(3)
+            .cloned()
+            .collect();
+        assert_eq!(seek(&map, &query, 3), scanned, "{query:?}");
+    }
+}

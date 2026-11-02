@@ -50,7 +50,8 @@ struct State {
     eviction: BTreeSet<(u32, u64, Identity)>,
     bytes: u64,
     failure: Option<StorageError>,
-    /// Latest arrival evicted for capacity, per `(dataset, namespace)`; age pruning is not a loss (B-18b).
+    /// Latest arrival lost to capacity eviction or a rebuild, per `(dataset, namespace)`; age pruning is not a loss
+    /// (B-18b). In memory only: losses before a restart are not known afterwards.
     // ponytail: never pruned, bounded by namespaces the cache has held, like the relay's head map.
     evicted: BTreeMap<(String, String), u64>,
 }
@@ -207,7 +208,7 @@ impl Replay {
     }
 
     /// Whether this namespace's cache holds everything that arrived within the window: healthy, one contiguous
-    /// range, and no capacity eviction of a record younger than the window.
+    /// range, and no record younger than the window lost to capacity or a rebuild since this process opened it.
     pub fn covers_window(&self, dataset: &str, namespace: &str, now_ms: u64) -> bool {
         if !self.healthy() || self.ranges(dataset, namespace).len() > 1 {
             return false;
@@ -246,7 +247,21 @@ impl Replay {
             Ok(())
         })();
         match &result {
-            Ok(()) => *state = State::default(),
+            Ok(()) => {
+                // Every record is gone; keep coverage honest until they would have left the window.
+                let mut lost = std::mem::take(&mut state.evicted);
+                for ((dataset, namespace, _), record) in &state.records {
+                    State::lose(
+                        &mut lost,
+                        (dataset.clone(), namespace.clone()),
+                        record.arrived_at,
+                    );
+                }
+                *state = State {
+                    evicted: lost,
+                    ..State::default()
+                };
+            }
             Err(error) => state.failure = Some(error.clone()),
         }
         result
@@ -342,8 +357,7 @@ impl Replay {
             state.insert(&self.config, id, record);
         }
         for (scope, at) in lost {
-            let latest = state.evicted.entry(scope).or_insert(at);
-            *latest = (*latest).max(at);
+            State::lose(&mut state.evicted, scope, at);
         }
         self.check_disk()
     }
@@ -378,6 +392,11 @@ impl Replay {
 }
 
 impl State {
+    fn lose(evicted: &mut BTreeMap<(String, String), u64>, scope: (String, String), at: u64) {
+        let latest = evicted.entry(scope).or_insert(at);
+        *latest = (*latest).max(at);
+    }
+
     fn insert(&mut self, config: &ReplayConfig, id: Identity, record: Record) {
         self.age.insert((record.arrived_at, id.clone()));
         self.eviction.insert((
