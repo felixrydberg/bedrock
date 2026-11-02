@@ -54,7 +54,7 @@ all membership changes until it returns.
   plans from applied membership. Each pass runs `placement::assign` (#18 / B-15) per dataset, over the members whose
   `datasets` include it, with 3 replicas and at most 16 ranges moving, and applies the handoff steps below. It then
   waits for its subscription to apply the writes, as for membership. `bedrock-quicksilver` places `quicksilver` and
-  `auth`; the CDN places its artifact holders as `artifacts` (B-34), which every L2 CDN member carries.
+  `auth`; `bedrock-cdn` places `cdn`, whose ref keys sit at their artifact's content hash (B-34, §4 decision 14).
 - **Owner checks.** Nodes read the directory from `membership::View::directory`. `placement::owners` lists the owners
   of a hash; a node serves a hash only if it holds it as `ready` or `leaving` in its own view. A caller routed by a
   stale view is rejected and retries the next owner. Revisions are ordinary dataset revisions, not a placement

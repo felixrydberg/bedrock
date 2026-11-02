@@ -92,9 +92,9 @@ Deploy at least three relays per cell (membership publication needs a majority),
 one relay per 500–1,000 nodes. Rotate the configured relay preference across nodes to distribute load;
 upper tiers need only a few relays. Provisioning is static configuration here.
 
-No node configures subscriptions. A CDN node follows `cdn` over the whole hash range in every
-namespace, since it needs all retention metadata. `bedrock-quicksilver` follows the ranges the
-relays push of each dataset it carries; `Session::join` maps those datasets to their engines.
+No node configures subscriptions. `bedrock-quicksilver` and `bedrock-cdn` follow the ranges the
+relays push of each dataset they carry (`cdn` for the CDN, whose `ref/{sha256}/…` keys are placed
+by content hash, `feature-drafts.md` §4 decision 14); `Session::join` maps those datasets to their engines.
 Every node also follows its own membership namespace whole. Customer
 `kv` opens/reads do not create interests. Leaf sessions also carry [cell membership](membership.md)
 (#15 / B-12). The leaf client stores a whole namespace under its namespace-NUL prefix and a
