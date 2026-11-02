@@ -35,3 +35,27 @@ The design must address:
 
 The shared interfaces may eventually need a group identity and routing contract, but their design is not a requirement
 to add speculative multi-group machinery to the initial single-group implementation.
+
+## Partial storage quarantine
+
+B-14 (#13) records the affected partition with each storage error but always quarantines the whole engine instance,
+because no adapter can yet prove that damage is limited. Narrower quarantine would shorten rebuilds once instances are
+large; L2 is never the only copy, so today whole-instance quarantine costs only rebuild time on one node.
+
+- **CDN artifacts first.** Artifacts are content-addressed, so `CacheStorage` (B-30) can verify the hash on every read
+  and quarantine one artifact: evict it, refetch from S3 and report it to the health manager without escalating. Only
+  repeated failures quarantine the whole cache. This fits the existing per-source model and needs no protocol change;
+  record it as a B-30 or B-22 amendment.
+- **Detection for RocksDB.** RocksDB names the damaged file (`file_in` already extracts it) but not its keys. The file's
+  smallest and largest keys narrow a checksum failure to one key span. Quicksilver L2 keys start with the big-endian
+  hash, so that span is a hash range, the unit placement assigns. L1 spans map to namespaces. Damage to revisions or
+  metadata still quarantines the whole instance, since they describe every key's progress.
+- **Routing.** The node can reject reads for a quarantined range through the owner check (`placement::serves`); callers
+  already retry the next owner, so this needs no protocol change. A short-lived per-range skip, like `Sources::behind`,
+  avoids repeated round trips. Publishing quarantined ranges in `Member` or the directory is a membership protocol
+  change, needs the specification updated first, and pays off only if relays should re-replicate the range.
+- **Repair.** Rebuild only that hash range without moving the dataset's applied revision backwards, reusing the range
+  bootstrap from #22 / B-21 handoffs.
+- **Containment.** A compaction that reads a corrupt SST fails and stops RocksDB writes, which brings back
+  whole-instance quarantine. The quarantined span must also be removed from compaction (delete the range and compact
+  around it, or drop the file).

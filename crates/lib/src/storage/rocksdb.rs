@@ -333,7 +333,7 @@ fn error(instance: &str, e: ::rocksdb::Error) -> StorageError {
         engine: ENGINE,
         instance: instance.to_owned(),
         file: file_in(&detail),
-        // RocksDB does not say which keys a damaged block held, so B-14 quarantines the whole instance.
+        // RocksDB does not say which keys a damaged block held; `health::storage` quarantines the whole instance.
         partition: None,
         detail,
     };

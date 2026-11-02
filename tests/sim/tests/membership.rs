@@ -1,5 +1,6 @@
 //! #15 / B-12 acceptance: cell membership from relay streams, and #19 / B-16: the L2 placement directory published
-//! beside it, through the real `bedrock-api` and `bedrock-relay` entry points. Replay one seed with
+//! beside it, with #13 / B-14 storage health in member updates, through the real `bedrock-api` and `bedrock-relay`
+//! entry points. Replay one seed with
 //! `BEDROCK_MEMBERSHIP_SEED=42` and the documented simulation flags.
 #![cfg(madsim)]
 
@@ -7,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bedrock_lib::health::storage::StorageHealth;
 use bedrock_lib::membership::{self, View};
 use bedrock_lib::node::{
     ApiConfig, Budget, Location, MembershipSettings, NodeConfig, RelayConfig, Tier,
@@ -15,6 +17,8 @@ use bedrock_lib::placement::{Directory, State};
 use bedrock_lib::relays::client::Session;
 use bedrock_lib::replication::pb;
 use bedrock_lib::s3::S3Config;
+use bedrock_lib::storage::StorageEngine;
+use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::transport::Peers;
 use bedrock_lib::transport::admin::Admin;
 use madsim::runtime::{Handle, NodeHandle, Runtime};
@@ -83,12 +87,20 @@ fn relay(name: &str, ip: &str, cell: &str, relays: &[&str]) -> RelayConfig {
     }
 }
 
+/// A leaf's storage-health manager and its one dataset's engine, raw and wrapped.
+type Storage = (
+    Arc<StorageHealth>,
+    Arc<MemoryEngine>,
+    Arc<dyn StorageEngine>,
+);
+
 /// What a test reads from a leaf process, across its restarts.
 #[derive(Default)]
 struct Leaf {
     view: Mutex<Option<Arc<View>>>,
     revision: AtomicU64,
     drain: Notify,
+    storage: Mutex<Option<Storage>>,
 }
 
 impl Leaf {
@@ -98,6 +110,17 @@ impl Leaf {
             .unwrap()
             .as_ref()
             .map(|view| view.members().unwrap().into_keys().collect())
+            .unwrap_or_default()
+    }
+
+    /// The unhealthy datasets `node` announced, as this leaf's view has them.
+    fn unhealthy(&self, node: &str) -> Vec<String> {
+        self.view
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|view| view.members().unwrap().remove(node))
+            .map(|member| member.unhealthy)
             .unwrap_or_default()
     }
 
@@ -142,10 +165,16 @@ fn spawn_leaf(
                 let (view, target) = View::new(service, cell);
                 let view = Arc::new(view);
                 *state.view.lock().unwrap() = Some(view.clone());
-                let peers = Arc::new(Peers::new(&Admin::new()));
+                let admin = Admin::new();
+                let peers = Arc::new(Peers::new(&admin));
+                let storage = StorageHealth::new(&admin);
+                let engine = Arc::new(MemoryEngine::new(service));
+                let wrapped = storage.wrap(service, "engine", engine.clone());
+                *state.storage.lock().unwrap() = Some((storage.clone(), engine, wrapped));
                 let member = pb::Member {
                     node_id: name.into(),
                     service: service.into(),
+                    datasets: vec![service.into()],
                     region: "eu".into(),
                     dc: "eu-1".into(),
                     cell: cell.into(),
@@ -164,6 +193,7 @@ fn spawn_leaf(
                                 state.revision.store(revision, Ordering::Relaxed);
                             }
                             view.refresh(&session, &peers).unwrap();
+                            session.set_unhealthy(&storage.unhealthy());
                         },
                     }
                 }
@@ -409,6 +439,30 @@ async fn placement() -> Vec<String> {
     .await;
     trace.push(format!("{} reassigned", started.elapsed().as_millis()));
     assert!(placed(&other.directory(), &["cdn-b"]));
+
+    // Corruption quarantines cdn-1's dataset; every node's view shows it, then shows the recovery.
+    let (storage, raw, engine) = leaves[0].1.storage.lock().unwrap().clone().unwrap();
+    engine.put(b"k", b"v").unwrap();
+    raw.corrupt(b"k");
+    assert!(engine.get(b"k").is_err());
+    until("quarantine published", Duration::from_secs(10), || {
+        leaves[..3]
+            .iter()
+            .all(|(_, leaf)| leaf.unhealthy("cdn-1") == ["cdn"])
+    })
+    .await;
+    trace.push(format!("{} quarantined", started.elapsed().as_millis()));
+    assert!(storage.rebuilding("cdn", "engine"));
+    raw.delete(b"k").unwrap();
+    assert!(storage.recovered("cdn", "engine"));
+    until("recovery published", Duration::from_secs(10), || {
+        leaves[..3]
+            .iter()
+            .all(|(_, leaf)| leaf.unhealthy("cdn-1").is_empty())
+    })
+    .await;
+    trace.push(format!("{} recovered", started.elapsed().as_millis()));
+    assert!(placed(&leaves[0].1.directory(), &names[..3]));
     trace
 }
 

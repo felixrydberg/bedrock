@@ -64,7 +64,8 @@ fn token(identity: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-/// An entry a node may announce: a known service, plain identities and `ready` or `draining`.
+/// An entry a node may announce: a known service, plain identities, `ready` or `draining`, and unhealthy datasets
+/// that are its own, in order and without repeats (so equal health compares equal).
 pub fn validate(member: &pb::Member) -> Result<(), Status> {
     let status = pb::member::Status::try_from(member.status);
     if !SERVICES.contains(&member.service.as_str())
@@ -74,6 +75,8 @@ pub fn validate(member: &pb::Member) -> Result<(), Status> {
             status,
             Ok(pb::member::Status::Ready | pb::member::Status::Draining)
         )
+        || !member.unhealthy.is_sorted_by(|a, b| a < b)
+        || !member.unhealthy.iter().all(|d| member.datasets.contains(d))
     {
         return Err(Status::invalid_argument("invalid membership entry"));
     }
@@ -101,6 +104,7 @@ pub fn member(config: &ServiceConfig, service: &str) -> pb::Member {
         failure_domain: node.location.failure_domain.clone(),
         status: pb::member::Status::Ready as i32,
         address: node.advertised(),
+        unhealthy: Vec::new(),
     }
 }
 
@@ -268,6 +272,8 @@ impl View {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+// ponytail: a pass plans a handful of changes, so boxing `Set` would save nothing measurable.
+#[allow(clippy::large_enum_variant)]
 pub enum Change {
     Set(pb::Member),
     Delete(MemberKey),
@@ -354,8 +360,14 @@ pub fn place(service: &str, actual: &Members, directory: &Directory) -> Vec<Chan
         .collect();
     let mut entries = placement::promote(directory, &members);
     if entries.is_empty() {
-        // ponytail: no health input until #13 / B-14 reports it in member updates.
-        entries = placement::assign(directory, &members, &BTreeSet::new(), REPLICAS, MAX_MOVING);
+        // A range carries all of the service's datasets, so storage trouble in any of them takes no new ranges (B-14).
+        // Such members keep what they hold for B-22 to rebuild; sources skip them meanwhile.
+        let unhealthy = members
+            .iter()
+            .filter(|(_, m)| !m.unhealthy.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
+        entries = placement::assign(directory, &members, &unhealthy, REPLICAS, MAX_MOVING);
     }
     entries
         .into_iter()

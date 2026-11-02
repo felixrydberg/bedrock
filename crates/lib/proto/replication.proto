@@ -43,6 +43,9 @@ message Member {
   // LEFT is relay-local: a draining node closed its stream and is removed without grace.
   Status status = 12;
   string address = 13;
+  // B-14: enabled datasets whose local storage is quarantined or rebuilding. Such a member gets no new L2 ranges and is
+  // skipped as a source for those datasets.
+  repeated string unhealthy = 14;
 }
 // B-16 L2 placement directory entry, under key `range/{start}` (16 lowercase hex digits) in the same namespace as
 // `Member`. The range ends where the next starts, or at 2^64.
@@ -73,7 +76,7 @@ message RelayRequest {
     Unfollow unfollow = 4;
     Recover recover = 5;
     bool progress = 6;
-    // Same node as Hello; changes only its status.
+    // Same node as Hello; changes only its status and unhealthy datasets.
     Member member = 7;
   }
 }

@@ -391,7 +391,7 @@ impl Hub {
         }
         self.changed();
     }
-    /// The first member must arrive on a leaf Hello; later ones may change only its status.
+    /// The first member must arrive on a leaf Hello; later ones may change only its status and unhealthy datasets.
     fn member(&self, id: u64, member: pb::Member) -> bool {
         if crate::membership::validate(&member).is_err() {
             return false;
@@ -400,14 +400,17 @@ impl Hub {
         let Some(sub) = subscribers.get_mut(&id) else {
             return false;
         };
-        let Some(current) = sub
-            .member
-            .as_mut()
-            .filter(|current| crate::membership::key(current) == crate::membership::key(&member))
-        else {
+        let Some(current) = sub.member.as_mut().filter(|current| {
+            crate::membership::key(current) == crate::membership::key(&member)
+                && member
+                    .unhealthy
+                    .iter()
+                    .all(|d| current.datasets.contains(d))
+        }) else {
             return false;
         };
         current.status = member.status;
+        current.unhealthy = member.unhealthy;
         drop(subscribers);
         self.members_changed();
         true
