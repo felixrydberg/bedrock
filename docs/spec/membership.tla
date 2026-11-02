@@ -3,8 +3,10 @@ EXTENDS Naturals, FiniteSets
 \* #15 / B-12 cell membership. Relays are numbered; the lowest relay of a majority
 \* side publishes. Mesh exchange and reconciliation are atomic in this abstraction.
 \* #19 / B-16: the publisher also writes the L2 placement directory into the same namespace.
-\* Points are possible range starts; a range ends where the next start begins.
-CONSTANTS Relays, Nodes, Grace, Points
+\* Points are possible range starts; a range ends where the next start begins. The model is
+\* one dataset's directory: each dataset has its own, given only to its Carriers.
+\* #22 / B-21: handoff.tla checks how owners become ready and how ranges are revoked.
+CONSTANTS Relays, Nodes, Grace, Points, Carriers
 None == 0
 VARIABLES up, side, conn, drain, leftAt, gone, gap, pub, split, starts, own
 vars == <<up, side, conn, drain, leftAt, gone, gap, pub, split, starts, own>>
@@ -89,7 +91,7 @@ Write(r, p, o) ==
     /\ Publisher(r) /\ (p \notin starts \/ o # own[p])
     /\ \A n \in Nodes :
         /\ o[n] = "populating" => \/ cur[n] = "populating"
-                                  \/ cur[n] = "none" /\ pub[n] = "ready"
+                                  \/ cur[n] = "none" /\ pub[n] = "ready" /\ n \in Carriers
         /\ o[n] = "ready" => cur[n] \in {"ready", "populating"}
         /\ o[n] = "leaving" => cur[n] \in Holds
         /\ (o[n] = "none" /\ cur[n] # "none") =>
@@ -115,10 +117,10 @@ TypeOK == /\ conn \in [Nodes -> Relays \cup {None}] /\ leftAt \in [Nodes -> Rela
           /\ own \in [Points -> [Nodes -> {"none", "populating"} \cup Holds]]
 \* Ends are implicit, so the directory covers the hash space after every write.
 Covered == 0 \in starts
-\* Only published, non-draining members are given new ranges.
+\* Only published, non-draining members carrying the dataset are given new ranges.
 NewOwnersPublished == [][\A h \in Points, n \in Nodes :
                             (Entry(h)'[n] = "populating" /\ Entry(h)[n] # "populating")
-                                => pub[n] = "ready"]_vars
+                                => pub[n] = "ready" /\ n \in Carriers]_vars
 \* A range that has a holder still in membership keeps a holder: a leaving owner goes only
 \* once a new owner is ready.
 NoEarlyDrop == [][\A h \in Points :

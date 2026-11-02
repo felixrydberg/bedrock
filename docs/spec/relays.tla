@@ -2,71 +2,132 @@
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 \* The single shared Relay.Session transport implements these transitions.
 \* Removing the superseded B-10 wire service does not add a second delivery path.
-CONSTANTS MaxRevision, QueueLimit
+\* #22 / B-21: one stream per dataset and range carries every namespace of the dataset, each
+\* with its own revisions. The relay pushes whether the subscriber owns the range; dropping it
+\* is the revoke, and the subscriber deletes the range.
+CONSTANTS MaxRevision, QueueLimit, Namespaces
 VARIABLES head, applied, queued, connected, cached, boundary, pinned, staging, retained, projected,
-          pending, ready
+          pending, ready, assigned, frames, following, reported
 vars == <<head, applied, queued, connected, cached, boundary, pinned, staging, retained, projected,
-          pending, ready>>
-\* Alternating revisions stand for payloads matching/not matching a fixed selector.
+          pending, ready, assigned, frames, following, reported>>
+\* Alternating revisions stand for payloads inside/outside the range.
 Selected(r) == r % 2 = 0
-\* pinned: the source holds a valid recovery lease. pending: an installed baseline awaits the
+\* pinned: the source holds valid recovery leases. pending: an installed baseline awaits the
 \* source's recovered confirmation; it is persisted with the installed state.
-Init == /\ head = 0 /\ applied = 0 /\ queued = <<>> /\ connected = TRUE
-        /\ cached = {} /\ retained = {} /\ projected = {}
-        /\ boundary = 0 /\ pinned = FALSE /\ staging = FALSE
+\* assigned: what the relay last pushed. frames: pushes the subscriber has not processed.
+\* following: the subscriber follows the range. reported: the relay told the publisher the
+\* subscriber is ready, which the directory keeps until the range is revoked.
+Caught == \A n \in Namespaces : applied[n] = head[n]
+Sent(n) == applied[n] + Cardinality({i \in 1..Len(queued) : queued[i].ns = n})
+Init == /\ head = [n \in Namespaces |-> 0] /\ applied = [n \in Namespaces |-> 0]
+        /\ queued = <<>> /\ connected = TRUE
+        /\ cached = [n \in Namespaces |-> {}] /\ retained = [n \in Namespaces |-> {}]
+        /\ projected = [n \in Namespaces |-> {}]
+        /\ boundary = [n \in Namespaces |-> 0] /\ pinned = FALSE /\ staging = FALSE
         /\ pending = FALSE /\ ready = FALSE
-Commit == /\ head < MaxRevision /\ head' = head + 1
-          /\ cached' = cached \cup {head + 1}
-          /\ retained' = retained \cup {head + 1}
-          /\ ready' = FALSE
-          /\ UNCHANGED <<applied, queued, connected, boundary, pinned, staging, projected, pending>>
-Send == /\ connected /\ ~staging /\ applied + Len(queued) < head
-        /\ Len(queued) < QueueLimit
-        /\ applied + Len(queued) + 1 \in cached \cup retained
-        /\ queued' = Append(queued, applied + Len(queued) + 1)
-        /\ UNCHANGED <<head, applied, connected, cached, boundary, pinned, staging, retained, projected, pending, ready>>
-ApplyCoverage == /\ Len(queued) > 0 /\ Head(queued) = applied + 1
-                 /\ applied' = Head(queued) /\ queued' = Tail(queued)
-                 /\ projected' = IF Selected(Head(queued)) THEN projected \cup {Head(queued)} ELSE projected
-                 /\ UNCHANGED <<head, connected, cached, boundary, pinned, staging, retained, pending, ready>>
-\* Disconnect aborts staging and releases the lease; an unconfirmed install stays pending.
+        /\ assigned = FALSE /\ frames = <<>> /\ following = FALSE /\ reported = FALSE
+Commit(n) == /\ head[n] < MaxRevision /\ head' = [head EXCEPT ![n] = @ + 1]
+             /\ cached' = [cached EXCEPT ![n] = @ \cup {head[n] + 1}]
+             /\ retained' = [retained EXCEPT ![n] = @ \cup {head[n] + 1}]
+             /\ ready' = FALSE
+             /\ UNCHANGED <<applied, queued, connected, boundary, pinned, staging, projected, pending,
+                            assigned, frames, following, reported>>
+\* Coverage of each namespace travels in order; namespaces interleave.
+Send(n) == /\ connected /\ following /\ ~staging /\ Sent(n) < head[n]
+           /\ Len(queued) < QueueLimit
+           /\ Sent(n) + 1 \in cached[n] \cup retained[n]
+           /\ queued' = Append(queued, [ns |-> n, r |-> Sent(n) + 1])
+           /\ UNCHANGED <<head, applied, connected, cached, boundary, pinned, staging, retained, projected,
+                          pending, ready, assigned, frames, following, reported>>
+ApplyCoverage == LET q == Head(queued) IN
+                 /\ Len(queued) > 0 /\ q.r = applied[q.ns] + 1
+                 /\ applied' = [applied EXCEPT ![q.ns] = q.r] /\ queued' = Tail(queued)
+                 /\ projected' = IF Selected(q.r) THEN [projected EXCEPT ![q.ns] = @ \cup {q.r}]
+                                 ELSE projected
+                 /\ UNCHANGED <<head, connected, cached, boundary, pinned, staging, retained, pending, ready,
+                                assigned, frames, following, reported>>
+\* Disconnect aborts staging and releases the leases; an unconfirmed install stays pending.
+\* Unprocessed pushes are lost; the next session starts with the full pushed set.
 Disconnect == /\ connected /\ connected' = FALSE /\ queued' = <<>>
-              /\ pinned' = FALSE /\ staging' = FALSE /\ ready' = FALSE
-              /\ UNCHANGED <<head, applied, cached, boundary, retained, projected, pending>>
-Reconnect == /\ ~connected /\ connected' = TRUE
-             /\ UNCHANGED <<head, applied, queued, cached, boundary, pinned, staging, retained, projected, pending, ready>>
-\* The lease expires without a disconnect; an unfinished transfer aborts.
+              /\ pinned' = FALSE /\ staging' = FALSE /\ ready' = FALSE /\ frames' = <<>>
+              /\ UNCHANGED <<head, applied, cached, boundary, retained, projected, pending,
+                             assigned, following, reported>>
+Reconnect == /\ ~connected /\ connected' = TRUE /\ frames' = <<assigned>>
+             /\ UNCHANGED <<head, applied, queued, cached, boundary, pinned, staging, retained, projected,
+                            pending, ready, assigned, following, reported>>
+\* The leases expire without a disconnect; an unfinished transfer aborts.
 ExpireLease == /\ pinned /\ pinned' = FALSE /\ staging' = FALSE
-               /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, retained, projected, pending, ready>>
-Evict == /\ \E r \in cached: cached' = cached \ {r}
-         /\ UNCHANGED <<head, applied, queued, connected, boundary, pinned, staging, retained, projected, pending, ready>>
-GC == /\ \E r \in retained: /\ (~pinned \/ r <= boundary)
-                              /\ retained' = retained \ {r}
-      /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, projected, pending, ready>>
-BeginBootstrap == /\ connected /\ ~staging /\ boundary' = head
+               /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, retained, projected, pending,
+                              ready, assigned, frames, following, reported>>
+Evict(n) == /\ \E r \in cached[n] : cached' = [cached EXCEPT ![n] = @ \ {r}]
+            /\ UNCHANGED <<head, applied, queued, connected, boundary, pinned, staging, retained, projected,
+                           pending, ready, assigned, frames, following, reported>>
+GC(n) == /\ \E r \in retained[n] : /\ (~pinned \/ r <= boundary[n])
+                                    /\ retained' = [retained EXCEPT ![n] = @ \ {r}]
+         /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, projected,
+                        pending, ready, assigned, frames, following, reported>>
+\* One transfer covers the range in every namespace, each at its own boundary.
+BeginBootstrap == /\ connected /\ following /\ ~staging /\ boundary' = head
                   /\ staging' = TRUE /\ pinned' = TRUE /\ queued' = <<>> /\ ready' = FALSE
-                  /\ UNCHANGED <<head, applied, cached, retained, connected, projected, pending>>
-\* Validated atomic installation. It does not confirm recovery.
-InstallValidated == /\ staging /\ pinned /\ boundary >= applied
+                  /\ UNCHANGED <<head, applied, cached, retained, connected, projected, pending,
+                                 assigned, frames, following, reported>>
+\* Validated atomic installation of every namespace. It does not confirm recovery.
+InstallValidated == /\ staging /\ pinned /\ \A n \in Namespaces : boundary[n] >= applied[n]
                     /\ applied' = boundary /\ staging' = FALSE /\ pending' = TRUE
-                    /\ projected' = {r \in 1..boundary : Selected(r)}
-                    /\ UNCHANGED <<head, queued, connected, cached, boundary, pinned, retained, ready>>
-\* The source's recovered Range: catch-up through head was acknowledged under a valid lease.
-Confirm == /\ connected /\ pinned /\ pending /\ ~staging /\ applied = head
+                    /\ projected' = [n \in Namespaces |-> {r \in 1..boundary[n] : Selected(r)}]
+                    /\ UNCHANGED <<head, queued, connected, cached, boundary, pinned, retained, ready,
+                                   assigned, frames, following, reported>>
+\* The source's recovered Range: catch-up through head was acknowledged under valid leases.
+Confirm == /\ connected /\ pinned /\ pending /\ ~staging /\ Caught
            /\ pending' = FALSE /\ pinned' = FALSE
-           /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, staging, retained, projected, ready>>
+           /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, staging, retained, projected, ready,
+                          assigned, frames, following, reported>>
 \* The receiver's local readiness check.
-BecomeReady == /\ connected /\ ~staging /\ ~pending /\ applied = head /\ ~ready /\ ready' = TRUE
-               /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, retained, projected, pending>>
-Next == Commit \/ Send \/ ApplyCoverage \/ Disconnect \/ Reconnect \/ ExpireLease \/ Evict
-        \/ BeginBootstrap \/ InstallValidated \/ Confirm \/ BecomeReady \/ GC
+BecomeReady == /\ connected /\ following /\ ~staging /\ ~pending /\ Caught /\ ~ready /\ ready' = TRUE
+               /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, retained,
+                              projected, pending, assigned, frames, following, reported>>
+\* The relay pushes the range (the directory made the subscriber an owner) or drops it (the
+\* directory removed it). Either clears the reported readiness of the earlier assignment.
+Assign == /\ connected /\ ~assigned /\ Len(frames) < QueueLimit
+          /\ assigned' = TRUE /\ frames' = Append(frames, TRUE) /\ reported' = FALSE
+          /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, retained,
+                         projected, pending, ready, following>>
+Revoke == /\ connected /\ assigned /\ Len(frames) < QueueLimit
+          /\ assigned' = FALSE /\ frames' = Append(frames, FALSE) /\ reported' = FALSE
+          /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, retained,
+                         projected, pending, ready, following>>
+\* The subscriber processes pushes in order. A revoke (confirmed against its own directory
+\* view, membership.tla) deletes the range: its coverage restarts from nothing.
+Receive == /\ frames # <<>> /\ frames' = Tail(frames)
+           /\ IF Head(frames)
+              THEN /\ following' = TRUE
+                   /\ UNCHANGED <<applied, queued, pinned, staging, projected, pending, ready>>
+              ELSE /\ following' = FALSE /\ queued' = <<>>
+                   /\ applied' = [n \in Namespaces |-> 0] /\ projected' = [n \in Namespaces |-> {}]
+                   /\ pinned' = FALSE /\ staging' = FALSE /\ pending' = FALSE /\ ready' = FALSE
+           /\ UNCHANGED <<head, connected, cached, boundary, retained, assigned, reported>>
+\* The relay's readiness, shared with the publisher: confirmed and caught up, counting only
+\* acknowledgements sent after the subscriber processed every push.
+Report == /\ connected /\ assigned /\ frames = <<>> /\ ~staging /\ ~pending /\ Caught /\ ~reported
+          /\ reported' = TRUE
+          /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, retained,
+                         projected, pending, ready, assigned, frames, following>>
+Next == \/ \E n \in Namespaces : Commit(n) \/ Send(n) \/ Evict(n) \/ GC(n)
+        \/ ApplyCoverage \/ Disconnect \/ Reconnect \/ ExpireLease
+        \/ BeginBootstrap \/ InstallValidated \/ Confirm \/ BecomeReady
+        \/ Assign \/ Revoke \/ Receive \/ Report
 Spec == Init /\ [][Next]_vars
-TypeOK == /\ applied \in 0..head /\ head \in 0..MaxRevision
-          /\ cached \subseteq 1..head /\ Len(queued) <= QueueLimit
-          /\ pending \in BOOLEAN /\ ready \in BOOLEAN
-OrderedCoverage == \A i \in 1..Len(queued): queued[i] = applied + i
+TypeOK == /\ \A n \in Namespaces : applied[n] \in 0..head[n] /\ head[n] \in 0..MaxRevision
+                                   /\ cached[n] \subseteq 1..head[n]
+          /\ Len(queued) <= QueueLimit /\ Len(frames) <= QueueLimit
+          /\ pending \in BOOLEAN /\ ready \in BOOLEAN /\ reported \in BOOLEAN
+OrderedCoverage == \A i \in 1..Len(queued) :
+                    queued[i].r = applied[queued[i].ns]
+                                  + Cardinality({j \in 1..i : queued[j].ns = queued[i].ns})
 ProtectedBootstrap == staging => pinned
-ProtectedTail == pinned => (boundary+1..head) \subseteq retained
-FilteredCoverage == projected = {r \in 1..applied : Selected(r)}
-ReadyAfterConfirmation == ready => (connected /\ ~staging /\ ~pending /\ applied = head)
+ProtectedTail == pinned => \A n \in Namespaces : (boundary[n]+1..head[n]) \subseteq retained[n]
+FilteredCoverage == \A n \in Namespaces : projected[n] = {r \in 1..applied[n] : Selected(r)}
+ReadyAfterConfirmation == ready => (connected /\ following /\ ~staging /\ ~pending /\ Caught)
+\* A reported subscriber still follows the range it was assigned: it has not deleted it.
+ReportedHolds == reported => (assigned /\ following)
 =============================================================================

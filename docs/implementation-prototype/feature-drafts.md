@@ -1744,6 +1744,27 @@ Labels: enhancement
     - **Specification first:** `membership.tla` gains the directory writes and a single assigner; a handoff model checks that
       a range is never dropped before its new owners are ready and that no node serves a range it neither owns nor is leaving;
       `relays.tla` covers relay-pushed interests and revokes. Update them before implementation.
+    - **Refined 2026-11-02 for #22 / B-21:**
+      - *Ranges per dataset.* Each dataset has its own ranges under `range/{dataset}/{start}`, given only to members whose
+        `datasets` include it. A node carrying `auth` but not `quicksilver` owns only `auth` ranges.
+      - *One stream per dataset and range.* A node follows `(dataset, range)`, and that stream carries every namespace of the
+        dataset. Events keep their namespace and per-namespace `sequence`; the node keeps one applied sequence per namespace,
+        and deliveries note coverage only for namespaces that changed. Nobody lists namespaces, so an idle namespace costs one
+        number per stream. A subscription selects either a namespace (membership) or a dataset range (L2), never both.
+      - *One pushed frame.* A relay sends each leaf its full owned range set per dataset, tagged with the directory revision it
+        was derived from. Ranges it adds are followed; ranges it drops are the revoke. The node confirms a revoke only once its
+        own view has reached that revision and shows it without the range while another owner is `ready`; otherwise it
+        refuses and reports. A relay drops a range from the set only after the published directory removed the node.
+      - *Readiness.* The holding relay derives it from the confirmed bootstrap (or a stream from revision 0) plus
+        acknowledgements through the head it saw at confirmation, counting only acknowledgements sent after the node applied
+        the frame that assigned the range. It shares a ready bit, not acknowledgements, over the sibling stream; the publisher
+        writes `ready` and then removes `leaving` owners once every other owner is `ready`.
+      - *Serving.* A node serves only ranges it holds as `ready` or `leaving` in its own view; `populating` owners do not serve.
+      - *Storage.* L2 data uses the hash-first layout, so a range is one scan across namespaces and one `delete_range`. Startup
+        rejects the earlier alpha layout instead of migrating it.
+      - *Deferred.* Dropping a `leaving` range early under disk pressure waits for the storage-health work (B-14).
+      - *Specification.* The handoff model is its own module, `docs/spec/handoff.tla`, over an abstract membership:
+        combined with `membership.tla`'s relay and clock state it was too large for TLC.
 
 ### Still open
 

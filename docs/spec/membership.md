@@ -1,4 +1,4 @@
-# Cell membership (#15 / B-12) and L2 placement directory (#19 / B-16)
+# Cell membership (#15 / B-12), L2 placement directory (#19 / B-16) and range handoff (#22 / B-21)
 
 A member is a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process that is receiving updates: it holds a leaf
 `Relay.Session` to a relay of its own cell. There is no heartbeat or gossip protocol and no epoch.
@@ -45,24 +45,45 @@ all membership changes until it returns.
 §4 decision 13 of `feature-drafts.md`. Applies to the `quicksilver` and `cdn` services; customer KV ranks its readers instead
 (#18 / B-15).
 
-- **Entries.** Key `range/{start}` (16 lowercase hex digits) in the same `{service}.{cell}` namespace, value an
-  encoded `Range`: owners with state `populating`, `ready` or `leaving`. A range ends where the next starts, or at
-  2⁶⁴, so every single write leaves the hash space covered with no gaps or overlaps. Node IDs cannot contain `/`,
-  so entries never collide with members. Membership and placement share the namespace's one revision order.
+- **Entries.** Each dataset has its own ranges: key `range/{dataset}/{start}` (16 lowercase hex digits) in the same
+  `{service}.{cell}` namespace, value an encoded `Range`: owners with state `populating`, `ready` or `leaving`. A
+  range ends where the dataset's next starts, or at 2⁶⁴, so every single write leaves the hash space covered with no
+  gaps or overlaps. Node IDs cannot contain `/`, so entries never collide with members. Membership and placement
+  share the namespace's one revision order.
 - **Assignment.** Only the membership publisher writes, and only once membership has nothing left to write, so it
-  plans from applied membership. Each pass either promotes the last pass's handoffs or runs `placement::assign`
-  (#18 / B-15) with 3 replicas and at most 16 ranges moving. It then waits for its subscription to apply the writes,
-  as for membership.
-- **Interim readiness.** Until #22 / B-21 derives readiness from the relays' bootstrap, promotion marks
-  `populating` owners `ready` and removes `leaving` ones on the next pass. Nothing reads L2 by range yet
-  (`quicksilver` is `full_replica`, `auth` on-demand), so no reader relies on the claim. A range whose owners are
-  all leaving keeps them.
+  plans from applied membership. Each pass runs `placement::assign` (#18 / B-15) per dataset, over the members whose
+  `datasets` include it, with 3 replicas and at most 16 ranges moving, and applies the handoff steps below. It then
+  waits for its subscription to apply the writes, as for membership.
 - **Owner checks.** Nodes read the directory from `membership::View::directory`. `placement::owners` lists the owners
-  of a hash; a node serves a hash only if `placement::serves` says it owns or is leaving it in its own view. A caller
-  routed by a stale view is rejected and retries the next owner. Revisions are ordinary dataset revisions, not a
-  placement epoch.
+  of a hash; a node serves a hash only if it holds it as `ready` or `leaving` in its own view. A caller routed by a
+  stale view is rejected and retries the next owner. Revisions are ordinary dataset revisions, not a placement
+  epoch.
 - **Freeze.** Without a majority nothing is written, so placement freezes with membership and nodes keep serving
   what they hold.
+
+## Range handoff
+
+#22 / B-21, §4 decision 13 as refined on 2026-11-02. Joins, failures and drains all use the same steps:
+
+1. Assignment writes new owners as `populating`.
+2. Every relay pushes each of its leaf members the full set of ranges it owns per dataset, in any state, tagged
+   with the directory revision it read. The member follows each new range as one stream that carries every
+   namespace of the dataset ([relays.md](relays.md#range-streams)), bootstrapping where needed.
+3. The holding relay counts the member ready for a range once its bootstrap is confirmed and it has acknowledged
+   through the head the relay saw then. It counts only acknowledgements sent after the member processed every
+   pushed set. It shares that ready bit with its siblings, never the acknowledgements; the publisher writes the
+   owner `ready`.
+4. A `leaving` owner keeps following and serving. Once every other owner of the entry is `ready`, the publisher
+   removes it.
+5. The relay then pushes a set without the range: that is the revoke. The member waits until its own view has
+   reached the pushed revision, then confirms that the view no longer lists it for the range and lists another
+   `ready` owner. It stops serving and following the range, deletes it with one `delete_range` over the hash span
+   and compacts that span. A revoke that does not match its view is refused and reported.
+
+Relays act only on the published directory. A relay that dies mid-handoff loses nothing: the member's next relay
+pushes the full set again and the publisher continues from published state. Without a majority nothing is
+written, so no range becomes `ready` or is revoked. A member cut off past the grace period is removed from its
+ranges; when it reconnects, the pushed set no longer lists them and it drops them.
 
 ## Model
 
@@ -90,7 +111,34 @@ checks those rules rather than `assign`'s balance:
 
 Owners are never demoted from `ready` to `populating`.
 
-It does not model message delays or a sibling whose stream fails silently: a node that moves to a relay whose
+The model is one dataset's directory; datasets have independent directories. `Carriers` are the nodes carrying
+that dataset, and `NewOwnersPublished` also requires a new owner to be one.
+
+`handoff.tla` checks the handoff on the same directory rules, with membership and the relay mesh abstract: a member
+is published while connected and removed only while disconnected, and `quorum` stands for a relay majority. Combined
+with this model's relay and clock state, the handoff was too large for TLC: a two-node check with three directory
+revisions passed 132 million distinct states without finishing. Per node and point it adds what relays last pushed
+(`told`), unprocessed pushed frames in order (`chan`), whether the node follows and holds the point's data (`follow`,
+`copy`), and what the node's own, possibly lagging, directory view says about the point (`view`): its own state
+and whether another owner is ready, the only facts the node reads from it. Each frame records whether the node's view has
+reached the revision the frame was derived from (`ok`), which is all a revoke's revision is used for; recording
+the revision itself made the state space too large. `Push` sends a change of the published directory, `Receive`
+follows or confirms and drops, `Copy` abstracts bootstrap and catch-up (relays.tla checks those), and `Observe`
+catches the node's view up. A disconnect loses the node's frames, and its
+next relay pushes everything again. `Write` marks an owner `ready` only from `ReadyFor`: the node is connected,
+processed every pushed frame, follows the range and holds it. With `Faulty`, `BadRevoke` lets a relay revoke on its
+own unpublished view. `Bound` limits directory revisions to `MaxRev` and each frame queue to two. With `Capped`, it
+also limits a run to `MaxCuts` disconnects and `MaxFlips` quorum changes, so TLC reaches deeper directory histories;
+uncapped configs keep both unlimited at shallower depth.
+
+- `ReadyHasData`: every `ready` or `leaving` owner holds the data, so no range is dropped before its new owners
+  are ready, even after a faulty revoke.
+- `ServesHeld`: a node that serves a point from its own view (`ready` or `leaving` there) holds its data.
+- `NewOwnersPublished`, `NoEarlyDrop` and `Freeze` as above, against the abstract membership.
+
+Neither model covers dropping a `leaving` range early under disk pressure (deferred to B-14).
+
+`membership.tla` does not model message delays or a sibling whose stream fails silently: a node that moves to a relay whose
 mesh stream to the publisher is dead but not yet detected can be removed and re-added once. Asymmetric
 partitions are not modeled. If relays A and B cannot reach each other but both reach C, both can publish
 and flap the entries they disagree on. The model does not prove liveness, the Rust implementation or the
@@ -130,6 +178,45 @@ Negative checks in ignored temporary copies, 2026-11-01: revoking a `leaving` ow
 `NoEarlyDrop` at depth 8. Dropping owners still in membership violates it at depth 9. Giving ranges to draining
 members violates `NewOwnersPublished` at depth 6. Writing from a relay without a majority violates `Freeze` at
 depth 5.
+
+With `Carriers`, TLC `2026.10.28.014557` (rev `56d37a9`) on 2026-11-02 checked `membership.cfg`
+(`Carriers = {1}`): 4,924,193 generated and 431,280 distinct states, depth 22, no violation (12 s). The state
+counts match the 2026-11-01 run; this TLC build reports the depth as 22.
+
+The handoff model, run from `docs/spec`:
+
+```sh
+java -XX:+UseParallelGC -cp ../../.codex-tmp/tla2tools.jar tlc2.TLC -workers 6 -checkpoint 5 -metadir ../../.codex-tmp/tlc-handoff -config handoff.cfg handoff.tla
+```
+
+The same TLC build on 2026-11-02, with `Nodes = {n1, n2}` under symmetry, both carrying the dataset, faulty
+revokes enabled and no caps:
+
+| Points | `MaxRev` | Generated states | Distinct states | Depth | Result |
+|---|---:|---:|---:|---:|---|
+| `{0}` | 4 | 28,163,121 | 2,782,754 | 40 | no violation (28 s) |
+| `{0}` (`handoff.cfg`) | 6 | 83,417,417 | 8,237,636 | 46 | no violation (1 min 37 s) |
+| `{0, 1}`, no faulty revokes | 3 | 965,875,582 | 88,204,865 | 48 | no violation (51 min 50 s after resuming from a checkpoint) |
+
+With two points ranges split. Faulty revokes act per point, so the one-point runs cover them; leaving them out keeps
+the two-point run small enough to finish. Capped two-point runs with deeper revisions have not finished on this machine.
+
+Negative checks in ignored temporary copies, 2026-11-02, with `Points = {0}` and `MaxRev = 4` unless stated:
+
+- Confirming a revoke without checking the node's view violates `ReadyHasData` at depth 15.
+- Marking an owner `ready` without its data violates `ReadyHasData` at depth 12.
+- Giving a range to a node that does not carry the dataset (`Carriers = {n1}`) violates `NewOwnersPublished` at
+  depth 8.
+- Writing the directory without a quorum violates `Freeze` at depth 9.
+- Confirming a revoke before the node's view reached its revision violates `ReadyHasData` at depth 20.
+- Counting readiness before the node processed every pushed frame violates `ReadyHasData` at depth 22
+  (`MaxRev = 6`, no faulty revokes). The trace: the range is revoked and assigned again, the relay counts the old
+  stream's acknowledgements, the owner is published `ready`, and the node then processes the queued revoke and
+  deletes the range.
+
+The first attempt combined the handoff with this model. Even with three directory revisions it passed 132 million
+distinct states without finishing, and an exact revision on every frame kept the separate model too large until
+frames recorded only whether the node's view had reached it.
 
 Implementation evidence is separate. Unit tests cover `membership::plan`, the relay member list and
 configuration validation. `tests/sim/tests/membership.rs` runs the real `bedrock-api` and `bedrock-relay` entry
