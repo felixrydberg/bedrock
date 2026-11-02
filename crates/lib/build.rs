@@ -5,6 +5,8 @@ fn main() {
     unsafe { std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap()) };
     tonic_build::configure()
         .bytes([".bedrock.replication.Delivery.events"])
+        // Ordered maps encode the same bytes on every run, which a replayed seed needs.
+        .btree_map(["."])
         .compile_protos(&["proto/replication.proto"], &["proto"])
         .unwrap();
 }

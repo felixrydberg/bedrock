@@ -111,10 +111,10 @@ fn targets(engine: &Arc<MemoryEngine>) -> Vec<Target> {
         selection: Selection {
             dataset: dataset.into(),
             namespace: namespace.into(),
-            buckets: Vec::new(),
         },
         engine: engine.clone(),
         prefix: prefix.to_vec(),
+        span: None,
     })
     .collect()
 }
@@ -243,7 +243,8 @@ fn follow(namespace: &str, from: u64) -> pb::RelayRequest {
         dataset: "auth".into(),
         namespace: namespace.into(),
         from,
-        buckets: Vec::new(),
+        span: None,
+        from_namespaces: Default::default(),
     }))
 }
 
@@ -272,6 +273,7 @@ async fn namespace_unfollow_preserves_the_other_namespace_on_the_same_session() 
                 dataset: "auth".into(),
                 namespace: delivery.namespace,
                 applied: delivery.through,
+                span: None,
             })))
             .await
             .unwrap();
@@ -280,6 +282,7 @@ async fn namespace_unfollow_preserves_the_other_namespace_on_the_same_session() 
     tx.send(request(pb::relay_request::Kind::Unfollow(pb::Unfollow {
         dataset: "auth".into(),
         namespace: "one".into(),
+        span: None,
     })))
     .await
     .unwrap();
@@ -342,7 +345,8 @@ async fn invalid_tier_and_customer_kv_subscriptions_are_rejected() {
         dataset: "kv".into(),
         namespace: "customer".into(),
         from: 1,
-        buckets: Vec::new(),
+        span: None,
+        from_namespaces: Default::default(),
     })))
     .await
     .unwrap();
@@ -464,10 +468,10 @@ async fn pruned_authoritative_cursor_bootstraps_through_two_tiers_then_applies_d
             selection: Selection {
                 dataset: "auth".into(),
                 namespace: "accounts".into(),
-                buckets: Vec::new(),
             },
             engine: local.clone(),
             prefix: b"a/".to_vec(),
+            span: None,
         }],
     )
     .unwrap();
@@ -549,10 +553,10 @@ async fn empty_authoritative_bootstrap_is_confirmed_through_relays_before_readin
             selection: Selection {
                 dataset: "auth".into(),
                 namespace: "accounts".into(),
-                buckets: Vec::new(),
             },
             engine: local.clone(),
             prefix: b"a/".to_vec(),
+            span: None,
         }],
     )
     .unwrap();
@@ -703,10 +707,10 @@ async fn restarted_relay_serves_validated_persisted_replay_while_parent_is_unava
             selection: Selection {
                 dataset: "auth".into(),
                 namespace: "accounts".into(),
-                buckets: Vec::new(),
             },
             engine: local.clone(),
             prefix: b"a/".to_vec(),
+            span: None,
         }],
     )
     .unwrap();
@@ -758,10 +762,10 @@ async fn stale_recovery_candidate_falls_back_to_the_writer_with_required_history
         selection: Selection {
             dataset: "auth".into(),
             namespace: "accounts".into(),
-            buckets: Vec::new(),
         },
         engine: local.clone(),
         prefix: b"a/".to_vec(),
+        span: None,
     };
     let first =
         Session::start(peers(), vec![writer_server.address.clone()], vec![target()]).unwrap();
@@ -825,4 +829,107 @@ async fn stale_recovery_candidate_falls_back_to_the_writer_with_required_history
     drop(resumed);
     authoritative.close().await.unwrap();
     stale.close().await.unwrap();
+}
+
+async fn put(writer: &Arc<Writer>, namespace: &str, key: &[u8], operation: Operation) {
+    writer
+        .commit(Write {
+            dataset: "quicksilver".into(),
+            namespace: namespace.into(),
+            key: key.to_vec(),
+            operation,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+}
+
+async fn until(what: &str, done: impl Fn() -> bool) {
+    tokio::time::timeout(DEADLINE, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+#[tokio::test]
+async fn range_follow_streams_every_namespace_and_only_its_hashes_through_two_tiers() {
+    use bedrock_lib::placement::hash_of;
+    use bedrock_lib::storage::{KeyRange, l2_key};
+    const HALF: u64 = 1 << 63;
+    let writer = writer().await;
+    let keys: Vec<Vec<u8>> = (0u8..16).map(|i| vec![b'k', i]).collect();
+    for namespace in ["a", "b"] {
+        for key in &keys {
+            put(&writer, namespace, key, Operation::Set(namespace.into())).await;
+        }
+    }
+    let source = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17501).await;
+    let top = relay("top", 3, &source.address);
+    let top_task = top.start();
+    let top = serve(top, 17502).await;
+    let cell = relay("cell", 1, &top.address);
+    let cell_task = cell.start();
+    let cell = serve(cell, 17503).await;
+    let local = Arc::new(MemoryEngine::new("local"));
+    let target = || Target {
+        selection: Selection {
+            dataset: "quicksilver".into(),
+            namespace: String::new(),
+        },
+        engine: local.clone(),
+        prefix: Vec::new(),
+        span: Some((0, HALF)),
+    };
+    let stored = |namespace: &str, key: &[u8]| {
+        local
+            .get(&l2_key(
+                hash_of("quicksilver", namespace, key),
+                namespace,
+                key,
+            ))
+            .unwrap()
+    };
+    let inside = |namespace: &str, key: &[u8]| hash_of("quicksilver", namespace, key) < HALF;
+    let session = Session::start(peers(), vec![cell.address.clone()], vec![target()]).unwrap();
+    let complete = |namespace: &'static str, value: &'static [u8]| {
+        let keys = keys.clone();
+        let stored = &stored;
+        move || {
+            keys.iter()
+                .filter(|key| inside(namespace, key))
+                .all(|key| stored(namespace, key).as_deref() == Some(value))
+        }
+    };
+    until("namespaces a and b", || {
+        complete("a", b"a")() && complete("b", b"b")()
+    })
+    .await;
+    assert!(keys.iter().filter(|key| inside("a", key)).count() > 0);
+    // Nothing outside the range arrives, in any namespace.
+    for entry in local.scan(&KeyRange::prefix(*b"l2/")).unwrap() {
+        let (key, _) = entry.unwrap();
+        let hash = u64::from_be_bytes(key[3..11].try_into().unwrap());
+        assert!(hash < HALF, "key outside the followed range");
+    }
+    // A namespace created after the follow is picked up without anyone listing it.
+    for key in &keys {
+        put(&writer, "c", key, Operation::Set(b"c".to_vec())).await;
+    }
+    until("new namespace c", complete("c", b"c")).await;
+    drop(session);
+    for key in &keys {
+        put(&writer, "a", key, Operation::Delete).await;
+    }
+    let resumed = Session::start(peers(), vec![cell.address.clone()], vec![target()]).unwrap();
+    until("deletes after restart", || {
+        keys.iter().all(|key| stored("a", key).is_none()) && complete("b", b"b")()
+    })
+    .await;
+    drop(resumed);
+    top_task.abort();
+    cell_task.abort();
+    writer.close().await.unwrap();
 }

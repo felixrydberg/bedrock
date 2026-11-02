@@ -63,6 +63,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
                 selection: selection.clone(),
                 engine:engine.clone(),
                 prefix,
+                span: None,
             }))
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;

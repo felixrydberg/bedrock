@@ -295,6 +295,17 @@ impl StorageEngine for RocksDbAdapter {
         Ok(bytes)
     }
 
+    /// RocksDB drops range tombstones and the keys under them only when compaction rewrites their files.
+    fn compact(&self, range: &KeyRange) -> StorageResult<()> {
+        if range.bounds().is_none() {
+            return Ok(());
+        }
+        let end = range.end.as_deref().map_or(KEY_END.to_vec(), data_key);
+        self.db
+            .compact_range_cf(self.data(), Some(data_key(&range.start)), Some(end));
+        self.health()
+    }
+
     fn health(&self) -> StorageResult<()> {
         // ponytail: the counter never resets, so an error RocksDB recovered from keeps the instance unhealthy until
         // restart; read the background error status instead if that quarantines too much.

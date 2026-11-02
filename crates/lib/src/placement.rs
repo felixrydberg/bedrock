@@ -7,11 +7,34 @@
 //!   `ready`, revoking `leaving` ones) belongs to the relays (#22 / B-21); until then the publisher [`promote`]s.
 //! - [`owners`] and [`serves`] read the published directory (#19 / B-16, `docs/spec/membership.md`).
 //! - [`rank`] orders customer-KV readers by rendezvous hash. Customer KV has no ranges.
+//! - [`hash_of`] places a key in the hash space; relay range streams select keys with [`in_span`] (#22 / B-21).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
+use sha2::{Digest, Sha256};
+
 use crate::replication::pb;
+
+/// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.
+pub fn hash_of(dataset: &str, namespace: &str, key: &[u8]) -> u64 {
+    let mut hash = Sha256::new();
+    for part in [dataset.as_bytes(), namespace.as_bytes(), key] {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
+    }
+    u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap())
+}
+
+/// Whether `hash` lies in `span`: `[start, end)`, where `end` 0 means 2⁶⁴.
+pub fn in_span(span: &pb::Span, hash: u64) -> bool {
+    hash >= span.start && (span.end == 0 || hash < span.end)
+}
+
+/// A span is valid when it is not empty.
+pub fn valid_span(span: &pb::Span) -> bool {
+    span.end == 0 || span.end > span.start
+}
 
 /// The hash space is `[0, 2⁶⁴)`.
 const SPACE: u128 = 1 << 64;
@@ -476,7 +499,7 @@ pub fn serves(directory: &Directory, node: &str, hash: u64) -> bool {
 }
 
 /// Customer-KV readers for a key, most preferred first: rendezvous hashing of `hash`
-/// (`buckets::hash_of("kv", namespace, key)`) with each member's node ID. The same members give the same order on every
+/// (`hash_of("kv", namespace, key)`) with each member's node ID. The same members give the same order on every
 /// node, and removing a member moves only the keys it ranked first. Pass the readers that may serve, in their order, to
 /// [`crate::health::Health::route`] to fall back to the next-ranked healthy one.
 // ponytail: O(N) hashes plus a sort per request, about 185 µs at 10,000 readers (release, 2026-10-31); add a precomputed

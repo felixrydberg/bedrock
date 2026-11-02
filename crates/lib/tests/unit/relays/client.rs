@@ -35,16 +35,45 @@ async fn drain_returns_once_the_draining_task_has_finished() {
     session.drain().await;
 }
 
-fn target(engine: Arc<MemoryEngine>, buckets: Vec<u32>) -> Target {
+fn target(engine: Arc<MemoryEngine>) -> Target {
     Target {
         selection: Selection {
             dataset: "auth".into(),
             namespace: "users".into(),
-            buckets,
         },
         engine,
         prefix: b"users\0".to_vec(),
+        span: None,
     }
+}
+
+/// The consumer of namespace `users` in a range of `auth`.
+fn ranged(engine: Arc<MemoryEngine>, range: (u64, u64)) -> Consumer {
+    let group = Target {
+        selection: Selection {
+            dataset: "auth".into(),
+            namespace: String::new(),
+        },
+        engine,
+        prefix: Vec::new(),
+        span: Some(range),
+    };
+    Consumer::in_range(&group, "users", range).unwrap()
+}
+
+/// Exactly the hash of `key` in `users`.
+fn only(key: &[u8]) -> (u64, u64) {
+    let hash = hash_of("auth", "users", key);
+    (hash, hash + 1)
+}
+
+fn stored_at(key: &[u8]) -> Vec<u8> {
+    l2_key(hash_of("auth", "users", key), "users", key)
+}
+
+fn in_range<T>(mut frame: T, range: (u64, u64), set: impl FnOnce(&mut T, Option<pb::Span>)) -> T {
+    set(&mut frame, span(Some(range)));
+    frame
 }
 
 fn event(sequence: u64, key: &[u8], value: Option<&[u8]>) -> pb::Event {
@@ -70,6 +99,7 @@ fn delivery(from: u64, through: u64, events: Vec<pb::Event>) -> pb::Delivery {
             .into_iter()
             .map(|event| event.encode_to_vec().into())
             .collect(),
+        span: None,
     }
 }
 
@@ -97,35 +127,73 @@ fn bootstrap(boundary: u64, entries: Vec<(&[u8], &[u8])>) -> pb::Bootstrap {
         end: true,
         entries,
         checksum: digest.finalize().to_vec(),
+        span: None,
     }
 }
 
 #[test]
-fn filtered_coverage_commits_empty_intervals_and_resumes_only_its_scope() {
+fn range_coverage_commits_empty_intervals_and_resumes_only_its_scope() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let bucket = bucket_of("auth", "users", b"k");
-    let mut consumer = Consumer::new(target(engine.clone(), vec![bucket])).unwrap();
+    let range = only(b"k");
+    let set = |d: &mut pb::Delivery, s| d.span = s;
+    let mut consumer = ranged(engine.clone(), range);
     assert!(
         consumer
-            .delivery(delivery(1, 5, vec![event(3, b"k", Some(b"v"))]))
+            .delivery(in_range(
+                delivery(1, 5, vec![event(3, b"k", Some(b"v"))]),
+                range,
+                set
+            ))
             .unwrap()
     );
     assert_eq!(consumer.applied, 5);
-    assert_eq!(engine.get(b"users\0k").unwrap(), Some(b"v".to_vec()));
-    assert!(consumer.delivery(delivery(6, 9, vec![])).unwrap());
+    assert_eq!(engine.get(&stored_at(b"k")).unwrap(), Some(b"v".to_vec()));
+    assert!(
+        consumer
+            .delivery(in_range(delivery(6, 9, vec![]), range, set))
+            .unwrap()
+    );
     assert_eq!(engine.revision(&consumer.revision).unwrap(), Some(9));
-    let resumed = Consumer::new(target(engine.clone(), vec![bucket, bucket])).unwrap();
+    let resumed = ranged(engine.clone(), range);
     assert_eq!(resumed.applied, 9);
     assert!(!resumed.recover);
-    let widened = Consumer::new(target(engine, vec![])).unwrap();
+    let widened = ranged(engine, (range.0, 0));
     assert_eq!(widened.applied, 0);
     assert!(widened.recover);
 }
 
 #[test]
+fn a_range_consumer_marks_its_namespace_so_a_restart_resumes_it() {
+    let engine = Arc::new(MemoryEngine::new("auth"));
+    let range = only(b"k");
+    let mut consumer = ranged(engine.clone(), range);
+    consumer
+        .delivery(in_range(delivery(1, 2, vec![]), range, |d, s| d.span = s))
+        .unwrap();
+    let group = Target {
+        selection: Selection {
+            dataset: "auth".into(),
+            namespace: String::new(),
+        },
+        engine,
+        prefix: Vec::new(),
+        span: Some(range),
+    };
+    let resumed = Consumer::resumed(&group, range).unwrap();
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(
+        resumed[0].scope(),
+        ("auth".into(), "users".into(), Some(range))
+    );
+    assert_eq!(resumed[0].applied, 2);
+    assert_eq!(resumed[0].resume(), 3);
+    assert!(Consumer::resumed(&group, (range.0, 0)).unwrap().is_empty());
+}
+
+#[test]
 fn gap_and_malformed_delivery_never_advance_or_partially_apply() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let mut consumer = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    let mut consumer = Consumer::new(target(engine.clone())).unwrap();
     assert!(
         !consumer
             .delivery(delivery(2, 2, vec![event(2, b"gap", Some(b"v"))]))
@@ -163,7 +231,7 @@ fn gap_and_malformed_delivery_never_advance_or_partially_apply() {
 #[test]
 fn duplicate_coverage_does_not_reapply_old_values() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let mut consumer = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    let mut consumer = Consumer::new(target(engine.clone())).unwrap();
     consumer
         .delivery(delivery(1, 1, vec![event(1, b"k", Some(b"first"))]))
         .unwrap();
@@ -177,33 +245,41 @@ fn duplicate_coverage_does_not_reapply_old_values() {
 }
 
 #[test]
-fn filtered_delivery_rejects_other_bucket_even_in_an_old_interval() {
+fn range_delivery_rejects_keys_outside_it_even_in_an_old_interval() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let bucket = bucket_of("auth", "users", b"k");
-    assert_ne!(bucket, bucket_of("auth", "users", b"other"));
-    let mut consumer = Consumer::new(target(engine, vec![bucket])).unwrap();
-    consumer.delivery(delivery(1, 1, vec![])).unwrap();
+    let range = only(b"k");
+    let set = |d: &mut pb::Delivery, s| d.span = s;
+    let mut consumer = ranged(engine, range);
+    consumer
+        .delivery(in_range(delivery(1, 1, vec![]), range, set))
+        .unwrap();
     assert!(
         consumer
-            .delivery(delivery(1, 1, vec![event(1, b"other", Some(b"v"))]))
+            .delivery(in_range(
+                delivery(1, 1, vec![event(1, b"other", Some(b"v"))]),
+                range,
+                set
+            ))
             .is_err()
+    );
+    assert!(
+        consumer.delivery(delivery(2, 2, vec![])).is_err(),
+        "a whole-namespace frame is another stream"
     );
     assert_eq!(consumer.applied, 1);
 }
 
 #[test]
-fn customer_kv_and_invalid_bucket_are_not_pushed_selections() {
-    let engine = Arc::new(MemoryEngine::new("auth"));
-    let mut kv = target(engine.clone(), vec![]);
+fn customer_kv_is_not_a_pushed_selection() {
+    let mut kv = target(Arc::new(MemoryEngine::new("auth")));
     kv.selection.dataset = "kv".into();
     assert!(Consumer::new(kv).is_err());
-    assert!(Consumer::new(target(engine, vec![COUNT])).is_err());
 }
 
 #[test]
 fn corrupt_or_unsorted_bootstrap_leaves_data_and_revision_untouched() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let mut consumer = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    let mut consumer = Consumer::new(target(engine.clone())).unwrap();
     consumer
         .delivery(delivery(1, 1, vec![event(1, b"old", Some(b"value"))]))
         .unwrap();
@@ -226,7 +302,7 @@ fn bootstrap_replaces_only_selected_scope_and_commits_its_boundary() {
     let engine = Arc::new(MemoryEngine::new("auth"));
     engine.put(b"users\0old", b"stale").unwrap();
     engine.put(b"elsewhere\0old", b"unrelated").unwrap();
-    let mut consumer = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    let mut consumer = Consumer::new(target(engine.clone())).unwrap();
     assert!(consumer.recover);
     assert!(
         consumer
@@ -251,7 +327,7 @@ fn bootstrap_replaces_only_selected_scope_and_commits_its_boundary() {
 #[test]
 fn bootstrap_header_is_checksummed_and_chunks_are_invisible_until_end() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let mut consumer = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    let mut consumer = Consumer::new(target(engine.clone())).unwrap();
     let complete = bootstrap(9, vec![(b"k", b"v")]);
     let begin = pb::Bootstrap {
         end: false,
@@ -275,45 +351,65 @@ fn bootstrap_header_is_checksummed_and_chunks_are_invisible_until_end() {
 }
 
 #[test]
-fn selector_change_bootstraps_before_reusing_progress_and_preserves_other_buckets() {
+fn range_change_bootstraps_before_reusing_progress_and_preserves_keys_outside_it() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let first = bucket_of("auth", "users", b"first");
-    let second = bucket_of("auth", "users", b"second");
-    assert_ne!(first, second);
-    let mut original = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    let whole = (0, 0);
+    let first = only(b"first");
+    assert_ne!(first, only(b"second"));
+    let mut original = ranged(engine.clone(), whole);
     original
-        .delivery(delivery(
-            1,
-            2,
-            vec![
-                event(1, b"first", Some(b"old")),
-                event(2, b"second", Some(b"keep")),
-            ],
+        .delivery(in_range(
+            delivery(
+                1,
+                2,
+                vec![
+                    event(1, b"first", Some(b"old")),
+                    event(2, b"second", Some(b"keep")),
+                ],
+            ),
+            whole,
+            |d, s| d.span = s,
         ))
         .unwrap();
-    let mut filtered = Consumer::new(target(engine.clone(), vec![first])).unwrap();
-    assert!(filtered.recover);
+    let mut narrowed = ranged(engine.clone(), first);
+    assert!(narrowed.recover);
+    assert_eq!(narrowed.resume(), 0);
     assert!(matches!(
-        filtered.request().kind,
+        narrowed.request().kind,
         Some(pb::relay_request::Kind::Recover(pb::Recover {
-            follow: Some(pb::Follow { from: 0, .. }),
+            follow: Some(pb::Follow {
+                from: 0,
+                span: Some(_),
+                ..
+            }),
             ..
         }))
     ));
-    assert!(filtered.delivery(delivery(1, 5, vec![])).is_err());
-    filtered
-        .bootstrap(bootstrap(9, vec![(b"first", b"new")]))
+    assert!(
+        narrowed
+            .delivery(in_range(delivery(1, 5, vec![]), first, |d, s| d.span = s))
+            .is_err()
+    );
+    narrowed
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"first", b"new")]),
+            first,
+            |b, s| b.span = s,
+        ))
         .unwrap();
-    assert_eq!(engine.get(b"users\0first").unwrap(), Some(b"new".to_vec()));
     assert_eq!(
-        engine.get(b"users\0second").unwrap(),
+        engine.get(&stored_at(b"first")).unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(
+        engine.get(&stored_at(b"second")).unwrap(),
         Some(b"keep".to_vec())
     );
-    let widened = Consumer::new(target(engine, vec![])).unwrap();
+    let widened = ranged(engine, whole);
     assert!(widened.recover);
     assert_eq!(
         widened.applied, 0,
-        "old full-scope cursor cannot become the new baseline"
+        "old full-range cursor cannot become the new baseline"
     );
 }
 
@@ -325,13 +421,14 @@ fn range(head: u64, recovered: bool) -> pb::ReplayRange {
         last: 0,
         head,
         recovered,
+        span: None,
     }
 }
 
 #[tokio::test]
 async fn installed_bootstrap_and_tail_wait_for_source_confirmation_before_reads_are_ready() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let mut consumer = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    let mut consumer = Consumer::new(target(engine.clone())).unwrap();
     assert!(
         consumer
             .bootstrap(bootstrap(9, vec![(b"k", b"v")]))
@@ -399,14 +496,14 @@ async fn installed_bootstrap_and_tail_wait_for_source_confirmation_before_reads_
     )
     .await
     .unwrap();
-    let reopened = Consumer::new(target(engine, vec![])).unwrap();
+    let reopened = Consumer::new(target(engine)).unwrap();
     assert!(reopened.validated());
 }
 
 #[test]
 fn missing_confirmation_forces_fresh_recovery_after_disconnect_or_process_restart() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let mut consumer = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    let mut consumer = Consumer::new(target(engine.clone())).unwrap();
     consumer
         .bootstrap(bootstrap(9, vec![(b"k", b"v")]))
         .unwrap();
@@ -425,7 +522,7 @@ fn missing_confirmation_forces_fresh_recovery_after_disconnect_or_process_restar
         !consumer.validated(),
         "reconnect requires a fresh bootstrap before confirming"
     );
-    let mut reopened = Consumer::new(target(engine, vec![])).unwrap();
+    let mut reopened = Consumer::new(target(engine)).unwrap();
     assert!(reopened.awaiting_confirmation);
     assert!(reopened.recover);
     assert!(!reopened.validated());
@@ -441,7 +538,7 @@ fn missing_confirmation_forces_fresh_recovery_after_disconnect_or_process_restar
 #[test]
 fn early_confirmation_never_confirms_an_incomplete_bootstrap() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    let mut consumer = Consumer::new(target(engine, vec![])).unwrap();
+    let mut consumer = Consumer::new(target(engine)).unwrap();
     let complete = bootstrap(0, vec![]);
     consumer
         .bootstrap(pb::Bootstrap {
@@ -467,9 +564,9 @@ fn early_confirmation_never_confirms_an_incomplete_bootstrap() {
 
 #[tokio::test]
 async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_available() {
-    let mut auth = Consumer::new(target(Arc::new(MemoryEngine::new("auth")), vec![])).unwrap();
+    let mut auth = Consumer::new(target(Arc::new(MemoryEngine::new("auth")))).unwrap();
     let healthy_engine = Arc::new(MemoryEngine::new("quicksilver"));
-    let mut healthy_target = target(healthy_engine.clone(), vec![]);
+    let mut healthy_target = target(healthy_engine.clone());
     healthy_target.selection.dataset = "quicksilver".into();
     let mut healthy = Consumer::new(healthy_target).unwrap();
     let mut intake = Intake::default();
@@ -484,6 +581,7 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
                 namespace: "users".into(),
                 code: tonic::Code::Unavailable as u32,
                 detail: "auth storage unavailable".into(),
+                span: None,
             }),
         )
         .unwrap();
@@ -584,17 +682,19 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
 #[test]
 fn local_storage_error_is_scoped_but_malformed_drain_coverage_is_still_fatal() {
     let engine = Arc::new(MemoryEngine::new("auth"));
-    engine.put(b"users\0broken", b"old").unwrap();
-    let bucket = bucket_of("auth", "users", b"k");
-    let mut consumer = Consumer::new(target(engine.clone(), vec![bucket])).unwrap();
-    engine.corrupt(b"users\0broken");
+    let whole = (0, 0);
+    engine.put(&stored_at(b"broken"), b"old").unwrap();
+    let mut consumer = ranged(engine.clone(), whole);
+    engine.corrupt(&stored_at(b"broken"));
     let scope = consumer.scope();
     let mut intake = Intake::default();
     let effect = intake
         .apply(
             &scope,
             &mut consumer,
-            Action::Bootstrap(bootstrap(9, vec![(b"k", b"v")])),
+            Action::Bootstrap(in_range(bootstrap(9, vec![(b"k", b"v")]), whole, |b, s| {
+                b.span = s
+            })),
         )
         .unwrap();
     assert!(
@@ -612,7 +712,11 @@ fn local_storage_error_is_scoped_but_malformed_drain_coverage_is_still_fatal() {
             .apply(
                 &scope,
                 &mut consumer,
-                Action::Delivery(delivery(1, 1, vec![event(1, b"k", Some(b"old-stream"))]))
+                Action::Delivery(in_range(
+                    delivery(1, 1, vec![event(1, b"k", Some(b"old-stream"))]),
+                    whole,
+                    |d, s| d.span = s
+                ))
             )
             .is_ok()
     );
@@ -620,8 +724,7 @@ fn local_storage_error_is_scoped_but_malformed_drain_coverage_is_still_fatal() {
         consumer.applied, 0,
         "drained data must not advance a failed scope"
     );
-    let mut malformed = delivery(2, 1, vec![]);
-    malformed.dataset = "auth".into();
+    let malformed = in_range(delivery(2, 1, vec![]), whole, |d, s| d.span = s);
     assert!(
         intake
             .apply(&scope, &mut consumer, Action::Delivery(malformed))

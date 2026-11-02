@@ -251,10 +251,10 @@ async fn scenario() -> u64 {
                     selection: Selection {
                         dataset: "auth".into(),
                         namespace: "accounts".into(),
-                        buckets: Vec::new(),
                     },
                     engine: engine.clone(),
                     prefix: b"accounts\0".to_vec(),
+                    span: None,
                 }],
             )
             .unwrap();

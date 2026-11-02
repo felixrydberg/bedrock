@@ -117,10 +117,10 @@ fn start(server: &str, engine: Arc<Recorded>) -> Session {
                 selection: Selection {
                     dataset: "auth".into(),
                     namespace: namespace.into(),
-                    buckets: Vec::new(),
                 },
                 engine: engine.clone(),
                 prefix: [namespace.as_bytes(), b"\0"].concat(),
+                span: None,
             })
             .collect(),
     )

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bedrock_lib::buckets::{COUNT, bucket_of};
+use bedrock_lib::placement::hash_of;
 use bedrock_lib::relays::Hub;
 use bedrock_lib::relays::replay::{Replay, ReplayConfig};
 use bedrock_lib::replication::log::Log;
@@ -33,6 +33,23 @@ const IN_FLIGHT: usize = 256;
 const REPLAY_BYTES: u64 = 16 * 1024 * 1024;
 const DATASET: &str = "quicksilver";
 const NAMESPACE: &str = "load";
+
+/// Subscriber `i` follows the `i`-th of `SUBSCRIBERS` equal hash ranges; the last ends at 2^64 (`end` 0).
+const WIDTH: u64 = u64::MAX / SUBSCRIBERS as u64 + 1;
+
+fn span(subscriber: usize) -> pb::Span {
+    let start = subscriber as u64 * WIDTH;
+    let end = if subscriber + 1 == SUBSCRIBERS {
+        0
+    } else {
+        start + WIDTH
+    };
+    pb::Span { start, end }
+}
+
+fn owner(key: &[u8]) -> usize {
+    (hash_of(DATASET, NAMESPACE, key) / WIDTH) as usize
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -108,14 +125,14 @@ async fn subscribe(
         stream.message().await.unwrap().unwrap().kind,
         Some(pb::relay_frame::Kind::Welcome(_))
     ));
-    // Deterministic disjoint partition: every bucket belongs to exactly one selector.
-    let buckets = (subscriber as u32..COUNT).step_by(SUBSCRIBERS).collect();
+    // Deterministic disjoint partition: every hash belongs to exactly one subscriber's range.
     tx.send(pb::RelayRequest {
         kind: Some(pb::relay_request::Kind::Follow(pb::Follow {
             dataset: DATASET.into(),
             namespace: NAMESPACE.into(),
             from: 1,
-            buckets,
+            span: Some(span(subscriber)),
+            from_namespaces: Default::default(),
         })),
     })
     .await
@@ -147,8 +164,7 @@ async fn subscribe(
                         };
                         if event.dataset != DATASET
                             || event.namespace != NAMESPACE
-                            || bucket_of(DATASET, NAMESPACE, &event.key) as usize % SUBSCRIBERS
-                                != subscriber
+                            || owner(&event.key) != subscriber
                         {
                             stats.errors.fetch_add(1, Ordering::Relaxed);
                             return;
@@ -164,6 +180,7 @@ async fn subscribe(
                                 dataset: DATASET.into(),
                                 namespace: NAMESPACE.into(),
                                 applied: delivery.through,
+                                span: Some(span(subscriber)),
                             })),
                         })
                         .await
@@ -308,7 +325,7 @@ async fn thousand_bucket_subscribers_at_ten_thousand_events_per_second() {
     .await
     .expect("not all subscribers established coverage before measurement");
     eprintln!(
-        "relay_load warmup: subscribers={SUBSCRIBERS}, replay_engine={replay_engine_name}, {}, selectors=bucket_mod_1000, buckets_per_selector=1048_or_1049",
+        "relay_load warmup: subscribers={SUBSCRIBERS}, replay_engine={replay_engine_name}, {}, selectors=equal_hash_ranges",
         process_memory()
     );
     // One key per owner makes payload traffic exactly round-robin across all selectors.
@@ -316,8 +333,7 @@ async fn thousand_bucket_subscribers_at_ten_thousand_events_per_second() {
     let mut candidate = 0u64;
     while keys.len() < SUBSCRIBERS {
         let key = candidate.to_be_bytes().to_vec();
-        let owner = bucket_of(DATASET, NAMESPACE, &key) as usize % SUBSCRIBERS;
-        keys.entry(owner).or_insert(key);
+        keys.entry(owner(&key)).or_insert(key);
         candidate += 1;
     }
     let keys: Vec<_> = keys.into_values().collect();

@@ -66,7 +66,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
     let closed = Arc::new(Watched::new(false));
     let changed = Arc::new(Watched::new(0));
     let follows = BTreeMap::from([(
-        ("auth".into(), "users".into()),
+        (("auth".into(), "users".into()), None),
         Interest {
             from: 1,
             acked: 0,
@@ -82,6 +82,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             events: events.clone(),
             closed: closed.clone(),
             follows,
+            ranges: BTreeMap::new(),
             changed: changed.clone(),
             member: None,
         },
@@ -117,7 +118,7 @@ async fn full_queue_disconnects_only_stalled_subscriber_and_releases_interest() 
     assert_eq!(fast.bytes.load(Ordering::Relaxed), 0);
     assert_eq!(hub.0.subscribers.lock().unwrap().len(), 1);
     drop(fast);
-    assert!(hub.desired().is_empty());
+    assert!(hub.idle());
 }
 
 #[tokio::test]
@@ -131,18 +132,19 @@ async fn byte_budget_disconnects_before_accepting_an_oversized_frame() {
             namespace: "users".into(),
             from: 1,
             through: 1,
-            events: vec![Bytes::from(vec![0; MAX_BYTES])]
+            events: vec![Bytes::from(vec![0; MAX_BYTES])],
+            span: None,
         })
     ));
     assert!(closed.get());
-    assert!(hub.desired().is_empty());
+    assert!(hub.idle());
 }
 
 #[tokio::test]
 async fn bootstrap_boundary_does_not_consume_the_event_acknowledgement_window() {
     let hub = hub();
     let (_frames, _) = subscriber(&hub, 1, MAX_EVENTS);
-    let key = ("auth".into(), "users".into());
+    let key = (("auth".into(), "users".into()), None);
     hub.advance(1, &key, 1, 100_000);
     hub.baseline(1, &key, 1, 100_000);
     assert_eq!(hub.outstanding(1, &key), 0);
@@ -155,7 +157,7 @@ async fn bootstrap_boundary_does_not_consume_the_event_acknowledgement_window() 
 async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
     let hub = hub();
     let (_frames, _) = subscriber(&hub, 1, MAX_EVENTS);
-    let key = ("auth".into(), "users".into());
+    let key = (("auth".into(), "users".into()), None);
     hub.advance(1, &key, 1, MAX_EVENTS as u64);
     hub.0
         .subscribers
@@ -165,7 +167,7 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
         .unwrap()
         .follows
         .insert(
-            ("auth".into(), "other".into()),
+            (("auth".into(), "other".into()), None),
             Interest {
                 from: 1,
                 acked: 0,
@@ -178,12 +180,7 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
         pumping
             .pump(
                 1,
-                pb::Follow {
-                    dataset: "auth".into(),
-                    namespace: "users".into(),
-                    from: 1,
-                    buckets: Vec::new(),
-                },
+                (("auth".into(), "users".into()), None),
                 1,
                 Vec::new(),
                 false,
@@ -191,7 +188,14 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
             .await
     });
     tokio::task::yield_now().await;
-    hub.unfollow(1, &key);
+    hub.unfollow(
+        1,
+        pb::Unfollow {
+            dataset: "auth".into(),
+            namespace: "users".into(),
+            span: None,
+        },
+    );
     tokio::time::timeout(Duration::from_secs(1), task)
         .await
         .unwrap()
@@ -199,7 +203,10 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
         .unwrap();
     assert_eq!(
         hub.desired(),
-        BTreeMap::from([(("auth".into(), "other".into()), 1)])
+        (
+            BTreeMap::from([(("auth".into(), "other".into()), 1)]),
+            BTreeSet::new()
+        )
     );
 }
 
@@ -207,7 +214,7 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
 async fn replaced_generation_cannot_enqueue_into_the_new_subscription() {
     let hub = hub();
     let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
-    let key = ("auth".into(), "users".into());
+    let key = (("auth".into(), "users".into()), None);
     hub.0
         .subscribers
         .lock()
@@ -245,6 +252,7 @@ async fn queued_record_bound_applies_across_namespaces_not_only_frames() {
             from: 1,
             through: 600,
             events: vec![Bytes::new(); 600],
+            span: None,
         })
     };
     assert!(hub.send(1, delivery("one")));
@@ -323,13 +331,8 @@ async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
     let (mut frames, closed) = subscriber(&hub, 1, MAX_EVENTS);
     let pumping = hub.clone();
     let task = tokio::spawn(async move {
-        let follow = pb::Follow {
-            dataset: "auth".into(),
-            namespace: "users".into(),
-            from: 0,
-            buckets: Vec::new(),
-        };
-        pumping.pump(1, follow, 1, Vec::new(), true).await
+        let key = (("auth".into(), "users".into()), None);
+        pumping.pump(1, key, 1, Vec::new(), true).await
     });
     // The reader stalls while the queue holds more than MAX_EVENTS worth of entries.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -387,7 +390,7 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
     assert_eq!(members.len(), 2);
     assert_eq!(
         members[&("kv".to_string(), "kv-2".to_string())].applied,
-        BTreeMap::from([(("auth".to_string(), "users".to_string()), 0)])
+        BTreeMap::from([((("auth".to_string(), "users".to_string()), None), 0)])
     );
     // Only the same identity may change, and a client cannot claim to have left.
     assert!(!hub.member(2, member("kv-2", pb::member::Status::Draining)));

@@ -18,3 +18,15 @@ fn inverted_range_is_empty() {
     assert!(KeyRange::new(*b"a", *b"a").bounds().is_none());
     assert!(!KeyRange::new(*b"b", *b"a").contains(b"b"));
 }
+
+#[test]
+fn l2_keys_sort_by_hash_across_namespaces() {
+    let low = l2_key(5, "b", b"k");
+    let high = l2_key(6, "a", b"k");
+    assert!(low < high);
+    assert!(l2_span(5, 6).contains(&low) && !l2_span(5, 6).contains(&high));
+    assert!(l2_span(6, 0).contains(&high) && l2_span(6, 0).contains(&l2_key(u64::MAX, "z", b"")));
+    assert!(!l2_span(0, 0).contains(b"l3/"));
+    assert_eq!(l2_parts(&low), Some((&b"b"[..], &b"k"[..])));
+    assert_eq!(l2_parts(b"l1/x"), None);
+}

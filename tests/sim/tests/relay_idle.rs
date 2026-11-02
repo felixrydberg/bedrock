@@ -92,8 +92,8 @@ async fn scenario() {
         let peers = Arc::new(Peers::new(&admin));
         let engine = Arc::new(MemoryEngine::new("auth"));
         let subscription = Session::start(peers.clone(), vec![PRIMARY.into(), BACKUP.into()], vec![Target {
-            selection: Selection { dataset: "auth".into(), namespace: "ns".into(), buckets: Vec::new() },
-            engine: engine.clone(), prefix: Vec::new(),
+            selection: Selection { dataset: "auth".into(), namespace: "ns".into() },
+            engine: engine.clone(), prefix: Vec::new(), span: None,
         }]).unwrap();
         timeout(Duration::from_secs(10), subscription.wait_for("auth", "ns", 1)).await.unwrap();
         sleep(Duration::from_secs(35)).await;

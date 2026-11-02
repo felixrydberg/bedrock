@@ -18,7 +18,11 @@ message Ack {
   string dataset = 1;
   string namespace = 2;
   uint64 applied = 3;
+  Span span = 4;
 }
+
+// A hash range [start, end) of `placement::hash_of`; `end` 0 means 2^64 (#22 / B-21).
+message Span { uint64 start = 1; uint64 end = 2; }
 
 // V1 relay session. Tier rank: leaf=0, cell=1, dc=2,
 // region=3, writer=4. Zero on Welcome is invalid.
@@ -44,8 +48,8 @@ message Member {
   Status status = 12;
   string address = 13;
 }
-// B-16 L2 placement directory entry, under key `range/{start}` (16 lowercase hex digits) in the same namespace as
-// `Member`. The range ends where the next starts, or at 2^64.
+// B-16 L2 placement directory entry, under key `range/{dataset}/{start}` (16 lowercase hex digits) in the same
+// namespace as `Member`. The range ends where the dataset's next starts, or at 2^64.
 message Range {
   message Owner {
     enum State { POPULATING = 0; READY = 1; LEAVING = 2; }
@@ -54,13 +58,17 @@ message Range {
   }
   repeated Owner owners = 1;
 }
+// A stream is one namespace (`span` unset), or one namespace's part of a hash range. A follow with an empty
+// namespace and a `span` follows that range in every namespace of the dataset, including ones created later; each
+// starts at `from_namespaces[namespace]`, or 1. Frames and acknowledgements name the stream they belong to.
 message Follow {
   string dataset = 1;
   string namespace = 2;
   uint64 from = 3;
-  repeated uint32 buckets = 4;
+  Span span = 4;
+  map<string, uint64> from_namespaces = 5;
 }
-message Unfollow { string dataset = 1; string namespace = 2; }
+message Unfollow { string dataset = 1; string namespace = 2; Span span = 3; }
 message Recover {
   Follow follow = 1;
   repeated string visited = 2;
@@ -75,6 +83,7 @@ message RelayRequest {
     bool progress = 6;
     // Same node as Hello; changes only its status.
     Member member = 7;
+    RangesAck ranges = 8;
   }
 }
 message Welcome { uint32 version = 1; uint32 tier = 2; }
@@ -84,6 +93,7 @@ message Delivery {
   uint64 from = 3;
   uint64 through = 4;
   repeated bytes events = 5;
+  Span span = 6;
 }
 message ReplayRange {
   string dataset = 1;
@@ -92,6 +102,7 @@ message ReplayRange {
   uint64 last = 4;
   uint64 head = 5;
   bool recovered = 6;
+  Span span = 7;
 }
 message StateEntry { bytes key = 1; bytes value = 2; }
 // Begin/end delimit a sorted, checksummed live-key view. Entries carry no tombstones.
@@ -104,12 +115,28 @@ message Bootstrap {
   bool end = 6;
   repeated StateEntry entries = 7;
   bytes checksum = 8;
+  Span span = 9;
 }
 message RelayError {
   string dataset = 1;
   string namespace = 2;
   uint32 code = 3;
   string detail = 4;
+  Span span = 5;
+}
+// Pushed by a relay to a leaf member (#22 / B-21): every range of `dataset` the member owns in the placement directory
+// at `revision`, in any state. The member follows ranges added; a range dropped from the set is the revoke.
+message Ranges {
+  string dataset = 1;
+  uint64 revision = 2;
+  repeated Span spans = 3;
+}
+// The member processed `Ranges` up to `revision`. `refused` lists revokes that did not match its own directory view.
+message RangesAck {
+  string dataset = 1;
+  uint64 revision = 2;
+  repeated Span refused = 3;
+  string reason = 4;
 }
 message RelayFrame {
   oneof kind {
@@ -119,18 +146,30 @@ message RelayFrame {
     Bootstrap bootstrap = 4;
     RelayError error = 5;
     bool tick = 6;
+    Ranges ranges = 7;
   }
 }
 service Relay { rpc Session(stream RelayRequest) returns (stream RelayFrame); }
 
 // Sibling relays (`replay_peers`) watch each other: a snapshot completed by `synced`, then changes.
 // An empty update is a progress tick. A relay shares only what its own sessions hold, never what it
-// learned from a sibling. B-12 shares leaf members; #41 / B-12b adds subscriber interests.
+// learned from a sibling. B-12 shares leaf members; #22 / B-21 adds their range readiness; #41 / B-12b adds
+// subscriber interests.
 message SiblingWatch {}
 message SiblingUpdate {
   repeated Member members = 1;
   // Only service and node_id are set.
   repeated Member members_removed = 2;
   bool synced = 3;
+  // Replaces the member's ready ranges of `dataset`; no spans clears them.
+  repeated Ready ready = 4;
+}
+// The ranges of `dataset` a leaf member is ready for: its bootstrap is confirmed and it acknowledged through the head
+// after processing every pushed `Ranges` (#22 / B-21). Never the acknowledgements themselves.
+message Ready {
+  string service = 1;
+  string node_id = 2;
+  string dataset = 3;
+  repeated Span spans = 4;
 }
 service Siblings { rpc Watch(SiblingWatch) returns (stream SiblingUpdate); }

@@ -1,5 +1,4 @@
 use super::*;
-use crate::buckets::hash_of;
 
 const R: usize = 3;
 
@@ -450,4 +449,23 @@ fn measure_ranking_ten_thousand_readers() {
         "rank over 10,000 readers: {:?} per request",
         start.elapsed() / rounds as u32
     );
+}
+
+#[test]
+fn hash_has_a_stable_cross_platform_vector() {
+    assert_eq!(hash_of("auth", "users", b"key"), 0x65d9_029d_77ca_9355);
+    assert_ne!(hash_of("ab", "c", b"key"), hash_of("a", "bc", b"key"));
+    assert_ne!(
+        hash_of("auth", "users", b"key"),
+        hash_of("cdn", "users", b"key")
+    );
+}
+
+#[test]
+fn spans_are_half_open_and_end_zero_is_the_top() {
+    let span = |start, end| pb::Span { start, end };
+    assert!(in_span(&span(10, 20), 10) && !in_span(&span(10, 20), 20));
+    assert!(in_span(&span(10, 0), u64::MAX) && !in_span(&span(10, 0), 9));
+    assert!(valid_span(&span(0, 0)) && valid_span(&span(1, 2)));
+    assert!(!valid_span(&span(2, 2)) && !valid_span(&span(3, 2)));
 }

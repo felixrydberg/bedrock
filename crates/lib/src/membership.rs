@@ -120,10 +120,10 @@ impl Published {
             selection: Selection {
                 dataset: DATASET.into(),
                 namespace,
-                buckets: Vec::new(),
             },
             engine: engine.clone(),
             prefix: prefix.clone(),
+            span: None,
         };
         (Self { engine, prefix }, target)
     }

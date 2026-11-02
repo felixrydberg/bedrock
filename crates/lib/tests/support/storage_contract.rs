@@ -32,6 +32,7 @@ macro_rules! storage_contract {
             failed_restore_leaves_engine_unchanged,
             corruption_is_an_error_not_a_miss,
             stats_disk_usage_and_health,
+            compact_keeps_data_outside_range,
         );
         #[tokio::test]
         async fn data_and_revision_commit_together() {
@@ -324,5 +325,19 @@ pub fn stats_disk_usage_and_health(h: &mut impl Harness) {
     assert!(
         matches!(usage, Ok(_) | Err(StorageError::Unsupported(_))),
         "{usage:?}"
+    );
+}
+
+pub fn compact_keeps_data_outside_range(h: &mut impl Harness) {
+    let engine = h.open();
+    for key in [b"a/1", b"b/1", b"b/2", b"c/1"] {
+        engine.put(key, b"v").unwrap();
+    }
+    engine.delete_range(KeyRange::prefix(*b"b/")).unwrap();
+    engine.compact(&KeyRange::prefix(*b"b/")).unwrap();
+    engine.compact(&KeyRange::new(*b"z", *b"a")).unwrap();
+    assert_eq!(
+        keys(engine.scan(&KeyRange::all())),
+        vec![b"a/1".to_vec(), b"c/1".to_vec()]
     );
 }

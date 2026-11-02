@@ -23,5 +23,5 @@ disk_mb = 102400
 [[subscriptions]]
 dataset = "quicksilver"
 namespace = "infrastructure"
-# Omitted buckets follows the namespace. L2-only consumers list owned bucket IDs.
+# A subscription follows the whole namespace. L2 ranges come from the relays' placement directory (#22 / B-21).
 # Auth namespaces are followed explicitly when needed.

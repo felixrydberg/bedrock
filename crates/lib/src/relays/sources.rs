@@ -44,7 +44,7 @@ impl Sources {
     /// draining ones, then those in the caller's failure `domain`. Never `populating` owners, owners that are no longer
     /// members, or holders that reported being behind `min_revision` within [`RECHECK`]. Open breakers are skipped
     /// unless every candidate's is open ([`Health::route`] fails open). Keys hash with
-    /// [`crate::buckets::hash_of`]; CDN artifacts use their content hash and minimum revision 0.
+    /// [`crate::placement::hash_of`]; CDN artifacts use their content hash and minimum revision 0.
     #[allow(clippy::too_many_arguments)]
     pub fn select<'a>(
         &self,

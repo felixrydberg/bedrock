@@ -74,6 +74,7 @@ impl pb::siblings_server::Siblings for Server {
                         })
                         .collect(),
                     synced: !synced,
+                    ready: Vec::new(),
                 };
                 if update.synced || !update.members.is_empty() || !update.members_removed.is_empty()
                 {

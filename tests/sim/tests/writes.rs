@@ -134,10 +134,10 @@ async fn scenario(api: SocketAddr, replication: String) {
                 selection: Selection {
                     dataset: "auth".into(),
                     namespace: namespace.into(),
-                    buckets: Vec::new(),
                 },
                 engine: applied.clone(),
                 prefix: [namespace.as_bytes(), b"\0"].concat(),
+                span: None,
             })
             .collect(),
     )
