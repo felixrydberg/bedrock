@@ -39,6 +39,37 @@ async fn metrics_health_and_readiness_respond() {
 }
 
 #[tokio::test]
+async fn introspection_and_labelled_metrics_respond() {
+    let admin = Admin::new();
+    let requests = Counter::<u64>::default();
+    admin.register_labelled(vec![("tier", "cell".into())], |registry| {
+        registry.register("labelled", "Test counter", requests.clone())
+    });
+    admin.introspect(|view, query| (view == "echo").then(|| format!("{{\"query\":\"{query}\"}}")));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(admin.clone().serve(listener));
+
+    let metrics = get(addr, "/metrics").await;
+    assert!(
+        metrics.contains("bedrock_labelled_total{tier=\"cell\"} 0"),
+        "{metrics}"
+    );
+    let echo = get(addr, "/introspect/echo?a=1").await;
+    assert!(echo.starts_with("HTTP/1.1 200"), "{echo}");
+    assert!(
+        echo.contains("application/json") && echo.ends_with("{\"query\":\"a=1\"}"),
+        "{echo}"
+    );
+    assert!(
+        get(addr, "/introspect/other")
+            .await
+            .starts_with("HTTP/1.1 404")
+    );
+}
+
+#[tokio::test]
 async fn admin_connections_are_bounded() {
     let admin = Admin::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

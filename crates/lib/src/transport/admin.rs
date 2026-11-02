@@ -3,11 +3,12 @@
 //!   low-cardinality dimensions (`feature-drafts.md` §4.8).
 //! - `/health`: the process is up.
 //! - `/ready`: 200 once the node has validated its state and serves traffic, 503 otherwise.
+//! - `/introspect/{view}?{query}`: read-only JSON from the handler a binary [`Admin::introspect`]s, e.g. relays (B-18b).
 
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -22,9 +23,13 @@ use tokio::sync::Semaphore;
 
 const MAX_ADMIN_CONNECTIONS: usize = 128;
 
+/// Answers `(view, query)` with a JSON body, or `None` for an unknown view.
+type Introspect = dyn Fn(&str, &str) -> Option<String> + Send + Sync;
+
 pub struct Admin {
     registry: Mutex<Registry>,
     ready: AtomicBool,
+    introspect: OnceLock<Box<Introspect>>,
 }
 
 impl Admin {
@@ -32,11 +37,35 @@ impl Admin {
         Arc::new(Admin {
             registry: Mutex::new(Registry::with_prefix("bedrock")),
             ready: AtomicBool::new(false),
+            introspect: OnceLock::new(),
         })
     }
 
     pub fn register(&self, name: &str, help: &str, metric: impl Metric) {
         self.registry.lock().unwrap().register(name, help, metric);
+    }
+
+    /// Registers into a sub-registry whose series all carry `labels`, which are fixed for the process (tier, cell).
+    pub fn register_labelled(
+        &self,
+        labels: Vec<(&'static str, String)>,
+        register: impl FnOnce(&mut Registry),
+    ) {
+        let labels = labels.into_iter().map(|(k, v)| (k.into(), v.into()));
+        register(
+            self.registry
+                .lock()
+                .unwrap()
+                .sub_registry_with_labels(labels),
+        );
+    }
+
+    /// Serves `/introspect/{view}`; the first handler set wins.
+    pub fn introspect(
+        &self,
+        handler: impl Fn(&str, &str) -> Option<String> + Send + Sync + 'static,
+    ) {
+        let _ = self.introspect.set(Box::new(handler));
     }
 
     pub fn set_ready(&self, ready: bool) {
@@ -68,7 +97,7 @@ impl Admin {
             };
             let admin = self.clone();
             let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
-                let rsp = admin.respond(req.uri().path());
+                let rsp = admin.respond(req.uri().path(), req.uri().query().unwrap_or(""));
                 async move { Ok::<_, Infallible>(rsp) }
             });
             tokio::spawn(async move {
@@ -84,7 +113,21 @@ impl Admin {
         }
     }
 
-    fn respond(&self, path: &str) -> Response<Full<Bytes>> {
+    fn respond(&self, path: &str, query: &str) -> Response<Full<Bytes>> {
+        if let Some(view) = path.strip_prefix("/introspect/") {
+            let body = self
+                .introspect
+                .get()
+                .and_then(|handler| handler(view, query));
+            return match body {
+                Some(body) => Self::response(StatusCode::OK, "application/json", body),
+                None => Self::response(
+                    StatusCode::NOT_FOUND,
+                    "text/plain; charset=utf-8",
+                    "not found".into(),
+                ),
+            };
+        }
         let (status, body) = match path {
             "/metrics" => (StatusCode::OK, self.render()),
             "/health" => (StatusCode::OK, "ok".into()),
@@ -97,6 +140,10 @@ impl Admin {
         } else {
             "text/plain; charset=utf-8"
         };
+        Self::response(status, content_type, body)
+    }
+
+    fn response(status: StatusCode, content_type: &str, body: String) -> Response<Full<Bytes>> {
         Response::builder()
             .status(status)
             .header(CONTENT_TYPE, content_type)

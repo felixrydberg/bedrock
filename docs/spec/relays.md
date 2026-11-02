@@ -119,6 +119,45 @@ view is retained during generation, so bootstrap memory scales with namespace si
 The current B-11 view/tail APIs also materialize retained history; this is not a
 constant-memory bootstrap implementation.
 
+## Introspection and metrics (#17 / B-18b)
+
+`bedrock-relay` serves read-only JSON on its admin listener at `/introspect/{view}`. Every list view is
+paginated (`limit`, default 100, at most 1,000; `after` is the `next` cursor of the previous page) and filtered
+by `dataset`, namespace `prefix` and `service`, so one namespace can be inspected without listing the rest:
+
+| View | Contents |
+|---|---|
+| `upstream` | connected upstream; per namespace the sequence received through (`cursor`), the upstream's announced head, revisions `behind`, the latest `committed_at` and its lag on arrival |
+| `namespaces` | per `(dataset, namespace)`: subscriber count, latest sequence received, head, replay ranges, events/s and bytes/s over 10-second windows, lag on arrival |
+| `subscribers` | per session: service, node and address of its member, follows with acknowledged revision and lag (head minus acknowledged), queued events and bytes, the member's disconnect count |
+| `membership` | the published members of each service with their status, the placement directory with every owner's state, and how long publication has been frozen |
+
+Sessions without a member (downstream relays, recovery sessions, member-less clients) report service `none`.
+Events carry one counter, so "revision" and "sequence" are the same number.
+
+Metrics carry the process's `tier` and `cell` plus at most `dataset`, `service` or placement `state`:
+events and bytes in (from upstream) and out (queued delivery frames), full-queue disconnects, the
+`relay_lag_seconds` histogram, subscribers by service, upstream revision lag (max and p99 across
+namespaces), replay coverage, placement ranges by state, directory writes and frozen seconds. The only
+per-namespace series are the top 20 namespaces by event rate and by revision lag, so the series count does
+not grow with namespaces. Gauges are computed from the hub at scrape time.
+
+- **End-to-end lag** is `now - committed_at` on the hub's injected runtime clock, observed once per event as it
+  enters a relay, at every tier. `committed_at` is never rewritten. Per-subscriber lag is in revisions.
+- **Revision lag behind upstream** compares the relay's received sequence with the head the upstream announces in
+  `Range` frames, which it sends at follow and recovery. It shows catch-up, not a parent that stops mid-stream;
+  the arrival lag and `committed_at` in `upstream` show that staleness.
+- **Replay coverage** counts a subscribed namespace as covered when the cache is healthy, holds one contiguous
+  range, and evicted nothing for capacity that arrived within the window. Age pruning is not a loss.
+- **Placement:** a range is `leaving` if any owner is, else `populating` if any owner is, else `ready`.
+  Pushed interests, handoff and revoke counts wait for #22 / B-21's relay-driven handoffs.
+
+Unit tests cover a constant series count at 100 and 100,000 namespaces, a stalled subscriber's rising lag and
+queue depth, paging and filters, and window coverage. `tests/relays.rs` reads `/introspect` and `/metrics` over
+admin HTTP through a writer → region → cell chain in both builds: the cell's namespace view matches what the
+leaf applied, and lag is reported at both tiers. On 2026-11-02 in WSL Ubuntu every check below passed: native
+tests 235 passed in 28 suites, simulation tests 197 passed in 28 suites.
+
 ## Checks and load measurement
 
 Workspace checks run in WSL Ubuntu (native RocksDB builds use

@@ -50,6 +50,9 @@ struct State {
     eviction: BTreeSet<(u32, u64, Identity)>,
     bytes: u64,
     failure: Option<StorageError>,
+    /// Latest arrival evicted for capacity, per `(dataset, namespace)`; age pruning is not a loss (B-18b).
+    // ponytail: never pruned, bounded by namespaces the cache has held, like the relay's head map.
+    evicted: BTreeMap<(String, String), u64>,
 }
 
 pub struct Replay {
@@ -203,6 +206,20 @@ impl Replay {
         ranges
     }
 
+    /// Whether this namespace's cache holds everything that arrived within the window: healthy, one contiguous
+    /// range, and no capacity eviction of a record younger than the window.
+    pub fn covers_window(&self, dataset: &str, namespace: &str, now_ms: u64) -> bool {
+        if !self.healthy() || self.ranges(dataset, namespace).len() > 1 {
+            return false;
+        }
+        self.lock().is_ok_and(|state| {
+            state
+                .evicted
+                .get(&(dataset.to_owned(), namespace.to_owned()))
+                .is_none_or(|at| now_ms.saturating_sub(*at) > self.config.window_ms)
+        })
+    }
+
     pub fn healthy(&self) -> bool {
         let Ok(mut state) = self.lock() else {
             return false;
@@ -294,6 +311,15 @@ impl Replay {
                 break;
             }
         }
+        let lost: Vec<_> = capacity_removed
+            .iter()
+            .map(|id| {
+                let record = candidates
+                    .get(id)
+                    .map_or_else(|| &state.records[id], |(r, _)| r);
+                ((id.0.clone(), id.1.clone()), record.arrived_at)
+            })
+            .collect();
         removed.extend(capacity_removed);
         let mut batch = WriteBatch::default();
         let mut retained = Vec::new();
@@ -314,6 +340,10 @@ impl Replay {
         }
         for (id, record) in retained {
             state.insert(&self.config, id, record);
+        }
+        for (scope, at) in lost {
+            let latest = state.evicted.entry(scope).or_insert(at);
+            *latest = (*latest).max(at);
         }
         self.check_disk()
     }

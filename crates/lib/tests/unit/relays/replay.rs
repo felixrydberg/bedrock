@@ -84,6 +84,41 @@ fn capacity_evicts_low_priority_then_oldest_and_persists_eviction() {
 }
 
 #[test]
+fn window_coverage_is_lost_only_to_capacity_eviction_or_gaps() {
+    let one = event("lo", "n", 1);
+    let bytes = (key(&identity(&one)).len() + encode(&one, 0).len()) as u64;
+    let replay = Replay::open(
+        Arc::new(MemoryEngine::new("replay")),
+        ReplayConfig {
+            max_bytes: bytes * 2,
+            window_ms: 10,
+            ..ReplayConfig::default()
+        },
+    )
+    .unwrap();
+    replay.append(&event("lo", "aged", 1), 0).unwrap();
+    replay.append(&event("lo", "aged", 2), 20).unwrap();
+    // Age pruning removed revision 1, which is outside the window.
+    assert_eq!(replay.ranges("lo", "aged"), [(2, 2)]);
+    assert!(replay.covers_window("lo", "aged", 20));
+    replay.append(&one, 21).unwrap();
+    replay.append(&event("lo", "n", 2), 22).unwrap();
+    assert!(
+        !replay.covers_window("lo", "aged", 22),
+        "revision 2 was evicted for capacity at 20"
+    );
+    assert!(
+        replay.covers_window("lo", "aged", 31),
+        "the eviction left the window"
+    );
+    replay.append(&event("lo", "n", 4), 23).unwrap();
+    assert!(
+        !replay.covers_window("lo", "n", 40),
+        "a gap is missing coverage"
+    );
+}
+
+#[test]
 fn checksum_and_identity_are_verified_before_recovery_or_delivery() {
     let engine = Arc::new(MemoryEngine::new("replay"));
     let original = event("kv", "n", 1);

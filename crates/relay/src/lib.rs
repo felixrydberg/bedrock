@@ -60,6 +60,7 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
     )
     .with_clock(now);
     let mut tasks = vec![hub.start()];
+    let mut publisher = None;
     // Every relay serves its siblings; only membership watches them so far (#41 / B-12b adds interests).
     if let Some(settings) = &config.membership {
         let (siblings, watching) = bedrock_lib::relays::siblings::Siblings::start(
@@ -67,20 +68,32 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
             config.replay_peers.clone(),
         );
         tasks.push(watching);
-        tasks.push(
-            bedrock_lib::membership::Cell::start(
-                hub.clone(),
-                peers,
-                config.upstreams.clone(),
-                siblings,
-                settings,
-                config.node.advertised(),
-                config.node.location.cell.clone(),
-                config.write_token.clone().unwrap_or_default(),
-            )
-            .map_err(|e| ConfigError(format!("membership: {e}")))?,
-        );
+        let (publishing, published) = bedrock_lib::membership::Cell::start(
+            hub.clone(),
+            peers,
+            config.upstreams.clone(),
+            siblings,
+            settings,
+            config.node.advertised(),
+            config.node.location.cell.clone(),
+            config.write_token.clone().unwrap_or_default(),
+        )
+        .map_err(|e| ConfigError(format!("membership: {e}")))?;
+        tasks.push(publishing);
+        publisher = Some(published);
     }
+    let tier = match config.tier {
+        node::Tier::Cell => "cell",
+        node::Tier::Dc => "dc",
+        node::Tier::Region => "region",
+    };
+    bedrock_lib::relays::introspection::register(
+        &admin,
+        &hub,
+        tier,
+        &config.node.location.cell,
+        publisher,
+    );
     let server = tonic::transport::Server::builder()
         .add_service(bedrock_lib::replication::pb::relay_server::RelayServer::new(hub.clone()))
         .add_service(
