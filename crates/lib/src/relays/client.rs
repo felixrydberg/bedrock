@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prost::Message;
-use serde::Deserialize;
+
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -20,7 +20,7 @@ use crate::transport::{Class, Peers};
 const TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Selection {
     pub dataset: String,
     pub namespace: String,

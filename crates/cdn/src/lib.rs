@@ -40,36 +40,34 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         tracing::info!(?role, "role enabled");
     }
     let admin = node::start_admin(&config.node).await?;
-    let targets = config
-        .subscriptions
-        .iter()
-        .map(|selection| {
-            if selection.dataset != "cdn" {
-                return Err(ConfigError(
-                    "CDN relay subscriptions permit only cdn".into(),
-                ));
+    // Every CDN node needs all retention metadata, so it follows `cdn` over the whole hash range, in every namespace.
+    // Artifact bytes are what is ranged (B-34).
+    let mut targets = Vec::new();
+    let mut skipped = false;
+    if let Some(instance) = datasets.get("cdn") {
+        match &instance.engine {
+            Ok(engine) if engine.health().is_ok() => {
+                targets.push(bedrock_lib::relays::client::Target {
+                    selection: bedrock_lib::relays::client::Selection {
+                        dataset: "cdn".into(),
+                        namespace: String::new(),
+                    },
+                    engine: engine.clone(),
+                    prefix: Vec::new(),
+                    span: Some((0, 0)),
+                })
             }
-            let instance = datasets
-                .get(&selection.dataset)
-                .ok_or_else(|| ConfigError("subscribed dataset is not enabled".into()))?;
-            let Ok(engine)=&instance.engine else{return Ok(None)};
-            if let Err(error)=engine.health(){
-                tracing::warn!(dataset=%selection.dataset,%error,"dataset unavailable; other subscriptions continue");
-                return Ok(None);
+            // ponytail: an unavailable dataset keeps the node unready until restart; rebuild the Session if hot
+            // recovery matters.
+            _ => {
+                tracing::warn!(
+                    dataset = "cdn",
+                    "dataset unavailable; retention metadata is not followed"
+                );
+                skipped = true;
             }
-            let mut prefix = selection.namespace.as_bytes().to_vec();
-            prefix.push(0);
-            Ok(Some(bedrock_lib::relays::client::Target {
-                selection: selection.clone(),
-                engine:engine.clone(),
-                prefix,
-                span: None,
-            }))
-        })
-        .collect::<Result<Vec<_>, ConfigError>>()?;
-    // ponytail: a skipped subscription keeps the node unready until restart; rebuild the Session if hot recovery matters.
-    let skipped = targets.iter().any(Option::is_none);
-    let mut targets: Vec<_> = targets.into_iter().flatten().collect();
+        }
+    }
     let (members, target) = membership::View::new("cdn", &config.node.location.cell);
     targets.push(target);
     let peers = std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin));

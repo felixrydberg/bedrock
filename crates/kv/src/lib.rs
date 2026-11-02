@@ -46,11 +46,11 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
 
 /// Customer KV has no pushed data: quicksilver, auth and cdn belong to other binaries.
 fn check_hosts_nothing_pushed(config: &ServiceConfig) -> Result<(), ConfigError> {
-    if config.datasets.is_empty() && config.subscriptions.is_empty() {
+    if config.datasets.is_empty() {
         return Ok(());
     }
     Err(ConfigError(
-        "bedrock-kv hosts no relay-fed datasets; datasets and subscriptions must be empty".into(),
+        "bedrock-kv hosts no relay-fed datasets; datasets must be empty".into(),
     ))
 }
 

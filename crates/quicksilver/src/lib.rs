@@ -49,12 +49,6 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
-    if !config.subscriptions.is_empty() {
-        return Err(ConfigError(
-            "Quicksilver data follows the relays' placement directory; remove [[subscriptions]] (#22 / B-21)"
-                .into(),
-        ));
-    }
     let admin = node::start_admin(&config.node).await?;
     // Relays push the ranges this node owns of each dataset it carries.
     let mut ranged = std::collections::BTreeMap::new();

@@ -219,7 +219,6 @@ async fn scenario() -> u64 {
             relays: vec![CELL.into()],
             api: WRITER.into(),
             s3_endpoint: "http://10.0.0.99:9000".into(),
-            subscriptions: Vec::new(),
         })
         .await
         .unwrap();

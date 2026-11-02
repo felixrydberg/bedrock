@@ -81,9 +81,6 @@ pub struct ServiceConfig {
     /// `bedrock-api` endpoint for writes, its `write_listen`.
     pub api: String,
     pub s3_endpoint: String,
-    /// Explicit pushed namespace interests; `bedrock-kv` (customer KV) has no relay subscription.
-    #[serde(default)]
-    pub subscriptions: Vec<crate::relays::client::Selection>,
 }
 
 impl ServiceConfig {
