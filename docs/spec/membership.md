@@ -225,7 +225,7 @@ points for seeds 1, 2 and 42, twice each, comparing traces. It covers join, rela
 drain, a cut-off node, a killed node, all relays down, and service and cell isolation. Its placement scenario
 starts four CDN members in one cell and one in another. Every node sees three ready owners per range in its own
 cell, and a killed member's ranges move to the others only after the grace period. Unit tests cover
-`membership::place`, directory decoding, `placement::promote` and the stale-view owner check. Replay one seed with
+`membership::place`, directory decoding, `placement::handoff` and the stale-view owner check. Replay one seed with
 `BEDROCK_MEMBERSHIP_SEED=42` and the simulation flags in [relays.md](relays.md#checks-and-load-measurement).
 
 On 2026-10-31 in WSL Ubuntu, every check listed in [relays.md](relays.md#checks-and-load-measurement) passed:
@@ -240,3 +240,10 @@ On 2026-11-01 in WSL Ubuntu, with the placement directory, the same checks passe
 suites. Simulation tests: 176 passed in 28 suites. Each placement seed (1, 2 and 42) produced the same trace twice:
 three ready owners per range 1.3 simulated seconds after start, and a killed member's ranges reassigned about
 20 s after it stopped.
+
+On 2026-11-02, with relay-derived readiness (#22 / B-21 phase 4), owners become `ready` only after their relays
+report them so, and `placement::promote` is gone. The placement scenario now waits until the directory has not
+changed for 5 s before killing a member, since rebalancing passes through placed states between handoffs. Seeds 1, 2
+and 42 each produced the same trace twice: placement settled 8.4–9.3 simulated seconds after start, and the killed
+member's ranges were reassigned about 21 s after it stopped. Native tests: 240 passed; simulation tests: 200 passed,
+28 suites each.

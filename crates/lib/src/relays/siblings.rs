@@ -1,7 +1,7 @@
 //! Sibling relays, the `replay_peers` of one tier, watch each other over one stream: a snapshot completed by `synced`,
 //! then changes, with progress ticks and the [`IDLE`] deadline. A relay shares only what its own sessions hold, never
-//! what it learned from a sibling. Today that is leaf members for cell membership (#15 / B-12); #41 / B-12b adds
-//! subscriber interests to the same update.
+//! what it learned from a sibling. Today that is leaf members for cell membership (#15 / B-12) and their range
+//! readiness (#22 / B-21); #41 / B-12b adds subscriber interests to the same update.
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,13 +20,11 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(1);
 
 pub type Members = BTreeMap<MemberKey, pb::Member>;
+/// Leaf member and dataset → the ranges its holding relay reports it ready for (#22 / B-21).
+pub type Ready = BTreeMap<(MemberKey, String), Vec<(u64, u64)>>;
 
-fn own(hub: &Hub) -> Members {
-    hub.members()
-        .into_iter()
-        .map(|(key, connected)| (key, connected.member))
-        .collect()
-}
+/// How often a relay rechecks its leaf members' readiness for its siblings.
+const READINESS: Duration = Duration::from_secs(1);
 
 /// Serves this relay's own state to its siblings. Every relay serves it.
 pub struct Server(pub Hub);
@@ -53,11 +51,26 @@ impl pb::siblings_server::Siblings for Server {
             let version = hub.member_version();
             let mut tick = tokio::time::interval(PROGRESS);
             tick.tick().await;
+            // ponytail: polls readiness, which acknowledgements change; wake on them if handoffs need lower latency.
+            let mut readiness = tokio::time::interval(READINESS);
             let mut sent = Members::new();
+            let mut sent_ready = Ready::new();
             let mut synced = false;
             loop {
                 let at = version.get();
-                let current = own(&hub);
+                let current = hub.members();
+                let ready = hub.ready();
+                let mut changed_ready: Vec<pb::Ready> = ready
+                    .iter()
+                    .filter(|(key, spans)| sent_ready.get(*key) != Some(*spans))
+                    .map(|(key, spans)| wire(key, spans))
+                    .collect();
+                changed_ready.extend(
+                    sent_ready
+                        .keys()
+                        .filter(|key| !ready.contains_key(*key))
+                        .map(|key| wire(key, &[])),
+                );
                 let update = pb::SiblingUpdate {
                     members: current
                         .iter()
@@ -74,23 +87,40 @@ impl pb::siblings_server::Siblings for Server {
                         })
                         .collect(),
                     synced: !synced,
-                    ready: Vec::new(),
+                    ready: changed_ready,
                 };
-                if update.synced || !update.members.is_empty() || !update.members_removed.is_empty()
+                if update.synced
+                    || !update.members.is_empty()
+                    || !update.members_removed.is_empty()
+                    || !update.ready.is_empty()
                 {
                     if !send(update).await {
                         return;
                     }
                     sent = current;
+                    sent_ready = ready;
                     synced = true;
                 }
                 tokio::select! {
                     _ = version.wait_until(|v| *v != at) => {},
+                    _ = readiness.tick() => {},
                     _ = tick.tick() => if !send(pb::SiblingUpdate::default()).await { return },
                 }
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+fn wire(((service, node_id), dataset): &(MemberKey, String), spans: &[(u64, u64)]) -> pb::Ready {
+    pb::Ready {
+        service: service.clone(),
+        node_id: node_id.clone(),
+        dataset: dataset.clone(),
+        spans: spans
+            .iter()
+            .map(|&(start, end)| pb::Span { start, end })
+            .collect(),
     }
 }
 
@@ -108,7 +138,7 @@ impl Drop for Tasks {
 /// The latest synced state of each sibling, `None` while its stream is down.
 pub struct Siblings {
     peers: Arc<Peers>,
-    state: Mutex<BTreeMap<String, Option<Members>>>,
+    state: Mutex<BTreeMap<String, Option<(Members, Ready)>>>,
     changed: Watched<u64>,
 }
 
@@ -137,7 +167,23 @@ impl Siblings {
     }
 
     pub fn state(&self) -> BTreeMap<String, Option<Members>> {
-        self.state.lock().unwrap().clone()
+        self.state
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(sibling, state)| (sibling.clone(), state.as_ref().map(|(m, _)| m.clone())))
+            .collect()
+    }
+
+    /// The readiness live siblings report for their own leaf members.
+    pub fn ready(&self) -> Ready {
+        self.state
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .flat_map(|(_, ready)| ready.clone())
+            .collect()
     }
 
     /// Bumped on every change to [`Siblings::state`].
@@ -149,7 +195,7 @@ impl Siblings {
         self.changed.wait_until(|v| *v != since).await;
     }
 
-    fn set(&self, sibling: &str, state: Option<Members>) {
+    fn set(&self, sibling: &str, state: Option<(Members, Ready)>) {
         self.state.lock().unwrap().insert(sibling.to_owned(), state);
         self.changed.update(|v| *v = v.wrapping_add(1));
     }
@@ -181,6 +227,7 @@ impl Siblings {
                 .await?
                 .into_inner();
             let mut members = Members::new();
+            let mut ready = Ready::new();
             let mut synced = false;
             loop {
                 let update = self
@@ -188,18 +235,34 @@ impl Siblings {
                     .call(sibling, Class::Control, IDLE, stream.message())
                     .await?
                     .ok_or_else(|| Status::unavailable("sibling relay closed"))?;
-                if synced && update.members.is_empty() && update.members_removed.is_empty() {
+                if synced
+                    && update.members.is_empty()
+                    && update.members_removed.is_empty()
+                    && update.ready.is_empty()
+                {
                     continue;
                 }
                 for member in update.members_removed {
-                    members.remove(&key(&member));
+                    let gone = key(&member);
+                    ready.retain(|(member, _), _| *member != gone);
+                    members.remove(&gone);
                 }
                 for member in update.members {
                     members.insert(key(&member), member);
                 }
+                for entry in update.ready {
+                    let at = ((entry.service, entry.node_id), entry.dataset);
+                    let spans: Vec<(u64, u64)> =
+                        entry.spans.iter().map(|s| (s.start, s.end)).collect();
+                    if spans.is_empty() {
+                        ready.remove(&at);
+                    } else {
+                        ready.insert(at, spans);
+                    }
+                }
                 synced |= update.synced;
                 if synced {
-                    self.set(sibling, Some(members.clone()));
+                    self.set(sibling, Some((members.clone(), ready.clone())));
                 }
             }
         }

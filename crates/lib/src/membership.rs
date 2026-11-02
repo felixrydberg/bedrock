@@ -27,7 +27,7 @@ use crate::node::{MembershipSettings, ServiceConfig};
 use crate::placement::{self, Directory, Owner, State};
 use crate::relays::client::{Selection, Session, Target};
 pub use crate::relays::siblings::Members;
-use crate::relays::siblings::Siblings;
+use crate::relays::siblings::{self, Siblings};
 use crate::relays::{Hub, IDLE, MemberKey};
 use crate::replication::pb;
 use crate::storage::memory::MemoryEngine;
@@ -367,8 +367,14 @@ pub fn plan(
 }
 
 /// One service's directory writes from the published `actual` members, per dataset it places, over the members
-/// carrying that dataset: promote what the last pass assigned, otherwise assign (`docs/spec/membership.tla`, `Write`).
-pub fn place(service: &str, actual: &Members, directories: &Directories) -> Vec<Change> {
+/// carrying that dataset: complete the handoffs `ready` reports, otherwise assign (`docs/spec/membership.tla` and
+/// `handoff.tla`, `Write`).
+pub fn place(
+    service: &str,
+    actual: &Members,
+    directories: &Directories,
+    ready: &siblings::Ready,
+) -> Vec<Change> {
     let Some((_, datasets)) = RANGED.iter().find(|(s, _)| *s == service) else {
         return Vec::new();
     };
@@ -384,7 +390,14 @@ pub fn place(service: &str, actual: &Members, directories: &Directories) -> Vec<
             .collect();
         let empty = Directory::new();
         let directory = directories.get(*dataset).unwrap_or(&empty);
-        let mut entries = placement::promote(directory, &members);
+        let ready: BTreeSet<(String, u64)> = ready
+            .iter()
+            .filter(|(((s, _), d), _)| s == service && d == dataset)
+            .flat_map(|(((_, node), _), spans)| {
+                spans.iter().map(|(start, _)| (node.clone(), *start))
+            })
+            .collect();
+        let mut entries = placement::handoff(directory, &members, &ready);
         if entries.is_empty() {
             // ponytail: no health input until #13 / B-14 reports it in member updates.
             entries =
@@ -398,6 +411,19 @@ pub fn place(service: &str, actual: &Members, directories: &Directories) -> Vec<
         }));
     }
     changes
+}
+
+/// The ranges `node` is listed in, in any state.
+fn owned(directory: &Directory, node: &str) -> Vec<pb::Span> {
+    let mut entries = directory.iter().peekable();
+    let mut spans = Vec::new();
+    while let Some((&start, owners)) = entries.next() {
+        if owners.iter().any(|o| o.node == node) {
+            let end = entries.peek().map_or(0, |(next, _)| **next);
+            spans.push(pb::Span { start, end });
+        }
+    }
+    spans
 }
 
 /// A cell relay's membership publisher.
@@ -485,12 +511,8 @@ impl Cell {
                 tracing::warn!(%error, "published membership unreadable; not publishing");
                 continue;
             }
-            let local: Members = self
-                .hub
-                .members()
-                .into_iter()
-                .map(|(key, connected)| (key, connected.member))
-                .collect();
+            let local = self.hub.members();
+            self.push(&local, &directories, &session);
             let remote = self.siblings.state();
             let seen = Observed {
                 me: &self.me,
@@ -510,8 +532,11 @@ impl Cell {
             };
             // Placement plans only from applied membership.
             if changes.is_empty() {
+                // Readiness comes from each member's holding relay: this one, or a live sibling.
+                let mut ready = self.hub.ready();
+                ready.extend(self.siblings.ready());
                 for (service, directories) in &directories {
-                    changes.extend(place(service, &actual, directories));
+                    changes.extend(place(service, &actual, directories, &ready));
                 }
             }
             let mut written = BTreeMap::new();
@@ -535,6 +560,38 @@ impl Cell {
                 let namespace = namespace(&service, &self.cell);
                 let _ = tokio::time::timeout(IDLE, session.wait_for(DATASET, &namespace, revision))
                     .await;
+            }
+        }
+    }
+
+    /// Pushes each of this relay's leaf members in the cell the ranges it owns of each dataset its service places,
+    /// from the published directory at the revision applied (#22 / B-21).
+    fn push(&self, local: &Members, directories: &[(&str, Directories)], session: &Session) {
+        for ((service, node), member) in local {
+            let (Some((_, datasets)), Some((_, published))) = (
+                RANGED.iter().find(|(s, _)| s == service),
+                directories.iter().find(|(s, _)| s == service),
+            ) else {
+                continue;
+            };
+            let Some(revision) = session.applied(DATASET, &namespace(service, &self.cell)) else {
+                continue;
+            };
+            if member.cell != self.cell {
+                continue;
+            }
+            for dataset in *datasets {
+                let spans = published
+                    .get(*dataset)
+                    .map(|directory| owned(directory, node))
+                    .unwrap_or_default();
+                let frame = pb::Ranges {
+                    dataset: (*dataset).into(),
+                    revision,
+                    spans,
+                };
+                self.hub
+                    .push_ranges(&(service.clone(), node.clone()), frame);
             }
         }
     }

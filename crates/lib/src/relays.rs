@@ -102,13 +102,6 @@ struct Inner {
 /// `(service, node_id)`.
 pub type MemberKey = (String, String);
 
-/// A member connected to this relay and its acknowledged revisions, for range readiness (#22 / B-21).
-#[derive(Debug, Clone, PartialEq)]
-pub struct Connected {
-    pub member: pb::Member,
-    pub applied: BTreeMap<StreamKey, u64>,
-}
-
 #[derive(Default)]
 struct Recent {
     records: BTreeMap<(Key, u64), EncodedEvent>,
@@ -126,12 +119,19 @@ struct Subscriber {
     ranges: BTreeMap<(String, (u64, u64)), u64>,
     changed: Arc<Watched<u64>>,
     member: Option<pb::Member>,
+    /// The range set last pushed to this leaf member per dataset, and the latest one it acknowledged (#22 / B-21).
+    pushed: BTreeMap<String, pb::Ranges>,
+    ranges_acked: BTreeMap<String, u64>,
 }
 struct Interest {
     from: u64,
     acked: u64,
     generation: u64,
     baseline: u64,
+    /// A bootstrap was sent and its recovered confirmation not yet.
+    confirming: bool,
+    /// The head this stream must be acknowledged through to count as ready, fixed when it first could.
+    target: Option<u64>,
 }
 
 /// Accounts serialized queue bytes when tonic drains a subscriber's bounded queue.
@@ -286,7 +286,7 @@ impl Hub {
     }
     /// Members on this relay's leaf sessions; the newest session wins a duplicate identity. Graceful leavers stay
     /// `LEFT` for [`IDLE`].
-    pub fn members(&self) -> BTreeMap<MemberKey, Connected> {
+    pub fn members(&self) -> siblings::Members {
         let mut members = BTreeMap::new();
         let now = crate::monotonic_now();
         let mut departed = self.0.departed.lock().unwrap();
@@ -296,31 +296,132 @@ impl Hub {
             self.members_changed();
         }
         for (key, (member, _)) in departed.iter() {
-            members.insert(
-                key.clone(),
-                Connected {
-                    member: member.clone(),
-                    applied: BTreeMap::new(),
-                },
-            );
+            members.insert(key.clone(), member.clone());
         }
         drop(departed);
         for sub in self.0.subscribers.lock().unwrap().values() {
             if let Some(member) = &sub.member {
-                members.insert(
-                    crate::membership::key(member),
-                    Connected {
-                        member: member.clone(),
-                        applied: sub
-                            .follows
-                            .iter()
-                            .map(|(key, interest)| (key.clone(), interest.acked))
-                            .collect(),
-                    },
-                );
+                members.insert(crate::membership::key(member), member.clone());
             }
         }
         members
+    }
+
+    /// The newest session of each leaf member, as [`Hub::members`] resolves a duplicate identity.
+    fn newest(subscribers: &BTreeMap<u64, Subscriber>) -> BTreeMap<MemberKey, u64> {
+        subscribers
+            .iter()
+            .filter_map(|(id, sub)| Some((crate::membership::key(sub.member.as_ref()?), *id)))
+            .collect()
+    }
+
+    /// Pushes a leaf member its range set of one dataset from the published directory (#22 / B-21), unless its
+    /// session already has that set. Relays push only published state.
+    pub fn push_ranges(&self, member: &MemberKey, frame: pb::Ranges) {
+        let id = {
+            let mut subscribers = self.0.subscribers.lock().unwrap();
+            let Some(&id) = Self::newest(&subscribers).get(member) else {
+                return;
+            };
+            let sub = subscribers.get_mut(&id).unwrap();
+            if sub
+                .pushed
+                .get(&frame.dataset)
+                .is_some_and(|pushed| pushed.spans == frame.spans)
+            {
+                return;
+            }
+            sub.pushed.insert(frame.dataset.clone(), frame.clone());
+            id
+        };
+        self.send(id, pb::relay_frame::Kind::Ranges(frame));
+    }
+
+    fn ranges_acked(&self, id: u64, ack: pb::RangesAck) {
+        let mut subscribers = self.0.subscribers.lock().unwrap();
+        let Some(sub) = subscribers.get_mut(&id) else {
+            return;
+        };
+        if !ack.refused.is_empty() {
+            tracing::warn!(
+                member = ?sub.member.as_ref().map(crate::membership::key),
+                dataset = %ack.dataset,
+                refused = ?ack.refused,
+                reason = %ack.reason,
+                "a member refused a revoke that its directory view does not confirm"
+            );
+        }
+        let acked = sub.ranges_acked.entry(ack.dataset).or_default();
+        *acked = (*acked).max(ack.revision);
+    }
+
+    /// The ranges each leaf member of this relay is ready for, per dataset (#22 / B-21, `docs/spec/handoff.tla`,
+    /// `ReadyFor`): the member acknowledged the latest set pushed to it, and in every namespace this relay knows the
+    /// range's stream finished any bootstrap and was acknowledged through the head seen once that held. The member
+    /// sends its stream changes before `RangesAck`, so a stream it dropped is gone by then and stale acknowledgements
+    /// never count. A pushed dataset whose namespaces the relay has not learned yet is not ready.
+    pub fn ready(&self) -> siblings::Ready {
+        let datasets: BTreeSet<String> = self
+            .0
+            .subscribers
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|sub| sub.pushed.keys().cloned())
+            .collect();
+        let heads: BTreeMap<String, Vec<(String, u64)>> = datasets
+            .into_iter()
+            .map(|dataset| {
+                let heads = self
+                    .namespaces(&dataset)
+                    .into_iter()
+                    .map(|namespace| {
+                        let head = self.source_head(&(dataset.clone(), namespace.clone()));
+                        (namespace, head.unwrap_or(0))
+                    })
+                    .collect();
+                (dataset, heads)
+            })
+            .collect();
+        let mut ready = siblings::Ready::new();
+        let mut subscribers = self.0.subscribers.lock().unwrap();
+        for (member, id) in Self::newest(&subscribers) {
+            let Subscriber {
+                pushed: frames,
+                ranges_acked,
+                follows,
+                ..
+            } = subscribers.get_mut(&id).unwrap();
+            for (dataset, frame) in frames.iter() {
+                let namespaces = &heads[dataset];
+                if ranges_acked
+                    .get(dataset)
+                    .is_none_or(|r| *r < frame.revision)
+                    || (namespaces.is_empty() && pushed(dataset))
+                {
+                    continue;
+                }
+                let spans: Vec<(u64, u64)> = frame
+                    .spans
+                    .iter()
+                    .map(|s| (s.start, s.end))
+                    .filter(|range| {
+                        namespaces.iter().all(|(namespace, head)| {
+                            follows
+                                .get_mut(&((dataset.clone(), namespace.clone()), Some(*range)))
+                                .is_some_and(|interest| {
+                                    !interest.confirming
+                                        && interest.acked >= *interest.target.get_or_insert(*head)
+                                })
+                        })
+                    })
+                    .collect();
+                if !spans.is_empty() {
+                    ready.insert((member.clone(), dataset.clone()), spans);
+                }
+            }
+        }
+        ready
     }
     fn head(&self, key: &Key) -> Arc<Watched<Option<u64>>> {
         let mut heads = self.0.heads.lock().unwrap();
@@ -511,6 +612,11 @@ impl Hub {
             }
             _ => None,
         };
+        let confirming = match &frame.kind {
+            Some(pb::relay_frame::Kind::Bootstrap(b)) if b.begin => Some(true),
+            Some(pb::relay_frame::Kind::Range(r)) if r.recovered => Some(false),
+            _ => None,
+        };
         sub.bytes.fetch_add(len, Ordering::Relaxed);
         sub.events.fetch_add(events, Ordering::Relaxed);
         match sub.tx.try_send(Ok(frame)) {
@@ -518,11 +624,18 @@ impl Hub {
                 // Published under the lock, so no acknowledgement can observe the frame first.
                 if let Some((key, _)) = scope
                     && let Some(interest) = sub.follows.get_mut(key)
-                    && let Some((from, baseline)) = position
                 {
-                    interest.from = from;
-                    if let Some(baseline) = baseline {
-                        interest.baseline = baseline;
+                    if let Some((from, baseline)) = position {
+                        interest.from = from;
+                        if let Some(baseline) = baseline {
+                            interest.baseline = baseline;
+                        }
+                    }
+                    if let Some(confirming) = confirming {
+                        interest.confirming = confirming;
+                        if confirming {
+                            interest.target = None;
+                        }
                     }
                 }
                 Ok(true)
@@ -871,6 +984,8 @@ impl Hub {
                     acked: from.max(1) - 1,
                     generation,
                     baseline: from.max(1) - 1,
+                    confirming: false,
+                    target: None,
                 },
             );
             sub.changed.update(|v| *v = v.wrapping_add(1));
@@ -1734,6 +1849,8 @@ impl pb::relay_server::Relay for Hub {
                 ranges: BTreeMap::new(),
                 changed: changed.clone(),
                 member,
+                pushed: BTreeMap::new(),
+                ranges_acked: BTreeMap::new(),
             },
         );
         self.members_changed();
@@ -1770,6 +1887,7 @@ impl pb::relay_server::Relay for Hub {
                             }
                             Some(pb::relay_request::Kind::Progress(true))=>{},
                             Some(pb::relay_request::Kind::Member(m))=>if !hub.member(id,m){break},
+                            Some(pb::relay_request::Kind::Ranges(a))=>hub.ranges_acked(id,a),
                             _=>break,
                         }},
                         _=>break,

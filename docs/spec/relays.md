@@ -45,6 +45,14 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
   `from_namespaces` entry of 0 asks for a fresh baseline; a namespace without an entry starts at 1.
 - **Readiness.** The relay reports a subscriber ready for a range only after it processed every pushed set and
   then acknowledged through the head, so an acknowledgement from before a pending revoke never counts.
+- **Relay side.** On every reconciliation pass each cell relay pushes its own leaf members their ranges per dataset
+  from the published directory, only when a set changed. `Hub::ready` counts a member ready for a range once its
+  `RangesAck` covers the latest pushed set and, in every namespace the relay knows, the range's stream finished any
+  bootstrap (its recovered confirmation was sent) and was acknowledged through the head recorded when it first
+  qualified. Relays share these ready bits with their siblings each second; the publisher writes `ready` from its own
+  and its live siblings' bits (`placement::handoff`), then drops `leaving` owners. A pushed dataset whose namespaces a
+  relay has not learned from upstream is never ready; a namespace the relay learns after a member was reported ready
+  is followed from then on, so a namespace created upstream but not yet relayed is the one gap.
 - **Member side.** A member keeps only the latest pushed set per dataset and applies it once its own membership
   view has reached the set's revision (`relays::ranges`): it follows added ranges, carries a split range's coverage
   to the parts it keeps, and drops a revoked range only when its view no longer lists it there and lists another
@@ -178,7 +186,8 @@ tests remain ignored by the ordinary workspace test command. With range streams
 (2026-11-02, #22 / B-21 phase 2), every check above passed again: 235 native and
 195 simulation tests in 28 suites each, including the range-follow integration test
 in both builds. With member-side pushed ranges and per-dataset directories (phase 3,
-same day), they passed again: 239 native and 199 simulation tests.
+same day), they passed again: 239 native and 199 simulation tests. With relay-side pushes and readiness (phase 4,
+same day): 240 native and 200 simulation tests.
 For cleanup validation, native lint reused a cached RocksDB archive through the
 dependency's supported `ROCKSDB_LIB_DIR` / `ROCKSDB_STATIC` settings; native tests
 built RocksDB normally. This avoids rebuilding C++ for the Rust-only lint step.

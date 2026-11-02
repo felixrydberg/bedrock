@@ -72,6 +72,8 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             acked: 0,
             generation: id,
             baseline: 0,
+            confirming: false,
+            target: None,
         },
     )]);
     hub.0.subscribers.lock().unwrap().insert(
@@ -85,6 +87,8 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             ranges: BTreeMap::new(),
             changed: changed.clone(),
             member: None,
+            pushed: BTreeMap::new(),
+            ranges_acked: BTreeMap::new(),
         },
     );
     (
@@ -173,6 +177,8 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
                 acked: 0,
                 generation: 2,
                 baseline: 0,
+                confirming: false,
+                target: None,
             },
         );
     let pumping = hub.clone();
@@ -386,12 +392,7 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
             .unwrap()
             .member = Some(member(node, pb::member::Status::Ready));
     }
-    let members = hub.members();
-    assert_eq!(members.len(), 2);
-    assert_eq!(
-        members[&("kv".to_string(), "kv-2".to_string())].applied,
-        BTreeMap::from([((("auth".to_string(), "users".to_string()), None), 0)])
-    );
+    assert_eq!(hub.members().len(), 2);
     // Only the same identity may change, and a client cannot claim to have left.
     assert!(!hub.member(2, member("kv-2", pb::member::Status::Draining)));
     assert!(!hub.member(2, member("kv-1", pb::member::Status::Left)));
@@ -412,19 +413,113 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
     // The newest session for an identity wins; closing it leaves a LEFT marker over the stale one.
     hub.remove(2);
     let key = ("kv".to_string(), "kv-1".to_string());
-    assert_eq!(
-        hub.members()[&key].member.status,
-        pb::member::Status::Ready as i32
-    );
+    assert_eq!(hub.members()[&key].status, pb::member::Status::Ready as i32);
     hub.remove(1);
-    assert_eq!(
-        hub.members()[&key].member.status,
-        pb::member::Status::Left as i32
-    );
+    assert_eq!(hub.members()[&key].status, pb::member::Status::Left as i32);
     // An ungraceful close leaves nothing behind.
     hub.remove(3);
     assert!(
         !hub.members()
             .contains_key(&("kv".to_string(), "kv-2".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_catching_up_every_namespace()
+ {
+    let hub = hub();
+    let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&1)
+        .unwrap()
+        .member = Some(member("q1", pb::member::Status::Ready));
+    let me = ("kv".to_string(), "q1".to_string());
+    let whole = (0, 0);
+    let site = (("quicksilver".to_string(), "site".to_string()), Some(whole));
+    hub.observe_head(&site.0, 5);
+    let ranges = |dataset: &str, revision| pb::Ranges {
+        dataset: dataset.into(),
+        revision,
+        spans: vec![pb::Span { start: 0, end: 0 }],
+    };
+    let ack = |dataset: &str, revision| pb::RangesAck {
+        dataset: dataset.into(),
+        revision,
+        refused: Vec::new(),
+        reason: String::new(),
+    };
+    hub.push_ranges(&me, ranges("quicksilver", 7));
+    hub.push_ranges(&me, ranges("quicksilver", 8));
+    let pushed = tokio_stream::StreamExt::next(&mut frames)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(pushed.kind, Some(pb::relay_frame::Kind::Ranges(r)) if r.revision == 7));
+    assert!(
+        frames.rx.as_mut().try_recv().is_err(),
+        "an unchanged set is not pushed again"
+    );
+
+    // Neither acknowledged nor followed yet.
+    assert!(hub.ready().is_empty());
+    hub.ranges_acked(1, ack("quicksilver", 7));
+    assert!(hub.ready().is_empty(), "no stream for the range yet");
+    let interest = |acked| Interest {
+        from: acked + 1,
+        acked,
+        generation: 9,
+        baseline: 0,
+        confirming: false,
+        target: None,
+    };
+    let set = |f: &dyn Fn(&mut Interest)| {
+        f(hub
+            .0
+            .subscribers
+            .lock()
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()
+            .follows
+            .get_mut(&site)
+            .unwrap())
+    };
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&1)
+        .unwrap()
+        .follows
+        .insert(site.clone(), interest(3));
+    assert!(hub.ready().is_empty(), "behind the head");
+    // The target is the head when the stream first could be ready; later writes do not move it.
+    hub.observe_head(&site.0, 9);
+    set(&|i| i.acked = 5);
+    let expected = siblings::Ready::from([((me.clone(), "quicksilver".to_string()), vec![whole])]);
+    assert_eq!(hub.ready(), expected);
+    set(&|i| i.confirming = true);
+    assert!(
+        hub.ready().is_empty(),
+        "a bootstrap awaiting confirmation is not ready"
+    );
+    set(&|i| i.confirming = false);
+    assert_eq!(hub.ready(), expected);
+
+    // A namespace the relay knows but the member does not follow yet holds the range back.
+    hub.observe_head(&("quicksilver".to_string(), "other".to_string()), 1);
+    assert!(hub.ready().is_empty());
+
+    // A pushed dataset whose namespaces the relay has not learned is not ready; a label with no data is.
+    hub.push_ranges(&me, ranges("auth", 3));
+    hub.ranges_acked(1, ack("auth", 3));
+    hub.push_ranges(&me, ranges("artifacts", 3));
+    hub.ranges_acked(1, ack("artifacts", 3));
+    assert_eq!(
+        hub.ready(),
+        siblings::Ready::from([((me, "artifacts".to_string()), vec![whole])])
     );
 }

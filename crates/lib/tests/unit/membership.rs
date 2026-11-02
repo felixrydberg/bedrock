@@ -298,10 +298,28 @@ fn directory_entries_sit_beside_members_in_one_namespace() {
     );
 }
 
-/// The publisher's directory passes for `service` until nothing changes; returns the number of passes.
+/// Every owner in `directories` as its relay would report it once its handoff completed.
+fn all_ready(service: &str, directories: &Directories) -> siblings::Ready {
+    let mut ready = siblings::Ready::new();
+    for (dataset, directory) in directories {
+        for (start, owners) in directory {
+            for owner in owners {
+                ready
+                    .entry(((service.into(), owner.node.clone()), dataset.clone()))
+                    .or_default()
+                    .push((*start, 0));
+            }
+        }
+    }
+    ready
+}
+
+/// The publisher's directory passes for `service` until nothing changes, with every relay reporting its members
+/// ready; returns the number of passes.
 fn settle(service: &str, actual: &Members, directories: &mut Directories) -> usize {
     for pass in 0..100 {
-        let changes = place(service, actual, directories);
+        let ready = all_ready(service, directories);
+        let changes = place(service, actual, directories, &ready);
         if changes.is_empty() {
             return pass;
         }
@@ -325,7 +343,7 @@ fn settle(service: &str, actual: &Members, directories: &mut Directories) -> usi
 }
 
 #[test]
-fn placement_promotes_then_assigns_only_its_own_service() {
+fn placement_completes_handoffs_then_assigns_only_its_own_service() {
     let node = |id: &str, service: &str, domain: &str| pb::Member {
         service: service.into(),
         roles: vec!["l2".into()],
@@ -340,7 +358,7 @@ fn placement_promotes_then_assigns_only_its_own_service() {
         node("qs-1", "quicksilver", "d"),
     ]);
     let mut directories = Directories::new();
-    let first = place("cdn", &actual, &directories);
+    let first = place("cdn", &actual, &directories, &siblings::Ready::new());
     let Some(Change::Range {
         dataset, owners, ..
     }) = first.first()

@@ -27,10 +27,14 @@ fn cell(n: usize, domains: usize) -> BTreeMap<String, pb::Member> {
         .collect()
 }
 
-/// Completes every handoff, as the publisher's next pass does.
+/// Completes every handoff, as the publisher's next pass does once every new owner's relay reports it ready.
 fn settle(directory: &mut Directory, members: &BTreeMap<String, pb::Member>) {
-    let promoted = promote(directory, members);
-    directory.extend(promoted);
+    let ready = directory
+        .iter()
+        .flat_map(|(start, owners)| owners.iter().map(move |o| (o.node.clone(), *start)))
+        .collect();
+    let done = handoff(directory, members, &ready);
+    directory.extend(done);
 }
 
 /// Plans, writes and completes handoffs until nothing changes.
@@ -332,7 +336,7 @@ fn balances_ten_thousand_weighted_members() {
 }
 
 #[test]
-fn promotion_never_leaves_a_range_without_a_holder() {
+fn handoff_marks_only_reported_owners_ready_and_never_leaves_a_range_without_a_holder() {
     let owner = |node: &str, state| Owner {
         node: node.into(),
         state,
@@ -349,12 +353,31 @@ fn promotion_never_leaves_a_range_without_a_holder() {
         ("a".into(), node("a", "a", 4.0, 1000)),
         ("b".into(), node("b", "b", 4.0, 1000)),
     ]);
+    let ready = BTreeSet::from([("b".to_string(), 10)]);
     assert_eq!(
-        promote(&directory, &members),
+        handoff(&directory, &members, &ready),
         Directory::from([(10, vec![owner("b", State::Ready)])])
     );
-    let no_populating_member = BTreeMap::from([("a".into(), members["a"].clone())]);
-    assert!(promote(&directory, &no_populating_member).is_empty());
+    // Until its relay reports it ready, nothing moves and the leaving owner keeps the range.
+    assert!(handoff(&directory, &members, &BTreeSet::new()).is_empty());
+    assert!(
+        handoff(
+            &directory,
+            &members,
+            &BTreeSet::from([("b".to_string(), 0)])
+        )
+        .is_empty(),
+        "readiness is per range"
+    );
+    // A ready owner that left the membership does not release the leaving one.
+    let gone = BTreeMap::from([("a".into(), members["a"].clone())]);
+    assert_eq!(
+        handoff(&directory, &gone, &ready),
+        Directory::from([(
+            10,
+            vec![owner("a", State::Leaving), owner("b", State::Ready)]
+        )])
+    );
 }
 
 #[test]

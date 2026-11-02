@@ -382,13 +382,30 @@ async fn placement() -> Vec<String> {
         "eu-1b",
         vec![format!("{OTHER_RELAY}:7000")],
     );
-    until("placed", Duration::from_secs(60), || {
-        leaves
-            .iter()
-            .all(|(_, leaf)| placed(&leaf.directory(), &names))
+    // Each handoff waits for its new owners' relays to report them ready, so rebalancing takes several passes and
+    // can pass through placed states between moves. Wait until the directory stops changing.
+    let deadline = bedrock_lib::monotonic_now() + Duration::from_secs(120);
+    let mut seen = (
+        leaves[0].1.revision.load(Ordering::Relaxed),
+        bedrock_lib::monotonic_now(),
+    );
+    loop {
+        let now = bedrock_lib::monotonic_now();
+        let revision = leaves[0].1.revision.load(Ordering::Relaxed);
+        if revision != seen.0 {
+            seen = (revision, now);
+        }
+        if now.duration_since(seen.1) >= Duration::from_secs(5)
+            && leaves
+                .iter()
+                .all(|(_, leaf)| placed(&leaf.directory(), &names))
             && placed(&other.directory(), &["cdn-b"])
-    })
-    .await;
+        {
+            break;
+        }
+        assert!(now < deadline, "placement settled within 120s");
+        sleep(Duration::from_millis(100)).await;
+    }
     let ranges = leaves[0].1.directory().len();
     trace.push(format!(
         "{} placed {ranges} ranges",
