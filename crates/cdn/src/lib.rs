@@ -78,6 +78,8 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         config.relays.clone(),
         targets,
         membership::member(&config, "cdn"),
+        // Artifact ranges carry no dataset to store yet (B-34).
+        Default::default(),
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));

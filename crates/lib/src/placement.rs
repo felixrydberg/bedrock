@@ -492,10 +492,12 @@ pub fn owners(directory: &Directory, hash: u64) -> &[Owner] {
         .map_or(&[], |(_, owners)| owners)
 }
 
-/// The owner check: a node serves only ranges it owns or is leaving in its own view. A caller routed by a stale view
-/// is rejected and retries the next owner.
+/// The owner check: a node serves only ranges it holds as `ready` or `leaving` in its own view; a `populating` owner
+/// may not have the data yet (#22 / B-21). A caller routed by a stale view is rejected and retries the next owner.
 pub fn serves(directory: &Directory, node: &str, hash: u64) -> bool {
-    owners(directory, hash).iter().any(|o| o.node == node)
+    owners(directory, hash)
+        .iter()
+        .any(|o| o.node == node && o.state != State::Populating)
 }
 
 /// Customer-KV readers for a key, most preferred first: rendezvous hashing of `hash`

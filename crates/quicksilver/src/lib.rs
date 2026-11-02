@@ -49,45 +49,38 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
+    if !config.subscriptions.is_empty() {
+        return Err(ConfigError(
+            "Quicksilver data follows the relays' placement directory; remove [[subscriptions]] (#22 / B-21)"
+                .into(),
+        ));
+    }
     let admin = node::start_admin(&config.node).await?;
-    let targets = config
-        .subscriptions
-        .iter()
-        .map(|selection| {
-            if !matches!(selection.dataset.as_str(), "quicksilver" | "auth") {
-                return Err(ConfigError(
-                    "Quicksilver relay subscriptions permit only quicksilver/auth".into(),
-                ));
+    // Relays push the ranges this node owns of each dataset it carries.
+    let mut ranged = std::collections::BTreeMap::new();
+    for instance in datasets.iter() {
+        let name = instance.dataset.name;
+        match &instance.engine {
+            Ok(engine) if engine.health().is_ok() => {
+                ranged.insert(name.to_owned(), engine.clone());
             }
-            let instance = datasets
-                .get(&selection.dataset)
-                .ok_or_else(|| ConfigError("subscribed dataset is not enabled".into()))?;
-            let Ok(engine)=&instance.engine else{return Ok(None)};
-            if let Err(error)=engine.health(){
-                tracing::warn!(dataset=%selection.dataset,%error,"dataset unavailable; other subscriptions continue");
-                return Ok(None);
-            }
-            let mut prefix = selection.namespace.as_bytes().to_vec();
-            prefix.push(0);
-            Ok(Some(bedrock_lib::relays::client::Target {
-                selection: selection.clone(),
-                engine:engine.clone(),
-                prefix,
-                span: None,
-            }))
-        })
-        .collect::<Result<Vec<_>, ConfigError>>()?;
-    // ponytail: a skipped subscription keeps the node unready until restart; rebuild the Session if hot recovery matters.
-    let skipped = targets.iter().any(Option::is_none);
-    let mut targets: Vec<_> = targets.into_iter().flatten().collect();
+            _ => tracing::warn!(
+                dataset = name,
+                "dataset unavailable; its ranges are not followed"
+            ),
+        }
+    }
+    // ponytail: a dataset unavailable at startup keeps the node unready until restart; rebuild the Session if hot
+    // recovery matters.
+    let skipped = ranged.len() != datasets.iter().count();
     let (members, target) = membership::View::new("quicksilver", &config.node.location.cell);
-    targets.push(target);
     let peers = std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin));
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
-        targets,
+        vec![target],
         membership::member(&config, "quicksilver"),
+        ranged,
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));

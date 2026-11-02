@@ -380,6 +380,12 @@ fn a_stale_route_is_rejected_and_the_retry_succeeds() {
             assert!(serves(&during_handoff, &owner.node, *start));
         }
     }
+    // A populating owner may not hold the data yet.
+    for (start, owners) in &moving {
+        for owner in owners.iter().filter(|o| o.state == State::Populating) {
+            assert!(!serves(&during_handoff, &owner.node, *start));
+        }
+    }
     // Routed by the old view to the owner `new` replaced, the request is rejected; the next old owner serves it.
     let old = owners(&stale, hash);
     let gone = old

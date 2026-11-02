@@ -45,6 +45,12 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
   `from_namespaces` entry of 0 asks for a fresh baseline; a namespace without an entry starts at 1.
 - **Readiness.** The relay reports a subscriber ready for a range only after it processed every pushed set and
   then acknowledged through the head, so an acknowledgement from before a pending revoke never counts.
+- **Member side.** A member keeps only the latest pushed set per dataset and applies it once its own membership
+  view has reached the set's revision (`relays::ranges`): it follows added ranges, carries a split range's coverage
+  to the parts it keeps, and drops a revoked range only when its view no longer lists it there and lists another
+  `ready` owner. A drop deletes the range's span and its consumers' progress in one atomic batch, then compacts the
+  span. It acknowledges every set it applied with `RangesAck`, listing the revokes it refused and why. A range
+  held before a restart resumes until the relays push the current set.
 
 ## Model
 
@@ -78,8 +84,9 @@ Deploy at least three relays per cell (membership publication needs a majority),
 one relay per 500–1,000 nodes. Rotate the configured relay preference across nodes to distribute load;
 upper tiers need only a few relays. Provisioning is static configuration here.
 
-Quicksilver/CDN `[[subscriptions]]` entries name a dataset and namespace, followed whole.
-The Quicksilver binary permits Quicksilver/Auth; CDN permits only CDN metadata. Customer
+CDN `[[subscriptions]]` entries name a `cdn` namespace, followed whole. `bedrock-quicksilver`
+takes no subscriptions: the relays push the ranges it owns of each dataset it carries, and
+`Session::join` maps those datasets to their engines. Customer
 `kv` opens/reads do not create interests. Leaf sessions also carry [cell membership](membership.md)
 (#15 / B-12). The leaf client stores a whole namespace under its namespace-NUL prefix and a
 range in the hash-first L2 layout (`l2/{hash}/{namespace}\0{key}`, `storage::l2_key`), and
@@ -169,7 +176,8 @@ ten relay protocol integration tests in both builds. Opt-in load and real-S3
 tests remain ignored by the ordinary workspace test command. With range streams
 (2026-11-02, #22 / B-21 phase 2), every check above passed again: 235 native and
 195 simulation tests in 28 suites each, including the range-follow integration test
-in both builds.
+in both builds. With member-side pushed ranges and per-dataset directories (phase 3,
+same day), they passed again: 239 native and 199 simulation tests.
 For cleanup validation, native lint reused a cached RocksDB archive through the
 dependency's supported `ROCKSDB_LIB_DIR` / `ROCKSDB_STATIC` settings; native tests
 built RocksDB normally. This avoids rebuilding C++ for the Rust-only lint step.

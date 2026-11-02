@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 
+use super::ranges::{self, Range};
 use crate::placement::{hash_of, in_span, valid_span};
 use crate::replication::log::Watched;
 use crate::replication::pb;
@@ -40,6 +41,17 @@ type Scope = (String, String, Option<(u64, u64)>);
 /// A range followed in every namespace of a dataset, with the engine its namespaces' consumers write to.
 type Groups = BTreeMap<(String, (u64, u64)), Arc<dyn StorageEngine>>;
 
+/// The ranges this process follows, and those relays push to a member (#22 / B-21).
+struct Pushed {
+    groups: Groups,
+    /// Dataset → the engine its pushed ranges are stored in; datasets the process does not carry are absent.
+    ranged: BTreeMap<String, Arc<dyn StorageEngine>>,
+    /// The member's node ID and the scope of its own membership view, which confirms revokes.
+    me: Option<(String, Scope)>,
+    /// The latest pushed set per dataset, applied once the member's view reaches its revision.
+    pending: BTreeMap<String, pb::Ranges>,
+}
+
 fn span(range: Option<(u64, u64)>) -> Option<pb::Span> {
     range.map(|(start, end)| pb::Span { start, end })
 }
@@ -51,6 +63,63 @@ fn range(span: Option<&pb::Span>) -> Option<(u64, u64)> {
 /// Revision marking that a range consumer exists, so a restart resumes every namespace it held.
 fn marker_prefix(dataset: &str, (start, end): (u64, u64)) -> String {
     format!("relay:range:{dataset}:{start:016x}-{end:016x}:")
+}
+
+/// The ranges of `dataset` held in `engine` before a restart, from their consumers' markers.
+fn held(engine: &dyn StorageEngine, dataset: &str) -> Result<BTreeSet<Range>, Status> {
+    let prefix = format!("relay:range:{dataset}:");
+    let revisions = engine
+        .snapshot()
+        .map_err(storage)?
+        .revisions()
+        .map_err(storage)?;
+    let parse = |rest: &str| {
+        let start = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
+        let end = u64::from_str_radix(rest.get(17..33)?, 16).ok()?;
+        (rest.get(16..17)? == "-" && rest.get(33..34)? == ":").then_some((start, end))
+    };
+    revisions
+        .iter()
+        .filter(|(_, value)| **value == 1)
+        .filter_map(|(name, _)| name.strip_prefix(&prefix))
+        .map(|rest| parse(rest).ok_or_else(|| Status::data_loss("invalid relay range marker")))
+        .collect()
+}
+
+/// The revision names of one consumer's progress.
+struct Names {
+    active_prefix: String,
+    active: String,
+    revision: String,
+    pending: String,
+    marker: Option<String>,
+}
+
+impl Names {
+    fn of(dataset: &str, namespace: &str, prefix: &[u8], span: Option<Range>) -> Self {
+        let mut hash = Sha256::new();
+        let range = span.map(|(start, end)| [start.to_be_bytes(), end.to_be_bytes()].concat());
+        // A range is part of the identity, so one namespace can be held in several ranges.
+        for part in [dataset.as_bytes(), namespace.as_bytes(), prefix]
+            .into_iter()
+            .chain(range.as_deref())
+        {
+            hash.update((part.len() as u64).to_be_bytes());
+            hash.update(part);
+        }
+        let scope = format!("{:x}", hash.finalize());
+        let active_prefix = format!("relay:active:{scope}:");
+        let selector = span
+            .map(|(start, end)| format!("l2:{start:016x}-{end:016x}"))
+            .unwrap_or_default();
+        Names {
+            active: format!("{active_prefix}{selector}"),
+            active_prefix,
+            revision: format!("relay:cursor:{scope}:{selector}"),
+            pending: format!("relay:pending:{scope}:{selector}"),
+            marker: span.map(|range| marker_prefix(dataset, range) + namespace),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -74,31 +143,50 @@ impl Session {
         upstreams: Vec<String>,
         targets: Vec<Target>,
     ) -> Result<Self, Status> {
-        Self::open(peers, upstreams, targets, None)
+        Self::open(peers, upstreams, targets, None, BTreeMap::new())
     }
 
     /// Like [`Session::start`], announcing `member` to the relays, which makes this process a cell member (B-12).
+    /// Relays push the member the L2 ranges it owns per dataset; `ranged` maps each dataset it carries to the engine
+    /// those ranges are stored in (#22 / B-21). `targets` must include the member's own membership view
+    /// ([`crate::membership::View`]), which confirms revokes.
     pub fn join(
         peers: Arc<Peers>,
         upstreams: Vec<String>,
         targets: Vec<Target>,
         member: pb::Member,
+        ranged: BTreeMap<String, Arc<dyn StorageEngine>>,
     ) -> Result<Self, Status> {
         crate::membership::validate(&member)?;
         if member.status != pb::member::Status::Ready as i32 {
             return Err(Status::invalid_argument("a joining member must be ready"));
         }
-        Self::open(peers, upstreams, targets, Some(member))
+        Self::open(peers, upstreams, targets, Some(member), ranged)
     }
 
     fn open(
         peers: Arc<Peers>,
         upstreams: Vec<String>,
-        targets: Vec<Target>,
+        mut targets: Vec<Target>,
         member: Option<pb::Member>,
+        ranged: BTreeMap<String, Arc<dyn StorageEngine>>,
     ) -> Result<Self, Status> {
         if upstreams.is_empty() {
             return Err(Status::invalid_argument("upstreams are required"));
+        }
+        // Ranges held before a restart resume where they left off until the relays push the current set.
+        for (dataset, engine) in &ranged {
+            for range in held(engine.as_ref(), dataset)? {
+                targets.push(Target {
+                    selection: Selection {
+                        dataset: dataset.clone(),
+                        namespace: String::new(),
+                    },
+                    engine: engine.clone(),
+                    prefix: Vec::new(),
+                    span: Some(range),
+                });
+            }
         }
         let mut consumers = BTreeMap::new();
         let mut groups = Groups::new();
@@ -135,6 +223,18 @@ impl Session {
                 }
             }
         }
+        let pushed = Pushed {
+            groups,
+            ranged,
+            me: member.as_ref().map(|m| {
+                let view = crate::membership::namespace(&m.service, &m.cell);
+                (
+                    m.node_id.clone(),
+                    (crate::membership::DATASET.to_owned(), view, None),
+                )
+            }),
+            pending: BTreeMap::new(),
+        };
         let progress = Arc::new(Mutex::new(state));
         let changes = Arc::new(Watched::new(0));
         let draining = member.as_ref().map(|_| Arc::new(Watched::new(false)));
@@ -142,7 +242,7 @@ impl Session {
             peers,
             upstreams,
             consumers,
-            groups,
+            pushed,
             progress.clone(),
             changes.clone(),
             member.zip(draining.clone()),
@@ -293,27 +393,18 @@ impl Consumer {
         {
             return Err(Status::invalid_argument("invalid relay selection"));
         }
-        let mut hash = Sha256::new();
-        for part in [
-            selection.dataset.as_bytes(),
-            selection.namespace.as_bytes(),
+        let Names {
+            active_prefix,
+            active,
+            revision,
+            pending: pending_confirmation,
+            marker,
+        } = Names::of(
+            &selection.dataset,
+            &selection.namespace,
             &target.prefix,
-        ] {
-            hash.update((part.len() as u64).to_be_bytes());
-            hash.update(part);
-        }
-        let scope = format!("{:x}", hash.finalize());
-        let active_prefix = format!("relay:active:{scope}:");
-        let selector = target
-            .span
-            .map(|(start, end)| format!("l2:{start:016x}-{end:016x}"))
-            .unwrap_or_default();
-        let marker = target
-            .span
-            .map(|range| marker_prefix(&selection.dataset, range) + &selection.namespace);
-        let active = format!("{active_prefix}{selector}");
-        let revision = format!("relay:cursor:{scope}:{selector}");
-        let pending_confirmation = format!("relay:pending:{scope}:{selector}");
+            target.span,
+        );
         let snapshot = target.engine.snapshot().map_err(storage)?;
         let revisions = snapshot.revisions().map_err(storage)?;
         let matches = revisions.get(&active) == Some(&1);
@@ -436,6 +527,33 @@ impl Consumer {
             0
         } else {
             self.applied.saturating_add(1)
+        }
+    }
+
+    /// Stops holding this stream: a restart no longer resumes it.
+    fn retire(&self, batch: &mut WriteBatch) {
+        batch
+            .set_revision(&self.active, 0)
+            .set_revision(&self.pending_confirmation, 0);
+        if let Some(marker) = &self.marker {
+            batch.set_revision(marker, 0);
+        }
+    }
+
+    /// Hands this range consumer's coverage to `range`, a part of its range a split kept: every revision applied for
+    /// the whole range is applied for the part. Unvalidated progress is not handed on; the part bootstraps.
+    fn carry(&self, batch: &mut WriteBatch, range: Range) {
+        if !self.validated() {
+            return;
+        }
+        let s = &self.target.selection;
+        let names = Names::of(&s.dataset, &s.namespace, &[], Some(range));
+        batch
+            .set_revision(&names.active, 1)
+            .set_revision(&names.revision, self.applied)
+            .set_revision(&names.pending, 0);
+        if let Some(marker) = &names.marker {
+            batch.set_revision(marker, 1);
         }
     }
 
@@ -689,7 +807,7 @@ async fn run(
     peers: Arc<Peers>,
     upstreams: Vec<String>,
     mut consumers: BTreeMap<Scope, Consumer>,
-    groups: Groups,
+    mut pushed: Pushed,
     progress: Arc<Mutex<Progress>>,
     changes: Arc<Watched<u64>>,
     member: Option<Membership>,
@@ -709,11 +827,13 @@ async fn run(
                     *head = None;
                 }
             });
+            // A new session starts with the relay's current set.
+            pushed.pending.clear();
             let error = connection(
                 &peers,
                 upstream,
                 &mut consumers,
-                &groups,
+                &mut pushed,
                 &progress,
                 &changes,
                 member.as_ref(),
@@ -749,13 +869,13 @@ async fn connection(
     peers: &Peers,
     upstream: &str,
     consumers: &mut BTreeMap<Scope, Consumer>,
-    groups: &Groups,
+    pushed: &mut Pushed,
     progress: &Mutex<Progress>,
     changes: &Watched<u64>,
     member: Option<&Membership>,
 ) -> Status {
     match connected(
-        peers, upstream, consumers, groups, progress, changes, member,
+        peers, upstream, consumers, pushed, progress, changes, member,
     )
     .await
     {
@@ -768,7 +888,7 @@ async fn connected(
     peers: &Peers,
     upstream: &str,
     consumers: &mut BTreeMap<Scope, Consumer>,
-    groups: &Groups,
+    pushed: &mut Pushed,
     progress: &Mutex<Progress>,
     changes: &Watched<u64>,
     member: Option<&Membership>,
@@ -809,7 +929,7 @@ async fn connected(
         send(&requests, consumer.request()).await?;
     }
     // One follow per range; the relay starts every namespace, each where its consumer left off.
-    for (dataset, range) in groups.keys() {
+    for (dataset, range) in pushed.groups.keys() {
         let from_namespaces = consumers
             .values()
             .filter(|c| c.target.selection.dataset == *dataset && c.target.span == Some(*range))
@@ -889,6 +1009,11 @@ async fn connected(
         };
         let (scope, action) = match frame.kind {
             Some(pb::relay_frame::Kind::Tick(true)) => continue,
+            Some(pb::relay_frame::Kind::Ranges(ranges)) => {
+                pushed.pending.insert(ranges.dataset.clone(), ranges);
+                settle(&requests, consumers, pushed, progress, changes).await?;
+                continue;
+            }
             Some(pb::relay_frame::Kind::Delivery(d)) => (
                 (
                     d.dataset.clone(),
@@ -926,7 +1051,7 @@ async fn connected(
         // A range stream's first frame for a namespace creates that namespace's consumer.
         if !consumers.contains_key(&scope)
             && let (dataset, namespace, Some(range)) = &scope
-            && let Some(engine) = groups.get(&(dataset.clone(), *range))
+            && let Some(engine) = pushed.groups.get(&(dataset.clone(), *range))
         {
             let target = Target {
                 selection: Selection {
@@ -980,7 +1105,190 @@ async fn connected(
             )
             .await?;
         }
+        // The membership view may have reached a pushed set's revision.
+        if !pushed.pending.is_empty() {
+            settle(&requests, consumers, pushed, progress, changes).await?;
+        }
     }
+}
+
+/// Applies each pushed range set whose revision the member's own directory view has reached: follows new ranges,
+/// narrows split ones, drops revoked ones the view confirms and refuses the rest, then acknowledges the set. The
+/// relay counts acknowledgements toward readiness only after that (`docs/spec/handoff.tla`, `ReadyFor`).
+async fn settle(
+    requests: &mpsc::Sender<pb::RelayRequest>,
+    consumers: &mut BTreeMap<Scope, Consumer>,
+    pushed: &mut Pushed,
+    progress: &Mutex<Progress>,
+    changes: &Watched<u64>,
+) -> Result<(), Status> {
+    let Some((node, view)) = pushed.me.clone() else {
+        pushed.pending.clear();
+        return Ok(());
+    };
+    let Some(membership) = consumers.get(&view).filter(|c| c.validated()) else {
+        return Ok(());
+    };
+    let due: Vec<String> = pushed
+        .pending
+        .iter()
+        .filter(|(_, frame)| frame.revision <= membership.applied)
+        .map(|(dataset, _)| dataset.clone())
+        .collect();
+    if due.is_empty() {
+        return Ok(());
+    }
+    let directories =
+        crate::membership::read(membership.target.engine.as_ref(), &membership.target.prefix)?.1;
+    for dataset in due {
+        let frame = pushed.pending.remove(&dataset).unwrap();
+        let mut refused = Vec::new();
+        let mut reasons = Vec::new();
+        if let Some(engine) = pushed.ranged.get(&dataset).cloned() {
+            let held: Vec<Range> = pushed
+                .groups
+                .keys()
+                .filter(|(d, _)| *d == dataset)
+                .map(|(_, range)| *range)
+                .collect();
+            let plan = ranges::plan(&held, &frame.spans)?;
+            for change in plan.changed {
+                let confirmed = change
+                    .dropped
+                    .iter()
+                    .try_for_each(|d| ranges::confirms(directories.get(&dataset), &node, *d));
+                if let Err(reason) = confirmed {
+                    tracing::warn!(%dataset, held = ?change.held, %reason, "refused a revoke the directory view does not confirm");
+                    refused.extend(change.dropped.iter().filter_map(|d| span(Some(*d))));
+                    reasons.push(reason);
+                    continue;
+                }
+                for kind in narrow(
+                    &dataset, &engine, &change, consumers, pushed, progress, changes,
+                )? {
+                    send(requests, pb::RelayRequest { kind: Some(kind) }).await?;
+                }
+            }
+            for range in plan.added {
+                pushed
+                    .groups
+                    .insert((dataset.clone(), range), engine.clone());
+                let follow = pb::Follow {
+                    dataset: dataset.clone(),
+                    namespace: String::new(),
+                    from: 0,
+                    span: span(Some(range)),
+                    from_namespaces: BTreeMap::new(),
+                };
+                send(
+                    requests,
+                    pb::RelayRequest {
+                        kind: Some(pb::relay_request::Kind::Follow(follow)),
+                    },
+                )
+                .await?;
+            }
+        }
+        let ack = pb::RangesAck {
+            dataset,
+            revision: frame.revision,
+            refused,
+            reason: reasons.join("; "),
+        };
+        send(
+            requests,
+            pb::RelayRequest {
+                kind: Some(pb::relay_request::Kind::Ranges(ack)),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Carries a held range's coverage to the parts a split kept and deletes the dropped parts in one atomic batch, then
+/// compacts them. Returns the requests that move the relay's streams to the kept parts.
+fn narrow(
+    dataset: &str,
+    engine: &Arc<dyn StorageEngine>,
+    change: &ranges::Change,
+    consumers: &mut BTreeMap<Scope, Consumer>,
+    pushed: &mut Pushed,
+    progress: &Mutex<Progress>,
+    changes: &Watched<u64>,
+) -> Result<Vec<pb::relay_request::Kind>, Status> {
+    let scopes: Vec<Scope> = consumers
+        .keys()
+        .filter(|(d, _, range)| d == dataset && *range == Some(change.held))
+        .cloned()
+        .collect();
+    let mut batch = WriteBatch::default();
+    for &(start, end) in &change.dropped {
+        batch.delete_range(l2_span(start, end));
+    }
+    for scope in &scopes {
+        let consumer = &consumers[scope];
+        consumer.retire(&mut batch);
+        for &kept in &change.kept {
+            consumer.carry(&mut batch, kept);
+        }
+    }
+    engine.write(batch).map_err(storage)?;
+    for &(start, end) in &change.dropped {
+        // ponytail: compacts inline on the session task; move it to a blocking task if it stalls deliveries.
+        if let Err(error) = engine.compact(&l2_span(start, end)) {
+            tracing::warn!(%error, "compacting a dropped range failed; its space is reclaimed by later compaction");
+        }
+    }
+    pushed.groups.remove(&(dataset.to_owned(), change.held));
+    for scope in &scopes {
+        consumers.remove(scope);
+    }
+    changed(progress, changes, |state| {
+        for scope in &scopes {
+            state.scopes.remove(scope);
+        }
+    });
+    let mut requests = vec![pb::relay_request::Kind::Unfollow(pb::Unfollow {
+        dataset: dataset.to_owned(),
+        namespace: String::new(),
+        span: span(Some(change.held)),
+    })];
+    let group = Target {
+        selection: Selection {
+            dataset: dataset.to_owned(),
+            namespace: String::new(),
+        },
+        engine: engine.clone(),
+        prefix: Vec::new(),
+        span: None,
+    };
+    for &kept in &change.kept {
+        pushed
+            .groups
+            .insert((dataset.to_owned(), kept), engine.clone());
+        let mut from_namespaces = BTreeMap::new();
+        for (_, namespace, _) in &scopes {
+            let consumer = Consumer::in_range(&group, namespace, kept)?;
+            from_namespaces.insert(namespace.clone(), consumer.resume());
+            let scope = consumer.scope();
+            changed(progress, changes, |state| {
+                state.scopes.insert(
+                    scope.clone(),
+                    (consumer.applied, None, consumer.validated()),
+                );
+            });
+            consumers.insert(scope, consumer);
+        }
+        requests.push(pb::relay_request::Kind::Follow(pb::Follow {
+            dataset: dataset.to_owned(),
+            namespace: String::new(),
+            from: 0,
+            span: span(Some(kept)),
+            from_namespaces,
+        }));
+    }
+    Ok(requests)
 }
 
 enum Action {

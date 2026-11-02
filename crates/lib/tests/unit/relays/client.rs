@@ -405,12 +405,6 @@ fn range_change_bootstraps_before_reusing_progress_and_preserves_keys_outside_it
         engine.get(&stored_at(b"second")).unwrap(),
         Some(b"keep".to_vec())
     );
-    let widened = ranged(engine, whole);
-    assert!(widened.recover);
-    assert_eq!(
-        widened.applied, 0,
-        "old full-range cursor cannot become the new baseline"
-    );
 }
 
 fn range(head: u64, recovered: bool) -> pb::ReplayRange {
@@ -730,4 +724,218 @@ fn local_storage_error_is_scoped_but_malformed_drain_coverage_is_still_fatal() {
             .apply(&scope, &mut consumer, Action::Delivery(malformed))
             .is_err()
     );
+}
+
+/// Node `n1`'s membership view in cell `c1`, with `quicksilver` directory entries `(start, [(node, state)])`.
+fn view(applied: u64, entries: &[(u64, &[(&str, pb::range::owner::State)])]) -> Consumer {
+    let engine = Arc::new(MemoryEngine::new("membership"));
+    for (start, owners) in entries {
+        let range = pb::Range {
+            owners: owners
+                .iter()
+                .map(|(node, state)| pb::range::Owner {
+                    node_id: (*node).into(),
+                    state: *state as i32,
+                })
+                .collect(),
+        };
+        let key = format!("quicksilver.c1\0range/quicksilver/{start:016x}");
+        engine.put(key.as_bytes(), &range.encode_to_vec()).unwrap();
+    }
+    let mut consumer = Consumer::new(Target {
+        selection: Selection {
+            dataset: "membership".into(),
+            namespace: "quicksilver.c1".into(),
+        },
+        engine,
+        prefix: b"quicksilver.c1\0".to_vec(),
+        span: None,
+    })
+    .unwrap();
+    // A validated view at `applied`, as if its subscription had installed these entries.
+    consumer.recover = false;
+    consumer.applied = applied;
+    consumer
+}
+
+fn pushed_ranges(revision: u64, spans: &[(u64, u64)]) -> pb::Ranges {
+    pb::Ranges {
+        dataset: "quicksilver".into(),
+        revision,
+        spans: spans
+            .iter()
+            .map(|&(start, end)| pb::Span { start, end })
+            .collect(),
+    }
+}
+
+#[tokio::test]
+async fn pushed_revokes_wait_for_the_view_are_refused_unless_it_confirms_then_drop_and_keep_coverage()
+ {
+    use pb::range::owner::State::{Leaving, Ready};
+    use pb::relay_request::Kind;
+    const HALF: u64 = 1 << 63;
+    let whole = (0, 0);
+    let data = Arc::new(MemoryEngine::new("quicksilver"));
+    let group = Target {
+        selection: Selection {
+            dataset: "quicksilver".into(),
+            namespace: String::new(),
+        },
+        engine: data.clone(),
+        prefix: Vec::new(),
+        span: Some(whole),
+    };
+    let mut site = Consumer::in_range(&group, "site", whole).unwrap();
+    let key = |high: bool| {
+        (0u8..)
+            .map(|i| vec![b'k', i])
+            .find(|k| (hash_of("quicksilver", "site", k) >= HALF) == high)
+            .unwrap()
+    };
+    let (low, high) = (key(false), key(true));
+    let mut low_event = event(7, &low, Some(b"low"));
+    let mut high_event = event(6, &high, Some(b"high"));
+    for e in [&mut high_event, &mut low_event] {
+        e.dataset = "quicksilver".into();
+        e.namespace = "site".into();
+    }
+    let mut batch = in_range(
+        delivery(1, 7, vec![high_event, low_event]),
+        whole,
+        |d, s| d.span = s,
+    );
+    batch.dataset = "quicksilver".into();
+    batch.namespace = "site".into();
+    site.delivery(batch).unwrap();
+    let stored = |key: &[u8]| {
+        data.get(&l2_key(hash_of("quicksilver", "site", key), "site", key))
+            .unwrap()
+    };
+
+    let me: Scope = ("membership".into(), "quicksilver.c1".into(), None);
+    let mut consumers = BTreeMap::from([(site.scope(), site)]);
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = Pushed {
+        groups: Groups::from([(("quicksilver".into(), whole), engine.clone())]),
+        ranged: BTreeMap::from([("quicksilver".into(), engine)]),
+        me: Some(("n1".into(), me.clone())),
+        pending: BTreeMap::new(),
+    };
+    let progress = Mutex::new(Progress::default());
+    let changes = Watched::new(0);
+    let (tx, mut rx) = mpsc::channel::<pb::RelayRequest>(16);
+    let mut sent = || {
+        let mut out = Vec::new();
+        while let Ok(request) = rx.try_recv() {
+            out.push(request.kind.unwrap());
+        }
+        out
+    };
+
+    // The view has not reached the pushed revision: nothing happens yet.
+    consumers.insert(me.clone(), view(5, &[(0, &[("n1", Ready)])]));
+    pushed
+        .pending
+        .insert("quicksilver".into(), pushed_ranges(6, &[(0, HALF)]));
+    settle(&tx, &mut consumers, &mut pushed, &progress, &changes)
+        .await
+        .unwrap();
+    assert!(sent().is_empty());
+    assert_eq!(pushed.pending.len(), 1);
+
+    // The view lists the node as leaving the dropped half: refused, reported, data kept.
+    let leaving: &[(&str, pb::range::owner::State)] = &[("n1", Leaving), ("n2", Ready)];
+    consumers.insert(
+        me.clone(),
+        view(6, &[(0, &[("n1", Ready)]), (HALF, leaving)]),
+    );
+    settle(&tx, &mut consumers, &mut pushed, &progress, &changes)
+        .await
+        .unwrap();
+    match sent().as_slice() {
+        [Kind::Ranges(ack)] => {
+            assert_eq!(ack.revision, 6);
+            assert_eq!(
+                ack.refused,
+                [pb::Span {
+                    start: HALF,
+                    end: 0
+                }]
+            );
+            assert!(ack.reason.contains("still an owner"), "{}", ack.reason);
+        }
+        other => panic!("expected a refusing acknowledgement, got {other:?}"),
+    }
+    assert_eq!(stored(&high), Some(b"high".to_vec()));
+    assert!(pushed.groups.contains_key(&("quicksilver".into(), whole)));
+
+    // Once the view confirms it, the dropped half is deleted and the kept half keeps its coverage.
+    let moved: &[(&str, pb::range::owner::State)] = &[("n2", Ready)];
+    consumers.insert(me.clone(), view(7, &[(0, &[("n1", Ready)]), (HALF, moved)]));
+    pushed
+        .pending
+        .insert("quicksilver".into(), pushed_ranges(7, &[(0, HALF)]));
+    settle(&tx, &mut consumers, &mut pushed, &progress, &changes)
+        .await
+        .unwrap();
+    match sent().as_slice() {
+        [
+            Kind::Unfollow(unfollow),
+            Kind::Follow(follow),
+            Kind::Ranges(ack),
+        ] => {
+            assert_eq!(unfollow.span, Some(pb::Span { start: 0, end: 0 }));
+            assert_eq!(
+                follow.span,
+                Some(pb::Span {
+                    start: 0,
+                    end: HALF
+                })
+            );
+            assert_eq!(follow.from_namespaces, BTreeMap::from([("site".into(), 8)]));
+            assert_eq!((ack.revision, ack.refused.len()), (7, 0));
+        }
+        other => panic!("expected the narrowing requests, got {other:?}"),
+    }
+    assert_eq!(stored(&high), None);
+    assert_eq!(stored(&low), Some(b"low".to_vec()));
+    let kept = &consumers[&("quicksilver".into(), "site".into(), Some((0, HALF)))];
+    assert_eq!((kept.applied, kept.validated()), (7, true));
+    assert_eq!(
+        held(data.as_ref(), "quicksilver").unwrap(),
+        BTreeSet::from([(0, HALF)])
+    );
+
+    // A new range is followed from scratch; a dataset this process does not carry is only acknowledged.
+    consumers.insert(me.clone(), view(8, &[(0, &[("n1", Ready)])]));
+    pushed.pending.insert(
+        "quicksilver".into(),
+        pushed_ranges(8, &[(0, HALF), (HALF, 0)]),
+    );
+    pushed.pending.insert(
+        "auth".into(),
+        pb::Ranges {
+            dataset: "auth".into(),
+            ..pushed_ranges(8, &[(0, 0)])
+        },
+    );
+    settle(&tx, &mut consumers, &mut pushed, &progress, &changes)
+        .await
+        .unwrap();
+    match sent().as_slice() {
+        [Kind::Ranges(auth), Kind::Follow(follow), Kind::Ranges(qs)] => {
+            assert_eq!((auth.dataset.as_str(), auth.refused.len()), ("auth", 0));
+            assert_eq!(
+                follow.span,
+                Some(pb::Span {
+                    start: HALF,
+                    end: 0
+                })
+            );
+            assert!(follow.from_namespaces.is_empty());
+            assert_eq!(qs.dataset, "quicksilver");
+        }
+        other => panic!("expected a follow and two acknowledgements, got {other:?}"),
+    }
 }

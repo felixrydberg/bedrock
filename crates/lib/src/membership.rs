@@ -40,10 +40,18 @@ pub const SERVICES: [&str; 3] = ["quicksilver", "kv", "cdn"];
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-plans at least this often, which is what expires grace periods.
 const RECONCILE: Duration = Duration::from_secs(1);
-/// Services whose L2 is placed in hash ranges; customer KV ranks its readers instead (#18 / B-15).
-const RANGED: [&str; 2] = ["quicksilver", "cdn"];
-/// Directory keys are `range/{start:016x}`; node IDs cannot contain `/`.
+/// The CDN's artifact holders (B-34), keyed by content hash. Not a pushed dataset: every L2 CDN member carries them.
+pub const ARTIFACTS: &str = "artifacts";
+/// Services whose L2 is placed in hash ranges, and the datasets each places; every dataset has its own ranges (§4
+/// decision 13). Customer KV ranks its readers instead (#18 / B-15).
+const RANGED: [(&str, &[&str]); 2] = [
+    ("quicksilver", &["quicksilver", "auth"]),
+    ("cdn", &[ARTIFACTS]),
+];
+/// Directory keys are `range/{dataset}/{start:016x}`; node IDs cannot contain `/`.
 const RANGE: &str = "range/";
+/// Dataset → its placement directory.
+pub type Directories = BTreeMap<String, Directory>;
 // ponytail: fixed until B-34 makes them per-service settings read at relay startup (CDN artifacts want 2 replicas).
 const REPLICAS: usize = 3;
 const MAX_MOVING: usize = 16;
@@ -128,36 +136,8 @@ impl Published {
         (Self { engine, prefix }, target)
     }
 
-    /// Node ID → entry, and the placement directory. An undecodable entry is corruption, never a missing one.
-    fn read(&self) -> Result<(BTreeMap<String, pb::Member>, Directory), Status> {
-        let mut members = BTreeMap::new();
-        let mut directory = Directory::new();
-        let scan = self
-            .engine
-            .scan(&KeyRange::prefix(self.prefix.clone()))
-            .map_err(|e| Status::internal(e.to_string()))?;
-        for entry in scan {
-            let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
-            let key = String::from_utf8(key[self.prefix.len()..].to_vec())
-                .map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
-            if let Some(start) = key.strip_prefix(RANGE) {
-                if start.len() != 16
-                    || !start
-                        .bytes()
-                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                {
-                    return Err(Status::data_loss("invalid range key"));
-                }
-                let start = u64::from_str_radix(start, 16)
-                    .map_err(|_| Status::data_loss("invalid range key"))?;
-                directory.insert(start, decode(&value)?);
-                continue;
-            }
-            let member = pb::Member::decode(value.as_slice())
-                .map_err(|e| Status::data_loss(e.to_string()))?;
-            members.insert(key, member);
-        }
-        Ok((members, directory))
+    fn read(&self) -> Result<(BTreeMap<String, pb::Member>, Directories), Status> {
+        read(&*self.engine, &self.prefix)
     }
 
     fn members(&self) -> Result<BTreeMap<String, pb::Member>, Status> {
@@ -180,6 +160,47 @@ impl Published {
         }
         Ok(members)
     }
+}
+
+/// Node ID → entry, and the placement directories, as stored under `prefix` by a subscription to the membership
+/// namespace. An undecodable entry is corruption, never a missing one.
+pub(crate) fn read(
+    engine: &dyn StorageEngine,
+    prefix: &[u8],
+) -> Result<(BTreeMap<String, pb::Member>, Directories), Status> {
+    let mut members = BTreeMap::new();
+    let mut directories = Directories::new();
+    let scan = engine
+        .scan(&KeyRange::prefix(prefix.to_vec()))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    for entry in scan {
+        let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
+        let key = String::from_utf8(key[prefix.len()..].to_vec())
+            .map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
+        if let Some(range) = key.strip_prefix(RANGE) {
+            let (dataset, start) = range
+                .split_once('/')
+                .filter(|(dataset, start)| {
+                    token(dataset)
+                        && start.len() == 16
+                        && start
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                })
+                .ok_or_else(|| Status::data_loss("invalid range key"))?;
+            let start = u64::from_str_radix(start, 16)
+                .map_err(|_| Status::data_loss("invalid range key"))?;
+            directories
+                .entry(dataset.to_owned())
+                .or_default()
+                .insert(start, decode(&value)?);
+            continue;
+        }
+        let member =
+            pb::Member::decode(value.as_slice()).map_err(|e| Status::data_loss(e.to_string()))?;
+        members.insert(key, member);
+    }
+    Ok((members, directories))
 }
 
 fn decode(value: &[u8]) -> Result<Vec<Owner>, Status> {
@@ -243,10 +264,10 @@ impl View {
         self.published.members()
     }
 
-    /// The service's L2 placement directory in this cell: route with [`placement::owners`], and serve only what
-    /// [`placement::serves`] allows. Empty for customer KV.
-    pub fn directory(&self) -> Result<Directory, Status> {
-        Ok(self.published.read()?.1)
+    /// One dataset's L2 placement directory in this cell: route with [`placement::owners`], and serve only what
+    /// [`placement::serves`] allows. Empty for customer KV and before the first write.
+    pub fn directory(&self, dataset: &str) -> Result<Directory, Status> {
+        Ok(self.published.read()?.1.remove(dataset).unwrap_or_default())
     }
 
     /// When the view has advanced, drops connections and breakers of members that left.
@@ -273,6 +294,7 @@ pub enum Change {
     Delete(MemberKey),
     Range {
         service: String,
+        dataset: String,
         start: u64,
         owners: Vec<Owner>,
     },
@@ -344,27 +366,38 @@ pub fn plan(
     Some(changes)
 }
 
-/// One ranged service's directory writes from the published `actual` members: promote what the last pass assigned,
-/// otherwise assign (`docs/spec/membership.tla`, `Write`).
-pub fn place(service: &str, actual: &Members, directory: &Directory) -> Vec<Change> {
-    let members: BTreeMap<_, _> = actual
-        .iter()
-        .filter(|((s, _), _)| s == service)
-        .map(|((_, id), member)| (id.clone(), member.clone()))
-        .collect();
-    let mut entries = placement::promote(directory, &members);
-    if entries.is_empty() {
-        // ponytail: no health input until #13 / B-14 reports it in member updates.
-        entries = placement::assign(directory, &members, &BTreeSet::new(), REPLICAS, MAX_MOVING);
-    }
-    entries
-        .into_iter()
-        .map(|(start, owners)| Change::Range {
+/// One service's directory writes from the published `actual` members, per dataset it places, over the members
+/// carrying that dataset: promote what the last pass assigned, otherwise assign (`docs/spec/membership.tla`, `Write`).
+pub fn place(service: &str, actual: &Members, directories: &Directories) -> Vec<Change> {
+    let Some((_, datasets)) = RANGED.iter().find(|(s, _)| *s == service) else {
+        return Vec::new();
+    };
+    let mut changes = Vec::new();
+    for dataset in *datasets {
+        let members: BTreeMap<_, _> = actual
+            .iter()
+            .filter(|((s, _), member)| {
+                s == service
+                    && (*dataset == ARTIFACTS || member.datasets.iter().any(|d| d == dataset))
+            })
+            .map(|((_, id), member)| (id.clone(), member.clone()))
+            .collect();
+        let empty = Directory::new();
+        let directory = directories.get(*dataset).unwrap_or(&empty);
+        let mut entries = placement::promote(directory, &members);
+        if entries.is_empty() {
+            // ponytail: no health input until #13 / B-14 reports it in member updates.
+            entries =
+                placement::assign(directory, &members, &BTreeSet::new(), REPLICAS, MAX_MOVING);
+        }
+        changes.extend(entries.into_iter().map(|(start, owners)| Change::Range {
             service: service.into(),
+            dataset: (*dataset).into(),
             start,
             owners,
-        })
-        .collect()
+        }));
+    }
+    changes
 }
 
 /// A cell relay's membership publisher.
@@ -477,10 +510,8 @@ impl Cell {
             };
             // Placement plans only from applied membership.
             if changes.is_empty() {
-                for (service, directory) in &directories {
-                    if RANGED.contains(service) {
-                        changes.extend(place(service, &actual, directory));
-                    }
+                for (service, directories) in &directories {
+                    changes.extend(place(service, &actual, directories));
                 }
             }
             let mut written = BTreeMap::new();
@@ -515,11 +546,12 @@ impl Cell {
             Change::Delete(key) => (hyper::Method::DELETE, key.clone(), Vec::new()),
             Change::Range {
                 service,
+                dataset,
                 start,
                 owners,
             } => (
                 hyper::Method::PUT,
-                (service.clone(), format!("{RANGE}{start:016x}")),
+                (service.clone(), format!("{RANGE}{dataset}/{start:016x}")),
                 encode(owners),
             ),
         };

@@ -20,8 +20,4 @@ cpus = 2.0
 memory_mb = 4096
 disk_mb = 102400
 
-[[subscriptions]]
-dataset = "quicksilver"
-namespace = "infrastructure"
-# A subscription follows the whole namespace. L2 ranges come from the relays' placement directory (#22 / B-21).
-# Auth namespaces are followed explicitly when needed.
+# No [[subscriptions]]: the relays push the L2 ranges this node owns of each dataset it carries (#22 / B-21).

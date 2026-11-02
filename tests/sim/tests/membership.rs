@@ -106,7 +106,7 @@ impl Leaf {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|view| view.directory().unwrap())
+            .map(|view| view.directory(bedrock_lib::membership::ARTIFACTS).unwrap())
             .unwrap_or_default()
     }
 }
@@ -154,7 +154,8 @@ fn spawn_leaf(
                     address,
                     ..Default::default()
                 };
-                let session = Session::join(peers.clone(), relays, vec![target], member).unwrap();
+                let session =
+                    Session::join(peers.clone(), relays, vec![target], member, Default::default()).unwrap();
                 let namespace = membership::namespace(service, cell);
                 loop {
                     tokio::select! {

@@ -1,5 +1,6 @@
 //! Pushed-data relay sessions, bounded fan-out and disposable replay (#14/B-17, #16/B-18).
 pub mod client;
+pub mod ranges;
 pub mod replay;
 pub mod siblings;
 pub mod sources;
