@@ -34,8 +34,8 @@ pub type Bounds<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 
 /// A storage failure. A missing key is not one: reads return `Ok(None)`.
 ///
-/// A miss falls back to other sources. `Corruption` must also reach storage-health handling (B-14), because the
-/// local copy can no longer be trusted.
+/// A miss falls back to other sources. `Corruption` also quarantines the instance through its
+/// [`crate::health::storage`] wrapper (B-14), because the local copy can no longer be trusted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
     IoError(ErrorContext),

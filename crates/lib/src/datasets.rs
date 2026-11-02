@@ -4,7 +4,7 @@
 //! `bedrock-quicksilver` hosts `quicksilver` and `auth`, `bedrock-cdn` hosts `cdn`, and neither opens the other's.
 //! `bedrock-kv` (customer KV) hosts no relay-fed dataset.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -187,13 +187,13 @@ impl Registry {
         self.instances.values()
     }
 
-    /// Ready only when every enabled dataset opened successfully and can serve reads and writes.
-    pub fn is_healthy(&self) -> bool {
+    /// Ready only when every enabled dataset opened successfully and either serves reads and writes or is `quarantined`
+    /// (B-14): a quarantined dataset is routed around, so the others keep the process ready.
+    pub fn is_healthy(&self, quarantined: &BTreeSet<String>) -> bool {
         self.iter().all(|instance| {
-            instance
-                .engine
-                .as_ref()
-                .is_ok_and(|engine| engine.health().is_ok())
+            instance.engine.as_ref().is_ok_and(|engine| {
+                quarantined.contains(instance.dataset.name) || engine.health().is_ok()
+            })
         })
     }
 }

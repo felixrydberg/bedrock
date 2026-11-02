@@ -185,6 +185,19 @@ async fn cdn_artifacts_resolve_by_content_hash() {
 
 #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
 #[cfg_attr(madsim, tokio::test)]
+async fn holders_with_unhealthy_storage_are_skipped_for_that_dataset_only() {
+    let health = Health::new(&Admin::new());
+    let mut members = members(&[("a", ""), ("b", "")]);
+    members.get_mut("a").unwrap().unhealthy = vec!["auth".into()];
+    let dir = directory(vec![owner("a", State::Ready), owner("b", State::Ready)]);
+    let sources = Sources::default();
+    let pick = |dataset| ids(&sources.select(&members, &dir, &health, "", dataset, "ns", H, 0));
+    assert_eq!(pick("auth"), ["b"]);
+    assert_eq!(pick("quicksilver"), ["a", "b"]);
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
 async fn kv_readers_fail_over_to_the_next_ranked() {
     let health = Health::new(&Admin::new());
     let mut members = members(&[("a", ""), ("b", ""), ("c", ""), ("d", "")]);

@@ -1,8 +1,10 @@
 use super::*;
+use crate::health::storage::StorageHealth;
 use crate::storage::memory::MemoryEngine;
 use crate::storage::{
     ErrorContext, KeyRange, Scan, Snapshot, StorageError, StorageStats, WriteBatch,
 };
+use crate::transport::admin::Admin;
 
 #[test]
 fn namespace_ids_are_nul_free() {
@@ -106,7 +108,7 @@ fn opens_one_isolated_instance_per_enabled_dataset() {
     let names: Vec<_> = r.iter().map(|i| i.dataset.name).collect();
     assert_eq!(names, ["kv", "quicksilver"]);
     assert!(r.get("auth").is_none());
-    assert!(r.is_healthy());
+    assert!(r.is_healthy(&BTreeSet::new()));
 
     let engine = |name| r.get(name).unwrap().engine.as_ref().unwrap();
     engine("kv").put(b"k", b"v").unwrap();
@@ -132,7 +134,7 @@ fn failing_instance_does_not_stop_others() {
     .unwrap();
     assert!(r.get("kv").unwrap().engine.is_err());
     assert!(r.get("quicksilver").unwrap().engine.is_ok());
-    assert!(!r.is_healthy());
+    assert!(!r.is_healthy(&BTreeSet::new()));
     let healthy = r.get("quicksilver").unwrap().engine.as_ref().unwrap();
     healthy.put(b"k", b"v").unwrap();
     assert_eq!(healthy.get(b"k").unwrap(), Some(b"v".to_vec()));
@@ -183,7 +185,30 @@ fn opened_but_unhealthy_engine_prevents_readiness() {
     })
     .unwrap();
     assert!(r.get("cdn").unwrap().engine.is_ok());
-    assert!(!r.is_healthy());
+    assert!(!r.is_healthy(&BTreeSet::new()));
+}
+
+#[test]
+fn quarantined_dataset_does_not_block_readiness() {
+    let storage = StorageHealth::new(&Admin::new());
+    let hosted = [dataset("auth"), dataset("quicksilver")];
+    let enabled = ["auth".to_string(), "quicksilver".into()];
+    let engines = std::sync::Mutex::new(Vec::new());
+    let r = Registry::open(&hosted, &enabled, |d| {
+        let engine = Arc::new(MemoryEngine::new(d.name));
+        engines.lock().unwrap().push(engine.clone());
+        Ok(storage.wrap(d.name, "engine", engine))
+    })
+    .unwrap();
+    let auth = engines.lock().unwrap()[0].clone();
+    auth.put(b"k", b"v").unwrap();
+    auth.corrupt(b"k");
+    let engine = |name| r.get(name).unwrap().engine.as_ref().unwrap();
+    assert!(engine("auth").get(b"k").is_err());
+    assert!(engine("auth").health().is_err());
+    assert!(!r.is_healthy(&BTreeSet::new()));
+    assert!(r.is_healthy(&storage.unhealthy()));
+    engine("quicksilver").put(b"k", b"v").unwrap();
 }
 
 #[test]

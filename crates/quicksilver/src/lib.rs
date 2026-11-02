@@ -5,6 +5,7 @@ mod operations {}
 pub mod storage;
 
 use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, ReplicationPolicy};
+use bedrock_lib::health::storage::StorageHealth;
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
 
@@ -42,14 +43,16 @@ const fn dataset(
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-quicksilver");
+    let admin = node::start_admin(&config.node).await?;
+    let storage = StorageHealth::new(&admin);
     let datasets = Registry::open(DATASETS, &config.datasets, |d| {
-        datasets::open_engine(&config.node.data_dir, d)
+        let engine = datasets::open_engine(&config.node.data_dir, d)?;
+        Ok(storage.wrap(d.name, "engine", engine))
     })?;
     // ponytail: role subsystems don't exist yet; each starts here as its issue lands.
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
-    let admin = node::start_admin(&config.node).await?;
     let targets = config
         .subscriptions
         .iter()
@@ -95,7 +98,10 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         tokio::select! {biased;
             ()=&mut shutdown=>break,
             _=readiness.tick()=>{
-                admin.set_ready(!skipped && datasets.is_healthy() && session.ready());
+                // Quarantined datasets are routed around (B-14); they do not hold back the others.
+                let unhealthy = storage.unhealthy();
+                admin.set_ready(!skipped && datasets.is_healthy(&unhealthy) && session.ready_except(&unhealthy));
+                session.set_unhealthy(&unhealthy);
                 if let Err(error)=members.refresh(&session,&peers){
                     tracing::warn!(%error,"membership view unreadable");
                 }

@@ -227,6 +227,18 @@ fn announced_entries_are_validated() {
         })
         .is_err()
     );
+    // Unhealthy datasets must be the member's own, in order and without repeats.
+    let health = |unhealthy: &[&str]| {
+        validate(&pb::Member {
+            datasets: vec!["auth".into(), "quicksilver".into()],
+            unhealthy: unhealthy.iter().map(|d| d.to_string()).collect(),
+            ..ready("kv-1")
+        })
+    };
+    assert!(health(&["auth", "quicksilver"]).is_ok());
+    assert!(health(&["quicksilver", "auth"]).is_err());
+    assert!(health(&["auth", "auth"]).is_err());
+    assert!(health(&["cdn"]).is_err());
 }
 
 #[test]
@@ -325,6 +337,25 @@ fn placement_promotes_then_assigns_only_its_own_service() {
         assert!(owners.iter().all(|o| o.state == State::Ready));
         assert!(owners.iter().all(|o| o.node.starts_with("cdn-")));
     }
+    // A member announcing unhealthy storage gets nothing new but keeps what it holds.
+    let mut sick = actual.clone();
+    sick.get_mut(&("cdn".to_string(), "cdn-4".to_string()))
+        .unwrap()
+        .unhealthy = vec!["cdn".into()];
+    let mut joined = sick.clone();
+    joined.insert(
+        ("cdn".to_string(), "cdn-5".to_string()),
+        node("cdn-5", "cdn", "b"),
+    );
+    let mut after = directory.clone();
+    settle("cdn", &joined, &mut after);
+    // Ranges may split, but every hash cdn-4 held stays with it and it gains none.
+    for (start, owners) in &after {
+        let before = placement::owners(&directory, *start);
+        let held = |owners: &[Owner]| owners.iter().any(|o| o.node == "cdn-4");
+        assert_eq!(held(owners), held(before), "range {start:x}");
+    }
+
     // A removed member's ranges are reassigned, still within the service.
     let mut removed = actual.clone();
     removed.remove(&("cdn".to_string(), "cdn-2".to_string()));
