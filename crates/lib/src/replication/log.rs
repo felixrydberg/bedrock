@@ -31,6 +31,12 @@ pub struct Watched<T> {
     changed: Notify,
 }
 
+impl<T: Clone + Default> Default for Watched<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
 impl<T: Clone> Watched<T> {
     pub fn new(value: T) -> Self {
         Watched {
@@ -69,6 +75,7 @@ impl<T: Clone> Watched<T> {
 #[derive(Default)]
 pub struct MemoryLog {
     namespaces: Mutex<BTreeMap<(String, String), NamespaceLog>>,
+    added: Watched<u64>,
     retention: Option<(fn() -> u64, u64)>,
 }
 
@@ -93,6 +100,7 @@ impl MemoryLog {
     pub fn with_retention(clock: fn() -> u64, retention_ms: u64) -> Self {
         Self {
             namespaces: Mutex::default(),
+            added: Watched::default(),
             retention: Some((clock, retention_ms)),
         }
     }
@@ -132,9 +140,7 @@ impl MemoryLog {
     /// nonzero head.
     pub fn reset(&self, dataset: &str, namespace: &str, boundary: u64) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
-        let log = namespaces
-            .entry((dataset.to_owned(), namespace.to_owned()))
-            .or_insert_with(NamespaceLog::new);
+        let log = self.entry(&mut namespaces, dataset, namespace);
         if !log.events.is_empty() || log.head.get() != 0 {
             return Err("cannot reset a non-empty log".into());
         }
@@ -169,9 +175,7 @@ impl MemoryLog {
     /// sequence overflow. An unseen namespace is created even if the append fails.
     pub fn append(&self, event: Event) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
-        let log = namespaces
-            .entry((event.dataset.clone(), event.namespace.clone()))
-            .or_insert_with(NamespaceLog::new);
+        let log = self.entry(&mut namespaces, &event.dataset, &event.namespace);
         let next = log
             .head
             .get()
@@ -223,8 +227,7 @@ impl Log for MemoryLog {
 
     fn head(&self, dataset: &str, namespace: &str) -> Arc<Watched<u64>> {
         let mut namespaces = self.namespaces.lock().unwrap();
-        let key = (dataset.to_owned(), namespace.to_owned());
-        let log = namespaces.entry(key).or_insert_with(NamespaceLog::new);
+        let log = self.entry(&mut namespaces, dataset, namespace);
         log.head.clone()
     }
 }
