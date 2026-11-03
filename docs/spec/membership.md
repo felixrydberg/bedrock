@@ -222,6 +222,9 @@ revokes enabled and no caps:
 | `{0}` (`handoff.cfg`) | 6 | 83,417,417 | 8,237,636 | 46 | no violation (1 min 37 s) |
 | `{0, 1}`, no faulty revokes | 3 | 965,875,582 | 88,204,865 | 48 | no violation (51 min 50 s after resuming from a checkpoint) |
 
+With a refused revoke making the relay push again (2026-11-03), TLC 1.8.0 checked `handoff.cfg` with 4 workers:
+124,714,070 generated and 11,769,576 distinct states, depth 49, no violation (6 min 32 s).
+
 With two points ranges split. Faulty revokes act per point, so the one-point runs cover them; leaving them out keeps
 the two-point run small enough to finish. Capped two-point runs with deeper revisions have not finished on this machine.
 
