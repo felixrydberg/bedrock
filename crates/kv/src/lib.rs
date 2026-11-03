@@ -4,6 +4,7 @@ use bedrock_lib::membership;
 use bedrock_lib::node::{self, ConfigError, ServiceConfig};
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
+/// Returns configuration, admin startup, or relay session initialization errors.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     check_hosts_nothing_pushed(&config)?;

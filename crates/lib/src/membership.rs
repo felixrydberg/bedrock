@@ -168,6 +168,7 @@ impl Published {
 
 /// Node ID → entry, and the placement directories, as stored under `prefix` by a subscription to the membership
 /// namespace. An undecodable entry is corruption, never a missing one.
+/// Storage scan failures return an internal status; malformed keys or entries return a data-loss status.
 pub(crate) fn read(
     engine: &dyn StorageEngine,
     prefix: &[u8],
@@ -269,7 +270,8 @@ impl View {
     }
 
     /// One dataset's L2 placement directory in this cell: route with [`placement::owners`], and serve only what
-    /// [`placement::serves`] allows. Empty for customer KV and before the first write.
+    /// [`placement::serves`] allows. Empty when the dataset has no directory, including for customer KV and before
+    /// the first write. Scan and decoding errors from the membership view are returned to the caller.
     pub fn directory(&self, dataset: &str) -> Result<Directory, Status> {
         Ok(self.published.read()?.1.remove(dataset).unwrap_or_default())
     }
@@ -457,7 +459,8 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Each service's published members and placement directory, as this relay's subscription applied them.
+    /// Each service's published members and per-dataset placement directories, as this relay's subscription applied
+    /// them. Returns scan or decoding errors from the membership views.
     #[allow(clippy::type_complexity)]
     pub fn views(
         &self,

@@ -21,6 +21,7 @@ fn end(range: Range) -> u128 {
     }
 }
 
+/// Whether `inner` lies within `outer`, including equal bounds. Ranges are half-open; neither range is validated.
 pub fn within(inner: Range, outer: Range) -> bool {
     inner.0 >= outer.0 && end(inner) <= end(outer)
 }
@@ -60,8 +61,8 @@ pub struct Plan {
     pub added: Vec<Range>,
 }
 
-/// What the pushed `spans` mean for the `held` ranges. Malformed or overlapping spans, and a pushed range that
-/// straddles a held one, are protocol errors: assignment only ever splits ranges.
+/// What the pushed `spans` mean for the `held` ranges. Malformed or overlapping spans and a pushed range that
+/// straddles a held one return a data-loss status: assignment only ever splits ranges.
 pub fn plan(held: &[Range], spans: &[pb::Span]) -> Result<Plan, Status> {
     if spans.iter().any(|s| !valid_span(s)) {
         return Err(Status::data_loss("invalid pushed range"));
@@ -95,7 +96,8 @@ pub fn plan(held: &[Range], spans: &[pb::Span]) -> Result<Plan, Status> {
 }
 
 /// Whether `node`'s own directory view confirms dropping `range`: every directory range overlapping it no longer lists
-/// the node, in any state, and has another owner `ready`. Otherwise the reason to refuse.
+/// the node, in any state, and has another owner `ready`. Returns a reason to refuse if the directory is missing,
+/// no directory range overlaps, or an overlapping range fails those checks.
 pub fn confirms(directory: Option<&Directory>, node: &str, range: Range) -> Result<(), String> {
     let directory = directory.ok_or("the directory view has no ranges for the dataset")?;
     let mut entries = directory.iter().peekable();

@@ -175,7 +175,8 @@ pub fn l2_span(start: u64, end: u64) -> KeyRange {
     }
 }
 
-/// The namespace and key of an [`l2_key`], or `None` for any other key.
+/// The namespace and key slices of an [`l2_key`]. Returns `None` if the `l2/` prefix, the following nine bytes, or
+/// the namespace's NUL separator are missing. Does not validate the byte after the hash or the namespace encoding.
 pub fn l2_parts(physical: &[u8]) -> Option<(&[u8], &[u8])> {
     let rest = physical.strip_prefix(b"l2/")?.get(9..)?;
     let nul = rest.iter().position(|b| *b == 0)?;
@@ -291,8 +292,8 @@ pub trait StorageEngine: Send + Sync {
         self.write(batch)
     }
 
-    /// Reclaims the space of deleted keys in `range`, such as a revoked L2 range (#22 / B-21). Engines that free
-    /// space on delete need do nothing.
+    /// Requests reclamation of space occupied by deleted keys in `range`, such as a revoked L2 range (#22 / B-21).
+    /// The default implementation does nothing.
     fn compact(&self, _range: &KeyRange) -> StorageResult<()> {
         Ok(())
     }

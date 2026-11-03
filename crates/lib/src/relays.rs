@@ -319,7 +319,8 @@ impl Hub {
     }
 
     /// Pushes a leaf member its range set of one dataset from the published directory (#22 / B-21), unless its
-    /// session already has that set. Relays push only published state.
+    /// session already has that set. A matching set is suppressed even if its revision differs; a missing session is
+    /// ignored. Relays push only published state.
     pub fn push_ranges(&self, member: &MemberKey, frame: pb::Ranges) {
         let id = {
             let mut subscribers = self.0.subscribers.lock().unwrap();
