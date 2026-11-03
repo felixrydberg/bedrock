@@ -8,8 +8,9 @@
 //!   other sources. Other datasets keep running, and readiness ignores quarantined ones. The process announces
 //!   [`StorageHealth::unhealthy`] datasets in its member updates, so relays assign it no new ranges and peers skip it as a
 //!   source for those datasets (`docs/spec/membership.md`).
-//! - **Recovery** belongs to B-22, which rebuilds through the engine it wrapped and reports [`StorageHealth::rebuilding`]
-//!   and [`StorageHealth::recovered`].
+//! - **Recovery** is [`crate::reconciliation::rebuild`] (#23 / B-22). A `Rebuilding` source still refuses every
+//!   [`StorageHealth::wrap`]ped call, so nothing is served from it, while its [`StorageHealth::wrap_replication`] handle
+//!   restores it. Only a validated rebuild makes it [`StorageHealth::recovered`].
 //!
 //! Processes are per service, so a broken CDN cache disk never marks the same machine's KV node unhealthy.
 
@@ -65,6 +66,7 @@ pub struct Report {
 struct Source {
     dataset: String,
     healthy: AtomicBool,
+    rebuilding: AtomicBool,
     consecutive: AtomicU32,
     report: Mutex<Report>,
 }
@@ -104,10 +106,32 @@ impl StorageHealth {
         layer: &'static str,
         engine: Arc<dyn StorageEngine>,
     ) -> Arc<dyn StorageEngine> {
+        self.monitored(dataset, layer, engine, false)
+    }
+
+    /// Like [`StorageHealth::wrap`], but it also works while the source is `Rebuilding`. Replication applies and
+    /// rebuilds write through it; serving reads never do.
+    pub fn wrap_replication(
+        self: &Arc<Self>,
+        dataset: &str,
+        layer: &'static str,
+        engine: Arc<dyn StorageEngine>,
+    ) -> Arc<dyn StorageEngine> {
+        self.monitored(dataset, layer, engine, true)
+    }
+
+    fn monitored(
+        self: &Arc<Self>,
+        dataset: &str,
+        layer: &'static str,
+        engine: Arc<dyn StorageEngine>,
+        rebuilds: bool,
+    ) -> Arc<dyn StorageEngine> {
         Arc::new(Monitored {
             health: self.clone(),
             source: self.source(dataset, layer),
             layer,
+            rebuilds,
             inner: engine,
         })
     }
@@ -134,6 +158,16 @@ impl StorageHealth {
         Some(source.report.lock().unwrap().clone())
     }
 
+    /// Every source's state, for the rebuild coordinator.
+    pub fn states(&self) -> BTreeMap<(String, &'static str), State> {
+        self.sources
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(key, source)| (key.clone(), source.report.lock().unwrap().state))
+            .collect()
+    }
+
     /// B-22 starts rebuilding an unhealthy source. Returns whether it was unhealthy.
     pub fn rebuilding(&self, dataset: &str, layer: &'static str) -> bool {
         self.transition(dataset, layer, State::Unhealthy, State::Rebuilding)
@@ -142,6 +176,11 @@ impl StorageHealth {
     /// B-22 restored and validated a rebuilding source; it serves again. Returns whether it was rebuilding.
     pub fn recovered(&self, dataset: &str, layer: &'static str) -> bool {
         self.transition(dataset, layer, State::Rebuilding, State::Healthy)
+    }
+
+    /// B-22 could not rebuild the source; it is quarantined until the next attempt. Returns whether it was rebuilding.
+    pub fn rebuild_failed(&self, dataset: &str, layer: &'static str) -> bool {
+        self.transition(dataset, layer, State::Rebuilding, State::Unhealthy)
     }
 
     fn source(&self, dataset: &str, layer: &'static str) -> Arc<Source> {
@@ -154,6 +193,7 @@ impl StorageHealth {
                 Arc::new(Source {
                     dataset: dataset.to_owned(),
                     healthy: AtomicBool::new(true),
+                    rebuilding: AtomicBool::new(false),
                     consecutive: AtomicU32::new(0),
                     report: Mutex::new(Report {
                         state: State::Healthy,
@@ -217,6 +257,9 @@ impl StorageHealth {
         source
             .healthy
             .store(to == State::Healthy, Ordering::Relaxed);
+        source
+            .rebuilding
+            .store(to == State::Rebuilding, Ordering::Relaxed);
     }
 
     fn gauge(&self, dataset: &str, state: State) -> Gauge {
@@ -234,12 +277,16 @@ struct Monitored {
     health: Arc<StorageHealth>,
     source: Arc<Source>,
     layer: &'static str,
+    /// A [`StorageHealth::wrap_replication`] handle, which also works while the source is rebuilding.
+    rebuilds: bool,
     inner: Arc<dyn StorageEngine>,
 }
 
 impl Monitored {
     fn call<T>(&self, result: impl FnOnce() -> StorageResult<T>) -> StorageResult<T> {
-        if !self.source.healthy.load(Ordering::Relaxed) {
+        if !self.source.healthy.load(Ordering::Relaxed)
+            && !(self.rebuilds && self.source.rebuilding.load(Ordering::Relaxed))
+        {
             return Err(StorageError::Unavailable(ErrorContext {
                 engine: "health",
                 instance: self.source.dataset.clone(),

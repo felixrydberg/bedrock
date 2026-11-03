@@ -9,6 +9,9 @@
 //! Repairs should start or advance a step and return, leaving progress to show in `actual()`: L2 handoff (#22 / B-21)
 //! plans "push interest and bootstrap" for a `populating` owner with no interest, "mark ready" once its bootstrap is
 //! acknowledged through the head, and "revoke" for a `leaving` owner once every new owner is `ready`.
+//! [`rebuild`] (#23 / B-22) plans "rebuild" for each quarantined storage source.
+
+pub mod rebuild;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display};

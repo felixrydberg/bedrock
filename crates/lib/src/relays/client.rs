@@ -35,17 +35,23 @@ pub struct Target {
 
 type Scope = (String, String);
 
+/// Rebuild generation requested per dataset ([`Rebuilder`]).
+type Rebuilds = Arc<Watched<BTreeMap<String, u64>>>;
+
 #[derive(Default)]
 struct Progress {
     connected: bool,
     scopes: BTreeMap<Scope, (u64, Option<u64>, bool)>,
     error: Option<Status>,
+    /// The latest rebuild generation each scope was validated after.
+    rebuilt: BTreeMap<Scope, u64>,
 }
 
 /// Owns its reconnecting task. Drop aborts it; `stop` joins before storage reuse.
 pub struct Session {
     progress: Arc<Mutex<Progress>>,
     changes: Arc<Watched<u64>>,
+    rebuilds: Rebuilds,
     task: tokio::task::JoinHandle<()>,
     member: Option<Membership>,
 }
@@ -97,6 +103,7 @@ impl Session {
         }
         let progress = Arc::new(Mutex::new(state));
         let changes = Arc::new(Watched::new(0));
+        let rebuilds = Rebuilds::default();
         let member = member.map(|member| Arc::new(Watched::new(member)));
         let task = tokio::spawn(run(
             peers,
@@ -104,11 +111,13 @@ impl Session {
             consumers,
             progress.clone(),
             changes.clone(),
+            rebuilds.clone(),
             member.clone(),
         ));
         Ok(Self {
             progress,
             changes,
+            rebuilds,
             task,
             member,
         })
@@ -200,6 +209,54 @@ impl Session {
             self.changes.wait_until(|now| *now != generation).await;
         }
     }
+
+    /// Re-bootstraps `dataset`'s subscriptions on request, for rebuilding its local storage (#23 / B-22).
+    pub fn rebuilder(&self, dataset: &str) -> Rebuilder {
+        Rebuilder {
+            dataset: dataset.to_owned(),
+            progress: self.progress.clone(),
+            changes: self.changes.clone(),
+            rebuilds: self.rebuilds.clone(),
+        }
+    }
+}
+
+/// Makes one dataset's subscriptions install fresh verified bootstraps, as after a local storage failure.
+pub struct Rebuilder {
+    dataset: String,
+    progress: Arc<Mutex<Progress>>,
+    changes: Arc<Watched<u64>>,
+    rebuilds: Rebuilds,
+}
+
+impl Rebuilder {
+    /// Abandons each subscription's current coverage, recovers it from a new bootstrap, and returns once every one is
+    /// validated again: bootstrap checksum verified, then confirmed through the relay's head. The caller bounds the wait.
+    pub async fn rebuild(&self) {
+        let mut generation = 0;
+        self.rebuilds.update(|requested| {
+            let entry = requested.entry(self.dataset.clone()).or_default();
+            *entry += 1;
+            generation = *entry;
+        });
+        loop {
+            let seen = self.changes.get();
+            {
+                let state = self.progress.lock().unwrap();
+                let rebuilt = state
+                    .scopes
+                    .iter()
+                    .filter(|((dataset, _), _)| *dataset == self.dataset)
+                    .all(|(scope, (_, _, validated))| {
+                        *validated && state.rebuilt.get(scope) >= Some(&generation)
+                    });
+                if rebuilt {
+                    return;
+                }
+            }
+            self.changes.wait_until(|now| *now != seen).await;
+        }
+    }
 }
 
 impl Drop for Session {
@@ -225,6 +282,8 @@ struct Consumer {
     recover: bool,
     awaiting_confirmation: bool,
     bootstrap: Option<BootstrapState>,
+    /// The rebuild generation this consumer has started recovering for.
+    rebuild: u64,
 }
 
 fn storage(error: crate::storage::StorageError) -> Status {
@@ -318,6 +377,7 @@ impl Consumer {
             recover,
             awaiting_confirmation,
             bootstrap: None,
+            rebuild: 0,
         })
     }
 
@@ -335,6 +395,24 @@ impl Consumer {
     fn reconnect(&mut self) {
         self.bootstrap = None;
         self.recover |= self.awaiting_confirmation;
+    }
+
+    /// Whether a rebuild of this consumer's dataset was requested since it last started one.
+    fn rebuild_requested(&self, requested: &BTreeMap<String, u64>) -> bool {
+        requested
+            .get(&self.target.selection.dataset)
+            .is_some_and(|generation| *generation > self.rebuild)
+    }
+
+    /// Starts recovering for a requested rebuild: no coverage counts until a fresh bootstrap installs.
+    fn start_rebuild(&mut self, requested: &BTreeMap<String, u64>) -> bool {
+        if !self.rebuild_requested(requested) {
+            return false;
+        }
+        self.rebuild = requested[&self.target.selection.dataset];
+        self.recover = true;
+        self.bootstrap = None;
+        true
     }
 
     fn range(&mut self, range: &pb::ReplayRange) -> Result<(), Status> {
@@ -622,6 +700,7 @@ async fn run(
     mut consumers: BTreeMap<Scope, Consumer>,
     progress: Arc<Mutex<Progress>>,
     changes: Arc<Watched<u64>>,
+    rebuilds: Rebuilds,
     member: Option<Membership>,
 ) {
     let drained = || member.as_ref().is_some_and(|m| draining(&m.get()));
@@ -630,13 +709,16 @@ async fn run(
             if drained() {
                 return;
             }
+            let requested = rebuilds.get();
             for consumer in consumers.values_mut() {
                 consumer.reconnect();
+                consumer.start_rebuild(&requested);
             }
             changed(&progress, &changes, |state| {
                 state.connected = false;
-                for (_, head, _) in state.scopes.values_mut() {
+                for (scope, (_, head, validated)) in state.scopes.iter_mut() {
                     *head = None;
+                    *validated = consumers[scope].validated();
                 }
             });
             let error = connection(
@@ -645,6 +727,7 @@ async fn run(
                 &mut consumers,
                 &progress,
                 &changes,
+                &rebuilds,
                 member.as_ref(),
             )
             .await;
@@ -680,9 +763,14 @@ async fn connection(
     consumers: &mut BTreeMap<Scope, Consumer>,
     progress: &Mutex<Progress>,
     changes: &Watched<u64>,
+    rebuilds: &Rebuilds,
     member: Option<&Membership>,
 ) -> Status {
-    match connected(peers, upstream, consumers, progress, changes, member).await {
+    match connected(
+        peers, upstream, consumers, progress, changes, rebuilds, member,
+    )
+    .await
+    {
         Ok(()) => Status::unavailable("relay stream ended"),
         Err(error) => error,
     }
@@ -694,6 +782,7 @@ async fn connected(
     consumers: &mut BTreeMap<Scope, Consumer>,
     progress: &Mutex<Progress>,
     changes: &Watched<u64>,
+    rebuilds: &Rebuilds,
     member: Option<&Membership>,
 ) -> Result<(), Status> {
     let (requests, receiver) = mpsc::channel(16);
@@ -763,6 +852,20 @@ async fn connected(
                             send(&requests, consumers.get(&scope).unwrap().request()).await?;
                         }
                     },
+                    requested = rebuilds.wait_until(|r| consumers.values().any(|c| c.rebuild_requested(r))) => {
+                        for (scope, consumer) in consumers.iter_mut() {
+                            if !consumer.start_rebuild(&requested) {
+                                continue;
+                            }
+                            // Drain the current subscription like after a local failure, and recover at once.
+                            intake.fail(scope, consumer, Status::aborted("local storage is rebuilding"));
+                            intake.retries.remove(scope);
+                            changed(progress, changes, |state| {
+                                state.scopes.get_mut(scope).unwrap().2 = false;
+                            });
+                            send(&requests, consumer.request()).await?;
+                        }
+                    },
                     frame = &mut reading => break Some(frame?),
                 }
             }
@@ -813,6 +916,9 @@ async fn connected(
             let entry = state.scopes.get_mut(&scope).unwrap();
             entry.0 = consumer.applied;
             entry.2 = consumer.validated();
+            if entry.2 {
+                state.rebuilt.insert(scope.clone(), consumer.rebuild);
+            }
             if effect.head.is_some() {
                 entry.1 = effect.head;
             }

@@ -45,8 +45,14 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-quicksilver");
     let admin = node::start_admin(&config.node).await?;
     let storage = StorageHealth::new(&admin);
+    // Subscriptions apply through the replication handles, which keep working while B-22 rebuilds a dataset.
+    let mut replication = std::collections::BTreeMap::new();
     let datasets = Registry::open(DATASETS, &config.datasets, |d| {
         let engine = datasets::open_engine(&config.node.data_dir, d)?;
+        replication.insert(
+            d.name,
+            storage.wrap_replication(d.name, "engine", engine.clone()),
+        );
         Ok(storage.wrap(d.name, "engine", engine))
     })?;
     // ponytail: role subsystems don't exist yet; each starts here as its issue lands.
@@ -74,7 +80,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
             prefix.push(0);
             Ok(Some(bedrock_lib::relays::client::Target {
                 selection: selection.clone(),
-                engine:engine.clone(),
+                engine:replication[selection.dataset.as_str()].clone(),
                 prefix,
             }))
         })
@@ -92,6 +98,14 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         membership::member(&config, "quicksilver"),
     )
     .map_err(|e| ConfigError(e.to_string()))?;
+    let rebuilding = bedrock_lib::reconciliation::rebuild::start(
+        &admin,
+        &storage,
+        &session,
+        "engine",
+        &replication,
+        bedrock_lib::buckets::hash_of("rebuild", &config.node.node_id, b""),
+    );
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
@@ -109,6 +123,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         }
     }
     admin.set_ready(false);
+    rebuilding.abort();
     session.drain().await;
     tracing::info!("shutting down");
     Ok(())

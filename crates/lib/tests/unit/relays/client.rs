@@ -8,6 +8,7 @@ async fn stop_joins_the_task_before_local_storage_can_be_replaced() {
     let session = Session {
         progress: Arc::default(),
         changes: Arc::new(Watched::new(0)),
+        rebuilds: Rebuilds::default(),
         task: tokio::spawn(async move {
             let _held = held;
             started.send(()).unwrap();
@@ -28,6 +29,7 @@ async fn drain_returns_once_the_draining_task_has_finished() {
     let session = Session {
         progress: Arc::default(),
         changes: Arc::new(Watched::new(0)),
+        rebuilds: Rebuilds::default(),
         task: tokio::spawn(async {}),
         member: Some(Arc::new(Watched::new(pb::Member::default()))),
     };
@@ -48,10 +50,12 @@ async fn storage_health_is_announced_and_quarantined_scopes_do_not_block_readine
             (("quicksilver".into(), "routes".into()), (5, Some(5), true)),
         ]),
         error: None,
+        ..Default::default()
     };
     let session = Session {
         progress: Arc::new(Mutex::new(progress)),
         changes: Arc::new(Watched::new(0)),
+        rebuilds: Rebuilds::default(),
         task: tokio::spawn(async {}),
         member: Some(member.clone()),
     };
@@ -390,11 +394,13 @@ async fn installed_bootstrap_and_tail_wait_for_source_confirmation_before_reads_
         connected: true,
         scopes: BTreeMap::from([(scope.clone(), (9, Some(10), consumer.validated()))]),
         error: None,
+        ..Default::default()
     }));
     let changes = Arc::new(Watched::new(0));
     let session = Session {
         progress: progress.clone(),
         changes: changes.clone(),
+        rebuilds: Rebuilds::default(),
         task: tokio::spawn(std::future::pending()),
         member: None,
     };
@@ -540,10 +546,12 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
             (healthy_scope, (1, Some(1), healthy.validated())),
         ]),
         error: failed.error,
+        ..Default::default()
     }));
     let session = Session {
         progress,
         changes: Arc::new(Watched::new(0)),
+        rebuilds: Rebuilds::default(),
         task: tokio::spawn(std::future::pending()),
         member: None,
     };
@@ -657,4 +665,77 @@ fn local_storage_error_is_scoped_but_malformed_drain_coverage_is_still_fatal() {
             .apply(&scope, &mut consumer, Action::Delivery(malformed))
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn rebuild_counts_only_after_a_fresh_verified_bootstrap() {
+    let engine = Arc::new(MemoryEngine::new("auth"));
+    let mut consumer = Consumer::new(target(engine.clone(), vec![])).unwrap();
+    consumer
+        .bootstrap(bootstrap(5, vec![(b"k", b"v")]))
+        .unwrap();
+    consumer.range(&range(5, true)).unwrap();
+    assert!(consumer.validated());
+    let scope = consumer.scope();
+    let progress = Arc::new(Mutex::new(Progress {
+        connected: true,
+        scopes: BTreeMap::from([(scope.clone(), (5, Some(5), true))]),
+        ..Default::default()
+    }));
+    let changes = Arc::new(Watched::new(0));
+    let session = Session {
+        progress: progress.clone(),
+        changes: changes.clone(),
+        rebuilds: Rebuilds::default(),
+        task: tokio::spawn(std::future::pending()),
+        member: None,
+    };
+    let rebuilder = session.rebuilder("auth");
+    let rebuilding = tokio::spawn(async move { rebuilder.rebuild().await });
+    let requested = session
+        .rebuilds
+        .wait_until(|requested| requested.get("auth") == Some(&1))
+        .await;
+    assert!(consumer.start_rebuild(&requested));
+    assert!(
+        !consumer.start_rebuild(&requested),
+        "one request starts one recovery"
+    );
+    assert!(matches!(
+        consumer.request().kind,
+        Some(pb::relay_request::Kind::Recover(pb::Recover {
+            follow: Some(pb::Follow { from: 0, .. }),
+            ..
+        }))
+    ));
+    tokio::task::yield_now().await;
+    assert!(!rebuilding.is_finished(), "the old coverage does not count");
+
+    // The instance was recreated empty; the old subscription's tail cannot rebuild it.
+    engine
+        .restore(&*MemoryEngine::new("empty").snapshot().unwrap())
+        .unwrap();
+    assert!(
+        consumer
+            .delivery(delivery(6, 6, vec![event(6, b"k", Some(b"tail"))]))
+            .is_err()
+    );
+    consumer
+        .bootstrap(bootstrap(6, vec![(b"k", b"fresh")]))
+        .unwrap();
+    assert!(
+        !consumer.validated(),
+        "a bootstrap still needs confirmation"
+    );
+    consumer.range(&range(6, true)).unwrap();
+    assert!(consumer.validated());
+    changed(&progress, &changes, |state| {
+        state.scopes.insert(scope.clone(), (6, Some(6), true));
+        state.rebuilt.insert(scope, consumer.rebuild);
+    });
+    tokio::time::timeout(Duration::from_secs(1), rebuilding)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(engine.get(b"users\0k").unwrap(), Some(b"fresh".to_vec()));
 }
