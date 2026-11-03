@@ -50,6 +50,10 @@ struct State {
     eviction: BTreeSet<(u32, u64, Identity)>,
     bytes: u64,
     failure: Option<StorageError>,
+    /// Latest arrival lost to capacity eviction or a rebuild, per `(dataset, namespace)`; age pruning is not a loss
+    /// (B-18b). In memory only: losses before a restart are not known afterwards.
+    // ponytail: never pruned, bounded by namespaces the cache has held, like the relay's head map.
+    evicted: BTreeMap<(String, String), u64>,
 }
 
 pub struct Replay {
@@ -203,6 +207,20 @@ impl Replay {
         ranges
     }
 
+    /// Whether this namespace's cache holds everything that arrived within the window: healthy, one contiguous
+    /// range, and no record younger than the window lost to capacity or a rebuild since this process opened it.
+    pub fn covers_window(&self, dataset: &str, namespace: &str, now_ms: u64) -> bool {
+        if !self.healthy() || self.ranges(dataset, namespace).len() > 1 {
+            return false;
+        }
+        self.lock().is_ok_and(|state| {
+            state
+                .evicted
+                .get(&(dataset.to_owned(), namespace.to_owned()))
+                .is_none_or(|at| now_ms.saturating_sub(*at) > self.config.window_ms)
+        })
+    }
+
     pub fn healthy(&self) -> bool {
         let Ok(mut state) = self.lock() else {
             return false;
@@ -229,7 +247,21 @@ impl Replay {
             Ok(())
         })();
         match &result {
-            Ok(()) => *state = State::default(),
+            Ok(()) => {
+                // Every record is gone; keep coverage honest until they would have left the window.
+                let mut lost = std::mem::take(&mut state.evicted);
+                for ((dataset, namespace, _), record) in &state.records {
+                    State::lose(
+                        &mut lost,
+                        (dataset.clone(), namespace.clone()),
+                        record.arrived_at,
+                    );
+                }
+                *state = State {
+                    evicted: lost,
+                    ..State::default()
+                };
+            }
             Err(error) => state.failure = Some(error.clone()),
         }
         result
@@ -294,6 +326,15 @@ impl Replay {
                 break;
             }
         }
+        let lost: Vec<_> = capacity_removed
+            .iter()
+            .map(|id| {
+                let record = candidates
+                    .get(id)
+                    .map_or_else(|| &state.records[id], |(r, _)| r);
+                ((id.0.clone(), id.1.clone()), record.arrived_at)
+            })
+            .collect();
         removed.extend(capacity_removed);
         let mut batch = WriteBatch::default();
         let mut retained = Vec::new();
@@ -314,6 +355,9 @@ impl Replay {
         }
         for (id, record) in retained {
             state.insert(&self.config, id, record);
+        }
+        for (scope, at) in lost {
+            State::lose(&mut state.evicted, scope, at);
         }
         self.check_disk()
     }
@@ -348,6 +392,11 @@ impl Replay {
 }
 
 impl State {
+    fn lose(evicted: &mut BTreeMap<(String, String), u64>, scope: (String, String), at: u64) {
+        let latest = evicted.entry(scope).or_insert(at);
+        *latest = (*latest).max(at);
+    }
+
     fn insert(&mut self, config: &ReplayConfig, id: Identity, record: Record) {
         self.age.insert((record.arrived_at, id.clone()));
         self.eviction.insert((

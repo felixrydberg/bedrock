@@ -1,4 +1,4 @@
-# Cell membership (#15 / B-12), L2 placement directory (#19 / B-16) and range handoff (#22 / B-21)
+# Cell membership (#15 / B-12), L2 placement directory (#19 / B-16), storage health (#13 / B-14) and range handoff (#22 / B-21)
 
 A member is a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process that is receiving updates: it holds a leaf
 `Relay.Session` to a relay of its own cell. There is no heartbeat or gossip protocol and no epoch.
@@ -6,9 +6,14 @@ A member is a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process that 
 ## Protocol
 
 - **Handshake.** A leaf `Hello` carries a `Member`: node ID, service, region, DC, cell, roles, datasets,
-  CPU/memory/disk budget, failure domain, advertised address and status (`ready`/`draining`). Later
-  `RelayRequest.member` messages may change only the status of the same `(service, node_id)`. Relay-to-relay
-  and recovery sessions carry no member. Identities are ASCII letters, digits, `-`, `_` and `.`.
+  CPU/memory/disk budget, failure domain, advertised address, status (`ready`/`draining`) and unhealthy
+  datasets. Later `RelayRequest.member` messages may change only the status and unhealthy datasets of the same
+  `(service, node_id)`. Relay-to-relay and recovery sessions carry no member. Identities are ASCII letters,
+  digits, `-`, `_` and `.`.
+- **Storage health.** `Member.unhealthy` lists, in order, the member's own datasets whose local storage its
+  process has quarantined or is rebuilding (`health::storage`). The session sends a member update when the list
+  changes and the current list on every `Hello`. It is published like any other change to the entry. It is not a
+  heartbeat: it is sent only on change, on the stream the node already holds.
 - **Relay view.** Each relay lists the members on its leaf sessions, the newest session winning a duplicate
   identity, with each subscription's acknowledged revision for range readiness (#22 / B-21). When a
   draining member's stream closes, the relay keeps it as relay-local `LEFT` for 30 seconds.
@@ -54,7 +59,9 @@ all membership changes until it returns.
   plans from applied membership. Each pass runs `placement::assign` (#18 / B-15) per dataset, over the members whose
   `datasets` include it, with 3 replicas and at most 16 ranges moving, and applies the handoff steps below. It then
   waits for its subscription to apply the writes, as for membership. `bedrock-quicksilver` places `quicksilver` and
-  `auth`; `bedrock-cdn` places `cdn`, whose ref keys sit at their artifact's content hash (B-34, §4 decision 14).
+  `auth`; `bedrock-cdn` places `cdn`, whose ref keys sit at their artifact's content hash (B-34, §4 decision 14). A
+  member announcing a dataset as unhealthy (#13 / B-14) gets no new ranges of it. It keeps what it holds, for B-22
+  to rebuild, and source selection skips it for the unhealthy datasets only.
 - **Owner checks.** Nodes read the directory from `membership::View::directory`. `placement::owners` lists the owners
   of a hash; a node serves a hash only if it holds it as `ready` or `leaving` in its own view. A caller routed by a
   stale view is rejected and retries the next owner. Revisions are ordinary dataset revisions, not a placement
@@ -106,7 +113,8 @@ The directory adds `Points`, the possible range starts, and `Write(r, p, o)`, wh
 checks those rules rather than `assign`'s balance:
 
 - `Covered`: start 0 always exists, so the implicit range ends cover the hash space.
-- `NewOwnersPublished`: only published, non-draining members become new owners.
+- `NewOwnersPublished`: only published, non-draining members whose published storage is healthy become new
+  owners. `Sicken` toggles a node's storage health (`sick`); `Set` publishes it with the status (`pubSick`).
 - `NoEarlyDrop`: a range with a holder (`ready` or `leaving`) still in membership keeps a holder. A `leaving` owner
   goes only when every other owner of the entry is ready.
 
@@ -180,6 +188,20 @@ Negative checks in ignored temporary copies, 2026-11-01: revoking a `leaving` ow
 members violates `NewOwnersPublished` at depth 6. Writing from a relay without a majority violates `Freeze` at
 depth 5.
 
+With storage health (#13 / B-14), TLC 1.8.0 on 2026-11-01 with `Grace = 2` and `Points = {0, 1}`:
+
+| Relays | Nodes | Generated states | Distinct states | Depth | Result |
+|---|---|---:|---:|---:|---|
+| `{1, 2, 3}` | `{1}` (`membership.cfg`) | 17,684,369 | 1,437,600 | 23 | no violation (1 min 17 s) |
+| `{1}` | `{1, 2}` | 237,939,713 | 18,496,000 | 28 | no violation (24 min 11 s) |
+
+Negative check in an ignored temporary copy, 2026-11-01: letting `Write` give ranges to a member whose published
+storage is unhealthy violates `NewOwnersPublished` at depth 6.
+
+After merging storage health with per-dataset `Carriers` (2026-11-03), TLC `2026.10.28.014557` checked
+`membership.cfg`: 17,684,369 generated and 1,437,600 distinct states, depth 24, no violation (1 min 12 s). With one
+node carrying the dataset the counts match the storage-health run; this TLC build reports the depth as 24.
+
 With `Carriers`, TLC `2026.10.28.014557` (rev `56d37a9`) on 2026-11-02 checked `membership.cfg`
 (`Carriers = {1}`): 4,924,193 generated and 431,280 distinct states, depth 22, no violation (12 s). The state
 counts match the 2026-11-01 run; this TLC build reports the depth as 22.
@@ -240,6 +262,13 @@ On 2026-11-01 in WSL Ubuntu, with the placement directory, the same checks passe
 suites. Simulation tests: 176 passed in 28 suites. Each placement seed (1, 2 and 42) produced the same trace twice:
 three ready owners per range 1.3 simulated seconds after start, and a killed member's ranges reassigned about
 20 s after it stopped.
+
+On 2026-11-01 in WSL Ubuntu, with storage health, the same checks passed. Native tests: 235 passed. Simulation
+tests: 197 passed in 28 suites. The placement scenario now also corrupts one member's wrapped engine: every node's
+view shows the dataset as unhealthy 0.1 simulated seconds after the corrupt read, and healthy again 0.1 s after the
+recovery. Seeds 1, 2 and 42 each produced the same trace twice. Unit tests cover quarantine and isolation in
+`health::storage`, readiness with a quarantined dataset, entry validation, relay member updates, session updates,
+placement without new ranges for unhealthy members, and source selection skipping them per dataset.
 
 On 2026-11-02, with relay-derived readiness (#22 / B-21 phase 4), owners become `ready` only after their relays
 report them so, and `placement::promote` is gone. The placement scenario now waits until the directory has not

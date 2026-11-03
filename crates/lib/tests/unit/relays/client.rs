@@ -13,7 +13,7 @@ async fn stop_joins_the_task_before_local_storage_can_be_replaced() {
             started.send(()).unwrap();
             std::future::pending::<()>().await;
         }),
-        draining: None,
+        member: None,
     };
     ready.await.unwrap();
     session.stop().await;
@@ -29,10 +29,43 @@ async fn drain_returns_once_the_draining_task_has_finished() {
         progress: Arc::default(),
         changes: Arc::new(Watched::new(0)),
         task: tokio::spawn(async {}),
-        draining: Some(Arc::new(Watched::new(false))),
+        member: Some(Arc::new(Watched::new(pb::Member::default()))),
     };
     // Polling the finished task again would panic.
     session.drain().await;
+}
+
+#[tokio::test]
+async fn storage_health_is_announced_and_quarantined_scopes_do_not_block_readiness() {
+    let member = Arc::new(Watched::new(pb::Member {
+        datasets: vec!["auth".into(), "quicksilver".into()],
+        ..Default::default()
+    }));
+    let progress = Progress {
+        connected: true,
+        scopes: BTreeMap::from([
+            (("auth".into(), "users".into(), None), (0, None, false)),
+            (
+                ("quicksilver".into(), "routes".into(), None),
+                (5, Some(5), true),
+            ),
+        ]),
+        error: None,
+    };
+    let session = Session {
+        progress: Arc::new(Mutex::new(progress)),
+        changes: Arc::new(Watched::new(0)),
+        task: tokio::spawn(async {}),
+        member: Some(member.clone()),
+    };
+    let quarantined = BTreeSet::from(["auth".to_string(), "cdn".to_string()]);
+    // A dataset the member never announced is dropped, or the relay would refuse the update.
+    session.set_unhealthy(&quarantined);
+    assert_eq!(member.get().unhealthy, ["auth"]);
+    assert!(!session.ready());
+    assert!(session.ready_except(&quarantined));
+    session.set_unhealthy(&BTreeSet::new());
+    assert!(member.get().unhealthy.is_empty());
 }
 
 fn target(engine: Arc<MemoryEngine>) -> Target {
@@ -457,7 +490,7 @@ async fn installed_bootstrap_and_tail_wait_for_source_confirmation_before_reads_
         progress: progress.clone(),
         changes: changes.clone(),
         task: tokio::spawn(std::future::pending()),
-        draining: None,
+        member: None,
     };
     assert!(!session.ready());
     assert!(
@@ -607,7 +640,7 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
         progress,
         changes: Arc::new(Watched::new(0)),
         task: tokio::spawn(std::future::pending()),
-        draining: None,
+        member: None,
     };
     assert!(!session.ready());
     assert!(session.error().is_some());

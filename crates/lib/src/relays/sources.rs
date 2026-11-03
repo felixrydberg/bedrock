@@ -1,5 +1,6 @@
 //! Source selection on a cache miss (#20 / B-19). Each node chooses from its own view of its cell: its service's members
-//! and placement directory ([`crate::membership::View`]), its circuit breakers (#12 / B-13) and the revisions holders
+//! and placement directory ([`crate::membership::View`]), its circuit breakers (#12 / B-13), the storage health members
+//! announce (#13 / B-14) and the revisions holders
 //! reported when they turned down a read. Relays stay off the read path.
 //!
 //! Freshness is checked by the holder when it serves. A holder behind the requested minimum revision rejects the read
@@ -42,7 +43,8 @@ impl Sources {
 
     /// Holders of `hash` in a ranged service (`quicksilver`, `cdn`), best first: `ready` owners before `leaving` or
     /// draining ones, then those in the caller's failure `domain`. Never `populating` owners, owners that are no longer
-    /// members, or holders that reported being behind `min_revision` within [`RECHECK`]. Open breakers are skipped
+    /// members, owners whose `dataset` storage is unhealthy, or holders that reported being behind `min_revision` within
+    /// [`RECHECK`]. Open breakers are skipped
     /// unless every candidate's is open ([`Health::route`] fails open). Keys hash with
     /// [`crate::placement::hash_of`]; CDN artifacts use their content hash and minimum revision 0.
     #[allow(clippy::too_many_arguments)]
@@ -69,6 +71,7 @@ impl Sources {
                 })
             })
             .filter_map(|o| Some((&o.state, members.get(&o.node)?)))
+            .filter(|(_, m)| !m.unhealthy.iter().any(|d| d == dataset))
             .collect();
         drop(behind);
         // Stable, so equal candidates keep directory order.

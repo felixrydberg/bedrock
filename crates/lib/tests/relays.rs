@@ -933,3 +933,134 @@ async fn range_follow_streams_every_namespace_and_only_its_hashes_through_two_ti
     cell_task.abort();
     writer.close().await.unwrap();
 }
+
+async fn admin_get(admin: &Arc<Admin>, path: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(admin.clone().serve(listener));
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: relay\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    task.abort();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    response.split_once("\r\n\r\n").unwrap().1.to_owned()
+}
+
+/// The series of `name` whose labels include every one of `labels`.
+fn sample(metrics: &str, name: &str, labels: &[&str]) -> Option<String> {
+    metrics
+        .lines()
+        .find(|line| {
+            line.starts_with(&format!("{name}{{")) && labels.iter().all(|l| line.contains(l))
+        })
+        .map(|line| line.rsplit(' ').next().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn introspection_matches_the_leaf_and_lag_is_reported_at_every_tier() {
+    use bedrock_lib::relays::introspection;
+    let writer = writer().await;
+    let source = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17901).await;
+    let clock = || 1_700_000_000_250;
+    let top = relay("top", 3, &source.address).with_clock(clock);
+    let top_admin = Admin::new();
+    introspection::register(&top_admin, &top, "region", "c1", None);
+    let top_task = top.start();
+    let top_server = serve(top, 17902).await;
+    let cell = relay("cell", 1, &top_server.address).with_clock(clock);
+    let cell_admin = Admin::new();
+    introspection::register(&cell_admin, &cell, "cell", "c1", None);
+    let cell_task = cell.start();
+    let cell_server = serve(cell, 17903).await;
+    for value in [b"one".as_slice(), b"two"] {
+        commit(
+            &writer,
+            "quicksilver",
+            "site",
+            Operation::Set(value.to_vec()),
+        )
+        .await;
+        commit(&writer, "auth", "accounts", Operation::Set(value.to_vec())).await;
+    }
+    let local = Arc::new(MemoryEngine::new("consumer"));
+    let session =
+        Session::start(peers(), vec![cell_server.address.clone()], targets(&local)).unwrap();
+    caught_up(&session, 2).await;
+
+    // Replay persistence is asynchronous; the view must settle on what the leaf applied.
+    let view = tokio::time::timeout(DEADLINE, async {
+        loop {
+            let body = admin_get(
+                &cell_admin,
+                "/introspect/namespaces?dataset=quicksilver&prefix=si",
+            )
+            .await;
+            let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if view["items"][0]["replay"] == serde_json::json!([[1, 2]]) {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("replay range reaches the applied revision");
+    let item = &view["items"][0];
+    assert_eq!(view["items"].as_array().unwrap().len(), 1, "{view}");
+    assert_eq!(item["namespace"], "site");
+    assert_eq!(item["subscribers"], 1);
+    assert_eq!(
+        item["latest"],
+        session.applied("quicksilver", "site").unwrap()
+    );
+    assert_eq!(item["head"], 2);
+    assert_eq!(item["lag_ms"], 250);
+
+    let subscribers: serde_json::Value =
+        serde_json::from_str(&admin_get(&top_admin, "/introspect/subscribers").await).unwrap();
+    assert_eq!(
+        subscribers["items"].as_array().unwrap().len(),
+        1,
+        "the cell relay"
+    );
+    let upstream: serde_json::Value =
+        serde_json::from_str(&admin_get(&cell_admin, "/introspect/upstream?dataset=auth").await)
+            .unwrap();
+    assert_eq!(upstream["connected"], top_server.address);
+    assert_eq!(upstream["items"][0]["cursor"], 2);
+
+    for (admin, tier) in [(&top_admin, "region"), (&cell_admin, "cell")] {
+        let metrics = admin_get(admin, "/metrics").await;
+        let labels = [
+            &format!("tier=\"{tier}\"") as &str,
+            "dataset=\"quicksilver\"",
+        ];
+        assert_eq!(
+            sample(&metrics, "bedrock_relay_lag_seconds_count", &labels).as_deref(),
+            Some("2"),
+            "{metrics}"
+        );
+        assert_eq!(
+            sample(&metrics, "bedrock_relay_lag_seconds_sum", &labels).as_deref(),
+            Some("0.5"),
+            "{metrics}"
+        );
+        assert_eq!(
+            sample(&metrics, "bedrock_relay_events_in_total", &labels).as_deref(),
+            Some("2"),
+            "{metrics}"
+        );
+        assert_eq!(
+            sample(&metrics, "bedrock_relay_subscribers", &["service=\"none\""]).as_deref(),
+            Some("1.0"),
+            "{metrics}"
+        );
+    }
+    drop(session);
+    top_task.abort();
+    cell_task.abort();
+    writer.close().await.unwrap();
+}

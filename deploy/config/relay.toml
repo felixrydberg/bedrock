@@ -2,6 +2,8 @@ node_id = "relay-eu-1a-1"
 listen = "0.0.0.0:7300"
 # The address siblings and nodes dial; siblings list it in their replay_peers.
 advertise = "relay-eu-1a-1:7300"
+# Metrics and /introspect (topology, node addresses, namespaces) are unauthenticated: expose on a trusted
+# management network only.
 admin_listen = "0.0.0.0:7301"
 data_dir = "/data"
 tier = "cell"

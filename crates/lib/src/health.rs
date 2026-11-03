@@ -7,7 +7,10 @@
 //! - **open → half-open** once the backoff has passed: the next real call to the peer is the probe.
 //! - **half-open → closed** on success, otherwise **open** again with double the backoff, up to [`MAX_BACKOFF`].
 //!
-//! The view is local to this node and never shared; removing a node from the cell is B-12's decision.
+//! The view is local to this node and never shared; removing a node from the cell is B-12's decision. Local storage
+//! health is [`storage`] (B-14).
+
+pub mod storage;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

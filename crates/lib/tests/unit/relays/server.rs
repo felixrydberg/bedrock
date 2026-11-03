@@ -410,6 +410,32 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
         hub.0.subscribers.lock().unwrap()[&2].member,
         Some(member("kv-1", pb::member::Status::Draining))
     );
+    // Storage health changes too (B-14), but only for datasets the member announced.
+    let with = |datasets: &[&str], unhealthy: &[&str]| pb::Member {
+        datasets: datasets.iter().map(|d| d.to_string()).collect(),
+        unhealthy: unhealthy.iter().map(|d| d.to_string()).collect(),
+        ..member("kv-1", pb::member::Status::Draining)
+    };
+    assert!(!hub.member(2, with(&["auth"], &["auth"])));
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&2)
+        .unwrap()
+        .member = Some(with(&["auth"], &[]));
+    assert!(hub.member(2, with(&["auth"], &["auth"])));
+    assert_eq!(
+        hub.0.subscribers.lock().unwrap()[&2].member,
+        Some(with(&["auth"], &["auth"]))
+    );
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&2)
+        .unwrap()
+        .member = Some(member("kv-1", pb::member::Status::Draining));
     // The newest session for an identity wins; closing it leaves a LEFT marker over the stale one.
     hub.remove(2);
     let key = ("kv".to_string(), "kv-1".to_string());

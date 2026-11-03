@@ -1,5 +1,6 @@
 //! Pushed-data relay sessions, bounded fan-out and disposable replay (#14/B-17, #16/B-18).
 pub mod client;
+pub mod introspection;
 pub mod ranges;
 pub mod replay;
 pub mod siblings;
@@ -97,6 +98,7 @@ struct Inner {
     /// Draining members whose stream closed, kept as `LEFT` so cell relays remove them without grace (B-12).
     departed: Mutex<BTreeMap<MemberKey, (pb::Member, tokio::time::Instant)>>,
     members_changed: Arc<Watched<u64>>,
+    stats: introspection::Stats,
 }
 
 /// `(service, node_id)`.
@@ -214,6 +216,7 @@ impl Hub {
             replay_bytes: AtomicUsize::new(0),
             departed: Mutex::default(),
             members_changed: Arc::new(Watched::new(0)),
+            stats: Default::default(),
         }))
     }
     pub fn with_clock(self, clock: fn() -> u64) -> Self {
@@ -501,6 +504,7 @@ impl Hub {
             sub.closed.update(|v| *v = true);
             sub.changed.update(|v| *v = v.wrapping_add(1));
             if let Some(mut member) = sub.member {
+                self.0.stats.disconnected(&member);
                 if member.status == pb::member::Status::Draining as i32 {
                     member.status = pb::member::Status::Left as i32;
                     self.0.departed.lock().unwrap().insert(
@@ -513,7 +517,7 @@ impl Hub {
         }
         self.changed();
     }
-    /// The first member must arrive on a leaf Hello; later ones may change only its status.
+    /// The first member must arrive on a leaf Hello; later ones may change only its status and unhealthy datasets.
     fn member(&self, id: u64, member: pb::Member) -> bool {
         if crate::membership::validate(&member).is_err() {
             return false;
@@ -522,14 +526,17 @@ impl Hub {
         let Some(sub) = subscribers.get_mut(&id) else {
             return false;
         };
-        let Some(current) = sub
-            .member
-            .as_mut()
-            .filter(|current| crate::membership::key(current) == crate::membership::key(&member))
-        else {
+        let Some(current) = sub.member.as_mut().filter(|current| {
+            crate::membership::key(current) == crate::membership::key(&member)
+                && member
+                    .unhealthy
+                    .iter()
+                    .all(|d| current.datasets.contains(d))
+        }) else {
             return false;
         };
         current.status = member.status;
+        current.unhealthy = member.unhealthy;
         drop(subscribers);
         self.members_changed();
         true
@@ -539,7 +546,7 @@ impl Hub {
         match self.enqueue(id, pb::RelayFrame { kind: Some(kind) }, None) {
             Ok(sent) => sent,
             Err(_) => {
-                self.remove(id);
+                self.drop_full(id);
                 false
             }
         }
@@ -575,7 +582,7 @@ impl Hub {
         })
         .await;
         queued.unwrap_or_else(|_| {
-            self.remove(id);
+            self.drop_full(id);
             false
         })
     }
@@ -617,10 +624,17 @@ impl Hub {
             Some(pb::relay_frame::Kind::Range(r)) if r.recovered => Some(false),
             _ => None,
         };
+        let delivery = match &frame.kind {
+            Some(pb::relay_frame::Kind::Delivery(d)) => Some(d.dataset.clone()),
+            _ => None,
+        };
         sub.bytes.fetch_add(len, Ordering::Relaxed);
         sub.events.fetch_add(events, Ordering::Relaxed);
         match sub.tx.try_send(Ok(frame)) {
             Ok(()) => {
+                if let Some(dataset) = delivery {
+                    self.0.stats.sent(dataset, events, len);
+                }
                 // Published under the lock, so no acknowledgement can observe the frame first.
                 if let Some((key, _)) = scope
                     && let Some(interest) = sub.follows.get_mut(key)
@@ -818,7 +832,12 @@ impl Hub {
                 self.0.replay_bytes.fetch_sub(size, Ordering::Relaxed);
             }
         }
-        self.encoded(event);
+        let committed_at = event.committed_at;
+        let bytes = self.encoded(event).bytes.len();
+        let now = self.0.clock.lock().unwrap().map(|clock| clock());
+        self.0
+            .stats
+            .received(&key, sequence, committed_at, bytes, now);
         self.observe_head(&key, sequence);
     }
     async fn read(&self, key: &Key, from: u64) -> Result<Vec<Encoded>, Status> {
@@ -1592,7 +1611,9 @@ impl Hub {
                 }
             }
             for peer in self.0.peers.health().route(&self.0.upstreams) {
-                if let Err(error) = self.upstream_session(peer).await {
+                let result = self.upstream_session(peer).await;
+                self.0.stats.connected(None);
+                if let Err(error) = result {
                     tracing::warn!(%peer,%error,"relay upstream failed");
                     self.0.peers.health().trip(peer);
                 }
@@ -1637,6 +1658,7 @@ impl Hub {
                 "upstream must be a higher tier",
             ));
         }
+        self.0.stats.connected(Some(peer));
         // Next expected revision per namespace, from namespace follows and whole-dataset follows alike.
         let mut sent = BTreeMap::<Key, u64>::new();
         let mut sent_datasets = BTreeSet::<String>::new();
@@ -1732,7 +1754,9 @@ impl Hub {
             received = crate::monotonic_now();
             match frame.kind {
                 Some(pb::relay_frame::Kind::Range(range)) => {
-                    self.observe_head(&(range.dataset, range.namespace), range.head);
+                    let key = (range.dataset, range.namespace);
+                    self.0.stats.upstream_head(&key, range.head);
+                    self.observe_head(&key, range.head);
                     self.changed();
                 }
                 Some(pb::relay_frame::Kind::Delivery(d)) => {
