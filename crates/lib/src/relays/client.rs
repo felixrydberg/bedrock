@@ -1012,6 +1012,7 @@ async fn connected(
             Some(pb::relay_frame::Kind::Ranges(ranges)) => {
                 pushed.pending.insert(ranges.dataset.clone(), ranges);
                 settle(&requests, consumers, pushed, progress, changes).await?;
+                intake.forget(consumers);
                 continue;
             }
             Some(pb::relay_frame::Kind::Delivery(d)) => (
@@ -1108,6 +1109,7 @@ async fn connected(
         // The membership view may have reached a pushed set's revision.
         if !pushed.pending.is_empty() {
             settle(&requests, consumers, pushed, progress, changes).await?;
+            intake.forget(consumers);
         }
     }
 }
@@ -1313,6 +1315,12 @@ struct Intake {
 }
 
 impl Intake {
+    /// Drops the failures and retries of scopes a revoke or split removed while they were pending.
+    fn forget(&mut self, consumers: &BTreeMap<Scope, Consumer>) {
+        self.failed.retain(|scope| consumers.contains_key(scope));
+        self.retries.retain(|scope| consumers.contains_key(scope));
+    }
+
     fn fail(&mut self, scope: &Scope, consumer: &mut Consumer, error: Status) -> Effect {
         consumer.recover = true;
         consumer.awaiting_confirmation = true;
