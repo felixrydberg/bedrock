@@ -451,3 +451,70 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
             .contains_key(&("kv".to_string(), "kv-2".to_string()))
     );
 }
+
+fn caller(service: &str, cell: &str, node_id: &str) -> Caller {
+    Caller {
+        service: service.into(),
+        cell: cell.into(),
+        node_id: node_id.into(),
+        hosts: vec!["10.0.0.7".into()],
+    }
+}
+
+#[test]
+fn sessions_are_authorized_by_the_callers_certificate() {
+    let member = pb::Member {
+        node_id: "n7".into(),
+        service: "kv".into(),
+        cell: "c1".into(),
+        address: "10.0.0.7:7000".into(),
+        ..Default::default()
+    };
+    let denied = |result: Result<(), Status>| {
+        assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied)
+    };
+    // A leaf of its own cell's relay, announcing itself.
+    authorize(&caller("kv", "c1", "n7"), 1, "c1", 0, Some(&member)).unwrap();
+    authorize(&caller("quicksilver", "c1", "q1"), 1, "c1", 0, None).unwrap();
+    denied(authorize(
+        &caller("kv", "c2", "n7"),
+        1,
+        "c1",
+        0,
+        Some(&member),
+    ));
+    denied(authorize(&caller("relay", "c1", "r1"), 1, "c1", 0, None));
+    // The announced member must be the caller.
+    denied(authorize(
+        &caller("kv", "c1", "n8"),
+        1,
+        "c1",
+        0,
+        Some(&member),
+    ));
+    denied(authorize(
+        &caller("cdn", "c1", "n7"),
+        1,
+        "c1",
+        0,
+        Some(&member),
+    ));
+    let elsewhere = pb::Member {
+        address: "10.0.0.8:7000".into(),
+        ..member.clone()
+    };
+    denied(authorize(
+        &caller("kv", "c1", "n7"),
+        1,
+        "c1",
+        0,
+        Some(&elsewhere),
+    ));
+    // Relays of any cell reach upper tiers and the writer; services never do.
+    authorize(&caller("relay", "c2", "r2"), 2, "dc", 1, None).unwrap();
+    authorize(&caller("relay", "c2", "r2"), WRITER, "", 3, None).unwrap();
+    denied(authorize(&caller("kv", "c1", "n7"), 2, "dc", 1, None));
+    denied(authorize(&caller("kv", "c1", "n7"), WRITER, "", 0, None));
+    // A relay without a configured cell admits no leaves.
+    denied(authorize(&caller("kv", "", "n7"), 1, "", 0, None));
+}

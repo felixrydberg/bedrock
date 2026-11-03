@@ -309,6 +309,7 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
     tokio::spawn(bedrock_api::serve(
         http,
         bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
+        None,
     ));
     let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let replication = grpc.local_addr().unwrap().to_string();
@@ -377,6 +378,7 @@ async fn simulated() {
             tokio::spawn(bedrock_api::serve(
                 http,
                 bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
+                None,
             ));
             tonic::transport::Server::builder()
                 .add_service(pb::relay_server::RelayServer::new(Hub::writer(

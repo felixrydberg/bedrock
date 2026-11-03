@@ -15,7 +15,10 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     }
     let admin = node::start_admin(&config.node).await?;
     let (members, target) = membership::View::new("kv", &config.node.location.cell);
-    let peers = std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin));
+    let peers = std::sync::Arc::new(
+        bedrock_lib::transport::Peers::new(&admin)
+            .with_tls(bedrock_lib::transport::tls::start(&config.node, "kv", &admin).await?),
+    );
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),

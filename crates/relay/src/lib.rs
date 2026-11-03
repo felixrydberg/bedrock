@@ -13,7 +13,8 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
         "starting bedrock-relay"
     );
     let admin = node::start_admin(&config.node).await?;
-    let peers = Arc::new(bedrock_lib::transport::Peers::new(&admin));
+    let tls = bedrock_lib::transport::tls::start(&config.node, "relay", &admin).await?;
+    let peers = Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(tls.clone()));
     let mut replay_config = bedrock_lib::relays::replay::ReplayConfig {
         max_bytes: config.replay.max_bytes.unwrap_or(1024 * 1024 * 1024),
         window_ms: config.replay.window_ms.unwrap_or(match config.tier {
@@ -58,7 +59,8 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
         config.replay_peers.clone(),
         replay,
     )
-    .with_clock(now);
+    .with_clock(now)
+    .with_cell(config.node.location.cell.clone());
     let mut tasks = vec![hub.start()];
     let mut publisher = None;
     // Every relay serves its siblings; only membership watches them so far (#41 / B-12b adds interests).
@@ -94,14 +96,14 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
         &config.node.location.cell,
         publisher,
     );
-    let server = tonic::transport::Server::builder()
+    let router = bedrock_lib::transport::server(tls.as_ref())
         .add_service(bedrock_lib::replication::pb::relay_server::RelayServer::new(hub.clone()))
         .add_service(
             bedrock_lib::replication::pb::siblings_server::SiblingsServer::new(
                 bedrock_lib::relays::siblings::Server(hub),
             ),
-        )
-        .serve(config.node.listen);
+        );
+    let server = bedrock_lib::transport::serve(router, config.node.listen, tls);
     admin.set_ready(true);
     tokio::select! {biased;
         () = node::shutdown_signal() => {},

@@ -5,7 +5,6 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
-tonic.workspace = true
 bedrock-lib.workspace = true
 tokio.workspace = true
 tracing.workspace = true

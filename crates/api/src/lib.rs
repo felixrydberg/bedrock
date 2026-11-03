@@ -7,6 +7,8 @@
 //! the committed sequence. An `Idempotency-Key` retry returns the original sequence while it remains
 //! within the configured retry duration (24 hours by default). An expired retry is a new write.
 //! Every write requires `Authorization: Bearer <write_token>`; the configured token grants access to all writes.
+//! With `tls` configured, both listeners use TLS (B-55): relays need a node certificate, while write callers may
+//! present one but still authenticate with the token.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +25,7 @@ use bedrock_lib::replication::Operation;
 use bedrock_lib::replication::writer::{
     CommitError, Persistence, PersistenceMetrics, Write, Writer,
 };
+use bedrock_lib::transport::{self, tls::Tls};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
@@ -33,6 +36,7 @@ use tokio::net::TcpListener;
 pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     tracing::info!(node_id = %config.node.node_id, "starting bedrock-api");
     let admin = node::start_admin(&config.node).await?;
+    let tls = transport::tls::start(&config.node, "api", &admin).await?;
     config
         .retention
         .validate()
@@ -58,18 +62,17 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     let writes = TcpListener::bind(config.write_listen)
         .await
         .map_err(|e| ConfigError(format!("write_listen {}: {e}", config.write_listen)))?;
-    let writes = tokio::spawn(serve(writes, app));
-    let replication = tonic::transport::Server::builder()
-        .add_service(
-            bedrock_lib::replication::pb::relay_server::RelayServer::new(
-                bedrock_lib::relays::Hub::writer(
-                    config.node.node_id.clone(),
-                    writer.clone(),
-                    Arc::new(bedrock_lib::transport::Peers::new(&admin)),
-                ),
+    let writes = tokio::spawn(serve(writes, app, tls.clone()));
+    let router = transport::server(tls.as_ref()).add_service(
+        bedrock_lib::replication::pb::relay_server::RelayServer::new(
+            bedrock_lib::relays::Hub::writer(
+                config.node.node_id.clone(),
+                writer.clone(),
+                Arc::new(transport::Peers::new(&admin).with_tls(tls.clone())),
             ),
-        )
-        .serve(config.node.listen);
+        ),
+    );
+    let replication = transport::serve(router, config.node.listen, tls);
 
     admin.set_ready(true);
     tokio::select! {
@@ -128,13 +131,28 @@ async fn authorize(State(write_token): State<Arc<str>>, request: Request, next: 
     next.run(request).await
 }
 
-/// Serves `app` over HTTP/1 through hyper. `axum::serve` does not run under madsim (#9).
-pub async fn serve(listener: TcpListener, app: Router) {
+/// Serves `app` over HTTP/1 through hyper, over TLS when `tls` is set. `axum::serve` does not run under madsim (#9).
+pub async fn serve(listener: TcpListener, app: Router, tls: Option<Arc<Tls>>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let service = TowerToHyperService::new(app.clone());
-                tokio::spawn(http1::Builder::new().serve_connection(TokioIo::new(stream), service));
+                let Some(tls) = tls.clone() else {
+                    tokio::spawn(
+                        http1::Builder::new().serve_connection(TokioIo::new(stream), service),
+                    );
+                    continue;
+                };
+                tokio::spawn(async move {
+                    match tls.accept_optional(stream).await {
+                        Ok(stream) => {
+                            let _ = http1::Builder::new()
+                                .serve_connection(TokioIo::new(stream), service)
+                                .await;
+                        }
+                        Err(error) => tracing::debug!(%error, "write tls handshake rejected"),
+                    }
+                });
             }
             Err(error) => tracing::warn!(%error, "accepting a write connection failed"),
         }

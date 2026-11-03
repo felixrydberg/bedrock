@@ -74,7 +74,10 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     let mut targets: Vec<_> = targets.into_iter().flatten().collect();
     let (members, target) = membership::View::new("cdn", &config.node.location.cell);
     targets.push(target);
-    let peers = std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin));
+    let peers = std::sync::Arc::new(
+        bedrock_lib::transport::Peers::new(&admin)
+            .with_tls(bedrock_lib::transport::tls::start(&config.node, "cdn", &admin).await?),
+    );
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
