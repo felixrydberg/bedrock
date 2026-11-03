@@ -98,6 +98,38 @@ impl MemoryLog {
     }
 
     /// Initializes an empty log at an already-installed state boundary.
+    /// The namespaces of `dataset` this log holds, in order.
+    pub fn namespaces(&self, dataset: &str) -> Vec<String> {
+        self.namespaces
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(d, _)| d == dataset)
+            .map(|(_, namespace)| namespace.clone())
+            .collect()
+    }
+
+    /// A counter incremented, with wrapping, when a dataset and namespace entry is first created.
+    pub fn added(&self) -> &Watched<u64> {
+        &self.added
+    }
+
+    fn entry<'a>(
+        &self,
+        namespaces: &'a mut BTreeMap<(String, String), NamespaceLog>,
+        dataset: &str,
+        namespace: &str,
+    ) -> &'a mut NamespaceLog {
+        namespaces
+            .entry((dataset.to_owned(), namespace.to_owned()))
+            .or_insert_with(|| {
+                self.added.update(|v| *v = v.wrapping_add(1));
+                NamespaceLog::new()
+            })
+    }
+
+    /// Initializes an empty log at an already-installed state boundary. Returns an error if the log has events or a
+    /// nonzero head.
     pub fn reset(&self, dataset: &str, namespace: &str, boundary: u64) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
         let log = namespaces
@@ -133,7 +165,8 @@ impl MemoryLog {
         Ok(())
     }
 
-    /// Commits `event`, which must carry its namespace's next sequence.
+    /// Commits `event`, which must carry its namespace's next sequence. Returns an error for a different sequence or
+    /// sequence overflow. An unseen namespace is created even if the append fails.
     pub fn append(&self, event: Event) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
         let log = namespaces

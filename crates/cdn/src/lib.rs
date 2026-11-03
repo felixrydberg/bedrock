@@ -30,6 +30,8 @@ pub const DATASETS: &[Dataset] = &[Dataset {
 }];
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
+/// If the enabled CDN engine cannot open or is unhealthy at startup, its subscription is skipped and the node stays
+/// unready until restart. Configuration, admin startup, registry and relay session initialization errors are returned.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-cdn");

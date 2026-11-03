@@ -422,3 +422,152 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
         );
     }
 }
+
+#[test]
+fn placement_filters_members_and_health_per_dataset() {
+    let node = |id: &str, datasets: &[&str], unhealthy: &[&str]| pb::Member {
+        service: "quicksilver".into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: datasets.iter().map(|d| (*d).into()).collect(),
+        unhealthy: unhealthy.iter().map(|d| (*d).into()).collect(),
+        ..ready(id)
+    };
+    let actual = members(&[
+        node("both-sick-auth", &["auth", "quicksilver"], &["auth"]),
+        node("auth-only", &["auth"], &[]),
+        node("qs-only", &["quicksilver"], &[]),
+        node("both", &["auth", "quicksilver"], &[]),
+        pb::Member {
+            service: "cdn".into(),
+            ..node("foreign", &["auth", "quicksilver"], &[])
+        },
+    ]);
+    let changes = place(
+        "quicksilver",
+        &actual,
+        &Directories::new(),
+        &siblings::Ready::new(),
+    );
+    let assigned = |dataset: &str| -> BTreeSet<String> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Range {
+                    dataset: d, owners, ..
+                } if d == dataset => Some(owners),
+                _ => None,
+            })
+            .flatten()
+            .map(|owner| {
+                assert_eq!(owner.state, State::Populating);
+                owner.node.clone()
+            })
+            .collect()
+    };
+    assert_eq!(
+        assigned("quicksilver"),
+        ["both-sick-auth", "qs-only", "both"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        assigned("auth"),
+        ["auth-only", "both"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    assert!(place("kv", &actual, &Directories::new(), &siblings::Ready::new()).is_empty());
+}
+
+#[test]
+fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
+    let owner = |node: &str, state| Owner {
+        node: node.into(),
+        state,
+    };
+    let node = |id: &str, status: pb::member::Status| pb::Member {
+        service: "quicksilver".into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: vec!["auth".into(), "quicksilver".into()],
+        status: status as i32,
+        ..ready(id)
+    };
+    let actual = members(&[
+        node("old", pb::member::Status::Draining),
+        node("a", pb::member::Status::Ready),
+        node("b", pb::member::Status::Ready),
+        node("c", pb::member::Status::Ready),
+    ]);
+    let initial = vec![
+        owner("old", State::Leaving),
+        owner("a", State::Populating),
+        owner("b", State::Populating),
+        owner("c", State::Populating),
+    ];
+    let directories = Directories::from([
+        ("auth".into(), Directory::from([(0, initial.clone())])),
+        (
+            "quicksilver".into(),
+            Directory::from([(0, initial.clone())]),
+        ),
+    ]);
+    let ready = siblings::Ready::from([
+        (
+            (("quicksilver".into(), "a".into()), "auth".into()),
+            vec![(0, 0)],
+        ),
+        ((("cdn".into(), "b".into()), "auth".into()), vec![(0, 0)]),
+        (
+            (("quicksilver".into(), "c".into()), "auth".into()),
+            vec![(1, 0)],
+        ),
+    ]);
+    assert_eq!(
+        place("quicksilver", &actual, &directories, &ready),
+        vec![Change::Range {
+            service: "quicksilver".into(),
+            dataset: "auth".into(),
+            start: 0,
+            owners: vec![
+                owner("old", State::Leaving),
+                owner("a", State::Ready),
+                owner("b", State::Populating),
+                owner("c", State::Populating),
+            ],
+        }]
+    );
+}
+
+#[test]
+fn malformed_dataset_range_entries_are_reported_as_data_loss() {
+    let (view, _) = View::new("quicksilver", "eu-1a");
+    let engine = &view.published.engine;
+    let prefix = b"quicksilver.eu-1a\0";
+    for suffix in [
+        "range//0000000000000000",
+        "range/auth!/0000000000000000",
+        "range/auth/000000000000000",
+        "range/auth/00000000000000000",
+        "range/auth/000000000000000g",
+        "range/auth/0000000000000000/extra",
+    ] {
+        let key = [prefix.as_slice(), suffix.as_bytes()].concat();
+        engine.put(&key, &encode(&[])).unwrap();
+        assert_eq!(
+            view.directory("auth").unwrap_err().code(),
+            tonic::Code::DataLoss,
+            "{suffix}"
+        );
+        engine.delete(&key).unwrap();
+    }
+    let key = [prefix.as_slice(), b"range/auth/0000000000000000"].concat();
+    engine.put(&key, &[0xff]).unwrap();
+    assert_eq!(
+        view.directory("auth").unwrap_err().code(),
+        tonic::Code::DataLoss
+    );
+}

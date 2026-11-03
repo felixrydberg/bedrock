@@ -67,7 +67,8 @@ fn marker_prefix(dataset: &str, (start, end): (u64, u64)) -> String {
     format!("relay:range:{dataset}:{start:016x}-{end:016x}:")
 }
 
-/// The ranges of `dataset` held in `engine` before a restart, from their consumers' markers.
+/// The ranges of `dataset` held in `engine` before a restart, from their consumers' markers. Returns an internal
+/// status on storage failure and a data-loss status for malformed active markers.
 fn held(engine: &dyn StorageEngine, dataset: &str) -> Result<BTreeSet<Range>, Status> {
     let prefix = format!("relay:range:{dataset}:");
     let revisions = engine
@@ -140,6 +141,9 @@ pub struct Session {
 }
 
 impl Session {
+    /// Starts a reconnecting relay session for `targets`. Returns an invalid-argument status for missing upstreams or
+    /// invalid or duplicate selections, an internal status for local storage errors, and a data-loss status for
+    /// corrupt persisted selector state during startup.
     pub fn start(
         peers: Arc<Peers>,
         upstreams: Vec<String>,
@@ -152,6 +156,8 @@ impl Session {
     /// Relays push the member the L2 ranges it owns per dataset; `ranged` maps each dataset it carries to the engine
     /// those ranges are stored in (#22 / B-21). `targets` must include the member's own membership view
     /// ([`crate::membership::View`]), which confirms revokes.
+    /// Returns an invalid-argument status if `member` is invalid or not ready, and propagates startup errors as in
+    /// [`Session::start`].
     pub fn join(
         peers: Arc<Peers>,
         upstreams: Vec<String>,
@@ -262,7 +268,8 @@ impl Session {
         self.ready_except(&BTreeSet::new())
     }
 
-    /// Like [`Session::ready`], ignoring the scopes of `datasets`, e.g. those quarantined by storage health (B-14).
+    /// Whether the session is connected and every scope outside `datasets` is validated and applied through its known
+    /// head. A connected session with no remaining scopes is ready. Exclude quarantined datasets (B-14) as needed.
     pub fn ready_except(&self, datasets: &BTreeSet<String>) -> bool {
         let state = self.progress.lock().unwrap();
         state.connected
@@ -280,7 +287,7 @@ impl Session {
         self.progress.lock().unwrap().error.clone()
     }
 
-    /// The validated revision applied for a whole-namespace scope.
+    /// The validated revision applied for a whole-namespace scope, or `None` if it is absent or not validated.
     pub fn applied(&self, dataset: &str, namespace: &str) -> Option<u64> {
         self.progress
             .lock()
@@ -326,7 +333,8 @@ impl Session {
         let _ = (&mut self.task).await;
     }
 
-    /// The caller supplies its read deadline. Only durable coverage satisfies the wait.
+    /// Waits for validated durable coverage of a whole-namespace scope through `revision`. The caller supplies its
+    /// read deadline; an absent scope can wait indefinitely.
     pub async fn wait_for(&self, dataset: &str, namespace: &str, revision: u64) {
         let scope = (dataset.to_owned(), namespace.to_owned(), None);
         loop {
@@ -667,7 +675,9 @@ impl Consumer {
         Ok(events)
     }
 
-    /// Returns false for a gap: the caller reissues Follow at the committed cursor.
+    /// Applies ordered selected coverage. Returns true for applied or already-applied coverage and false for a gap,
+    /// so the caller can reissue Follow at the committed cursor. Invalid coverage returns a data-loss status; storage
+    /// failures return an internal status.
     fn delivery(&mut self, delivery: pb::Delivery) -> Result<bool, Status> {
         let events = self.delivery_events(&delivery)?;
         if self.bootstrap.is_some() || self.recover {
@@ -695,6 +705,9 @@ impl Consumer {
         Ok(true)
     }
 
+    /// Validates bootstrap chunks and atomically replaces the selected keys at completion. Returns false until the
+    /// final chunk and true after installation. Invalid chunks or checksums return a data-loss status; storage
+    /// failures return an internal status.
     fn bootstrap(&mut self, chunk: pb::Bootstrap) -> Result<bool, Status> {
         if chunk.dataset != self.target.selection.dataset
             || chunk.namespace != self.target.selection.namespace
@@ -1259,7 +1272,8 @@ async fn settle(
 }
 
 /// Carries a held range's coverage to the parts a split kept and deletes the dropped parts in one atomic batch, then
-/// compacts them. Returns the requests that move the relay's streams to the kept parts.
+/// attempts to compact them. Returns the requests that move the relay's streams to the kept parts. Write and consumer
+/// initialization errors propagate; compaction errors are logged and do not fail the operation.
 fn narrow(
     dataset: &str,
     engine: &Arc<dyn StorageEngine>,

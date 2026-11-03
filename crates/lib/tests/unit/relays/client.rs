@@ -224,6 +224,28 @@ fn a_range_consumer_marks_its_namespace_so_a_restart_resumes_it() {
 }
 
 #[test]
+fn restart_ignores_inactive_and_other_dataset_markers_but_rejects_corrupt_active_markers() {
+    let engine = MemoryEngine::new("ranges");
+    let mut batch = WriteBatch::default();
+    batch
+        .set_revision(marker_prefix("auth", (10, 20)) + "users", 1)
+        .set_revision(marker_prefix("auth", (10, 20)) + "admins", 1)
+        .set_revision(marker_prefix("auth", (20, 0)) + "retired", 0)
+        .set_revision("relay:range:cdn:malformed", 1)
+        .set_revision("relay:range:auth:malformed", 0);
+    engine.write(batch).unwrap();
+    assert_eq!(held(&engine, "auth").unwrap(), BTreeSet::from([(10, 20)]));
+
+    let mut batch = WriteBatch::default();
+    batch.set_revision("relay:range:auth:malformed", 1);
+    engine.write(batch).unwrap();
+    assert_eq!(
+        held(&engine, "auth").unwrap_err().code(),
+        tonic::Code::DataLoss
+    );
+}
+
+#[test]
 fn gap_and_malformed_delivery_never_advance_or_partially_apply() {
     let engine = Arc::new(MemoryEngine::new("auth"));
     let mut consumer = Consumer::new(target(engine.clone())).unwrap();
@@ -438,6 +460,91 @@ fn range_change_bootstraps_before_reusing_progress_and_preserves_keys_outside_it
         engine.get(&stored_at(b"second")).unwrap(),
         Some(b"keep".to_vec())
     );
+}
+
+#[test]
+fn range_bootstrap_preserves_other_namespaces_in_the_same_span() {
+    let engine = Arc::new(MemoryEngine::new("auth"));
+    let whole = (0, 0);
+    let users_old = stored_at(b"old");
+    let admins_old = l2_key(hash_of("auth", "admins", b"old"), "admins", b"old");
+    engine.put(&users_old, b"stale").unwrap();
+    engine.put(&admins_old, b"keep").unwrap();
+    let mut consumer = ranged(engine.clone(), whole);
+    assert!(consumer.recover);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"new", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    assert_eq!(engine.get(&users_old).unwrap(), None);
+    assert_eq!(
+        engine.get(&stored_at(b"new")).unwrap(),
+        Some(b"value".to_vec())
+    );
+    assert_eq!(engine.get(&admins_old).unwrap(), Some(b"keep".to_vec()));
+    assert_eq!(engine.revision(&consumer.revision).unwrap(), Some(9));
+}
+
+#[test]
+fn splitting_unconfirmed_coverage_requires_the_kept_range_to_recover() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let whole = (0, 0);
+    let kept = only(b"k");
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    assert!(!consumer.validated());
+
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut consumers = BTreeMap::from([(consumer.scope(), consumer)]);
+    let mut pushed = Pushed {
+        groups: Groups::from([(("auth".into(), whole), engine.clone())]),
+        ranged: BTreeMap::from([("auth".into(), engine.clone())]),
+        me: None,
+        pending: BTreeMap::new(),
+        retired: BTreeSet::new(),
+    };
+    let progress = Mutex::new(Progress::default());
+    let changes = Watched::new(0);
+    let requests = narrow(
+        "auth",
+        &engine,
+        &ranges::Change {
+            held: whole,
+            kept: vec![kept],
+            dropped: vec![(0, kept.0), (kept.1, 0)],
+        },
+        &mut consumers,
+        &mut pushed,
+        &progress,
+        &changes,
+    )
+    .unwrap();
+    match requests.as_slice() {
+        [
+            pb::relay_request::Kind::Unfollow(_),
+            pb::relay_request::Kind::Follow(follow),
+        ] => {
+            assert_eq!(
+                follow.from_namespaces,
+                BTreeMap::from([("users".into(), 0)])
+            );
+        }
+        other => panic!("expected unfollow and recovery follow, got {other:?}"),
+    }
+    let replacement = &consumers[&("auth".into(), "users".into(), Some(kept))];
+    assert!(!replacement.validated());
+    assert_eq!(replacement.resume(), 0);
+    assert_eq!(data.get(&stored_at(b"k")).unwrap(), Some(b"value".to_vec()));
+    assert!(held(data.as_ref(), "auth").unwrap().is_empty());
 }
 
 fn range(head: u64, recovered: bool) -> pb::ReplayRange {

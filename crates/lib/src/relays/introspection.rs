@@ -706,7 +706,8 @@ fn upstream(hub: &Hub, query: &Query) -> Value {
     value
 }
 
-/// Per namespace: subscribers, latest sequence received and head, replay ranges and rates.
+/// Per namespace: subscribers, latest sequence received and head, replay ranges and rates. A subscriber following
+/// multiple ranges of a namespace is counted once.
 fn namespaces(hub: &Hub, query: &Query) -> Value {
     let subs = hub.snapshot();
     let served = served(&subs, query);
@@ -753,7 +754,7 @@ fn namespaces(hub: &Hub, query: &Query) -> Value {
     page(items, query.after_key(), query.limit, namespace_cursor)
 }
 
-/// Per session: identity, follows with acknowledged revision and lag, queue depth and the member's disconnects.
+/// Per session: identity, follows with range, acknowledged revision and lag, queue depth and the member's disconnects.
 fn subscribers(hub: &Hub, query: &Query) -> Value {
     let disconnects = hub.0.stats.disconnects.lock().unwrap().clone();
     let filtered = query.dataset.is_some() || !query.prefix.is_empty();
@@ -795,7 +796,8 @@ fn subscribers(hub: &Hub, query: &Query) -> Value {
     page(items, after, query.limit, u64::to_string)
 }
 
-/// The cell view this relay publishes, with each member's status, and the placement directory.
+/// The cell view this relay publishes, with each member's status and per-dataset placement directories. A failed view
+/// read is returned in the JSON error field.
 fn membership(publisher: Option<&Publisher>, query: &Query) -> Value {
     let Some(publisher) = publisher else {
         return json!({ "publishing": false, "services": [] });

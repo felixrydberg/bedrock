@@ -16,7 +16,8 @@ pub enum Keyspace {
 }
 
 impl Keyspace {
-    /// Every key of `namespace` in this keyspace starts with this; use it with `KeyRange::prefix`.
+    /// Returns a prefix for `namespace` in this keyspace; for L2, it selects only keys with the chosen hash. Use it
+    /// with `KeyRange::prefix`.
     ///
     /// # Panics
     /// Panics if `namespace` contains NUL.
