@@ -1286,7 +1286,8 @@ Labels: enhancement
 `notes.md` lists an Auth dataset (API key hashes, permissions, status) replicated `on_demand`. It is not in the main architecture doc yet.
 
 **Describe the solution you'd like**
-- An `auth` dataset using the `on_demand` policy (push on first read). It never uses the `cached` TTL model: a revocation must not wait for a TTL.
+- An `auth` dataset with a `keys` namespace (§4 decision 13, fixed namespaces), using the `on_demand` policy (push on first
+  read). It never uses the `cached` TTL model: a revocation must not wait for a TTL.
 - Fail-closed behaviour for revocations: revocation must be enforced authoritatively, not only eventually.
 - Drain hook (B-21b): a node drain moves its ranges; a cell drain has nothing to move; a namespace drain is `Unsupported`.
 
@@ -1784,8 +1785,13 @@ Labels: enhancement
         `datasets` include it. A node carrying `auth` but not `quicksilver` owns only `auth` ranges.
       - *One stream per dataset and range.* A node follows `(dataset, range)`, and that stream carries every namespace of the
         dataset. Events keep their namespace and per-namespace `sequence`; the node keeps one applied sequence per namespace,
-        and deliveries note coverage only for namespaces that changed. Nobody lists namespaces, so an idle namespace costs one
-        number per stream. A subscription selects either a namespace (membership) or a dataset range (L2), never both.
+        and deliveries note coverage only for namespaces that changed, so an idle namespace costs one number per stream. A
+        subscription selects either a namespace (membership) or a dataset range (L2), never both.
+      - *Fixed namespaces.* Decided 2026-11-03. Each ranged dataset's namespaces are fixed in code (`placement::namespaces`):
+        `quicksilver` has `infrastructure`, `auth` has `keys`, `cdn` has `pages` and `workers`. The writer's scope validation is
+        the one place that rejects any other namespace of these datasets. Relays count a node ready only once it holds every
+        listed namespace, so a namespace a relay has not seen a write for yet cannot be skipped. Adding a namespace means
+        shipping new code.
       - *One pushed frame.* A relay sends each leaf its full owned range set per dataset, tagged with the directory revision it
         was derived from. Ranges it adds are followed; ranges it drops are the revoke. The node confirms a revoke only once its
         own view has reached that revision and shows it without the range while another owner is `ready`; otherwise it

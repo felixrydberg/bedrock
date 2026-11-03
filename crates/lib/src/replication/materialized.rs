@@ -193,6 +193,13 @@ pub(crate) fn validate_scope(dataset: &str, namespace: &str) -> StorageResult<()
             "invalid dataset or namespace identity",
         )));
     }
+    let fixed = crate::placement::namespaces(dataset);
+    if !fixed.is_empty() && !fixed.contains(&namespace) {
+        return Err(StorageError::Unsupported(context(
+            "namespace",
+            "not one of the dataset's fixed namespaces",
+        )));
+    }
     Ok(())
 }
 

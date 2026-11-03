@@ -262,13 +262,10 @@ fn directory_entries_sit_beside_members_in_one_namespace() {
         },
     ];
     engine
-        .put(
-            &at("range/artifacts/0000000000000000"),
-            &encode(&owners[..1]),
-        )
+        .put(&at("range/cdn/0000000000000000"), &encode(&owners[..1]))
         .unwrap();
     engine
-        .put(&at("range/artifacts/8000000000000000"), &encode(&owners))
+        .put(&at("range/cdn/8000000000000000"), &encode(&owners))
         .unwrap();
     engine
         .put(&at("range/other/0000000000000000"), &encode(&owners))
@@ -277,16 +274,16 @@ fn directory_entries_sit_beside_members_in_one_namespace() {
         view.members().unwrap().into_keys().collect::<Vec<_>>(),
         ["cdn-1"]
     );
-    let directory = view.directory(ARTIFACTS).unwrap();
+    let directory = view.directory("cdn").unwrap();
     assert_eq!(directory.len(), 2, "each dataset has its own ranges");
     assert_eq!(directory[&0], owners[..1]);
     assert_eq!(directory[&(1 << 63)], owners);
     assert!(view.directory("absent").unwrap().is_empty());
-    for invalid in ["range/artifacts/000000000000000A", "range/0000000000000000"] {
+    for invalid in ["range/cdn/000000000000000A", "range/0000000000000000"] {
         engine.put(&at(invalid), &encode(&owners[..1])).unwrap();
         assert_eq!(view.members().unwrap().len(), 1);
         assert_eq!(
-            view.directory(ARTIFACTS).unwrap_err().code(),
+            view.directory("cdn").unwrap_err().code(),
             tonic::Code::DataLoss
         );
         engine.delete(&at(invalid)).unwrap();
@@ -299,13 +296,10 @@ fn directory_entries_sit_beside_members_in_one_namespace() {
         }],
     };
     engine
-        .put(
-            &at("range/artifacts/0000000000000000"),
-            &unknown.encode_to_vec(),
-        )
+        .put(&at("range/cdn/0000000000000000"), &unknown.encode_to_vec())
         .unwrap();
     assert_eq!(
-        view.directory(ARTIFACTS).unwrap_err().code(),
+        view.directory("cdn").unwrap_err().code(),
         tonic::Code::DataLoss
     );
 }
@@ -360,6 +354,7 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
         service: service.into(),
         roles: vec!["l2".into()],
         failure_domain: domain.into(),
+        datasets: vec![service.into()],
         ..ready(id)
     };
     let actual = members(&[
@@ -367,6 +362,11 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
         node("cdn-2", "cdn", "b"),
         node("cdn-3", "cdn", "c"),
         node("cdn-4", "cdn", "a"),
+        // Carries no dataset, so it owns nothing.
+        pb::Member {
+            datasets: Vec::new(),
+            ..node("cdn-0", "cdn", "d")
+        },
         node("qs-1", "quicksilver", "d"),
     ]);
     let mut directories = Directories::new();
@@ -377,14 +377,18 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
     else {
         panic!("nothing assigned: {first:?}");
     };
-    assert_eq!(dataset, ARTIFACTS);
+    assert_eq!(dataset, "cdn");
     assert!(owners.iter().all(|o| o.state == State::Populating));
     assert!(settle("cdn", &actual, &mut directories) >= 2);
     assert_eq!(directories.len(), 1);
-    for owners in directories[ARTIFACTS].values() {
+    for owners in directories["cdn"].values() {
         assert_eq!(owners.len(), REPLICAS);
         assert!(owners.iter().all(|o| o.state == State::Ready));
-        assert!(owners.iter().all(|o| o.node.starts_with("cdn-")));
+        assert!(
+            owners
+                .iter()
+                .all(|o| o.node.starts_with("cdn-") && o.node != "cdn-0")
+        );
     }
     // A member announcing unhealthy storage gets nothing new but keeps what it holds.
     let mut sick = actual.clone();
@@ -399,8 +403,8 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
     let mut after = directories.clone();
     settle("cdn", &joined, &mut after);
     // Ranges may split, but every hash cdn-4 held stays with it and it gains none.
-    for (start, owners) in &after[ARTIFACTS] {
-        let before = placement::owners(&directories[ARTIFACTS], *start);
+    for (start, owners) in &after["cdn"] {
+        let before = placement::owners(&directories["cdn"], *start);
         let held = |owners: &[Owner]| owners.iter().any(|o| o.node == "cdn-4");
         assert_eq!(held(owners), held(before), "range {start:x}");
     }
@@ -409,7 +413,7 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
     let mut removed = actual.clone();
     removed.remove(&("cdn".to_string(), "cdn-2".to_string()));
     settle("cdn", &removed, &mut directories);
-    for owners in directories[ARTIFACTS].values() {
+    for owners in directories["cdn"].values() {
         assert_eq!(owners.len(), REPLICAS);
         assert!(
             owners

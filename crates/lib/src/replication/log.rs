@@ -31,12 +31,6 @@ pub struct Watched<T> {
     changed: Notify,
 }
 
-impl<T: Clone + Default> Default for Watched<T> {
-    fn default() -> Self {
-        Self::new(T::default())
-    }
-}
-
 impl<T: Clone> Watched<T> {
     pub fn new(value: T) -> Self {
         Watched {
@@ -75,8 +69,6 @@ impl<T: Clone> Watched<T> {
 #[derive(Default)]
 pub struct MemoryLog {
     namespaces: Mutex<BTreeMap<(String, String), NamespaceLog>>,
-    /// Bumped when a namespace is added, so range streams pick it up (#22 / B-21).
-    added: Watched<u64>,
     retention: Option<(fn() -> u64, u64)>,
 }
 
@@ -101,44 +93,16 @@ impl MemoryLog {
     pub fn with_retention(clock: fn() -> u64, retention_ms: u64) -> Self {
         Self {
             namespaces: Mutex::default(),
-            added: Watched::default(),
             retention: Some((clock, retention_ms)),
         }
-    }
-
-    /// The namespaces of `dataset` this log holds, in order.
-    pub fn namespaces(&self, dataset: &str) -> Vec<String> {
-        self.namespaces
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|(d, _)| d == dataset)
-            .map(|(_, namespace)| namespace.clone())
-            .collect()
-    }
-
-    pub fn added(&self) -> &Watched<u64> {
-        &self.added
-    }
-
-    fn entry<'a>(
-        &self,
-        namespaces: &'a mut BTreeMap<(String, String), NamespaceLog>,
-        dataset: &str,
-        namespace: &str,
-    ) -> &'a mut NamespaceLog {
-        namespaces
-            .entry((dataset.to_owned(), namespace.to_owned()))
-            .or_insert_with(|| {
-                self.added.update(|v| *v = v.wrapping_add(1));
-                NamespaceLog::new()
-            })
     }
 
     /// Initializes an empty log at an already-installed state boundary.
     pub fn reset(&self, dataset: &str, namespace: &str, boundary: u64) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
-        let log = self.entry(&mut namespaces, dataset, namespace);
+        let log = namespaces
+            .entry((dataset.to_owned(), namespace.to_owned()))
+            .or_insert_with(NamespaceLog::new);
         if !log.events.is_empty() || log.head.get() != 0 {
             return Err("cannot reset a non-empty log".into());
         }
@@ -172,7 +136,9 @@ impl MemoryLog {
     /// Commits `event`, which must carry its namespace's next sequence.
     pub fn append(&self, event: Event) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
-        let log = self.entry(&mut namespaces, &event.dataset, &event.namespace);
+        let log = namespaces
+            .entry((event.dataset.clone(), event.namespace.clone()))
+            .or_insert_with(NamespaceLog::new);
         let next = log
             .head
             .get()
@@ -224,7 +190,9 @@ impl Log for MemoryLog {
 
     fn head(&self, dataset: &str, namespace: &str) -> Arc<Watched<u64>> {
         let mut namespaces = self.namespaces.lock().unwrap();
-        self.entry(&mut namespaces, dataset, namespace).head.clone()
+        let key = (dataset.to_owned(), namespace.to_owned());
+        let log = namespaces.entry(key).or_insert_with(NamespaceLog::new);
+        log.head.clone()
     }
 }
 

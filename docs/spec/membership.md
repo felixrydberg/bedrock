@@ -276,3 +276,12 @@ changed for 5 s before killing a member, since rebalancing passes through placed
 and 42 each produced the same trace twice: placement settled 8.4–9.3 simulated seconds after start, and the killed
 member's ranges were reassigned about 21 s after it stopped. Native tests: 240 passed; simulation tests: 200 passed,
 28 suites each.
+
+On 2026-11-03, with each ranged dataset's namespaces fixed in code and the CDN placing and following `cdn` ranges
+(the `artifacts` label is gone), the same checks passed in WSL Ubuntu: format, native and simulation clippy, native
+tests (256 passed) and simulation tests (217 passed). A relay now counts every fixed namespace toward readiness, even
+one no write has reached yet, so a fresh `cdn` dataset still gets ready owners in the placement scenario. The
+handoff scenario (`data_follows_ownership_through_faults_and_replays_per_seed`) writes to both `cdn` namespaces
+through `bedrock-api` while members join, fail over, restart, are cut off, are killed and drain, and the relays lose
+their majority. It checks that every holder keeps exactly the data of its own ranges. Seeds 1, 2 and 42 each
+produced the same trace twice in all three membership scenarios.

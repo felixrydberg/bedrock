@@ -124,7 +124,7 @@ fn relay(name: &str, tier: u32, sources: &[&str], peers: Arc<Peers>) -> Hub {
 }
 
 async fn caught_up(session: &Session, revision: u64) {
-    timeout(DEADLINE, session.wait_for("auth", "accounts", revision))
+    timeout(DEADLINE, session.wait_for("auth", "keys", revision))
         .await
         .unwrap_or_else(|_| panic!("revision {revision} stalled: {:?}", session.error()));
 }
@@ -151,7 +151,7 @@ async fn phase(writer: &Arc<Writer>, session: &Session, first: u64, last: u64) -
             writer
                 .commit(Write {
                     dataset: "auth".into(),
-                    namespace: "accounts".into(),
+                    namespace: "keys".into(),
                     key: b"key".to_vec(),
                     operation,
                     idempotency_key: None
@@ -249,7 +249,7 @@ async fn scenario() -> u64 {
                 vec![Target {
                     selection: Selection {
                         dataset: "auth".into(),
-                        namespace: "accounts".into(),
+                        namespace: "keys".into(),
                     },
                     engine: engine.clone(),
                     prefix: b"accounts\0".to_vec(),

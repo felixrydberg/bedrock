@@ -25,7 +25,7 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-const NAMESPACES: [&str; 2] = ["a", "b"];
+const NAMESPACES: [&str; 2] = ["pages", "workers"];
 const WRITES: usize = 200;
 const WRITE_TOKEN: &str = "test-writer-token";
 const AUTHORIZATION: &str = "Bearer test-writer-token";
@@ -38,7 +38,7 @@ struct Recorded {
 impl Recorded {
     fn new() -> Self {
         Self {
-            engine: MemoryEngine::new("auth"),
+            engine: MemoryEngine::new("cdn"),
             batches: Mutex::default(),
         }
     }
@@ -132,7 +132,7 @@ async fn scenario(api: SocketAddr, replication: String) {
             .into_iter()
             .map(|namespace| Target {
                 selection: Selection {
-                    dataset: "auth".into(),
+                    dataset: "cdn".into(),
                     namespace: namespace.into(),
                 },
                 engine: applied.clone(),
@@ -157,7 +157,7 @@ async fn scenario(api: SocketAddr, replication: String) {
             let (status, _) = send(
                 api,
                 method,
-                "/v1/auth/a/key/0",
+                "/v1/cdn/pages/key/0",
                 "w0",
                 "unauthorized".into(),
                 &authorization,
@@ -174,7 +174,7 @@ async fn scenario(api: SocketAddr, replication: String) {
     let (status, _) = send(
         api,
         "PUT",
-        "/v1/auth/a/key/0",
+        "/v1/cdn/pages/key/0",
         "",
         String::new(),
         &[AUTHORIZATION],
@@ -191,7 +191,7 @@ async fn scenario(api: SocketAddr, replication: String) {
                 } else {
                     ("PUT", i.to_string())
                 };
-                let path = format!("/v1/auth/{namespace}/key/{}", i % 5);
+                let path = format!("/v1/cdn/{namespace}/key/{}", i % 5);
                 let (status, sequence) = send(
                     api,
                     method,
@@ -229,7 +229,15 @@ async fn scenario(api: SocketAddr, replication: String) {
     }
 
     // A committed idempotency key still requires authorization on every retry.
-    let (status, _) = send(api, "DELETE", "/v1/auth/a/key/0", "w0", String::new(), &[]).await;
+    let (status, _) = send(
+        api,
+        "DELETE",
+        "/v1/cdn/pages/key/0",
+        "w0",
+        String::new(),
+        &[],
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     for (namespace, acked) in &acked {
@@ -240,7 +248,7 @@ async fn scenario(api: SocketAddr, replication: String) {
         );
         timeout(
             Duration::from_secs(30),
-            subscription.wait_for("auth", namespace, head),
+            subscription.wait_for("cdn", namespace, head),
         )
         .await
         .unwrap_or_else(|_| panic!("{namespace} did not reach {head}"));

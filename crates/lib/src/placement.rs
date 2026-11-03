@@ -8,6 +8,7 @@
 //! - [`owners`] and [`serves`] read the published directory (#19 / B-16, `docs/spec/membership.md`).
 //! - [`rank`] orders customer-KV readers by rendezvous hash. Customer KV has no ranges.
 //! - [`hash_of`] places a key in the hash space; relay range streams select keys with [`in_span`] (#22 / B-21).
+//! - [`namespaces`] is the fixed namespace set of each ranged dataset, so relays know every namespace a range covers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
@@ -17,6 +18,17 @@ use sha2::{Digest, Sha256};
 use crate::replication::pb;
 
 /// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.
+/// The namespaces of a dataset placed in L2 ranges, fixed in code; empty for every other dataset. The writer accepts no
+/// other namespace of a ranged dataset, and a member is ready for a range only once it holds all of them (#22 / B-21).
+pub fn namespaces(dataset: &str) -> &'static [&'static str] {
+    match dataset {
+        "quicksilver" => &["infrastructure"],
+        "auth" => &["keys"],
+        "cdn" => &["pages", "workers"],
+        _ => &[],
+    }
+}
+
 pub fn hash_of(dataset: &str, namespace: &str, key: &[u8]) -> u64 {
     let mut hash = Sha256::new();
     for part in [dataset.as_bytes(), namespace.as_bytes(), key] {

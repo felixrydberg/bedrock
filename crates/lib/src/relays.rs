@@ -117,8 +117,8 @@ struct Subscriber {
     events: Arc<AtomicUsize>,
     closed: Arc<Watched<bool>>,
     follows: BTreeMap<StreamKey, Interest>,
-    /// Range follows across every namespace of a dataset: `(dataset, range)` → generation.
-    ranges: BTreeMap<(String, (u64, u64)), u64>,
+    /// Range follows across every namespace of a dataset.
+    ranges: BTreeSet<(String, (u64, u64))>,
     changed: Arc<Watched<u64>>,
     member: Option<pb::Member>,
     /// The range set last pushed to this leaf member per dataset, and the latest one it acknowledged (#22 / B-21).
@@ -403,7 +403,6 @@ impl Hub {
                 if ranges_acked
                     .get(dataset)
                     .is_none_or(|r| *r < frame.revision)
-                    || (namespaces.is_empty() && pushed(dataset))
                 {
                     continue;
                 }
@@ -916,78 +915,31 @@ impl Hub {
         }
     }
 
-    /// The namespaces of `dataset` this hub knows: the writer's, or those heard from upstream.
+    /// The namespaces of `dataset`, fixed in code ([`crate::placement::namespaces`]).
     fn namespaces(&self, dataset: &str) -> Vec<String> {
-        if let Some(writer) = &self.0.writer {
-            return writer.log().namespaces(dataset);
-        }
-        self.0
-            .heads
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|(d, _)| d == dataset)
-            .map(|(_, namespace)| namespace.clone())
+        crate::placement::namespaces(dataset)
+            .iter()
+            .map(|namespace| namespace.to_string())
             .collect()
     }
 
-    /// Follows `range` in every namespace of the dataset, including namespaces that appear later.
+    /// Follows `range` in every namespace of the dataset.
     // ponytail: one stream task per subscriber, namespace and range; drive idle namespaces from one task per range if
-    // namespace counts grow. The wire protocol carries no namespace list, so that change stays inside the relay.
+    // namespace counts grow.
     fn follow_range(&self, id: u64, follow: pb::Follow, range: (u64, u64), visited: Vec<String>) {
-        let generation = self.0.ids.fetch_add(1, Ordering::Relaxed);
         let dataset = follow.dataset.clone();
-        let changes = {
-            let mut subscribers = self.0.subscribers.lock().unwrap();
-            let Some(sub) = subscribers.get_mut(&id) else {
-                return;
-            };
-            sub.ranges.insert((dataset.clone(), range), generation);
-            sub.changed.clone()
+        match self.0.subscribers.lock().unwrap().get_mut(&id) {
+            Some(sub) => sub.ranges.insert((dataset.clone(), range)),
+            None => return,
         };
         // The upstream loop follows the dataset as soon as one subscriber follows it by range.
         self.changed();
-        let hub = self.clone();
-        tokio::spawn(async move {
-            let mut started = BTreeSet::new();
-            loop {
-                let version = hub.0.changed.get();
-                let local = changes.get();
-                let writer = hub.0.writer.clone();
-                let added = writer.as_ref().map(|w| w.log().added().get());
-                let current = hub
-                    .0
-                    .subscribers
-                    .lock()
-                    .unwrap()
-                    .get(&id)
-                    .and_then(|sub| sub.ranges.get(&(dataset.clone(), range)).copied());
-                if current != Some(generation) {
-                    return;
-                }
-                for namespace in hub.namespaces(&dataset) {
-                    if started.insert(namespace.clone()) {
-                        // 0 asks for a fresh baseline; a namespace the subscriber has not seen starts at 1.
-                        let from = follow.from_namespaces.get(&namespace).copied().unwrap_or(1);
-                        let key = ((dataset.clone(), namespace), Some(range));
-                        hub.follow_stream(id, key, from, visited.clone(), from == 0);
-                    }
-                }
-                let new_namespace = async {
-                    match &writer {
-                        Some(w) => {
-                            w.log().added().wait_until(|v| Some(*v) != added).await;
-                        }
-                        None => std::future::pending::<()>().await,
-                    }
-                };
-                tokio::select! {biased;
-                    _=hub.0.changed.wait_until(|v|*v!=version)=>{},
-                    _=changes.wait_until(|v|*v!=local)=>{},
-                    ()=new_namespace=>{},
-                }
-            }
-        });
+        for namespace in self.namespaces(&dataset) {
+            // 0 asks for a fresh baseline; a namespace the subscriber has not seen starts at 1.
+            let from = follow.from_namespaces.get(&namespace).copied().unwrap_or(1);
+            let key = ((dataset.clone(), namespace), Some(range));
+            self.follow_stream(id, key, from, visited.clone(), from == 0);
+        }
     }
 
     fn follow_stream(&self, id: u64, key: StreamKey, from: u64, visited: Vec<String>, force: bool) {
@@ -1590,7 +1542,7 @@ impl Hub {
         let mut namespaces = BTreeMap::new();
         let mut datasets = BTreeSet::new();
         for sub in self.0.subscribers.lock().unwrap().values() {
-            datasets.extend(sub.ranges.keys().map(|(dataset, _)| dataset.clone()));
+            datasets.extend(sub.ranges.iter().map(|(dataset, _)| dataset.clone()));
             for ((key, _), interest) in &sub.follows {
                 namespaces
                     .entry(key.clone())
@@ -1873,7 +1825,7 @@ impl pb::relay_server::Relay for Hub {
                 events: events.clone(),
                 closed: closed.clone(),
                 follows: BTreeMap::new(),
-                ranges: BTreeMap::new(),
+                ranges: BTreeSet::new(),
                 changed: changed.clone(),
                 member,
                 pushed: BTreeMap::new(),

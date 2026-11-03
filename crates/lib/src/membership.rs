@@ -40,14 +40,9 @@ pub const SERVICES: [&str; 3] = ["quicksilver", "kv", "cdn"];
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-plans at least this often, which is what expires grace periods.
 const RECONCILE: Duration = Duration::from_secs(1);
-/// The CDN's artifact holders (B-34), keyed by content hash. Not a pushed dataset: every L2 CDN member carries them.
-pub const ARTIFACTS: &str = "artifacts";
 /// Services whose L2 is placed in hash ranges, and the datasets each places; every dataset has its own ranges (§4
-/// decision 13). Customer KV ranks its readers instead (#18 / B-15).
-const RANGED: [(&str, &[&str]); 2] = [
-    ("quicksilver", &["quicksilver", "auth"]),
-    ("cdn", &[ARTIFACTS]),
-];
+/// decisions 13 and 14). Customer KV ranks its readers instead (#18 / B-15).
+const RANGED: [(&str, &[&str]); 2] = [("quicksilver", &["quicksilver", "auth"]), ("cdn", &["cdn"])];
 /// Directory keys are `range/{dataset}/{start:016x}`; node IDs cannot contain `/`.
 const RANGE: &str = "range/";
 /// Dataset → its placement directory.
@@ -395,10 +390,7 @@ pub fn place(
     for dataset in *datasets {
         let members: BTreeMap<_, _> = actual
             .iter()
-            .filter(|((s, _), member)| {
-                s == service
-                    && (*dataset == ARTIFACTS || member.datasets.iter().any(|d| d == dataset))
-            })
+            .filter(|((s, _), member)| s == service && member.datasets.iter().any(|d| d == dataset))
             .map(|((_, id), member)| (id.clone(), member.clone()))
             .collect();
         let empty = Directory::new();
@@ -412,16 +404,11 @@ pub fn place(
             .collect();
         let mut entries = placement::handoff(directory, &members, &ready);
         if entries.is_empty() {
-            // Storage trouble in a dataset takes no new ranges of it (B-14); every CDN member carries the artifacts,
-            // so any of its trouble counts there. Such members keep what they hold for B-22 to rebuild; sources skip
-            // them meanwhile.
+            // Storage trouble in a dataset takes no new ranges of it (B-14). Such members keep what they hold for B-22
+            // to rebuild; sources skip them meanwhile.
             let unhealthy = members
                 .iter()
-                .filter(|(_, m)| {
-                    m.unhealthy
-                        .iter()
-                        .any(|d| d == dataset || *dataset == ARTIFACTS)
-                })
+                .filter(|(_, m)| m.unhealthy.iter().any(|d| d == dataset))
                 .map(|(id, _)| id.clone())
                 .collect();
             entries = placement::assign(directory, &members, &unhealthy, REPLICAS, MAX_MOVING);

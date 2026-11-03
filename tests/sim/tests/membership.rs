@@ -1,10 +1,11 @@
-//! #15 / B-12 acceptance: cell membership from relay streams, and #19 / B-16: the L2 placement directory published
-//! beside it, with #13 / B-14 storage health in member updates, through the real `bedrock-api` and `bedrock-relay`
-//! entry points. Replay one seed with
-//! `BEDROCK_MEMBERSHIP_SEED=42` and the documented simulation flags.
+//! #15 / B-12 acceptance: cell membership from relay streams; #19 / B-16: the L2 placement directory published
+//! beside it, with #13 / B-14 storage health in member updates; #22 / B-21: range handoff with data following
+//! ownership while writes run. All through the real `bedrock-api` and `bedrock-relay` entry points. Replay one seed
+//! with `BEDROCK_MEMBERSHIP_SEED=42` and the documented simulation flags.
 #![cfg(madsim)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,14 +14,18 @@ use bedrock_lib::membership::{self, View};
 use bedrock_lib::node::{
     ApiConfig, Budget, Location, MembershipSettings, NodeConfig, RelayConfig, Tier,
 };
+use bedrock_lib::placement::hash_of;
 use bedrock_lib::placement::{Directory, State};
 use bedrock_lib::relays::client::Session;
 use bedrock_lib::replication::pb;
 use bedrock_lib::s3::S3Config;
-use bedrock_lib::storage::StorageEngine;
 use bedrock_lib::storage::memory::MemoryEngine;
+use bedrock_lib::storage::{KeyRange, StorageEngine, l2_parts};
 use bedrock_lib::transport::Peers;
 use bedrock_lib::transport::admin::Admin;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper_util::rt::TokioIo;
 use madsim::runtime::{Handle, NodeHandle, Runtime};
 use tokio::sync::Notify;
 use tokio::time::sleep;
@@ -101,9 +106,20 @@ struct Leaf {
     revision: AtomicU64,
     drain: Notify,
     storage: Mutex<Option<Storage>>,
+    /// The `cdn` ranges a holder keeps; it survives restarts.
+    data: Option<Arc<MemoryEngine>>,
 }
 
 impl Leaf {
+    fn directory_of(&self, dataset: &str) -> Directory {
+        self.view
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|view| view.directory(dataset).unwrap())
+            .unwrap_or_default()
+    }
+
     fn members(&self) -> Vec<String> {
         self.view
             .lock()
@@ -129,7 +145,7 @@ impl Leaf {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|view| view.directory(bedrock_lib::membership::ARTIFACTS).unwrap())
+            .map(|view| view.directory("cdn").unwrap())
             .unwrap_or_default()
     }
 }
@@ -152,7 +168,28 @@ fn spawn_leaf(
     cell: &'static str,
     relays: Vec<String>,
 ) -> (NodeHandle, Arc<Leaf>) {
-    let leaf = Arc::new(Leaf::default());
+    spawn_member(name, ip, service, cell, relays, Leaf::default())
+}
+
+/// A `bedrock-cdn` member carrying the `cdn` dataset. It runs the same session as the binary (`Session::join` with
+/// the dataset's engine) over an engine the test can read.
+fn spawn_holder(name: &'static str, ip: &str, relays: Vec<String>) -> (NodeHandle, Arc<Leaf>) {
+    let leaf = Leaf {
+        data: Some(Arc::new(MemoryEngine::new("cdn"))),
+        ..Leaf::default()
+    };
+    spawn_member(name, ip, "cdn", "eu-1a", relays, leaf)
+}
+
+fn spawn_member(
+    name: &'static str,
+    ip: &str,
+    service: &'static str,
+    cell: &'static str,
+    relays: Vec<String>,
+    leaf: Leaf,
+) -> (NodeHandle, Arc<Leaf>) {
+    let leaf = Arc::new(leaf);
     let state = leaf.clone();
     let address = format!("{ip}:7000");
     let node = Handle::current()
@@ -168,9 +205,17 @@ fn spawn_leaf(
                 let admin = Admin::new();
                 let peers = Arc::new(Peers::new(&admin));
                 let storage = StorageHealth::new(&admin);
-                let engine = Arc::new(MemoryEngine::new(service));
+                let engine = state
+                    .data
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(MemoryEngine::new(service)));
                 let wrapped = storage.wrap(service, "engine", engine.clone());
-                *state.storage.lock().unwrap() = Some((storage.clone(), engine, wrapped));
+                *state.storage.lock().unwrap() = Some((storage.clone(), engine, wrapped.clone()));
+                // Relays push ranges of the dataset named after the service; customer KV has none.
+                let mut ranged: BTreeMap<String, Arc<dyn StorageEngine>> = BTreeMap::new();
+                if service != "kv" {
+                    ranged.insert(service.into(), wrapped);
+                }
                 let member = pb::Member {
                     node_id: name.into(),
                     service: service.into(),
@@ -184,7 +229,7 @@ fn spawn_leaf(
                     ..Default::default()
                 };
                 let session =
-                    Session::join(peers.clone(), relays, vec![target], member, Default::default()).unwrap();
+                    Session::join(peers.clone(), relays, vec![target], member, ranged).unwrap();
                 let namespace = membership::namespace(service, cell);
                 loop {
                     tokio::select! {
@@ -484,6 +529,470 @@ async fn placement() -> Vec<String> {
     trace
 }
 
+const WRITER: &str = "10.0.3.50";
+const NAMESPACES: [&str; 2] = ["pages", "workers"];
+const KEYS: u64 = 24;
+
+/// `(namespace, key)` → value.
+type Values = BTreeMap<(String, Vec<u8>), Vec<u8>>;
+
+/// The writer's record of what it committed, and a pause switch for data checks.
+#[derive(Default)]
+struct Model {
+    values: Mutex<Values>,
+    writes: AtomicU64,
+    pause: AtomicBool,
+    paused: AtomicBool,
+}
+
+/// One write through `bedrock-api`'s HTTP endpoint; `None` deletes.
+async fn write(namespace: &str, key: &[u8], value: Option<&[u8]>, idempotency: u64) -> bool {
+    let attempt = async {
+        let stream = tokio::net::TcpStream::connect(format!("{API}:7002"))
+            .await
+            .ok()?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .ok()?;
+        tokio::spawn(connection);
+        let key = String::from_utf8(key.to_vec()).unwrap();
+        let request = hyper::Request::builder()
+            .method(if value.is_some() { "PUT" } else { "DELETE" })
+            .uri(format!("/v1/cdn/{namespace}/{key}"))
+            .header("host", "api")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("idempotency-key", format!("handoff-{idempotency}"))
+            .body(Full::new(Bytes::from(value.unwrap_or_default().to_vec())))
+            .unwrap();
+        let response = sender.send_request(request).await.ok()?;
+        let ok = response.status().is_success();
+        response.into_body().collect().await.ok()?;
+        Some(ok)
+    };
+    tokio::time::timeout(Duration::from_secs(5), attempt)
+        .await
+        .ok()
+        .flatten()
+        == Some(true)
+}
+
+/// Writes throughout: every 100 ms one key of one namespace is set, or every fifth time deleted. A failed write is
+/// retried with the same idempotency key, so the record matches what was committed.
+async fn writer(model: Arc<Model>) {
+    loop {
+        if model.pause.load(Ordering::SeqCst) {
+            model.paused.store(true, Ordering::SeqCst);
+            sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        model.paused.store(false, Ordering::SeqCst);
+        let n = model.writes.load(Ordering::SeqCst);
+        let namespace = NAMESPACES[(n % 2) as usize];
+        let key = format!("k{:02}", (n / 2 * 7) % KEYS).into_bytes();
+        let value = (n % 5 != 4).then(|| format!("v{n}").into_bytes());
+        while !write(namespace, &key, value.as_deref(), n).await {
+            sleep(Duration::from_millis(200)).await;
+        }
+        {
+            let mut values = model.values.lock().unwrap();
+            match value {
+                Some(value) => values.insert((namespace.into(), key), value),
+                None => values.remove(&(namespace.into(), key)),
+            };
+        }
+        model.writes.store(n + 1, Ordering::SeqCst);
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// `(namespace, key)` → value of every key a holder stores, by its stored hash.
+fn stored(engine: &MemoryEngine) -> BTreeMap<(String, Vec<u8>), (u64, Vec<u8>)> {
+    engine
+        .scan(&KeyRange::prefix(*b"l2/"))
+        .unwrap()
+        .map(|entry| {
+            let (key, value) = entry.unwrap();
+            let hash = u64::from_be_bytes(key[3..11].try_into().unwrap());
+            let (namespace, key) = l2_parts(&key).unwrap();
+            let namespace = String::from_utf8(namespace.to_vec()).unwrap();
+            ((namespace, key.to_vec()), (hash, value))
+        })
+        .collect()
+}
+
+/// The directory's entries as `(start, end)` ranges with their owners; `end` 0 is 2⁶⁴.
+fn entries(directory: &Directory) -> Vec<((u64, u64), Vec<bedrock_lib::placement::Owner>)> {
+    let mut entries = directory.iter().peekable();
+    let mut out = Vec::new();
+    while let Some((&start, owners)) = entries.next() {
+        let end = entries.peek().map_or(0, |(next, _)| **next);
+        out.push(((start, end), owners.clone()));
+    }
+    out
+}
+
+fn within((start, end): (u64, u64), hash: u64) -> bool {
+    hash >= start && (end == 0 || hash < end)
+}
+
+/// Whether, in `reference`'s directory, every `ready` holder in `holders` stores exactly the committed data of its
+/// ranges and no holder stores a key outside the ranges it is listed for in any state.
+fn follows_ownership(
+    reference: &Leaf,
+    holders: &[(&str, &Arc<Leaf>)],
+    expected: &BTreeMap<(String, Vec<u8>), Vec<u8>>,
+) -> Result<(), String> {
+    let directory = entries(&reference.directory_of("cdn"));
+    if directory.is_empty() {
+        return Err("no directory".into());
+    }
+    for (name, leaf) in holders {
+        let held = stored(leaf.data.as_ref().unwrap());
+        for ((namespace, key), (hash, _)) in &held {
+            if !directory.iter().any(|(range, owners)| {
+                within(*range, *hash) && owners.iter().any(|o| o.node == *name)
+            }) {
+                return Err(format!(
+                    "{name} keeps {namespace}/{key:?} outside its ranges"
+                ));
+            }
+        }
+        for (range, owners) in &directory {
+            if !owners
+                .iter()
+                .any(|o| o.node == *name && o.state == State::Ready)
+            {
+                continue;
+            }
+            let mine = |hash: u64| within(*range, hash);
+            let want: BTreeMap<_, _> = expected
+                .iter()
+                .filter(|((namespace, key), _)| mine(hash_of("cdn", namespace, key)))
+                .collect();
+            let have: BTreeMap<_, _> = held
+                .iter()
+                .filter(|(_, (hash, _))| mine(*hash))
+                .map(|(at, (_, value))| (at, value))
+                .collect();
+            if want != have {
+                return Err(format!("{name} differs from the writer in {range:x?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pauses the writer, then waits until data follows ownership in `reference`'s directory.
+async fn check_data(what: &str, model: &Model, reference: &Leaf, holders: &[(&str, &Arc<Leaf>)]) {
+    model.pause.store(true, Ordering::SeqCst);
+    until("writer paused", Duration::from_secs(30), || {
+        model.paused.load(Ordering::SeqCst)
+    })
+    .await;
+    let expected = model.values.lock().unwrap().clone();
+    let deadline = bedrock_lib::monotonic_now() + Duration::from_secs(60);
+    loop {
+        match follows_ownership(reference, holders, &expected) {
+            Ok(()) => break,
+            Err(why) => assert!(
+                bedrock_lib::monotonic_now() < deadline,
+                "{what}: data does not follow ownership: {why}"
+            ),
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+    model.pause.store(false, Ordering::SeqCst);
+}
+
+/// Every range of `reference`'s `cdn` directory has `min(3, members)` ready owners from `members`, and the
+/// directory has not changed for 5 s.
+async fn settled(what: &str, reference: &Leaf, members: &[&str]) {
+    let deadline = bedrock_lib::monotonic_now() + Duration::from_secs(180);
+    let mut seen = (
+        reference.revision.load(Ordering::Relaxed),
+        bedrock_lib::monotonic_now(),
+    );
+    loop {
+        let now = bedrock_lib::monotonic_now();
+        let revision = reference.revision.load(Ordering::Relaxed);
+        if revision != seen.0 {
+            seen = (revision, now);
+        }
+        if now.duration_since(seen.1) >= Duration::from_secs(5)
+            && placed(&reference.directory_of("cdn"), members)
+        {
+            return;
+        }
+        assert!(now < deadline, "{what}: placement settled within 180 s");
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Runs throughout: no member's view lists a directory owner it never saw as a member (one revision order), and no
+/// member's own view shows it `ready` for a range it holds no progress for in some namespace the writer has written
+/// (no owner is ready before its copy). Another member's view may lag behind a revoke the owner already applied.
+async fn invariants(leaves: Vec<(&'static str, Arc<Leaf>)>, model: Arc<Model>) {
+    let mut seen: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    loop {
+        sleep(Duration::from_millis(200)).await;
+        let written: BTreeSet<String> = model
+            .values
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(namespace, _)| namespace.clone())
+            .collect();
+        for (name, leaf) in &leaves {
+            let Some(view) = leaf.view.lock().unwrap().clone() else {
+                continue;
+            };
+            // The directory first: its owners were members at its revision or before.
+            let (Ok(directory), Ok(members)) = (view.directory("cdn"), view.members()) else {
+                continue;
+            };
+            let ever = seen.entry(name).or_default();
+            ever.extend(members.into_keys());
+            for (range, owners) in entries(&directory) {
+                for owner in &owners {
+                    assert!(
+                        ever.contains(&owner.node),
+                        "{name} sees owner {} it never saw as a member",
+                        owner.node
+                    );
+                    if owner.state != State::Ready || owner.node != *name {
+                        continue;
+                    }
+                    let revisions = leaf
+                        .data
+                        .as_ref()
+                        .unwrap()
+                        .snapshot()
+                        .unwrap()
+                        .revisions()
+                        .unwrap();
+                    for namespace in &written {
+                        let held = revisions.iter().any(|(marker, value)| {
+                            *value == 1
+                                && marker
+                                    .strip_prefix("relay:range:cdn:")
+                                    .and_then(|rest| {
+                                        let start =
+                                            u64::from_str_radix(rest.get(..16)?, 16).ok()?;
+                                        let end =
+                                            u64::from_str_radix(rest.get(17..33)?, 16).ok()?;
+                                        (rest.get(34..)? == namespace).then_some((start, end))
+                                    })
+                                    .is_some_and(|held| {
+                                        within(held, range.0)
+                                            && (held.1 == 0 || (range.1 != 0 && range.1 <= held.1))
+                                    })
+                        });
+                        assert!(
+                            held,
+                            "{} is ready for {range:x?} without progress in {namespace}",
+                            owner.node
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// #22 / B-21: data follows ownership through joins, failures, drains and relay faults, with writes running.
+async fn replication() -> Vec<String> {
+    let handle = Handle::current();
+    let mut trace = Vec::new();
+    let started = bedrock_lib::monotonic_now();
+    let mark = |trace: &mut Vec<String>, event: &str, leaf: &Leaf| {
+        trace.push(format!(
+            "{} {event} at revision {} with {} ranges",
+            started.elapsed().as_millis(),
+            leaf.revision.load(Ordering::Relaxed),
+            leaf.directory_of("cdn").len()
+        ));
+    };
+    spawn("api", API, || bedrock_api::run(api()));
+    let relays: Vec<NodeHandle> = CELL_RELAYS
+        .iter()
+        .enumerate()
+        .map(|(i, ip)| {
+            let name = format!("relay-{}", i + 1);
+            let config = relay(&name, ip, "eu-1a", &CELL_RELAYS);
+            spawn(&name, ip, move || bedrock_relay::run(config.clone()))
+        })
+        .collect();
+    let ordered = |first: usize| -> Vec<String> {
+        (0..3)
+            .map(|i| format!("{}:7000", CELL_RELAYS[(first + i) % 3]))
+            .collect()
+    };
+    let model = Arc::new(Model::default());
+    let writing = model.clone();
+    Handle::current()
+        .create_node()
+        .name("writer")
+        .ip(WRITER.parse().unwrap())
+        .init(move || writer(writing.clone()))
+        .build();
+    let (_, q1) = spawn_holder("holder-1", "10.0.3.21", ordered(0));
+    let (q2_node, q2) = spawn_holder("holder-2", "10.0.3.22", ordered(1));
+    let (q3_node, q3) = spawn_holder("holder-3", "10.0.3.23", ordered(2));
+    let all = |holders: &[(&'static str, &Arc<Leaf>)]| -> Vec<(&'static str, Arc<Leaf>)> {
+        holders.iter().map(|(n, l)| (*n, (*l).clone())).collect()
+    };
+
+    settled(
+        "initial placement",
+        &q1,
+        &["holder-1", "holder-2", "holder-3"],
+    )
+    .await;
+    check_data(
+        "initial placement",
+        &model,
+        &q1,
+        &[("holder-1", &q1), ("holder-2", &q2), ("holder-3", &q3)],
+    )
+    .await;
+    mark(&mut trace, "placed", &q1);
+
+    // A joining member takes ranges; the others hand theirs off and drop what they no longer own.
+    let (q4_node, q4) = spawn_holder("holder-4", "10.0.3.24", ordered(0));
+    let watched = all(&[
+        ("holder-1", &q1),
+        ("holder-2", &q2),
+        ("holder-3", &q3),
+        ("holder-4", &q4),
+    ]);
+    tokio::spawn(invariants(watched, model.clone()));
+    let four = ["holder-1", "holder-2", "holder-3", "holder-4"];
+    settled("join", &q1, &four).await;
+    assert!(
+        entries(&q1.directory_of("cdn"))
+            .iter()
+            .any(|(_, owners)| owners.iter().any(|o| o.node == "holder-4")),
+        "the joining member took no range"
+    );
+    let holders = [
+        ("holder-1", &q1),
+        ("holder-2", &q2),
+        ("holder-3", &q3),
+        ("holder-4", &q4),
+    ];
+    check_data("join", &model, &q1, &holders).await;
+    mark(&mut trace, "joined", &q1);
+
+    // A relay failover within the grace period moves nothing.
+    let before = q2.directory_of("cdn");
+    handle.kill(relays[0].id());
+    sleep(GRACE - Duration::from_secs(2)).await;
+    assert_eq!(
+        q2.directory_of("cdn"),
+        before,
+        "relay failover moved ranges"
+    );
+    handle.restart(relays[0].id());
+    settled("relay failover", &q2, &four).await;
+    check_data("relay failover", &model, &q2, &holders).await;
+    mark(&mut trace, "relay failover", &q2);
+
+    // A member restarted within the grace period keeps its ranges and resumes them.
+    let before = q1.directory_of("cdn");
+    handle.kill(q2_node.id());
+    sleep(Duration::from_secs(3)).await;
+    handle.restart(q2_node.id());
+    sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        q1.directory_of("cdn"),
+        before,
+        "a restart within grace moved ranges"
+    );
+    check_data("restart", &model, &q1, &holders).await;
+    mark(&mut trace, "restarted", &q1);
+
+    // A member cut off from every relay loses its ranges after the grace period and takes ranges again once healed.
+    let network = madsim::net::NetSim::current();
+    let relay_ids: Vec<_> = relays.iter().map(NodeHandle::id).collect();
+    for relay in &relay_ids {
+        network.clog_link(q3_node.id(), *relay);
+        network.clog_link(*relay, q3_node.id());
+    }
+    settled("cut off", &q1, &["holder-1", "holder-2", "holder-4"]).await;
+    check_data(
+        "cut off",
+        &model,
+        &q1,
+        &[("holder-1", &q1), ("holder-2", &q2), ("holder-4", &q4)],
+    )
+    .await;
+    mark(&mut trace, "cut off", &q1);
+    for relay in &relay_ids {
+        network.unclog_link(q3_node.id(), *relay);
+        network.unclog_link(*relay, q3_node.id());
+    }
+    settled("healed", &q1, &four).await;
+    check_data("healed", &model, &q1, &holders).await;
+    mark(&mut trace, "healed", &q1);
+
+    // A killed member's ranges are rebuilt elsewhere after the grace period.
+    handle.kill(q4_node.id());
+    let three = ["holder-1", "holder-2", "holder-3"];
+    settled("killed", &q1, &three).await;
+    check_data(
+        "killed",
+        &model,
+        &q1,
+        &[("holder-1", &q1), ("holder-2", &q2), ("holder-3", &q3)],
+    )
+    .await;
+    mark(&mut trace, "killed", &q1);
+
+    // A draining member gets nothing new and leaves at once; the others take its ranges.
+    q3.drain.notify_one();
+    settled("drained", &q1, &["holder-1", "holder-2"]).await;
+    check_data(
+        "drained",
+        &model,
+        &q1,
+        &[("holder-1", &q1), ("holder-2", &q2)],
+    )
+    .await;
+    mark(&mut trace, "drained", &q1);
+
+    // Without a relay majority nothing moves or is revoked, even when a member returns.
+    handle.kill(relays[1].id());
+    handle.kill(relays[2].id());
+    let before = q1.directory_of("cdn");
+    let revision = q1.revision.load(Ordering::Relaxed);
+    handle.restart(q4_node.id());
+    sleep(GRACE + IDLE).await;
+    assert_eq!(
+        q1.directory_of("cdn"),
+        before,
+        "placement moved without a majority"
+    );
+    assert_eq!(
+        q1.revision.load(Ordering::Relaxed),
+        revision,
+        "a write happened without a majority"
+    );
+    mark(&mut trace, "frozen", &q1);
+    handle.restart(relays[1].id());
+    handle.restart(relays[2].id());
+    settled("majority back", &q1, &["holder-1", "holder-2", "holder-4"]).await;
+    check_data(
+        "majority back",
+        &model,
+        &q1,
+        &[("holder-1", &q1), ("holder-2", &q2), ("holder-4", &q4)],
+    )
+    .await;
+    mark(&mut trace, "majority back", &q1);
+    trace.push(format!("{} writes", model.writes.load(Ordering::SeqCst)));
+    trace
+}
+
 #[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
 fn run<F: Future<Output = Vec<String>> + 'static>(seed: u64, scenario: fn() -> F) -> Vec<String> {
     std::thread::spawn(move || {
@@ -510,6 +1019,19 @@ fn membership_follows_relay_streams_and_replays_per_seed() {
         let first = run(seed, scenario);
         assert_eq!(first, run(seed, scenario), "seed {seed} changed its trace");
         println!("membership seed {seed}: {first:?}");
+    }
+}
+
+#[test]
+fn data_follows_ownership_through_faults_and_replays_per_seed() {
+    for seed in seeds() {
+        let first = run(seed, replication);
+        assert_eq!(
+            first,
+            run(seed, replication),
+            "seed {seed} changed its trace"
+        );
+        println!("replication seed {seed}: {first:?}");
     }
 }
 

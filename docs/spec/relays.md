@@ -31,7 +31,10 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
   `[start, end)` (`end` 0 meaning 2⁶⁴), never both. A range follow is one stream carrying every namespace of the
   dataset. Events keep their namespace and per-namespace revision. Coverage is per namespace: a delivery notes how
   far each namespace it touches is covered, so namespaces without writes add nothing. The subscriber keeps one
-  covered revision per namespace and resumes with that table. Nobody lists the namespaces.
+  covered revision per namespace and resumes with that table. Each ranged dataset has a fixed namespace set in code
+  (`placement::namespaces`): `quicksilver` has `infrastructure`, `auth` has `keys` and `cdn` has `pages` and
+  `workers`. The writer rejects any other namespace of these datasets, so the list is complete. This is the
+  model's constant `Namespaces`.
 - **Pushed ranges.** A relay pushes each leaf subscriber its full owned range set per dataset, tagged with the
   directory revision it was derived from. The subscriber follows the ranges added. A range dropped from the set is
   the revoke: the subscriber confirms it against its own directory view, then unfollows and deletes the range, or
@@ -40,19 +43,17 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
 - **Bootstrap.** Each namespace of the range bootstraps at its own boundary under its own lease and installs
   atomically. Readiness requires every namespace confirmed and caught up.
 - **Relays.** A relay follows a dataset whole (`[0, 2⁶⁴)`) from its upstream as soon as one subscriber follows it
-  by range, and never also by namespace. It learns namespaces from upstream deliveries (the writer from its log),
-  starts each subscriber's range in every namespace it knows, and adds namespaces as they appear. A range follow's
-  `from_namespaces` entry of 0 asks for a fresh baseline; a namespace without an entry starts at 1.
+  by range, and never also by namespace. It starts each subscriber's range in every namespace of the dataset. A range
+  follow's `from_namespaces` entry of 0 asks for a fresh baseline; a namespace without an entry starts at 1.
 - **Readiness.** The relay reports a subscriber ready for a range only after it processed every pushed set and
   then acknowledged through the head, so an acknowledgement from before a pending revoke never counts.
 - **Relay side.** On every reconciliation pass each cell relay pushes its own leaf members their ranges per dataset
   from the published directory, only when a set changed. `Hub::ready` counts a member ready for a range once its
-  `RangesAck` covers the latest pushed set and, in every namespace the relay knows, the range's stream finished any
+  `RangesAck` covers the latest pushed set and, in every namespace of the dataset, the range's stream finished any
   bootstrap (its recovered confirmation was sent) and was acknowledged through the head recorded when it first
   qualified. Relays share these ready bits with their siblings each second; the publisher writes `ready` from its own
-  and its live siblings' bits (`placement::handoff`), then drops `leaving` owners. A pushed dataset whose namespaces a
-  relay has not learned from upstream is never ready; a namespace the relay learns after a member was reported ready
-  is followed from then on, so a namespace created upstream but not yet relayed is the one gap.
+  and its live siblings' bits (`placement::handoff`), then drops `leaving` owners. A namespace with no writes yet
+  counts too, so a member cannot be ready while it still lacks a namespace.
 - **Member side.** A member keeps only the latest pushed set per dataset and applies it once its own membership
   view has reached the set's revision (`relays::ranges`): it follows added ranges, carries a split range's coverage
   to the parts it keeps, and drops a revoked range only when its view no longer lists it there and lists another

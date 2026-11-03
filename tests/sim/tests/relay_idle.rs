@@ -43,7 +43,7 @@ async fn append(writer: &Arc<Writer>, sequence: u64) {
         writer
             .commit(Write {
                 dataset: "auth".into(),
-                namespace: "ns".into(),
+                namespace: "keys".into(),
                 key: b"k".to_vec(),
                 operation: Operation::Set(sequence.to_be_bytes().to_vec()),
                 idempotency_key: None,
@@ -92,10 +92,10 @@ async fn scenario() {
         let peers = Arc::new(Peers::new(&admin));
         let engine = Arc::new(MemoryEngine::new("auth"));
         let subscription = Session::start(peers.clone(), vec![PRIMARY.into(), BACKUP.into()], vec![Target {
-            selection: Selection { dataset: "auth".into(), namespace: "ns".into() },
+            selection: Selection { dataset: "auth".into(), namespace: "keys".into() },
             engine: engine.clone(), prefix: Vec::new(), span: None,
         }]).unwrap();
-        timeout(Duration::from_secs(10), subscription.wait_for("auth", "ns", 1)).await.unwrap();
+        timeout(Duration::from_secs(10), subscription.wait_for("auth", "keys", 1)).await.unwrap();
         sleep(Duration::from_secs(35)).await;
         assert_eq!(peers.health().state(PRIMARY), State::Closed, "healthy idle acknowledgements must keep the source alive");
 
@@ -106,7 +106,7 @@ async fn scenario() {
         }).await.expect("source did not expire missing incoming acknowledgements");
         append(&primary_log, 2).await;
         append(&backup_log, 2).await;
-        timeout(Duration::from_secs(15), subscription.wait_for("auth", "ns", 2)).await.expect("subscriber did not fail over");
+        timeout(Duration::from_secs(15), subscription.wait_for("auth", "keys", 2)).await.expect("subscriber did not fail over");
         assert_eq!(engine.get(b"k").unwrap(), Some(2_u64.to_be_bytes().to_vec()));
         assert!(subscription.ready());
         assert!(!admin.render().lines().any(|line| line.contains("outcome=\"Timeout\"") && !line.ends_with(" 0")),

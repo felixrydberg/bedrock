@@ -106,7 +106,7 @@ fn stalled(hub: &Hub, id: u64) -> mpsc::Receiver<Result<pb::RelayFrame, tonic::S
             events: Arc::new(AtomicUsize::new(0)),
             closed: Arc::new(Watched::new(false)),
             follows: BTreeMap::new(),
-            ranges: BTreeMap::new(),
+            ranges: Default::default(),
             changed: Arc::new(Watched::new(0)),
             member: None,
             pushed: BTreeMap::new(),

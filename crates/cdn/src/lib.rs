@@ -12,8 +12,8 @@ use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
 
 pub const DATASETS: &[Dataset] = &[Dataset {
     name: "cdn",
-    // Global retention namespaces (`workers`, `pages`; B-32). Every `bedrock-cdn` needs every record, so they are never
-    // evicted; idle artifact bytes are, through `CacheStorage` (B-44).
+    // Global retention namespaces (`workers`, `pages`; B-32). A range's L2 owners never evict its records; idle artifact
+    // bytes are evicted through `CacheStorage` (B-44).
     defaults: Policy {
         replication: ReplicationPolicy::Global,
         cache: CachePolicy {
@@ -43,44 +43,31 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
-    // Every CDN node needs all retention metadata, so it follows `cdn` over the whole hash range, in every namespace.
-    // Artifact bytes are what is ranged (B-34).
-    let mut targets = Vec::new();
-    let mut skipped = false;
-    if let Some(instance) = datasets.get("cdn") {
+    // Relays push the `cdn` ranges this node owns, like Quicksilver's (§4 decision 14).
+    let mut ranged = std::collections::BTreeMap::new();
+    for instance in datasets.iter() {
+        let name = instance.dataset.name;
         match &instance.engine {
             Ok(engine) if engine.health().is_ok() => {
-                targets.push(bedrock_lib::relays::client::Target {
-                    selection: bedrock_lib::relays::client::Selection {
-                        dataset: "cdn".into(),
-                        namespace: String::new(),
-                    },
-                    engine: engine.clone(),
-                    prefix: Vec::new(),
-                    span: Some((0, 0)),
-                })
+                ranged.insert(name.to_owned(), engine.clone());
             }
-            // ponytail: an unavailable dataset keeps the node unready until restart; rebuild the Session if hot
-            // recovery matters.
-            _ => {
-                tracing::warn!(
-                    dataset = "cdn",
-                    "dataset unavailable; retention metadata is not followed"
-                );
-                skipped = true;
-            }
+            _ => tracing::warn!(
+                dataset = name,
+                "dataset unavailable; its ranges are not followed"
+            ),
         }
     }
+    // ponytail: a dataset unavailable at startup keeps the node unready until restart; rebuild the Session if hot
+    // recovery matters.
+    let skipped = ranged.len() != datasets.iter().count();
     let (members, target) = membership::View::new("cdn", &config.node.location.cell);
-    targets.push(target);
     let peers = std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin));
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
-        targets,
+        vec![target],
         membership::member(&config, "cdn"),
-        // Artifact ranges carry no dataset to store yet (B-34).
-        Default::default(),
+        ranged,
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
