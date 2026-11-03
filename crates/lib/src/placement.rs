@@ -17,7 +17,6 @@ use sha2::{Digest, Sha256};
 
 use crate::replication::pb;
 
-/// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.
 /// The namespaces of a dataset placed in L2 ranges, fixed in code; empty for every other dataset. The writer accepts no
 /// other namespace of a ranged dataset, and a member is ready for a range only once it holds all of them (#22 / B-21).
 pub fn namespaces(dataset: &str) -> &'static [&'static str] {
@@ -29,6 +28,7 @@ pub fn namespaces(dataset: &str) -> &'static [&'static str] {
     }
 }
 
+/// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.
 pub fn hash_of(dataset: &str, namespace: &str, key: &[u8]) -> u64 {
     let mut hash = Sha256::new();
     for part in [dataset.as_bytes(), namespace.as_bytes(), key] {

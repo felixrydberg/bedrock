@@ -86,7 +86,8 @@ all membership changes until it returns.
 5. The relay then pushes a set without the range: that is the revoke. The member waits until its own view has
    reached the pushed revision, then confirms that the view no longer lists it for the range and lists another
    `ready` owner. It stops serving and following the range, deletes it with one `delete_range` over the hash span
-   and compacts that span. A revoke that does not match its view is refused and reported.
+   and compacts that span. A revoke that does not match its view is refused and reported, and the relay pushes the
+   set again on its next pass.
 
 Relays act only on the published directory. A relay that dies mid-handoff loses nothing: the member's next relay
 pushes the full set again and the publisher continues from published state. Without a majority nothing is

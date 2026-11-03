@@ -637,3 +637,53 @@ fn sessions_are_authorized_by_the_callers_certificate() {
     // A relay without a configured cell admits no leaves.
     denied(authorize(&caller("kv", "", "n7"), 1, "", 0, None));
 }
+
+#[tokio::test]
+async fn a_refused_push_is_pushed_again_on_the_next_pass() {
+    let hub = hub();
+    let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&1)
+        .unwrap()
+        .member = Some(member("q1", pb::member::Status::Ready));
+    let me = ("kv".to_string(), "q1".to_string());
+    let ranges = |revision| pb::Ranges {
+        dataset: "quicksilver".into(),
+        revision,
+        spans: vec![pb::Span {
+            start: 0,
+            end: 1 << 63,
+        }],
+    };
+    let refused = |revision| pb::RangesAck {
+        dataset: "quicksilver".into(),
+        revision,
+        refused: vec![pb::Span {
+            start: 1 << 63,
+            end: 0,
+        }],
+        reason: "still an owner".into(),
+    };
+    let mut next = async || match tokio_stream::StreamExt::next(&mut frames)
+        .await
+        .unwrap()
+        .unwrap()
+        .kind
+    {
+        Some(pb::relay_frame::Kind::Ranges(r)) => r.revision,
+        other => panic!("expected a pushed set, got {other:?}"),
+    };
+    hub.push_ranges(&me, ranges(7));
+    assert_eq!(next().await, 7);
+    // A refusal of an older set does not forget the newer one.
+    hub.ranges_acked(1, refused(6));
+    hub.push_ranges(&me, ranges(8));
+    // The current set is refused: the next pass pushes the same spans again.
+    hub.ranges_acked(1, refused(7));
+    hub.push_ranges(&me, ranges(9));
+    let again = tokio::time::timeout(std::time::Duration::from_secs(1), next());
+    assert_eq!(again.await.expect("the refused set is pushed again"), 9);
+}

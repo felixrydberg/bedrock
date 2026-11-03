@@ -1163,3 +1163,37 @@ async fn rebuild_counts_only_after_a_fresh_verified_bootstrap() {
         .unwrap();
     assert_eq!(engine.get(b"users\0k").unwrap(), Some(b"fresh".to_vec()));
 }
+
+#[tokio::test]
+async fn a_member_announces_only_the_ranged_datasets_it_follows() {
+    let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
+    let member = pb::Member {
+        node_id: "q1".into(),
+        service: "quicksilver".into(),
+        cell: "c1".into(),
+        status: pb::member::Status::Ready as i32,
+        datasets: vec!["auth".into(), "quicksilver".into()],
+        ..Default::default()
+    };
+    let engine: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new("quicksilver"));
+    let ranged = BTreeMap::from([("quicksilver".to_string(), engine)]);
+    let relays = vec!["10.0.0.1:7000".to_string()];
+    // Without its own membership view the member could never confirm a revoke.
+    let refused = Session::join(
+        peers.clone(),
+        relays.clone(),
+        Vec::new(),
+        member.clone(),
+        ranged.clone(),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    // `auth` did not open, so placement must not give this member its ranges.
+    let (_, view) = crate::membership::View::new("quicksilver", "c1");
+    let session = Session::join(peers, relays, vec![view], member, ranged).unwrap();
+    assert_eq!(
+        session.member.as_ref().unwrap().get().datasets,
+        ["quicksilver"]
+    );
+}

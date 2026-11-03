@@ -58,7 +58,8 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
   view has reached the set's revision (`relays::ranges`): it follows added ranges, carries a split range's coverage
   to the parts it keeps, and drops a revoked range only when its view no longer lists it there and lists another
   `ready` owner. A drop deletes the range's span and its consumers' progress in one atomic batch, then compacts the
-  span. It acknowledges every set it applied with `RangesAck`, listing the revokes it refused and why. A range
+  span. It acknowledges every set it applied with `RangesAck`, listing the revokes it refused and why; the relay
+  then forgets that set and pushes it again on its next publish pass. A range
   held before a restart resumes until the relays push the current set.
 
 ## Model

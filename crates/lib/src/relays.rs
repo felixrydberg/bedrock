@@ -375,6 +375,14 @@ impl Hub {
                 reason = %ack.reason,
                 "a member refused a revoke that its directory view does not confirm"
             );
+            // Forget the refused set, so the next publish pass pushes it again.
+            if sub
+                .pushed
+                .get(&ack.dataset)
+                .is_some_and(|pushed| pushed.revision == ack.revision)
+            {
+                sub.pushed.remove(&ack.dataset);
+            }
         }
         let acked = sub.ranges_acked.entry(ack.dataset).or_default();
         *acked = (*acked).max(ack.revision);

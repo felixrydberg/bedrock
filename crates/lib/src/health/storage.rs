@@ -351,6 +351,10 @@ impl StorageEngine for Monitored {
     fn health(&self) -> StorageResult<()> {
         self.call(|| self.inner.health())
     }
+
+    fn compact(&self, range: &KeyRange) -> StorageResult<()> {
+        self.call(|| self.inner.compact(range))
+    }
 }
 
 struct MonitoredSnapshot<'a> {

@@ -195,9 +195,10 @@ pub(crate) fn validate_scope(dataset: &str, namespace: &str) -> StorageResult<()
     }
     let fixed = crate::placement::namespaces(dataset);
     if !fixed.is_empty() && !fixed.contains(&namespace) {
+        // Named, since a persisted one stops `Writer::open` until it is removed.
         return Err(StorageError::Unsupported(context(
             "namespace",
-            "not one of the dataset's fixed namespaces",
+            format!("{dataset}/{namespace} is not one of the dataset's fixed namespaces"),
         )));
     }
     Ok(())

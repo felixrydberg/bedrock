@@ -161,16 +161,21 @@ impl Session {
     /// Like [`Session::start`], announcing `member` to the relays, which makes this process a cell member (B-12).
     /// Relays push the member the L2 ranges it owns per dataset; `ranged` maps each dataset it carries to the engine
     /// those ranges are stored in (#22 / B-21). `targets` must include the member's own membership view
-    /// ([`crate::membership::View`]), which confirms revokes.
-    /// Returns an invalid-argument status if `member` is invalid or not ready, and propagates startup errors as in
-    /// [`Session::start`].
+    /// ([`crate::membership::View`]), which confirms revokes. The member announces only the ranged datasets in
+    /// `ranged`, so placement never gives it ranges it would not follow.
+    /// Returns an invalid-argument status if `member` is invalid or not ready, or if `ranged` is not empty and `targets`
+    /// lack the membership view, and propagates startup errors as in [`Session::start`].
     pub fn join(
         peers: Arc<Peers>,
         upstreams: Vec<String>,
         targets: Vec<Target>,
-        member: pb::Member,
+        mut member: pb::Member,
         ranged: BTreeMap<String, Arc<dyn StorageEngine>>,
     ) -> Result<Self, Status> {
+        member
+            .datasets
+            .retain(|d| !super::pushed(d) || ranged.contains_key(d));
+        member.unhealthy.retain(|d| member.datasets.contains(d));
         crate::membership::validate(&member)?;
         if member.status != pb::member::Status::Ready as i32 {
             return Err(Status::invalid_argument("a joining member must be ready"));
@@ -250,6 +255,17 @@ impl Session {
             pending: BTreeMap::new(),
             retired: BTreeSet::new(),
         };
+        // Without its own view a member could never confirm a revoke or acknowledge a pushed set.
+        if !pushed.ranged.is_empty()
+            && !pushed
+                .me
+                .as_ref()
+                .is_some_and(|(_, view)| consumers.contains_key(view))
+        {
+            return Err(Status::invalid_argument(
+                "pushed ranges need the member's membership view",
+            ));
+        }
         let progress = Arc::new(Mutex::new(state));
         let changes = Arc::new(Watched::new(0));
         let rebuilds = Rebuilds::default();

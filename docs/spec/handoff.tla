@@ -104,18 +104,21 @@ Observe(n) == /\ conn[n] /\ view[n] # Current(n)
 \* A revoke is confirmed only once the node's view has reached the frame's revision and
 \* shows the node without h while another owner of h is ready; otherwise it is refused.
 Confirms(n, h) == view[n][h].mine = "none" /\ view[n][h].other
-\* The node processes its next frame for h: follow, drop (delete_range), or refuse.
+\* The node processes its next frame for h: follow, drop (delete_range), or refuse. A refusal
+\* reaches the relay in the acknowledgement, which forgets what it pushed so it pushes again.
 Receive(n, h) == LET f == Head(chan[n][h]) IN
                  /\ chan[n][h] # <<>>
                  /\ f.on \/ f.ok
                  /\ chan' = [chan EXCEPT ![n][h] = Tail(@)]
                  /\ IF f.on THEN /\ follow' = [follow EXCEPT ![n][h] = TRUE]
-                                 /\ UNCHANGED copy
+                                 /\ UNCHANGED <<copy, told>>
                     ELSE IF Confirms(n, h)
                          THEN /\ follow' = [follow EXCEPT ![n][h] = FALSE]
                               /\ copy' = [copy EXCEPT ![n][h] = FALSE]
-                         ELSE UNCHANGED <<follow, copy>>
-                 /\ UNCHANGED <<pub, conn, quorum, starts, own, rev, told, view, cuts, flips>>
+                              /\ UNCHANGED told
+                         ELSE /\ told' = [told EXCEPT ![n][h] = "unknown"]
+                              /\ UNCHANGED <<follow, copy>>
+                 /\ UNCHANGED <<pub, conn, quorum, starts, own, rev, view, cuts, flips>>
 \* Bootstrap and catch-up of a followed point (relays.tla checks how).
 Copy(n, h) == /\ conn[n] /\ follow[n][h] /\ ~copy[n][h]
               /\ copy' = [copy EXCEPT ![n][h] = TRUE]
