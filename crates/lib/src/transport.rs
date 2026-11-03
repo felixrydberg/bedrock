@@ -4,25 +4,33 @@
 //!
 //! Under madsim, tonic's own timeouts, limits and keepalive do nothing, so timeouts and traffic separation live here
 //! where the simulation can test them.
+//!
+//! With `tls` configured, connections use mutual TLS ([`tls`], B-55) and servers learn each verified [`Caller`].
 
 pub mod admin;
+pub mod tls;
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use tonic::transport::{Channel, Endpoint};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Status};
 
 use crate::health::Health;
 use admin::Admin;
+use tls::Tls;
 
 /// HTTP/2 pings on idle connections, so a dead peer behind a quiet persistent stream is noticed (B-13).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// TLS servers begin a graceful close of older connections, so peers whose calls finish handshake again with current
+/// certificates. Without a grace limit, long-lived streams such as relay sessions keep running.
+const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 3600);
 
 /// Traffic class. Each class has its own connection per peer, so bulk transfers fill their own HTTP/2 flow-control
 /// windows instead of delaying control and replication messages (`cdn.md`, Artifact Transfer).
@@ -51,6 +59,7 @@ pub struct Peers {
     channels: Mutex<BTreeMap<(String, Class), Channel>>,
     calls: Family<CallLabels, Counter>,
     health: Health,
+    tls: Option<Arc<Tls>>,
 }
 
 impl Peers {
@@ -65,7 +74,14 @@ impl Peers {
             channels: Mutex::default(),
             calls,
             health: Health::new(admin),
+            tls: None,
         }
+    }
+
+    /// Dials peers over mutual TLS when `tls` is set (B-55).
+    pub fn with_tls(mut self, tls: Option<Arc<Tls>>) -> Self {
+        self.tls = tls;
+        self
     }
 
     /// Per-peer circuit breakers fed by [`Peers::call`]; route through [`Health::route`].
@@ -80,13 +96,25 @@ impl Peers {
         if let Some(channel) = channels.get(&(addr.to_owned(), class)) {
             return Ok(channel.clone());
         }
-        let channel = Endpoint::from_shared(format!("http://{addr}"))?
+        // The scheme only labels requests; with TLS the connector encrypts.
+        let endpoint = Endpoint::from_shared(format!("http://{addr}"))?
             .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
-            .keep_alive_while_idle(true)
-            .connect_lazy();
+            .keep_alive_while_idle(true);
+        let channel = match &self.tls {
+            Some(tls) => tls.channel(endpoint),
+            None => endpoint.connect_lazy(),
+        };
         channels.insert((addr.to_owned(), class), channel.clone());
         Ok(channel)
+    }
+
+    /// A raw connection to `addr` for non-gRPC protocols (the B-12 membership writes), over TLS when configured.
+    pub async fn dial(&self, addr: &str) -> std::io::Result<Box<dyn Io>> {
+        match &self.tls {
+            Some(tls) => tls.dial(addr).await,
+            None => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
+        }
     }
 
     /// Drops `addr`'s connections and breaker, e.g. once it left the cell's membership. Later use starts afresh.
@@ -125,6 +153,90 @@ impl Peers {
             .record(addr, probe, !result.as_ref().is_err_and(peer_failed));
         result
     }
+}
+
+/// A byte stream from [`Peers::dial`].
+pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
+
+/// A gRPC server builder; with TLS, connections start a graceful close after [`MAX_CONNECTION_AGE`]. Serve it with
+/// [`serve`].
+pub fn server(tls: Option<&Arc<Tls>>) -> Server {
+    let server = Server::builder();
+    match tls {
+        Some(_) => server.max_connection_age(MAX_CONNECTION_AGE),
+        None => server,
+    }
+}
+
+/// Serves `router` on `addr`, over mutual TLS when `tls` is set.
+pub async fn serve(
+    router: tonic::transport::server::Router,
+    addr: std::net::SocketAddr,
+    tls: Option<Arc<Tls>>,
+) -> Result<(), String> {
+    match tls {
+        Some(tls) => tls.serve(router, addr).await,
+        None => router.serve(addr).await.map_err(|e| e.to_string()),
+    }
+}
+
+/// The node a verified client certificate names (B-55). TLS servers put it in every request's extensions; plaintext
+/// servers have none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    pub service: String,
+    pub cell: String,
+    pub node_id: String,
+    /// The certificate's DNS and IP SANs.
+    pub hosts: Vec<String>,
+}
+
+impl Caller {
+    pub fn of<T>(request: &tonic::Request<T>) -> Option<&Caller> {
+        request.extensions().get::<Caller>()
+    }
+
+    /// Fails unless the caller runs one of `services`, in `cell` when given.
+    pub fn require(&self, services: &[&str], cell: Option<&str>) -> Result<(), Status> {
+        if !services.contains(&self.service.as_str()) || cell.is_some_and(|cell| cell != self.cell)
+        {
+            return Err(Status::permission_denied(format!(
+                "{} {} in cell {} may not call this",
+                self.service, self.node_id, self.cell
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether `host` (a DNS name or IP address) is one of the certificate's SANs.
+    pub fn has_host(&self, host: &str) -> bool {
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => self.hosts.iter().any(|h| h.parse() == Ok(ip)),
+            Err(_) => self.hosts.iter().any(|h| h.eq_ignore_ascii_case(host)),
+        }
+    }
+}
+
+/// `bedrock://{service}/{cell}/{node_id}`, the URI SAN that names a node, as `(service, cell, node_id)`.
+pub fn parse_identity(uri: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = uri.strip_prefix("bedrock://")?.split('/');
+    let identity = (parts.next()?, parts.next()?, parts.next()?);
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
+    (parts.next().is_none() && plain(identity.0) && plain(identity.1) && plain(identity.2))
+        .then_some(identity)
+}
+
+/// The host of `host:port`, without IPv6 brackets.
+pub fn host_of(addr: &str) -> &str {
+    let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 /// Whether `status` means the peer failed, rather than answered the request with an error (`NOT_FOUND`, a rejected

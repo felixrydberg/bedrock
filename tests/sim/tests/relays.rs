@@ -213,6 +213,7 @@ async fn scenario() -> u64 {
                 admin_listen: "10.0.0.4:7101".parse().unwrap(),
                 data_dir: "/data/quicksilver-neighbor".into(),
                 budget: Budget::default(),
+                tls: None,
             },
             roles: vec![Role::L1],
             datasets: vec!["quicksilver".into()],

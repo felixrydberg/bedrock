@@ -180,6 +180,9 @@ Rules this implies:
 | B-51 | Worker and Pages request front ends | Compute | not decided | B-35, B-50 |
 | B-48 | Compiled Worker artifact caching | Compute | not decided | B-51 |
 | B-52 | Deploy end-to-end acceptance | Compute | not decided | B-29, B-36, B-50, B-51 |
+| **M — Node security** (parent [#44](https://github.com/felixrydberg/bedrock/issues/44); scope amended 2026-11-03, drafts not yet issues) |||||
+| B-55 | Mutual TLS and caller identity for node-to-node traffic, enabled by config | Shared core | `lib/transport` + every bin | B-03, B-12, B-17 |
+| B-54 | Deployment guide: private networking and node certificates (Kubernetes, Docker, bare metal) | Foundation (docs) | `docs/deployment/` + `deploy/` | B-02, B-55 |
 
 ### Parallel work inside the shared core
 
@@ -1595,6 +1598,180 @@ Labels: enhancement
 - **Implementation:** Compute / deploy control plane.
 - **Depends on:** B-29, B-36, B-50, B-51.
 - **Acceptance criteria:** Every scenario passes in CI or in a nightly job.
+
+---
+
+### M — Node security (proposal for #44)
+
+> Proposal, 2026-11-03. [#44](https://github.com/felixrydberg/bedrock/issues/44) asks for a Nebula overlay between all
+> nodes, mTLS on node-to-node RPC, and certificates issued and stored in OpenBao. Scope update, 2026-11-03 (user
+> decision): Bedrock runs on Kubernetes, customer Docker hosts and bare metal, so the binaries implement only mTLS,
+> enabled by configuration. Private networking (Nebula or the platform's own) and certificate issuance (OpenBao or any
+> other CA) are deployment choices, documented per deployment type. OpenBao is the reference issuer, not a requirement.
+> This narrows #44; the [scope amendment](https://github.com/felixrydberg/bedrock/issues/44#issuecomment-6598728634)
+> is recorded there.
+
+Today every listener binds a public address in `network_mode: host` and carries plaintext: relay and writer `Relay`/`Siblings`
+gRPC (`crates/relay/src/lib.rs`, `crates/api/src/lib.rs`), the write API over HTTP/1 with a shared bearer token, and the
+admin endpoint (`/metrics`, `/health`, `/ready`). Any host that can reach a relay can open a leaf session and announce
+any `Member` (`node_id`, `service`, `cell`, `address`, budgets), which places it in membership and L2 range assignment.
+
+- **mTLS (B-55, binaries)** authenticates each process: an X.509 certificate per binary instance names its service, cell
+  and node. Servers authorize callers by that identity, and relays bind the announced `Member` to it. It must hold on its
+  own over public links, because a private network is optional.
+- **Deployment guide (B-54, docs)** covers how certificates reach the configured paths and how the network is made
+  private on each deployment type. Nebula is one of those options, for machines spanning several networks. It needs no
+  Bedrock code: `listen` and `advertise` point at the overlay address.
+
+---
+
+#### B-55 — Mutual TLS and caller identity between nodes
+
+```
+Title:  Feature 🚀: Mutual TLS and caller identity for node-to-node traffic
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+Node-to-node gRPC and the write API are plaintext. A relay accepts any leaf session and trusts the `Member` it
+announces, so a host that reaches a relay can join membership under another node's `node_id` and receive L2 ranges.
+
+**Describe the solution you'd like**
+- **Enabled by configuration, fail closed.** `NodeConfig` gains an optional `tls = { cert, key, ca }` (file paths).
+  - Absent: plaintext as today, with a startup warning and the gauge `transport_tls_enabled 0`.
+  - Present: mTLS is required on every node-to-node listener and connection. Until the files load, `/ready` stays false;
+    if they do not load within a fixed startup timeout, the process exits with an error. A configured node never falls
+    back to plaintext. A file appearing at a path does not by itself enable TLS.
+  - A TLS server rejects plaintext clients and the reverse, so a cell runs one mode. Moving an existing cell to TLS is a
+    cutover; there is no mixed mode.
+- **Certificate contract** (what any issuer must produce, documented in B-54): a PEM private key, a PEM certificate chain
+  and a PEM CA bundle. The leaf certificate has extended key usages `serverAuth` and `clientAuth`, a URI SAN
+  `bedrock://{service}/{cell}/{node_id}` (`service` ∈ `quicksilver`, `kv`, `cdn`, `relay`, `api`; `node_id` and `cell`
+  already exclude `/`), and a DNS or IP SAN for the host in `advertise`. Startup rejects a certificate whose URI SAN
+  does not match the node's own `service`, `cell` and `node_id`.
+- **Identity.** One parser in `lib/transport` turns a verified peer chain into `Caller { service, cell, node_id }`.
+- **Transport.** `Peers::channel` dials `https://` with the client certificate and verifies the server chain against the
+  CA bundle and the dialed host against the server's SANs. Every server requires a client certificate from that bundle.
+  TLS 1.3 only, through rustls/tokio-rustls (already in the lockfile) on tonic's `serve_with_incoming` and
+  `connect_with_connector_lazy`, so certificates can be swapped (see Rotation).
+- **Authorization** in the RPC handlers, from `Caller`, never from fields in the request:
+
+  | Server | Accepts |
+  |---|---|
+  | api `Relay.Session` | `relay` |
+  | relay `Relay.Session`, leaf (`tier` 0) | `quicksilver`, `kv`, `cdn` in the relay's own cell |
+  | relay `Relay.Session`, lower relay tier | `relay` |
+  | relay `Siblings.Watch` | `relay` in the same cell |
+  | api write HTTP (HTTPS when `tls` is set) | Any caller; a client certificate is optional and every caller keeps the bearer token (open question 1) |
+
+  Clients check the server too: a leaf or relay session only accepts frames from a `relay` or `api` peer.
+- **Membership binding.** A leaf `Hello`'s `Member` must match the caller: same `service`, `cell` and `node_id`, and
+  the host in `address` must be one of the caller certificate's SANs. Otherwise the relay rejects the session with
+  `PERMISSION_DENIED`, which is a caller error and does not trip the caller's breaker for the relay (B-13). Budgets and
+  roles stay self-reported.
+- **Rotation without restart.** Every handshake uses the current rustls configs, on the server through the TLS
+  acceptor and on the client through the custom connector, so new handshakes pick up renewed files. Files are polled
+  every 10 seconds and compared by content, which also catches Kubernetes' atomic symlink swap of mounted Secrets. A
+  renewal that fails to parse, has expired or does not match the node keeps the previous certificate and raises an
+  error metric. Existing connections keep their handshake identity: gRPC servers begin a graceful close after 24
+  hours (`max_connection_age`, no grace limit), so long-lived relay sessions keep running, and the write listener has
+  no age limit.
+- **Admin endpoint** stays plain HTTP without client certificates. Deployments bind it to loopback or a private
+  interface (B-54).
+- **Metrics.** `transport_tls_enabled`, inbound handshake failures, reload failures and seconds until the local
+  certificate expires, all without labels. Rejected sessions are logged with the caller's identity.
+- **Simulation.** madsim-tonic ignores TLS and has no `serve_with_incoming`, so the TLS adapter is compiled out under
+  `cfg(madsim)`, as RocksDB is: simulated nodes run plaintext, and configuring `tls` there fails at startup.
+  Authorization is a pure function of the `Caller` (unit-tested in both builds); real-socket tests with a generated CA
+  cover the wiring.
+- **Specification.** Authorization only removes callers the protocol already treats as failed peers, and adds no
+  messages or states; `relays.tla` and `membership.tla` stay unchanged. Revisit if review shows otherwise.
+
+**Additional context**
+- **Implementation:** Shared core (`lib/transport`) plus wiring in every binary.
+- **Module:** `lib/transport`, `lib/node` (config), `lib/relays` (session authorization and membership binding), `api`.
+- **Depends on:** B-03 (transport), B-12 (membership entries), B-17 (relay sessions).
+- **Doc reference:** #44; `kv.md` §17 (security-sensitive actions fail closed).
+- **Acceptance criteria:**
+  - Real-binary test with a CA generated in the test: a session without a client certificate, with a certificate from
+    another CA, with an expired certificate, or as the wrong service is rejected; a valid one succeeds.
+  - A leaf announcing another `node_id`, another cell or an address outside its SANs is rejected before it joins
+    membership.
+  - With `tls` set and the files missing, the node stays unready and then exits; it never serves plaintext. Without
+    `tls`, it serves plaintext and reports `transport_tls_enabled 0`.
+  - Replacing the files in place and by symlink swap changes the certificate on new handshakes without dropping
+    sessions; a corrupt or mismatched renewal keeps the old certificate and is reported.
+  - Normal and `cfg(madsim)` builds pass the existing seeds; bulk-transfer throughput with TLS is measured against
+    plaintext and recorded.
+
+---
+
+#### B-54 — Deployment guide: private networking and certificate issuance
+
+```
+Title:  Feature 🚀: Deployment guide for private networking and node certificates
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+B-55 makes the binaries require certificates at configured paths but does not say where they come from. Bedrock runs on
+Kubernetes, customer Docker hosts and bare metal at several providers, and each has its own way to issue certificates and
+keep traffic private.
+
+**Describe the solution you'd like**
+- A guide under `docs/deployment/` with the B-55 certificate contract, and per deployment type how the files reach the
+  configured paths, how they renew before expiry, how the network is restricted, and where the admin endpoint binds:
+
+  | Deployment | Certificates | Private network |
+  |---|---|---|
+  | Kubernetes | cert-manager `Certificate` per pod → Secret mounted read-only. With OpenBao, cert-manager's Vault issuer (compatibility to be verified) | The cluster's CNI (for example WireGuard encryption) and NetworkPolicies limiting each port to the callers in B-55's table |
+  | Docker / compose | OpenBao Agent container writing into a volume shared with the services, or any script that writes the files | Host firewall; Nebula when hosts span networks |
+  | Bare metal across providers | OpenBao Agent as a systemd unit | Nebula, below |
+  | Local / tests | No `tls` section, or a test CA from a script | — |
+
+- **OpenBao reference setup**: a PKI intermediate with one role per service (`client_flag`,
+  `server_flag`, URI SANs limited by `allowed_uri_sans_template` to the machine's own `cell` and `node_id`, DNS SANs
+  by `allowed_domains_template` to its own host, IP SANs off, 7-day TTL, `generate_lease` set). One AppRole per
+  machine, whose response-wrapped `secret_id` is delivered before every agent start, with a policy allowing only `issue/{service}` for the services it
+  runs. Agent templates use `secret`: OpenBao's docs describe `pkiCert` re-fetching only at startup or after expiry,
+  and leased secrets at 85% of their TTL. The setup is run once against an OpenBao dev server to confirm this.
+- **Nebula**, for machines spanning several networks:
+  - Nebula 1.10+ with v2 certificates on a dedicated IPv4 /16, as a host service outside the Bedrock containers.
+  - At least three lighthouses at different providers; Nebula's own relay feature stays off for hosts with public addresses.
+  - Host firewall on the public interface: Nebula UDP 4242 and SSH from the operator network only.
+  - Nebula groups (`service`, `relay`, `api`, `monitoring`, `ops`) limit ports: relay `listen` ← `service`, `relay`;
+    api `listen` ← `relay`; api `write_listen` ← `relay`, `ops`; `admin_listen` ← `monitoring`, `ops`.
+  - Host keys are generated on the machine; only the public key is signed (open question 2 covers where the CA key lives).
+  - Removing a machine: its fingerprint goes into `pki.blocklist` on every host, with `pki.disconnect_invalid: true`.
+    Its TLS certificate then expires within its lifetime because the machine can no longer renew.
+- `deploy/config/*.toml` show a commented `[tls]` section; `docker-compose.local.yml` stays plaintext.
+
+**Additional context**
+- **Implementation:** Foundation (deployment). Documentation and example configuration; no Rust changes.
+- **Module:** `docs/deployment/security.md`, `deploy/config/`.
+- **Depends on:** B-02, B-55.
+- **Acceptance criteria:**
+  - The compose + OpenBao path is run end to end once: certificates are issued, a cell starts with TLS, renewal swaps the
+    certificate without dropping sessions. Recorded in the guide.
+  - The Nebula path is run once on machines in two networks: Bedrock ports answer only on overlay addresses and a
+    blocklisted machine loses its tunnels. Recorded in the guide.
+  - Steps not run end to end (for example the Kubernetes/cert-manager path) are marked untested in the guide.
+
+---
+
+#### Open questions for #44
+
+1. **Write API callers that are not nodes** (deploy tooling, future Compute). Implemented for now: the write listener
+   uses TLS with an optional client certificate, and every caller, relays included, keeps the bearer token until the
+   Auth dataset (B-42) exists. Moving relays' membership writes to certificate identity only is a later choice.
+2. **Nebula CA key in the reference setup.** OpenBao has no built-in Nebula engine. Options: (a) the community
+   `openbao-plugin-secrets-nebula` (MIT, Nebula v2 support, one maintainer; whether the CA key stays inside OpenBao and
+   whether it signs a supplied public key must be checked before use), or (b) the CA key in OpenBao KV, signed with
+   `nebula-cert sign -in-pub` on an operator machine. Proposal: (b).
+3. **Ordering with the hardening gate (B-23).** Proposal: neither blocks the other. B-55 changes the transport, so when it
+   lands it reruns the madsim seeds and real-binary crash tests; B-23 does not wait for it.
+4. **Lifetimes in the reference setup.** 7-day node certificates and 90-day Nebula certificates. Shorter node certificates
+   shrink the revocation window and the tolerated issuer outage at the same time.
 
 ---
 
