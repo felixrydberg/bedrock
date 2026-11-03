@@ -3,15 +3,50 @@
 //! Both are pure and deterministic, so every relay and node computes the same result from the same inputs.
 //! - [`assign`] is run by the cell relays' majority membership publisher. From the published placement directory and
 //!   membership it returns the directory entries to write: ranges of removed members get new owners, and members far from
-//!   their capacity-weighted share take ranges from the most loaded, splitting where needed. Handoff (marking owners
-//!   `ready`, revoking `leaving` ones) belongs to the relays (#22 / B-21); until then the publisher [`promote`]s.
+//!   their capacity-weighted share take ranges from the most loaded, splitting where needed. [`handoff`] then marks
+//!   owners `ready` as their relays report them so and removes `leaving` ones (#22 / B-21).
 //! - [`owners`] and [`serves`] read the published directory (#19 / B-16, `docs/spec/membership.md`).
 //! - [`rank`] orders customer-KV readers by rendezvous hash. Customer KV has no ranges.
+//! - [`hash_of`] places a key in the hash space; relay range streams select keys with [`in_span`] (#22 / B-21).
+//! - [`namespaces`] is the fixed namespace set of each ranged dataset, so relays know every namespace a range covers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Unbounded};
 
+use sha2::{Digest, Sha256};
+
 use crate::replication::pb;
+
+/// The namespaces of a dataset placed in L2 ranges, fixed in code; empty for every other dataset. The writer accepts no
+/// other namespace of a ranged dataset, and a member is ready for a range only once it holds all of them (#22 / B-21).
+pub fn namespaces(dataset: &str) -> &'static [&'static str] {
+    match dataset {
+        "quicksilver" => &["infrastructure"],
+        "auth" => &["keys"],
+        "cdn" => &["pages", "workers"],
+        _ => &[],
+    }
+}
+
+/// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.
+pub fn hash_of(dataset: &str, namespace: &str, key: &[u8]) -> u64 {
+    let mut hash = Sha256::new();
+    for part in [dataset.as_bytes(), namespace.as_bytes(), key] {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part);
+    }
+    u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap())
+}
+
+/// Whether `hash` lies in `span`: `[start, end)`, where `end` 0 means 2⁶⁴.
+pub fn in_span(span: &pb::Span, hash: u64) -> bool {
+    hash >= span.start && (span.end == 0 || hash < span.end)
+}
+
+/// A span is valid when it is not empty.
+pub fn valid_span(span: &pb::Span) -> bool {
+    span.end == 0 || span.end > span.start
+}
 
 /// The hash space is `[0, 2⁶⁴)`.
 const SPACE: u128 = 1 << 64;
@@ -433,30 +468,32 @@ fn ratio(load: u128, target: f64) -> u64 {
     (load as f64 / target).to_bits()
 }
 
-/// The entries to write so `populating` owners become `ready` and `leaving` ones go. A range whose owners are all
-/// leaving keeps them, so no range loses its last holder.
-// ponytail: claims readiness without a bootstrap, which is safe only while nothing reads L2 by range (quicksilver is
-// full_replica, auth on-demand); #22 / B-21 replaces it with the relays' bootstrap plus acknowledgement.
-pub fn promote(directory: &Directory, members: &BTreeMap<String, pb::Member>) -> Directory {
+/// The entries to write as handoffs complete (#22 / B-21, `docs/spec/handoff.tla`, `Write`): a `populating` owner whose
+/// relay reports it ready for the entry (`ready` holds `(node, start)`) becomes `ready`. Once no owner of an entry is
+/// populating and a `ready` one is still a member, its `leaving` owners go, so no range loses its last holder.
+pub fn handoff(
+    directory: &Directory,
+    members: &BTreeMap<String, pb::Member>,
+    ready: &BTreeSet<(String, u64)>,
+) -> Directory {
     directory
         .iter()
-        .filter(|(_, owners)| {
-            owners
-                .iter()
-                .any(|o| o.state != State::Ready && members.contains_key(&o.node))
-                && owners
+        .filter_map(|(start, owners)| {
+            let mut next = owners.clone();
+            for owner in &mut next {
+                if owner.state == State::Populating && ready.contains(&(owner.node.clone(), *start))
+                {
+                    owner.state = State::Ready;
+                }
+            }
+            if next.iter().all(|o| o.state != State::Populating)
+                && next
                     .iter()
-                    .any(|o| o.holds() && members.contains_key(&o.node))
-        })
-        .map(|(start, owners)| {
-            let ready = owners
-                .iter()
-                .filter(|o| o.holds() && members.contains_key(&o.node))
-                .map(|o| Owner {
-                    node: o.node.clone(),
-                    state: State::Ready,
-                });
-            (*start, ready.collect())
+                    .any(|o| o.state == State::Ready && members.contains_key(&o.node))
+            {
+                next.retain(|o| o.state != State::Leaving);
+            }
+            (next != *owners).then_some((*start, next))
         })
         .collect()
 }
@@ -469,14 +506,16 @@ pub fn owners(directory: &Directory, hash: u64) -> &[Owner] {
         .map_or(&[], |(_, owners)| owners)
 }
 
-/// The owner check: a node serves only ranges it owns or is leaving in its own view. A caller routed by a stale view
-/// is rejected and retries the next owner.
+/// The owner check: a node serves only ranges it holds as `ready` or `leaving` in its own view; a `populating` owner
+/// may not have the data yet (#22 / B-21). A caller routed by a stale view is rejected and retries the next owner.
 pub fn serves(directory: &Directory, node: &str, hash: u64) -> bool {
-    owners(directory, hash).iter().any(|o| o.node == node)
+    owners(directory, hash)
+        .iter()
+        .any(|o| o.node == node && o.state != State::Populating)
 }
 
 /// Customer-KV readers for a key, most preferred first: rendezvous hashing of `hash`
-/// (`buckets::hash_of("kv", namespace, key)`) with each member's node ID. The same members give the same order on every
+/// (`hash_of("kv", namespace, key)`) with each member's node ID. The same members give the same order on every
 /// node, and removing a member moves only the keys it ranked first. Pass the readers that may serve, in their order, to
 /// [`crate::health::Health::route`] to fall back to the next-ranked healthy one.
 // ponytail: O(N) hashes plus a sort per request, about 185 µs at 10,000 readers (release, 2026-10-31); add a precomputed

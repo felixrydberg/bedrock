@@ -12,8 +12,8 @@ use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
 
 pub const DATASETS: &[Dataset] = &[Dataset {
     name: "cdn",
-    // Global retention namespaces (`workers`, `pages`; B-32). Every `bedrock-cdn` needs every record, so they are never
-    // evicted; idle artifact bytes are, through `CacheStorage` (B-44).
+    // Global retention namespaces (`workers`, `pages`; B-32). A range's L2 owners never evict its records; idle artifact
+    // bytes are evicted through `CacheStorage` (B-44).
     defaults: Policy {
         replication: ReplicationPolicy::Global,
         cache: CachePolicy {
@@ -30,12 +30,14 @@ pub const DATASETS: &[Dataset] = &[Dataset {
 }];
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
+/// If the enabled CDN engine cannot open or is unhealthy at startup, its ranges are not followed and the node stays
+/// unready until restart. Configuration, admin startup, registry and relay session initialization errors are returned.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-cdn");
     let admin = node::start_admin(&config.node).await?;
     let storage = StorageHealth::new(&admin);
-    // Subscriptions apply through the replication handles, which keep working while B-22 rebuilds a dataset.
+    // Pushed ranges apply through the replication handles, which keep working while B-22 rebuilds a dataset.
     let mut replication = std::collections::BTreeMap::new();
     let datasets = Registry::open(DATASETS, &config.datasets, |d| {
         let engine = datasets::open_engine(&config.node.data_dir, d)?;
@@ -49,37 +51,24 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
-    let targets = config
-        .subscriptions
-        .iter()
-        .map(|selection| {
-            if selection.dataset != "cdn" {
-                return Err(ConfigError(
-                    "CDN relay subscriptions permit only cdn".into(),
-                ));
+    // Relays push the `cdn` ranges this node owns, like Quicksilver's (§4 decision 14).
+    let mut ranged = std::collections::BTreeMap::new();
+    for instance in datasets.iter() {
+        let name = instance.dataset.name;
+        match &instance.engine {
+            Ok(engine) if engine.health().is_ok() => {
+                ranged.insert(name.to_owned(), replication[name].clone());
             }
-            let instance = datasets
-                .get(&selection.dataset)
-                .ok_or_else(|| ConfigError("subscribed dataset is not enabled".into()))?;
-            let Ok(engine)=&instance.engine else{return Ok(None)};
-            if let Err(error)=engine.health(){
-                tracing::warn!(dataset=%selection.dataset,%error,"dataset unavailable; other subscriptions continue");
-                return Ok(None);
-            }
-            let mut prefix = selection.namespace.as_bytes().to_vec();
-            prefix.push(0);
-            Ok(Some(bedrock_lib::relays::client::Target {
-                selection: selection.clone(),
-                engine:replication[selection.dataset.as_str()].clone(),
-                prefix,
-            }))
-        })
-        .collect::<Result<Vec<_>, ConfigError>>()?;
-    // ponytail: a skipped subscription keeps the node unready until restart; rebuild the Session if hot recovery matters.
-    let skipped = targets.iter().any(Option::is_none);
-    let mut targets: Vec<_> = targets.into_iter().flatten().collect();
+            _ => tracing::warn!(
+                dataset = name,
+                "dataset unavailable; its ranges are not followed"
+            ),
+        }
+    }
+    // ponytail: a dataset unavailable at startup keeps the node unready until restart; rebuild the Session if hot
+    // recovery matters.
+    let skipped = ranged.len() != datasets.iter().count();
     let (members, target) = membership::View::new("cdn", &config.node.location.cell);
-    targets.push(target);
     let peers = std::sync::Arc::new(
         bedrock_lib::transport::Peers::new(&admin)
             .with_tls(bedrock_lib::transport::tls::start(&config.node, "cdn", &admin).await?),
@@ -87,8 +76,9 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
-        targets,
+        vec![target],
         membership::member(&config, "cdn"),
+        ranged,
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let rebuilding = bedrock_lib::reconciliation::rebuild::start(
@@ -97,7 +87,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         &session,
         "engine",
         &replication,
-        bedrock_lib::buckets::hash_of("rebuild", &config.node.node_id, b""),
+        bedrock_lib::placement::hash_of("rebuild", &config.node.node_id, b""),
     );
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());

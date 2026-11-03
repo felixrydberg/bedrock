@@ -59,7 +59,7 @@ crates/
 ├── relay/        # bedrock/relay — relay process: tiers, fan-out, replay, membership      → binary `bedrock-relay`
 ├── quicksilver/  # bedrock/quicksilver — quicksilver + auth: storage (hash-range keyspaces), namespaces → binary `bedrock-quicksilver`
 ├── kv/           # bedrock/kv  — customer KV: S3 namespace readers, cache residency, operations → binary `bedrock-kv`
-└── cdn/          # bedrock/cdn — artifact_storage, artifact_transfer, manifests, retention → binary `bedrock-cdn`
+└── cdn/          # bedrock/cdn — artifact_storage, artifact_transfer, paths, retention → binary `bedrock-cdn`
 ```
 
 ### Deployment model: separate binaries, one shared library
@@ -75,7 +75,7 @@ server runs every service, each service is its own process, and code is shared a
 | `bedrock-relay` | Relay tree, fan-out, replay log, cell membership, L2 placement directory and handoffs (§4 decision 13), regional directory | — (`tier` and `upstreams` in config) |
 | `bedrock-quicksilver` | Pushed `quicksilver` and `auth` over relay-assigned hash ranges (§4 decision 13) | `l1`, `l2` |
 | `bedrock-kv` | Customer `kv`: S3-backed namespace readers and caches; no hash ranges or buckets (§4 decision 12) | `l1`, `l2` (only logged until B-39) |
-| `bedrock-cdn` | Dataset `cdn` (retention metadata) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
+| `bedrock-cdn` | Dataset `cdn` (path rows and ref keys) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
 
 Rules this implies:
 
@@ -84,15 +84,16 @@ Rules this implies:
   `lib/membership` for the cell view). A Quicksilver, KV or CDN crash never takes a relay with it, and relays deploy on their own schedule.
 - **`quicksilver`, `kv`, `cdn`, `relay` and `api` depend on `lib` only, never on each other.**
 - **KV and CDN share infrastructure, not data.** Writes use `bedrock-api` and its sequencing/durability system.
-  `bedrock-quicksilver` subscribes to `quicksilver` and `auth`; `bedrock-cdn` subscribes only to `cdn` retention metadata.
+  `bedrock-quicksilver` subscribes to `quicksilver` and `auth`; `bedrock-cdn` follows only the `cdn` ranges its relay pushes.
   Customer `kv` has no relay subscriptions, replay queues or subscription-driven placement. Its readers use S3-backed
   namespace databases. `bedrock-kv` holds a relay connection only for its own `kv` membership, without another heartbeat,
   and reads Quicksilver/Auth (namespace directory, credentials) from `bedrock-quicksilver` nodes, not from a local copy.
 - **Customer KV is isolated from the control plane.** Tenant load (hot namespaces, cold-open storms, slow S3) can exhaust
   `bedrock-kv` without taking down Quicksilver/Auth, which Workers, CDN and deploy tooling depend on (§4 decision 12).
-- **Retention operations are plain `SET`/`DELETE` writes** to keys in the `cdn` dataset. The write API and relays are generic,
-  and only `bedrock-cdn` interprets them when it applies them (manifest expansion, reference counts).
-- **The CDN serves by hash and knows nothing about deployments.** Workers, Pages, deployments, revisions and which version is live
+- **CDN path rows and ref keys are plain `SET`/`DELETE` writes** to the `cdn` dataset, sent in bulk (B-09c). The write API and
+  relays are generic; the only CDN rule in the shared core is that `ref/{sha256}/…` keys are placed by their content hash.
+  `bedrock-cdn` keeps them as ordinary range data: no manifest expansion and no reference counts (§4 decision 14).
+- **The CDN serves by key and hash and knows nothing about deployments.** A deployment ID is an opaque part of a key. Workers, Pages, deployments, revisions and which version is live
   belong to the Compute and deploy control plane (track L), a client of KV and the CDN (B-50, B-51).
 - **Each binary has its own service view.** Membership, health, the placement directory and the regional directory are
   per service, and each binary reads only its own service's views. Relays assign L2 ranges per service (§4 decision 13). A node with a broken CDN cache disk is still a healthy KV node, and the reverse.
@@ -125,6 +126,7 @@ Rules this implies:
 | [B-10](https://github.com/felixrydberg/bedrock/issues/10) | Stream subscriptions with consistent revision boundary | Shared core | `lib/replication` | B-09, B-03 |
 | [B-11](https://github.com/felixrydberg/bedrock/issues/11) | Generic API atomic materialized state, retained events and recovery | Shared core | `lib/storage`, `lib/replication`, `lib/s3`, `api` wiring | B-09, B-07, B-04, B-06, B-23a |
 | B-09b | Raft write quorum for the API (later) | Shared core | `lib/replication` + `api` bin | B-09, B-10, B-11, B-13 |
+| B-09c | Bulk writes: many keys of one namespace in one revision | Shared core | `lib/replication`, `lib/relays` + `api` bin | B-11, B-23 |
 | **D — Shared core: cluster** |||||
 | [B-13](https://github.com/felixrydberg/bedrock/issues/12) | Peer reachability from real traffic | Shared core | `lib/health` | B-03 |
 | [B-14](https://github.com/felixrydberg/bedrock/issues/13) | Storage-health manager and failure isolation | Shared core | `lib/health` | B-04, B-13 |
@@ -156,8 +158,8 @@ Rules this implies:
 | **I — First CDN** (parallel with H; no dependency on KV drafts) |||||
 | B-30 | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
 | B-31 | Artifact transfer | CDN | `cdn/artifact_transfer` | B-30 |
-| B-32 | `cdn` retention and shared manifest format/reader | CDN | `cdn/retention`, `cdn/manifests` | B-23, B-30 |
-| B-33 | Publish client using shared manifests/retention | CDN | `cdn/manifests` | B-30, B-32 |
+| B-32 | `cdn` path rows and ref keys (§4 decision 14) | CDN | `cdn/retention`, `cdn/paths` | B-23, B-30, B-09c |
+| B-33 | Publish client writing path rows and ref keys in bulk | CDN | `cdn/paths` | B-30, B-32 |
 | B-34 | Regional L2 with two-replica artifact placement | CDN | `cdn/retention`, `cdn/artifact_storage` | B-31, B-32 |
 | B-35 | Artifact retrieval interface | CDN | `cdn/artifact_transfer` | B-33, B-34 |
 | B-36 | CDN end-to-end acceptance | CDN | `cdn` | B-30 … B-35 |
@@ -171,13 +173,13 @@ Rules this implies:
 | **K — CDN refinements** (parallel with J) |||||
 | B-43 | Artifact replica repair and range migration | CDN | `cdn/retention` | B-36 |
 | B-44 | Coordinated eviction, GC and failure recovery | CDN | `cdn/retention` | B-43 |
-| B-45 | Prewarming and manifest readiness | CDN | `cdn/manifests` | B-36 |
+| B-45 | Prewarming and artifact-set readiness | CDN | `cdn/retention` | B-36 |
 | B-46 | Optional unreplicated L1 and popularity-based retention | CDN | `cdn/artifact_storage`, `cdn/retention` | B-44 |
 | B-47 | Filesystem `CacheStorage` adapter | CDN | `cdn/artifact_storage` | B-36 |
 | B-49 | Large-object and range transfers | CDN | `cdn/artifact_transfer` | B-36 |
 | **L — Compute and deploy control plane (future)** |||||
 | B-50 | Deploy control plane: publish, activate, roll back, delete | Compute | not decided | B-24, B-33, B-45 |
-| B-51 | Worker and Pages request front ends | Compute | not decided | B-35, B-50 |
+| B-51 | Gateway: Worker and Pages request routing | Compute | not decided | B-35, B-50 |
 | B-48 | Compiled Worker artifact caching | Compute | not decided | B-51 |
 | B-52 | Deploy end-to-end acceptance | Compute | not decided | B-29, B-36, B-50, B-51 |
 | **M — Node security** (parent [#44](https://github.com/felixrydberg/bedrock/issues/44); scope amended 2026-11-03, drafts not yet issues) |||||
@@ -202,9 +204,9 @@ Rules this implies:
 | KV Phase 4 (relays, streams, replay) | B-17 … B-19 (cache-fill broadcast dropped, decision 11) |
 | KV Phase 5 (cache routing and residency; pushed-data redistribution stays shared) | B-15, B-16, B-19, B-27, B-28 |
 | KV Phase 6 (optimisation) | B-38, B-40, B-41, B-53 |
-| CDN Phase 1 (artifact storage, transfer, manifests + publish, hash-addressed retrieval) | B-30, B-31, B-33, B-35 (dependency order still applies: B-33 needs B-32's manifest codec, B-35 needs B-34's L2) |
+| CDN Phase 1 (artifact storage, transfer, path rows + publish, key- and hash-addressed retrieval) | B-30, B-31, B-33, B-35 (dependency order still applies: B-33 needs B-32's row codec, B-35 needs B-34's L2) |
 | CDN Phase 2 (global retention streams, regional placement) | B-32, B-34 |
-| CDN Phase 3 (manifest-based retention and recovery) | B-32 (manifest refcounts), B-43, B-44 |
+| CDN Phase 3 (ref-key retention and recovery) | B-32 (ref keys), B-43, B-44 |
 | CDN Phase 4 (optimisation) | B-45, B-46, B-47, B-49 (compiled Worker caching moved to B-48 in track L) |
 | Deployment parts of the CDN doc (activation, rollbacks, Worker/Pages retrieval) | B-50, B-51, B-48, B-52 |
 
@@ -331,6 +333,37 @@ At scale the write path needs automatic failover, fencing of old leaders and low
   A new leader accepts writes within the election timeout plus documented recovery time. An old-term leader cannot commit
   or publish stale storage state. Persistence/replay retries do not double-apply data or skip revisions. Raft truncation cannot
   strand a closed namespace. Update TLA+ before this protocol change, then rerun the applicable B-23 gates and nightly history.
+
+---
+
+#### B-09c — Bulk writes: many keys of one namespace in one revision
+
+```
+Title:  Feature 🚀: Bulk writes that commit many keys of one namespace in one revision and fan out per range
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+A Pages deployment with 10,000 files writes 20,000 CDN keys (§4 decision 14). The write API takes one key per request, and a
+deployment must become visible all at once, never half written.
+
+**Describe the solution you'd like**
+- A generic bulk route in `bedrock-api`: many `SET`/`DELETE` operations for one dataset and namespace, committed atomically as
+  one revision, so every key of a bulk is visible or none is.
+- One replication event carries the operations. Relays filter it per key for range streams: each range receives the operations
+  it owns, and a range with none notes coverage for that revision only, as for any filtered event today.
+- Nodes apply their share and the revision atomically, duplicate-safe, like a single-key event.
+- A configured size cap per bulk; larger writes are split by the caller, which records the last revision.
+- Reuse the existing event format, sequencing, applier and B-11 materialization; the write API stays free of product code.
+
+**Additional context**
+- **Implementation:** Shared core.
+- **Module:** `lib/replication`, `lib/relays`, plus the `api` crate.
+- **Doc reference:** §4 decision 14; `kv.md` §8.
+- **Depends on:** B-11, B-23. Update the TLA+ specification first: one revision covering many keys, and per-range filtering.
+- **Acceptance criteria:** A crash mid-bulk never exposes part of it after recovery. A range stream receives exactly its own
+  keys of a bulk and coverage for the rest. Replaying a bulk is duplicate-safe. A bulk over the cap is rejected explicitly.
+  Normal and `cfg(madsim)` builds pass the applicable B-23 checks.
 
 ---
 
@@ -722,104 +755,88 @@ This must not swamp relay traffic and must not duplicate fetches when many reque
 
 ---
 
-#### B-32 — `cdn` retention and shared manifest format/reader
+#### B-32 — `cdn` path rows and ref keys
 
 ```
-Title:  Feature 🚀: CDN retention operations with shared manifest format and verified reads
+Title:  Feature 🚀: CDN path rows and ref keys in the `cdn` dataset
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Which artifacts the CDN keeps is declared through replicated retention state, not by tracking artifact locations globally.
-This reuses the shared replication and sequencing infrastructure (`bedrock-api`, `bedrock-relay`), not KV itself.
-The `cdn` dataset belongs to the CDN: `bedrock-quicksilver` and `bedrock-kv` never host or subscribe to it, just as `bedrock-cdn` never subscribes to a KV dataset.
+Which artifacts the CDN keeps, and which artifact a URL path serves, is declared through replicated keys, not by tracking
+artifact locations globally (§4 decision 14). This reuses the shared replication and sequencing infrastructure
+(`bedrock-api`, `bedrock-relay`), not KV itself. The `cdn` dataset belongs to the CDN: `bedrock-quicksilver` and `bedrock-kv`
+never host or subscribe to it, just as `bedrock-cdn` never subscribes to a KV dataset.
 
 **Describe the solution you'd like**
-- A `cdn` dataset (B-06) with global retention namespaces, replicated to every region. The deploy control plane (B-50) uses
-  `workers` and `pages`; the CDN treats namespace names as opaque. It holds metadata only, never artifact bytes, and its
+- A `cdn` dataset (B-06) with global namespaces, replicated to every region. The deploy control plane (B-50) uses `workers` and
+  `pages`; the CDN treats namespace names and deployment IDs as opaque. It holds metadata only, never artifact bytes, and its
   records are never evicted.
-- The four retention operations are plain writes through `bedrock-api` (B-09). The write API and relays are generic over datasets
-  and need no CDN code:
+- Two key kinds, written in bulk through `bedrock-api` (B-09c). The write API and relays are generic over datasets:
 
-  | Logical operation | Write |
-  |---|---|
-  | `RETAIN_MANIFEST` | `SET manifest/{manifest_hash}` |
-  | `RELEASE_MANIFEST` | `DELETE manifest/{manifest_hash}` |
-  | `RETAIN_ARTIFACT` | `SET artifact/{sha256}` |
-  | `RELEASE_ARTIFACT` | `DELETE artifact/{sha256}` |
+  | Key | Value | Placed by |
+  |---|---|---|
+  | `path/{deployment_id}/{path}` | `{sha256, content type, size}` | the normal `(dataset, namespace, key)` hash |
+  | `ref/{sha256}/{deployment_id}` | empty | the sha256's first 8 bytes, ignoring the namespace |
 
-- A client in `cdn/retention` with typed `retain_manifest(...)` etc. that turns calls into those writes.
-- Implement the canonical immutable manifest format (`path → sha256`, plus metadata), encoding/decoding and
-  hash-verified reader in `cdn/manifests` here: retention is its first consumer. Reuse B-30's content-addressed
-  storage/cache for manifest bytes. B-33 consumes this implementation; do not create a provisional retention codec
-  that B-33 later replaces, or make B-32 depend on B-33.
-- `bedrock-cdn` uses the existing B-17 `Relay.Session` client for every retention namespace. Integrate richer
-  application behavior once at its existing data/covered-progress boundary, reusing or consolidating B-08 hook
-  semantics instead of retaining a parallel applier/subscriber. CDN application:
-  - expands manifests into artifact retention requirements
-  - keeps reference counts shared across manifests
-  - stores this derived state in a local `lib/storage` instance
-- Derived state can be thrown away: rebuild using B-18's existing session recovery over B-11's coherent state
-  and lease-protected tail, then the same CDN application behavior. Reuse the transfer, checksum validation,
-  exact-boundary resumption and recovery confirmation; no second bootstrap protocol or mandatory portable archive.
-  State replacement/derived writes and represented covered progress must remain atomic and unready until validated.
+- The one shared-core change: `placement::hash_of` places `cdn` keys of the form `ref/{64 hex}/…` by that hash, so relays route
+  them, and nodes store them in the hash-first L2 layout, by content. Every other key, including a malformed `cdn` key, keeps the
+  normal hash.
+- One canonical codec for path-row values in `cdn/paths`, shared with B-33 and B-35. A malformed value is an explicit error.
+- `bedrock-cdn` follows the `cdn` ranges its relay pushes (#22 / B-21) and keeps both key kinds as ordinary L2 range data in
+  `lib/storage`. An artifact is retained while any `ref/{sha256}/…` key exists in any namespace: one prefix scan, no counts.
+- No derived state: range bootstrap (B-18, B-21) rebuilds everything a holder needs, with its existing validation,
+  exact-boundary resumption and readiness. No manifest expansion, reference-count table or second recovery path.
   No artifact locations are stored globally.
-- Remove superseded application/rebuild wrappers and migrate their useful tests in this integration. Keep shared
-  log/view/storage primitives and actual inspection/local-install utilities with identified uses. Do not prebuild
-  this product hook framework in earlier core issues merely to replace it here.
 
 **Additional context**
-- **Implementation:** CDN. Writes, ordering and fan-out come from the shared infrastructure. Interpretation lives in `bedrock-cdn`.
-- **Module:** `cdn/retention`, shared codec/verified reader in `cdn/manifests`.
-- **Doc reference:** `cdn.md` §3 Declarative Retention, §4 Phase 2, Core Principle 5; §1 "Deployment model" in this file.
-- **Depends on:** B-23 and B-30; reuse created B-08/B-11/B-17/B-18 contracts.
+- **Implementation:** CDN, plus the `hash_of` rule in the shared core. Writes, ordering and fan-out come from the shared infrastructure.
+- **Module:** `cdn/retention`, row codec in `cdn/paths`, `lib/placement`.
+- **Doc reference:** `cdn.md` §3 Declarative Retention, §4 Phase 2, Core Principle 5; §4 decision 14 in this file.
+- **Depends on:** B-23, B-30 and B-09c; reuse created B-08/B-11/B-17/B-18/B-21 contracts.
 - **Acceptance criteria:**
-  - Manifest encoding/decoding and verified reads use one canonical implementation shared with B-33. A bad hash or missing manifest is an explicit error.
-  - Retaining two manifests that share artifacts gives correct refcounts.
-  - Releasing one keeps the shared artifacts.
-  - Live delivery, duplicate/gap handling, restart and obsolete-cursor bootstrap run through the shared session; derived state and covered cursor cannot diverge on a crash.
-  - Wiping `bedrock-cdn`'s local state rebuilds identical refcounts through protected recovery under concurrent writes/GC; corruption, interruption and lease expiry cannot establish readiness.
+  - A `ref/` key reaches exactly the owners of its sha256's range in every cell, whatever its namespace.
+  - Two deployments sharing an artifact keep it retained; releasing one keeps the shared artifact.
+  - Wiping `bedrock-cdn`'s local state rebuilds identical rows and ref keys through range bootstrap under concurrent writes;
+    corruption, interruption and lease expiry cannot establish readiness.
   - `bedrock-quicksilver` and `bedrock-kv` receive no `cdn` events, and the `quicksilver`, `kv` and `cdn` crates have no dependency on each other.
 
 ---
 
-#### B-33 — Publish client using shared manifests and retention
+#### B-33 — Publish client writing path rows and ref keys in bulk
 
 ```
-Title:  Feature 🚀: Idempotent publish client using the shared manifest and retention contracts
+Title:  Feature 🚀: Idempotent publish and release client for path rows and ref keys
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-A set of related artifacts (for example a Pages site with thousands of files) needs one handle: a mapping from paths to artifact hashes.
-Publishing must guarantee that a returned handle points only at stored, retained content.
-The CDN is a backing service: it knows manifests and artifacts, never deployments, Workers or which version is live.
+A set of related artifacts (for example a Pages site with thousands of files) is published under one deployment ID.
+Publishing must guarantee that once it returns, every path row points at stored, retained content.
+The CDN is a backing service: it knows keys and artifacts, never deployments, Workers or which version is live.
 
 **Describe the solution you'd like**
-- Reuse B-32's canonical manifest format, codec and hash-verified reader, and B-30's content-addressed storage/cache.
-  This draft owns publish orchestration, not another manifest implementation or cache backend.
-- A publish client in `cdn/manifests`:
-  1. Upload the artifacts.
-  2. Upload the manifest.
-  3. `RETAIN_MANIFEST` in the caller's retention namespace (a write to the `cdn` dataset through `bedrock-api`, see B-32),
-     so caching starts in every region.
-  4. Return `manifest_hash` only once steps 1-3 have succeeded.
-- **Contract for callers:** a returned `manifest_hash` is stored and retained until the caller sends `RELEASE_MANIFEST`.
-  Callers must write their own references to it (for example in Quicksilver) only after publishing, and remove them before
-  releasing. The deploy control plane (B-50) is the first such caller.
-- Publishing is idempotent: republishing the same content returns the same `manifest_hash` and retains it once.
-- `bedrock-cdn` subscribes to the `cdn` dataset only, never to `quicksilver` or any other KV dataset.
-- Reuse the shared verified manifest cache by hash. Manifests are immutable, so a cached manifest never needs invalidating.
-- Compose B-30 storage and B-32 retention calls directly; no temporary publisher/manifest facade or second subscription/recovery loop.
+- Reuse B-32's row codec and B-30's content-addressed storage. This draft owns publish orchestration only.
+- `publish(namespace, deployment_id, files)` in `cdn/paths`:
+  1. Upload every artifact to S3 by sha256. Uploads are idempotent; never skip one because another tenant stored it.
+  2. Bulk-write (B-09c) every `path/{deployment_id}/{path}` row and one `ref/{sha256}/{deployment_id}` per distinct sha256,
+     split into bulks under the size cap. A Worker writes only the ref key of its bundle.
+  3. Return the revision of the last bulk once steps 1-2 have succeeded.
+- `release(namespace, deployment_id, files)` deletes the same keys in bulks under the size cap; a failed bulk is retried.
+- **Contract for callers:** after `publish` returns, the deployment's rows are readable at that revision and their artifacts are
+  retained until `release`. Callers write their own references to the deployment (for example in Quicksilver) only after
+  publishing, and remove them before releasing. The deploy control plane (B-50) is the first such caller.
+- Publishing is idempotent: rerunning it with the same files writes the same keys.
+- `bedrock-cdn` follows only `cdn` ranges, never `quicksilver` or any other KV dataset.
 
 **Additional context**
 - **Implementation:** CDN.
-- **Module:** `cdn/manifests`.
-- **Doc reference:** `cdn.md` §3 Deployment Integration.
+- **Module:** `cdn/paths`.
+- **Doc reference:** `cdn.md` §3 Deployment Integration; §4 decision 14.
 - **Depends on:** B-30, B-32.
-- **Acceptance criteria:** The publish client never returns a `manifest_hash` whose artifacts or manifest are missing or not retained.
-  A manifest fetched by hash always matches its hash. Killing the client between any two steps and rerunning it produces the
-  same end state. `bedrock-cdn` receives no events from any KV dataset.
+- **Acceptance criteria:** `publish` never returns while a row's artifact is missing from S3 or unretained. Killing the client
+  between any two steps and rerunning it produces the same end state. A crash never makes part of one bulk visible.
+  `bedrock-cdn` receives no events from any KV dataset.
 
 ---
 
@@ -833,12 +850,12 @@ Labels: enhancement
 **Is your feature request related to a problem? Please describe.**
 Retained artifacts must be held by two verified nodes per cell, chosen with the shared range placement (decision 13).
 Local availability must be tracked separately from range ownership.
-Applying `RETAIN_MANIFEST` must not make both cold holders independently download the same artifact from S3.
+A publish must not make both cold holders independently download the same artifact from S3.
 
 **Describe the solution you'd like**
-- The artifact hash falls in one hash range (B-16); that range's two owners in the placement directory (B-15) are the holders.
-  Relays deliver its retention metadata only to them.
-- Only the selected holders initiate prewarming for their artifacts when retention is applied.
+- The artifact hash falls in one `cdn` hash range (B-16); that range's two owners in the placement directory (B-15) are the
+  holders. Relays deliver its `ref/` keys only to them (§4 decision 14).
+- Only the selected holders initiate prewarming for an artifact, when its first `ref/` key arrives.
 - Reuse verified local or peer copies first. On a completely cold miss, the first holder fetches from S3.
   The second requests the artifact from the first through B-31, starting or joining its coalesced fetch.
 - If the first holder fails or times out, the second falls back to S3 using B-31's retries and timeouts.
@@ -861,7 +878,7 @@ Applying `RETAIN_MANIFEST` must not make both cold holders independently downloa
 - **Known limits:** Download suppression is per cell and best-effort. Separate cells fetch independently; failover or
   differing membership views can cause duplicate S3 downloads.
 - **Acceptance criteria:**
-  - After `RETAIN_MANIFEST`, every artifact has two verified holders in each cell. Availability lookups return only holders that really have the bytes.
+  - After a publish, every artifact has two verified holders in each cell. Availability lookups return only holders that really have the bytes.
   - With stable placement and healthy nodes, concurrent prewarming on both cold holders causes one S3 download and produces two verified copies.
   - The second holder can request the first before it starts prewarming; concurrent requests on the first share one fetch.
   - Failure or timeout of the first holder lets the second complete from S3 without waiting indefinitely.
@@ -871,27 +888,30 @@ Applying `RETAIN_MANIFEST` must not make both cold holders independently downloa
 #### B-35 — Artifact retrieval interface
 
 ```
-Title:  Feature 🚀: Hash-addressed CDN retrieval interface (streaming API and HTTP)
+Title:  Feature 🚀: Key- and hash-addressed CDN retrieval interface (streaming API and HTTP)
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Callers need artifacts from the nearest healthy copy through one retrieval API, addressed only by content hash.
+Callers need a path row and then the artifact from the nearest healthy copy, both by point lookup.
 
 **Describe the solution you'd like**
-- `get(manifest_hash, path)` and `get_artifact(hash)`, both streaming. Everything is addressed by hash; the CDN never knows
-  what a manifest belongs to. Callers resolve which `manifest_hash` they want themselves.
-- Uses the B-22 `SourceChain` with CDN tiers: local cache → L2 holders → peers → S3.
-- One HTTP surface (`/manifests/{manifest_hash}/{path}`, `/artifacts/{hash}`) and the same calls as an internal API.
+- `get_path(namespace, deployment_id, path, min_revision)` returns the row; `get_artifact(sha256)` streams the bytes. The CDN
+  never knows what a deployment is; callers (the Gateway, B-51) resolve which deployment they want themselves.
+- A path row is read from its key's owners at `min_revision` or later; an owner that is behind waits or the caller retries the next.
+- Artifacts use the B-22 `SourceChain` with CDN tiers: local cache → L2 holders of the sha256 → peers → S3.
+- One HTTP surface (`/paths/{namespace}/{deployment_id}/{path}`, `/artifacts/{sha256}`) and the same calls as an internal API.
 - Correct content type and caching headers for immutable content.
 
 **Additional context**
 - **Implementation:** CDN.
 - **Module:** `cdn/artifact_transfer` (retrieval), served by the `bedrock-cdn` binary.
 - **Doc reference:** `cdn.md` §3 Deployment Integration, §4 Phase 1 ("Basic Worker and Pages artifact retrieval"; the
-  Worker- and Pages-specific front ends are B-51).
+  Gateway is B-51).
 - **Depends on:** B-33, B-34.
-- **Acceptance criteria:** Requests are served from L2 in steady state. Requests still succeed when both L2 holders are down (via S3). The response hash always matches the manifest. An unknown `manifest_hash` returns not found.
+- **Acceptance criteria:** Requests are served from L2 in steady state. Artifact requests still succeed when both L2 holders are
+  down (via S3). The returned bytes always match the row's sha256. A missing row returns not found; a row behind `min_revision`
+  is never returned.
 
 ---
 
@@ -907,7 +927,7 @@ Labels: enhancement
 
 **Describe the solution you'd like**
 - Scenarios:
-  - publish a manifest, then fetch it and its artifacts by hash from every region
+  - publish a deployment, then fetch its path rows and artifacts from every region
   - kill one L2 holder
   - kill a relay during publish
   - corrupt a cached artifact
@@ -1026,7 +1046,8 @@ Labels: enhancement
 `notes.md` lists an Auth dataset (API key hashes, permissions, status) replicated `on_demand`. It is not in the main architecture doc yet.
 
 **Describe the solution you'd like**
-- An `auth` dataset using the `on_demand` policy (push on first read). It never uses the `cached` TTL model: a revocation must not wait for a TTL.
+- An `auth` dataset with a `keys` namespace (§4 decision 13, fixed namespaces), using the `on_demand` policy (push on first
+  read). It never uses the `cached` TTL model: a revocation must not wait for a TTL.
 - Fail-closed behaviour for revocations: revocation must be enforced authoritatively, not only eventually.
 - Drain hook (B-21b): a node drain moves its ranges; a cell drain has nothing to move; a namespace drain is `Unsupported`.
 
@@ -1122,16 +1143,20 @@ Released artifacts need to be removed safely across replicas and from S3.
 Retention state must also recover cleanly after node and relay failures, without any per-artifact global metadata.
 
 **Describe the solution you'd like**
-- Coordinated eviction when a refcount reaches zero, across both replicas.
+- Coordinated eviction when an artifact's last `ref/` key is deleted, across both holders.
 - Idle eviction: both L2 holders evict a retained artifact that has not been read within a configurable idle window, and
   under storage pressure the least recently read first. S3 keeps it, it stays retained, and the next miss fetches it again.
 - S3 garbage collection with a grace period. GC deletes an S3 object only when:
-  - it was released (its refcount reached zero), not merely never retained. Objects uploaded by a publish that has not reached
-    `RETAIN_MANIFEST` yet (B-33 steps 1-2) are never candidates, and
-  - it is older than the grace period, and no retained manifest references it at deletion time (re-checked, since a new deploy
-    can retain the same content hash again).
+  - it was released (its last `ref/` key was deleted), not merely never retained. Objects uploaded by a publish that has not
+    written its ref keys yet (B-33 step 1) are never candidates, and
+  - it is older than the grace period, and no `ref/` key for it exists at deletion time (re-checked by the holders, since a
+    new deploy can retain the same content hash again).
+- Deletion is version-protected: the bucket is versioned, and GC deletes only the object version it found released and past
+  the grace period. A publish always uploads (B-33 step 1), creating a newer version that a concurrent GC never deletes, so
+  re-checking ref keys is not the only guard.
+- S3 GC runs in one designated cell: its holders of a range see every ref key of the artifacts in it.
 - Orphans from failed publishes (uploaded, never retained) are swept separately, only after a much longer grace period than any publish takes.
-- Recovery of retention state after relay and node loss, using B-11's consistent materialized-state view and subsequent retained database events, resuming the stream boundary.
+- Recovery of ref keys after relay and node loss through range bootstrap (B-21), using B-11's consistent materialized-state view and subsequent retained database events, resuming the stream boundary.
 - Reconciliation without per-artifact global location tracking.
 
 **Additional context**
@@ -1140,14 +1165,14 @@ Retention state must also recover cleanly after node and relay failures, without
 - **Doc reference:** `cdn.md` §3 Declarative Retention, §4 Phase 3.
 - **Depends on:** B-43.
 - **Acceptance criteria:** An artifact that is still referenced is never deleted from S3. An idle retained artifact leaves L2
-  after the idle window and is served from S3 on the next request. Released artifacts are reclaimed within the grace window. State converges after a relay failure. An artifact uploaded by an in-progress publish is never deleted before its `RETAIN_MANIFEST` arrives. An artifact released by one manifest and retained by another during GC is kept.
+  after the idle window and is served from S3 on the next request. Released artifacts are reclaimed within the grace window. State converges after a relay failure. An artifact uploaded by an in-progress publish is never deleted before its ref keys arrive. An artifact released by one deployment and retained by another during GC is kept.
 
 ---
 
-#### B-45 — Prewarming and manifest readiness
+#### B-45 — Prewarming and artifact-set readiness
 
 ```
-Title:  Feature 🚀: Regional prewarming on retain and per-manifest readiness reporting
+Title:  Feature 🚀: Regional prewarming on publish and readiness reporting for a set of artifacts
 Labels: enhancement
 ```
 
@@ -1155,17 +1180,19 @@ Labels: enhancement
 Newly published content should not start cold in every region, and callers need to know when it is warm.
 
 **Describe the solution you'd like**
-- Prewarm: when `bedrock-cdn` applies `RETAIN_MANIFEST`, its L2 holders fetch every artifact of the manifest.
-- Readiness: each cell reports per `manifest_hash` whether both L2 holders have every artifact, readable through the retrieval
-  API (B-35). Callers can wait for all cells, or a threshold with a timeout, before they start sending traffic.
-- Waiting is optional: using a manifest early is still correct, since misses fall back to S3, just cold.
+- Prewarm: when a holder applies an artifact's first `ref/` key, it fetches the artifact (B-34).
+- Readiness: given a set of sha256s (for example a deployment's files, which the caller published), each cell groups them by
+  owner from its placement directory, asks each owner which it holds verified, and reports whether both holders have every
+  artifact, through the retrieval API (B-35). Callers can wait for all cells, or a threshold with a timeout, before they
+  start sending traffic.
+- Waiting is optional: using a deployment early is still correct, since misses fall back to S3, just cold.
 
 **Additional context**
 - **Implementation:** CDN refinement (CDN Phase 4).
-- **Module:** `cdn/manifests`.
-- **Doc reference:** `cdn.md` §3 Deployment Integration, §4 Phase 4.
+- **Module:** `cdn/retention`.
+- **Doc reference:** `cdn.md` §3 Deployment Integration, §4 Phase 4; §4 decision 14.
 - **Depends on:** B-36.
-- **Acceptance criteria:** A manifest reported ready in a cell gets close to 100% L2 hits there on its first requests.
+- **Acceptance criteria:** A set reported ready in a cell gets close to 100% L2 hits there on its first requests.
   Readiness turns false when a holder is lost and true again after repair (B-43).
 
 ---
@@ -1178,10 +1205,10 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Hot artifacts gain from per-node caching. Retention driven only by manifests ignores real demand.
+Hot artifacts gain from per-node caching. Retention driven only by ref keys ignores real demand.
 
 **Describe the solution you'd like**
-- An optional per-node L1 that caches independently, evicts automatically and is never replicated.
+- An optional per-node L1 that caches path rows and artifact bytes by sha256 in memory, evicts automatically and is never replicated.
 - Separate L2 and L1 storage areas; L1 evicts on its own, independently of L2 idle eviction (B-44).
 - Popularity signals feed into retention decisions.
 
@@ -1261,20 +1288,21 @@ Something has to own the order, so that every intermediate state is safe and a f
 **Describe the solution you'd like**
 - Every revision of a Worker or Pages site is its own deployment with its own `deployment_id`.
 - Quicksilver schema, owned by this draft (typed accessors included): `deployment/{deployment_id} → {runtime settings, bindings,
-  env/secret references, manifest_hash}` and `worker/{worker_id}/active → deployment_id`.
+  env/secret references, cdn_revision, bundle sha256 for Workers}` and `worker/{worker_id}/active → deployment_id`. A project
+  name or host resolves to a `deployment_id` here; the CDN only ever sees the UUID.
 - **Publish and activate**, in this order:
-  1. Publish the artifacts and manifest with the CDN publish client (B-33), into the `workers` or `pages` retention namespace.
-     It returns `manifest_hash` once uploaded and retained.
-  2. *(Optional)* wait for manifest readiness (B-45).
+  1. Publish the artifacts with the CDN publish client (B-33) under the new `deployment_id`, into the `workers` or `pages`
+     namespace. It returns `cdn_revision` once the bytes are uploaded and the path rows and ref keys are written.
+  2. *(Optional)* wait for readiness of the deployment's artifacts (B-45).
   3. Write `deployment/{deployment_id}` to Quicksilver.
   4. Write `worker/{worker_id}/active` to make it live. Can be batched with step 3, or written later.
-- **Why this order:** Quicksilver only ever names manifests that exist and are retained, so CDN GC (B-44) cannot delete artifacts
-  a deployment points at. A deploy that fails after step 1
-  leaves a retained manifest that nothing uses (harmless, cleaned up by a retry or a release).
-- **Rollback:** write a previous `deployment_id` to `worker/{worker_id}/active`. Keep the N previous deployments' manifests retained.
+- **Why this order:** Quicksilver only ever names deployments whose rows exist and whose artifacts are retained, so CDN GC
+  (B-44) cannot delete artifacts a deployment points at. A deploy that fails after step 1
+  leaves retained rows that nothing uses (harmless, cleaned up by a retry or a release).
+- **Rollback:** write a previous `deployment_id` to `worker/{worker_id}/active`. Keep the N previous deployments' rows and ref keys.
   Only requested artifacts that remain warm within the idle window (B-44) are guaranteed to be served from L2; cold artifacts may
-  fetch from S3 unless the full manifest was prewarmed (B-45). Reading the deployment record does not warm its full manifest.
-- **Delete** runs in reverse: remove `deployment/{deployment_id}` (it must not be active), then `RELEASE_MANIFEST`.
+  fetch from S3 unless the deployment was prewarmed (B-45). Reading the deployment record does not warm its artifacts.
+- **Delete** runs in reverse: remove `deployment/{deployment_id}` (it must not be active), then `release` (B-33).
 - Every step is idempotent, keyed by `deployment_id`.
 
 **Additional context**
@@ -1282,32 +1310,39 @@ Something has to own the order, so that every intermediate state is safe and a f
 - **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §3 Deployment Integration.
 - **Depends on:** B-24, B-33, B-45.
 - **Acceptance criteria:** Killing the control plane between any two steps and rerunning the deploy produces the same end state.
-  No Quicksilver deployment ever references an unretained manifest. Rollback requests for artifacts that remain warm within the
-  idle window need no S3 fallback; cold artifacts may require S3 unless the full manifest is prewarmed.
+  No Quicksilver deployment ever references unretained artifacts. Rollback requests for artifacts that remain warm within the
+  idle window need no S3 fallback; cold artifacts may require S3 unless the deployment is prewarmed.
 
 ---
 
-#### B-51 — Worker and Pages request front ends
+#### B-51 — Gateway: Worker and Pages request routing
 
 ```
-Title:  Feature 🚀: Pages host routing and Worker bundle fetch on top of the hash-addressed CDN
+Title:  Feature 🚀: Gateway routing Worker and Pages requests through Quicksilver and the CDN
 Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-A Pages request arrives with a host and a path, and a Worker cold start needs its bundle. Both must be turned into CDN hash lookups.
+A request arrives with a host and a path. Something must decide whether it is a Worker or a Pages deployment and turn it into
+point lookups; the CDN and Quicksilver only answer for keys and artifacts.
 
 **Describe the solution you'd like**
-- Pages front end: host → site → `worker/{id}/active` → `deployment/{id}.manifest_hash` (Quicksilver) → `get(manifest_hash, path)` (B-35).
-- Worker bundle fetch: active deployment → `manifest_hash` → `get_artifact` for the bundle.
+- The Gateway resolves the host (or project name) to the active `deployment_id` in Quicksilver, then reads
+  `deployment/{deployment_id}`, which says Worker or Pages.
+- Worker: route the request to a node that invokes it. A cold start fetches the bundle with `get_artifact(bundle sha256)` (B-35).
+- Pages: `get_path("pages", deployment_id, path, cdn_revision)` gives the sha256, then `get_artifact(sha256)` from its holders.
+  Index files, SPA fallbacks, redirects and the 404 page are further path rows.
+- Path rows and artifacts are immutable, so the Gateway caches both in memory without invalidation; a warm request makes no
+  CDN lookup.
 - Content type, caching headers and not-found handling for deployments.
 
 **Additional context**
 - **Implementation:** Compute / deploy control plane.
-- **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §4 Phase 1 ("Basic Worker and Pages artifact retrieval").
+- **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §4 Phase 1 ("Basic Worker and Pages artifact retrieval"); §4 decision 14.
 - **Depends on:** B-35, B-50.
 - **Acceptance criteria:** A Pages request resolves to the active deployment's file. Switching `active` changes the served
-  version in every region once Quicksilver has propagated.
+  version in every region once Quicksilver has propagated. A Pages request never sees a row behind its deployment's
+  `cdn_revision`.
 
 ---
 
@@ -1578,10 +1613,10 @@ initial KV delivery.
    datasets, relay replay and CDN metadata. B-11 adds asynchronous S3 materialized storage for generic API writers across
    datasets; B-39 later integrates KV readers. `kv/storage` owns reader retention/cache policy; `quicksilver/storage` owns
    the pushed L1/L2 keyspaces; CDN retains `CacheStorage`.
-3. **KV and CDN share infrastructure, not datasets.** Retention operations are plain writes to the `cdn` dataset through the
-   generic `bedrock-api` and `bedrock-relay`; only `bedrock-cdn` interprets them (B-32). `bedrock-quicksilver` and `bedrock-kv` never
+3. **KV and CDN share infrastructure, not datasets.** CDN path rows and ref keys are plain writes to the `cdn` dataset through the
+   generic `bedrock-api` and `bedrock-relay`; only `bedrock-cdn` reads them (B-32, decision 14). `bedrock-quicksilver` and `bedrock-kv` never
    subscribe to `cdn`, and `bedrock-cdn` never subscribes to `quicksilver`, `kv` or `auth`. Customer `kv` has no relay delivery at all;
-   Quicksilver carries its directory metadata. The CDN serves by `manifest_hash`. Shared writers/storage remain generic
+   Quicksilver carries its directory metadata. The CDN serves path rows by key and artifacts by content hash (decision 14). Shared writers/storage remain generic
    and never import another binary's product code.
 4. **No heartbeat or gossip protocol.** Membership comes from the subscriber streams nodes already hold to their cell relays (B-12):
    relays merge their connected lists and publish them as a replicated namespace, with a grace period on disconnect.
@@ -1679,7 +1714,8 @@ initial KV delivery.
     Replaces the fixed 2²⁰ virtual buckets and per-node rendezvous ownership (B-15, B-16) for the pushed `quicksilver` and
     `auth` datasets and the CDN. Customer-KV cache affinity hashes `(namespace, key)` with rendezvous directly and uses no
     ranges (decision 11's readers own no persistent data). Chosen over a hash ring and over simplified buckets.
-    - **Key space:** an L2 key maps to a 64-bit hash of `(dataset, namespace, key)`; CDN artifacts use their content hash.
+    - **Key space:** an L2 key maps to a 64-bit hash of `(dataset, namespace, key)`; CDN `ref/{sha256}/…` keys use the
+      artifact's content hash instead (decision 14).
       Ownership is assigned in contiguous ranges of that hash space, not raw key order, so sequential keys do not concentrate.
       L2 storage keys start with the big-endian hash: a range is one contiguous scan, and dropping it is one `delete_range`
       followed by compaction of that span (RocksDB reclaims range tombstones only on compaction). No bucket count caps a cell.
@@ -1716,6 +1752,63 @@ initial KV delivery.
     - **Specification first:** `membership.tla` gains the directory writes and a single assigner; a handoff model checks that
       a range is never dropped before its new owners are ready and that no node serves a range it neither owns nor is leaving;
       `relays.tla` covers relay-pushed interests and revokes. Update them before implementation.
+    - **Refined 2026-11-02 for #22 / B-21:**
+      - *Ranges per dataset.* Each dataset has its own ranges under `range/{dataset}/{start}`, given only to members whose
+        `datasets` include it. A node carrying `auth` but not `quicksilver` owns only `auth` ranges.
+      - *One stream per dataset and range.* A node follows `(dataset, range)`, and that stream carries every namespace of the
+        dataset. Events keep their namespace and per-namespace `sequence`; the node keeps one applied sequence per namespace,
+        and deliveries note coverage only for namespaces that changed, so an idle namespace costs one number per stream. A
+        subscription selects either a namespace (membership) or a dataset range (L2), never both.
+      - *Fixed namespaces.* Decided 2026-11-03. Each ranged dataset's namespaces are fixed in code (`placement::namespaces`):
+        `quicksilver` has `infrastructure`, `auth` has `keys`, `cdn` has `pages` and `workers`. The writer's scope validation is
+        the one place that rejects any other namespace of these datasets. Relays count a node ready only once it holds every
+        listed namespace, so a namespace a relay has not seen a write for yet cannot be skipped. Adding a namespace means
+        shipping new code.
+      - *One pushed frame.* A relay sends each leaf its full owned range set per dataset, tagged with the directory revision it
+        was derived from. Ranges it adds are followed; ranges it drops are the revoke. The node confirms a revoke only once its
+        own view has reached that revision and shows it without the range while another owner is `ready`; otherwise it
+        refuses and reports. A relay drops a range from the set only after the published directory removed the node.
+      - *Readiness.* The holding relay derives it from the confirmed bootstrap (or a stream from revision 0) plus
+        acknowledgements through the head it saw at confirmation, counting only acknowledgements sent after the node applied
+        the frame that assigned the range. It shares a ready bit, not acknowledgements, over the sibling stream; the publisher
+        writes `ready` and then removes `leaving` owners once every other owner is `ready`.
+      - *Serving.* A node serves only ranges it holds as `ready` or `leaving` in its own view; `populating` owners do not serve.
+      - *Storage.* L2 data uses the hash-first layout, so a range is one scan across namespaces and one `delete_range`. Startup
+        rejects the earlier alpha layout instead of migrating it.
+      - *Deferred.* Dropping a `leaving` range early under disk pressure waits for the storage-health work (B-14).
+      - *Specification.* The handoff model is its own module, `docs/spec/handoff.tla`, over an abstract membership:
+        combined with `membership.tla`'s relay and clock state it was too large for TLC.
+      - *CDN.* The `cdn` dataset is ranged like `quicksilver` and `auth`: CDN members carry `cdn` in their `datasets`, own
+        `range/cdn/{start}` entries and follow the ranges their relay pushes. This replaces the earlier `artifacts` label
+        and the whole-range follow of `cdn` (decision 14).
+14. **CDN: path rows and ref keys instead of manifests.** Decided 2026-11-02.
+    Replaces the manifest file, the `RETAIN_*`/`RELEASE_*` operations and the manifest reference counts in B-32, B-33 and B-35.
+    - **Records** in the `cdn` dataset. The namespace is the caller's retention namespace (`workers`, `pages`), opaque to the CDN.
+      - `path/{deployment_id}/{path}` → `{sha256, content type, size}`: which bytes a URL path serves. Pages only.
+      - `ref/{sha256}/{deployment_id}` → empty: keeps the artifact. An artifact is retained while any `ref/{sha256}/…` key exists
+        in any namespace; two deployments sharing a file write two ref keys and hold one copy.
+    - **Deployment IDs** are immutable UUIDs. A project name resolves to a UUID in Quicksilver, never in a CDN key, so rows never
+      change and every cache keeps them without invalidation. To the CDN the ID is an opaque string.
+    - **Placement:** `ref/` keys by the first 8 bytes of their sha256, ignoring the namespace, so an artifact's holders receive
+      exactly its ref keys and `workers` and `pages` share one holder set. Path rows use the normal `(dataset, namespace, key)` hash.
+    - **Writes:** a publish uploads the bytes to S3 by sha256, then writes every path row and ref key of the deployment in bulk
+      (B-09c): one revision for all of them. A deployment larger than one bulk is split; the caller records the last bulk's
+      revision. Release starts only after the control plane removed its references to the deployment, then deletes the same
+      keys in bulks under the cap, retrying any that fail. Rerunning either converges.
+    - **Reads (Gateway, B-51):** host or project → `deployment_id` → `deployment/{id}` in Quicksilver says Worker or Pages. A Worker
+      goes to compute, and its record holds the bundle's sha256. Pages reads `path/{id}/{path}` at the recorded minimum revision,
+      then the artifact from its sha256's holders. Both are point reads of immutable data, so a warm Gateway does neither.
+    - **No derived state.** Holders keep path rows and ref keys as ordinary L2 range data, rebuilt by range bootstrap (B-21).
+      Ref keys arriving trigger prewarming (B-34); the last ref key of an artifact leaving makes it a GC candidate (B-44).
+    - **Storage tiers.** L2 owners keep path rows and ref keys on disk and never evict them; they hold artifact bytes until idle
+      (B-44). L1 is an unreplicated memory cache of rows and of bytes by sha256 (B-46). S3 holds the bytes authoritatively; the
+      replication log and B-11 state hold the rows.
+    - **Tenant isolation.** A publish never skips an upload because another tenant already stored the same sha256 (that would
+      reveal the file exists). Uploads are idempotent by sha256; L2 deduplicates across tenants.
+    - **Why:** a manifest file has to be fetched and parsed by every node that expands it (with every CDN node following all of
+      `cdn`, about 1 GB per cell for a 10,000-file publish on 1,000 nodes) or on the request path. Per-file rows make every lookup
+      a point read and send each record only to its 2 owners per cell.
+    - **Cost:** two keys per file in the log, and bulk writes become a shared-core prerequisite (B-09c).
 
 ### Still open
 
@@ -1852,3 +1945,12 @@ text. Original descriptions and earlier amendments are preserved. #44 is unaffec
 | #24 / B-22b | [Bounded range moves](https://github.com/felixrydberg/bedrock/issues/24#issuecomment-6546266248) |
 | #25 / B-23 | [Placement and handoff invariants](https://github.com/felixrydberg/bedrock/issues/25#issuecomment-6546266463) |
 | #41 / B-12b | [Hash-range interest selectors](https://github.com/felixrydberg/bedrock/issues/41#issuecomment-6546266677) |
+
+### CDN placement amendment recorded in comments — 2026-11-02
+
+§4 decision 14 (path rows and ref keys instead of manifests; the CDN follows pushed `cdn` ranges) was posted to the one
+affected open issue and read back. B-32 to B-36, B-44 to B-46, B-50, B-51 and the new B-09c are still drafts and were edited here.
+
+| Issue / plan ID | Amendment comment |
+|---|---|
+| #22 / B-21 | [CDN follows pushed `cdn` ranges](https://github.com/felixrydberg/bedrock/issues/22#issuecomment-6588674643) |

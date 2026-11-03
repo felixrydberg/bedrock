@@ -86,6 +86,38 @@ fn data_and_revisions_survive_reopen() {
 }
 
 #[test]
+fn compact_reclaims_a_deleted_range() {
+    let mut harness = Rocks::default();
+    let engine = harness.open();
+    // Incompressible values, so the SST files hold about 8 MiB.
+    let mut state = 1u64;
+    for i in 0..2048u32 {
+        let value: Vec<u8> = (0..4096)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                (state >> 56) as u8
+            })
+            .collect();
+        engine
+            .put(&[b"r/".as_slice(), &i.to_be_bytes()].concat(), &value)
+            .unwrap();
+    }
+    engine.put(b"s/kept", b"v").unwrap();
+    engine.db.flush_cf(engine.data()).unwrap();
+    let full = engine.disk_usage().unwrap();
+    engine.delete_range(KeyRange::prefix(*b"r/")).unwrap();
+    engine.compact(&KeyRange::prefix(*b"r/")).unwrap();
+    let after = engine.disk_usage().unwrap();
+    assert!(
+        after + 4 * 1024 * 1024 < full,
+        "{after} bytes left of {full}"
+    );
+    assert_eq!(engine.get(b"s/kept"), Ok(Some(b"v".to_vec())));
+}
+
+#[test]
 fn file_in_message() {
     let message = "Corruption: block checksum mismatch: stored = 1, computed = 2, type = 4  in /d/000009.sst offset 0 size 77";
     assert_eq!(file_in(message).as_deref(), Some("/d/000009.sst"));

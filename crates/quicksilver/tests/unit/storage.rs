@@ -28,3 +28,14 @@ fn keyspaces_and_hashes_are_disjoint_and_ordered() {
             .contains(&Keyspace::L2 { hash: 256 }.key("ns", b""))
     );
 }
+
+#[test]
+fn l2_keys_match_relay_layout_for_nested_namespaces_and_binary_keys() {
+    let hash = 0x0102_0304_0506_0708;
+    let keyspace = Keyspace::L2 { hash };
+    for (namespace, key) in [("", &b""[..]), ("customer/store", &b"\0key\xff"[..])] {
+        let physical = keyspace.key(namespace, key);
+        assert_eq!(physical, bedrock_lib::storage::l2_key(hash, namespace, key));
+        assert!(bedrock_lib::storage::l2_span(hash, hash + 1).contains(&physical));
+    }
+}

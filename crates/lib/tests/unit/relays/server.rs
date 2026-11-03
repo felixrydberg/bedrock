@@ -15,7 +15,7 @@ fn hub() -> Hub {
 fn replay_event(sequence: u64) -> Event {
     Event {
         dataset: "auth".into(),
-        namespace: "users".into(),
+        namespace: "keys".into(),
         stream: "auth-0".into(),
         sequence,
         epoch: 1,
@@ -45,7 +45,7 @@ async fn reconnect_resumes_after_only_the_contiguous_cached_prefix() {
         Vec::new(),
         Some(replay),
     );
-    let key = ("auth".into(), "users".into());
+    let key = ("auth".into(), "keys".into());
     assert_eq!(hub.resume_from(&key, 1), 3);
     hub.encoded(replay_event(3));
     assert_eq!(hub.resume_from(&key, 1), 4);
@@ -66,12 +66,14 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
     let closed = Arc::new(Watched::new(false));
     let changed = Arc::new(Watched::new(0));
     let follows = BTreeMap::from([(
-        ("auth".into(), "users".into()),
+        (("auth".into(), "keys".into()), None),
         Interest {
             from: 1,
             acked: 0,
             generation: id,
             baseline: 0,
+            confirming: false,
+            target: None,
         },
     )]);
     hub.0.subscribers.lock().unwrap().insert(
@@ -82,8 +84,11 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             events: events.clone(),
             closed: closed.clone(),
             follows,
+            ranges: Default::default(),
             changed: changed.clone(),
             member: None,
+            pushed: BTreeMap::new(),
+            ranges_acked: BTreeMap::new(),
         },
     );
     (
@@ -117,7 +122,7 @@ async fn full_queue_disconnects_only_stalled_subscriber_and_releases_interest() 
     assert_eq!(fast.bytes.load(Ordering::Relaxed), 0);
     assert_eq!(hub.0.subscribers.lock().unwrap().len(), 1);
     drop(fast);
-    assert!(hub.desired().is_empty());
+    assert!(hub.idle());
 }
 
 #[tokio::test]
@@ -128,21 +133,22 @@ async fn byte_budget_disconnects_before_accepting_an_oversized_frame() {
         1,
         pb::relay_frame::Kind::Delivery(pb::Delivery {
             dataset: "auth".into(),
-            namespace: "users".into(),
+            namespace: "keys".into(),
             from: 1,
             through: 1,
-            events: vec![Bytes::from(vec![0; MAX_BYTES])]
+            events: vec![Bytes::from(vec![0; MAX_BYTES])],
+            span: None,
         })
     ));
     assert!(closed.get());
-    assert!(hub.desired().is_empty());
+    assert!(hub.idle());
 }
 
 #[tokio::test]
 async fn bootstrap_boundary_does_not_consume_the_event_acknowledgement_window() {
     let hub = hub();
     let (_frames, _) = subscriber(&hub, 1, MAX_EVENTS);
-    let key = ("auth".into(), "users".into());
+    let key = (("auth".into(), "keys".into()), None);
     hub.advance(1, &key, 1, 100_000);
     hub.baseline(1, &key, 1, 100_000);
     assert_eq!(hub.outstanding(1, &key), 0);
@@ -155,7 +161,7 @@ async fn bootstrap_boundary_does_not_consume_the_event_acknowledgement_window() 
 async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
     let hub = hub();
     let (_frames, _) = subscriber(&hub, 1, MAX_EVENTS);
-    let key = ("auth".into(), "users".into());
+    let key = (("auth".into(), "keys".into()), None);
     hub.advance(1, &key, 1, MAX_EVENTS as u64);
     hub.0
         .subscribers
@@ -165,12 +171,14 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
         .unwrap()
         .follows
         .insert(
-            ("auth".into(), "other".into()),
+            (("auth".into(), "other".into()), None),
             Interest {
                 from: 1,
                 acked: 0,
                 generation: 2,
                 baseline: 0,
+                confirming: false,
+                target: None,
             },
         );
     let pumping = hub.clone();
@@ -178,12 +186,7 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
         pumping
             .pump(
                 1,
-                pb::Follow {
-                    dataset: "auth".into(),
-                    namespace: "users".into(),
-                    from: 1,
-                    buckets: Vec::new(),
-                },
+                (("auth".into(), "keys".into()), None),
                 1,
                 Vec::new(),
                 false,
@@ -191,7 +194,14 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
             .await
     });
     tokio::task::yield_now().await;
-    hub.unfollow(1, &key);
+    hub.unfollow(
+        1,
+        pb::Unfollow {
+            dataset: "auth".into(),
+            namespace: "keys".into(),
+            span: None,
+        },
+    );
     tokio::time::timeout(Duration::from_secs(1), task)
         .await
         .unwrap()
@@ -199,7 +209,10 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
         .unwrap();
     assert_eq!(
         hub.desired(),
-        BTreeMap::from([(("auth".into(), "other".into()), 1)])
+        (
+            BTreeMap::from([(("auth".into(), "other".into()), 1)]),
+            BTreeSet::new()
+        )
     );
 }
 
@@ -207,7 +220,7 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
 async fn replaced_generation_cannot_enqueue_into_the_new_subscription() {
     let hub = hub();
     let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
-    let key = ("auth".into(), "users".into());
+    let key = (("auth".into(), "keys".into()), None);
     hub.0
         .subscribers
         .lock()
@@ -245,6 +258,7 @@ async fn queued_record_bound_applies_across_namespaces_not_only_frames() {
             from: 1,
             through: 600,
             events: vec![Bytes::new(); 600],
+            span: None,
         })
     };
     assert!(hub.send(1, delivery("one")));
@@ -272,7 +286,7 @@ async fn a_full_replay_persistence_queue_never_blocks_live_history() {
     for sequence in 1u64..=2048 {
         hub.publish(Event {
             dataset: "auth".into(),
-            namespace: "users".into(),
+            namespace: "keys".into(),
             stream: "auth-0".into(),
             sequence,
             epoch: 1,
@@ -282,8 +296,8 @@ async fn a_full_replay_persistence_queue_never_blocks_live_history() {
         });
     }
     assert!(hub.0.replay_bytes.load(Ordering::Relaxed) <= MAX_BYTES);
-    assert!(replay.ranges("auth", "users").is_empty());
-    let key = ("auth".into(), "users".into());
+    assert!(replay.ranges("auth", "keys").is_empty());
+    let key = ("auth".into(), "keys".into());
     assert_eq!(hub.source_head(&key), Some(2048));
     assert_eq!(hub.read(&key, 2048).await.unwrap()[0].0, 2048);
 }
@@ -307,7 +321,7 @@ async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
         writer
             .commit(Write {
                 dataset: "auth".into(),
-                namespace: "users".into(),
+                namespace: "keys".into(),
                 key: key.to_be_bytes().to_vec(),
                 operation: crate::replication::Operation::Set(vec![42]),
                 idempotency_key: None,
@@ -323,13 +337,8 @@ async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
     let (mut frames, closed) = subscriber(&hub, 1, MAX_EVENTS);
     let pumping = hub.clone();
     let task = tokio::spawn(async move {
-        let follow = pb::Follow {
-            dataset: "auth".into(),
-            namespace: "users".into(),
-            from: 0,
-            buckets: Vec::new(),
-        };
-        pumping.pump(1, follow, 1, Vec::new(), true).await
+        let key = (("auth".into(), "keys".into()), None);
+        pumping.pump(1, key, 1, Vec::new(), true).await
     });
     // The reader stalls while the queue holds more than MAX_EVENTS worth of entries.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -383,12 +392,7 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
             .unwrap()
             .member = Some(member(node, pb::member::Status::Ready));
     }
-    let members = hub.members();
-    assert_eq!(members.len(), 2);
-    assert_eq!(
-        members[&("kv".to_string(), "kv-2".to_string())].applied,
-        BTreeMap::from([(("auth".to_string(), "users".to_string()), 0)])
-    );
+    assert_eq!(hub.members().len(), 2);
     // Only the same identity may change, and a client cannot claim to have left.
     assert!(!hub.member(2, member("kv-2", pb::member::Status::Draining)));
     assert!(!hub.member(2, member("kv-1", pb::member::Status::Left)));
@@ -435,21 +439,127 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
     // The newest session for an identity wins; closing it leaves a LEFT marker over the stale one.
     hub.remove(2);
     let key = ("kv".to_string(), "kv-1".to_string());
-    assert_eq!(
-        hub.members()[&key].member.status,
-        pb::member::Status::Ready as i32
-    );
+    assert_eq!(hub.members()[&key].status, pb::member::Status::Ready as i32);
     hub.remove(1);
-    assert_eq!(
-        hub.members()[&key].member.status,
-        pb::member::Status::Left as i32
-    );
+    assert_eq!(hub.members()[&key].status, pb::member::Status::Left as i32);
     // An ungraceful close leaves nothing behind.
     hub.remove(3);
     assert!(
         !hub.members()
             .contains_key(&("kv".to_string(), "kv-2".to_string()))
     );
+}
+
+#[tokio::test]
+async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_catching_up_every_namespace()
+ {
+    let hub = hub();
+    let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&1)
+        .unwrap()
+        .member = Some(member("q1", pb::member::Status::Ready));
+    let me = ("kv".to_string(), "q1".to_string());
+    let whole = (0, 0);
+    let site = (
+        ("quicksilver".to_string(), "infrastructure".to_string()),
+        Some(whole),
+    );
+    hub.observe_head(&site.0, 5);
+    let ranges = |dataset: &str, revision| pb::Ranges {
+        dataset: dataset.into(),
+        revision,
+        spans: vec![pb::Span { start: 0, end: 0 }],
+    };
+    let ack = |dataset: &str, revision| pb::RangesAck {
+        dataset: dataset.into(),
+        revision,
+        refused: Vec::new(),
+        reason: String::new(),
+    };
+    hub.push_ranges(&me, ranges("quicksilver", 7));
+    hub.push_ranges(&me, ranges("quicksilver", 8));
+    let pushed = tokio_stream::StreamExt::next(&mut frames)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(pushed.kind, Some(pb::relay_frame::Kind::Ranges(r)) if r.revision == 7));
+    assert!(
+        frames.rx.as_mut().try_recv().is_err(),
+        "an unchanged set is not pushed again"
+    );
+
+    // Neither acknowledged nor followed yet.
+    assert!(hub.ready().is_empty());
+    hub.ranges_acked(1, ack("quicksilver", 7));
+    assert!(hub.ready().is_empty(), "no stream for the range yet");
+    let interest = |acked| Interest {
+        from: acked + 1,
+        acked,
+        generation: 9,
+        baseline: 0,
+        confirming: false,
+        target: None,
+    };
+    let set = |f: &dyn Fn(&mut Interest)| {
+        f(hub
+            .0
+            .subscribers
+            .lock()
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()
+            .follows
+            .get_mut(&site)
+            .unwrap())
+    };
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&1)
+        .unwrap()
+        .follows
+        .insert(site.clone(), interest(3));
+    assert!(hub.ready().is_empty(), "behind the head");
+    // The target is the head when the stream first could be ready; later writes do not move it.
+    hub.observe_head(&site.0, 9);
+    set(&|i| i.acked = 5);
+    let expected = siblings::Ready::from([((me.clone(), "quicksilver".to_string()), vec![whole])]);
+    assert_eq!(hub.ready(), expected);
+    set(&|i| i.confirming = true);
+    assert!(
+        hub.ready().is_empty(),
+        "a bootstrap awaiting confirmation is not ready"
+    );
+    set(&|i| i.confirming = false);
+    assert_eq!(hub.ready(), expected);
+
+    // Every fixed namespace counts, even one no write has reached the relay for yet.
+    hub.push_ranges(&me, ranges("cdn", 3));
+    hub.ranges_acked(1, ack("cdn", 3));
+    let follow = |namespace: &str| {
+        hub.0
+            .subscribers
+            .lock()
+            .unwrap()
+            .get_mut(&1)
+            .unwrap()
+            .follows
+            .insert(
+                (("cdn".to_string(), namespace.to_string()), Some(whole)),
+                interest(0),
+            );
+    };
+    follow("pages");
+    assert_eq!(hub.ready(), expected, "`workers` is not followed yet");
+    follow("workers");
+    let mut both = expected.clone();
+    both.insert((me, "cdn".to_string()), vec![whole]);
+    assert_eq!(hub.ready(), both);
 }
 
 fn caller(service: &str, cell: &str, node_id: &str) -> Caller {
@@ -526,4 +636,54 @@ fn sessions_are_authorized_by_the_callers_certificate() {
     denied(authorize(&caller("kv", "c1", "n7"), WRITER, "", 0, None));
     // A relay without a configured cell admits no leaves.
     denied(authorize(&caller("kv", "", "n7"), 1, "", 0, None));
+}
+
+#[tokio::test]
+async fn a_refused_push_is_pushed_again_on_the_next_pass() {
+    let hub = hub();
+    let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&1)
+        .unwrap()
+        .member = Some(member("q1", pb::member::Status::Ready));
+    let me = ("kv".to_string(), "q1".to_string());
+    let ranges = |revision| pb::Ranges {
+        dataset: "quicksilver".into(),
+        revision,
+        spans: vec![pb::Span {
+            start: 0,
+            end: 1 << 63,
+        }],
+    };
+    let refused = |revision| pb::RangesAck {
+        dataset: "quicksilver".into(),
+        revision,
+        refused: vec![pb::Span {
+            start: 1 << 63,
+            end: 0,
+        }],
+        reason: "still an owner".into(),
+    };
+    let mut next = async || match tokio_stream::StreamExt::next(&mut frames)
+        .await
+        .unwrap()
+        .unwrap()
+        .kind
+    {
+        Some(pb::relay_frame::Kind::Ranges(r)) => r.revision,
+        other => panic!("expected a pushed set, got {other:?}"),
+    };
+    hub.push_ranges(&me, ranges(7));
+    assert_eq!(next().await, 7);
+    // A refusal of an older set does not forget the newer one.
+    hub.ranges_acked(1, refused(6));
+    hub.push_ranges(&me, ranges(8));
+    // The current set is refused: the next pass pushes the same spans again.
+    hub.ranges_acked(1, refused(7));
+    hub.push_ranges(&me, ranges(9));
+    let again = tokio::time::timeout(std::time::Duration::from_secs(1), next());
+    assert_eq!(again.await.expect("the refused set is pushed again"), 9);
 }

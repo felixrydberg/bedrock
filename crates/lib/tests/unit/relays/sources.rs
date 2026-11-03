@@ -1,9 +1,9 @@
 use tokio::time::sleep;
 
 use super::*;
-use crate::buckets::hash_of;
 use crate::health::CONSECUTIVE_FAILURES;
 use crate::placement::Owner;
+use crate::placement::hash_of;
 use crate::transport::admin::Admin;
 
 fn member(id: &str, domain: &str) -> pb::Member {

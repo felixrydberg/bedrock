@@ -4,6 +4,7 @@ use bedrock_lib::membership;
 use bedrock_lib::node::{self, ConfigError, ServiceConfig};
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
+/// Returns configuration, admin startup, or relay session initialization errors.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     check_hosts_nothing_pushed(&config)?;
@@ -24,6 +25,8 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         config.relays.clone(),
         vec![target],
         membership::member(&config, "kv"),
+        // Customer KV has no ranges.
+        Default::default(),
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -47,11 +50,11 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
 
 /// Customer KV has no pushed data: quicksilver, auth and cdn belong to other binaries.
 fn check_hosts_nothing_pushed(config: &ServiceConfig) -> Result<(), ConfigError> {
-    if config.datasets.is_empty() && config.subscriptions.is_empty() {
+    if config.datasets.is_empty() {
         return Ok(());
     }
     Err(ConfigError(
-        "bedrock-kv hosts no relay-fed datasets; datasets and subscriptions must be empty".into(),
+        "bedrock-kv hosts no relay-fed datasets; datasets must be empty".into(),
     ))
 }
 

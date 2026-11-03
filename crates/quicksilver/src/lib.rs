@@ -40,12 +40,14 @@ const fn dataset(
 }
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
+/// Enabled datasets whose engines cannot open or are unhealthy at startup are skipped and keep the node unready until
+/// restart. Configuration, admin startup, registry and relay session initialization errors are returned.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-quicksilver");
     let admin = node::start_admin(&config.node).await?;
     let storage = StorageHealth::new(&admin);
-    // Subscriptions apply through the replication handles, which keep working while B-22 rebuilds a dataset.
+    // Pushed ranges apply through the replication handles, which keep working while B-22 rebuilds a dataset.
     let mut replication = std::collections::BTreeMap::new();
     let datasets = Registry::open(DATASETS, &config.datasets, |d| {
         let engine = datasets::open_engine(&config.node.data_dir, d)?;
@@ -59,37 +61,24 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
-    let targets = config
-        .subscriptions
-        .iter()
-        .map(|selection| {
-            if !matches!(selection.dataset.as_str(), "quicksilver" | "auth") {
-                return Err(ConfigError(
-                    "Quicksilver relay subscriptions permit only quicksilver/auth".into(),
-                ));
+    // Relays push the ranges this node owns of each dataset it carries.
+    let mut ranged = std::collections::BTreeMap::new();
+    for instance in datasets.iter() {
+        let name = instance.dataset.name;
+        match &instance.engine {
+            Ok(engine) if engine.health().is_ok() => {
+                ranged.insert(name.to_owned(), replication[name].clone());
             }
-            let instance = datasets
-                .get(&selection.dataset)
-                .ok_or_else(|| ConfigError("subscribed dataset is not enabled".into()))?;
-            let Ok(engine)=&instance.engine else{return Ok(None)};
-            if let Err(error)=engine.health(){
-                tracing::warn!(dataset=%selection.dataset,%error,"dataset unavailable; other subscriptions continue");
-                return Ok(None);
-            }
-            let mut prefix = selection.namespace.as_bytes().to_vec();
-            prefix.push(0);
-            Ok(Some(bedrock_lib::relays::client::Target {
-                selection: selection.clone(),
-                engine:replication[selection.dataset.as_str()].clone(),
-                prefix,
-            }))
-        })
-        .collect::<Result<Vec<_>, ConfigError>>()?;
-    // ponytail: a skipped subscription keeps the node unready until restart; rebuild the Session if hot recovery matters.
-    let skipped = targets.iter().any(Option::is_none);
-    let mut targets: Vec<_> = targets.into_iter().flatten().collect();
+            _ => tracing::warn!(
+                dataset = name,
+                "dataset unavailable; its ranges are not followed"
+            ),
+        }
+    }
+    // ponytail: a dataset unavailable at startup keeps the node unready until restart; rebuild the Session if hot
+    // recovery matters.
+    let skipped = ranged.len() != datasets.iter().count();
     let (members, target) = membership::View::new("quicksilver", &config.node.location.cell);
-    targets.push(target);
     let peers =
         std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(
             bedrock_lib::transport::tls::start(&config.node, "quicksilver", &admin).await?,
@@ -97,8 +86,9 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
-        targets,
+        vec![target],
         membership::member(&config, "quicksilver"),
+        ranged,
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let rebuilding = bedrock_lib::reconciliation::rebuild::start(
@@ -107,7 +97,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         &session,
         "engine",
         &replication,
-        bedrock_lib::buckets::hash_of("rebuild", &config.node.node_id, b""),
+        bedrock_lib::placement::hash_of("rebuild", &config.node.node_id, b""),
     );
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());

@@ -8,12 +8,11 @@ and never create a live edge. This is the sole subscription transport; the
 superseded B-10 Replication.Subscribe client, service and relay bridge were removed.
 The writer's ordered log and change notifications remain shared primitives.
 
-Each follow is a dataset/namespace plus a canonical bucket selector. An empty
-selector means the whole namespace. Delivery covers an inclusive consecutive
-namespace revision interval, including revisions whose payload belongs to another
-bucket. Matching original events and the covered cursor commit atomically.
-Selector identity is persisted with the cursor; changing it requires a new validated
-baseline. Coverage never renumbers events or changes committed_at. Tick proves
+Each follow selects a namespace or a dataset hash range ([range streams](#range-streams)).
+Delivery covers an inclusive consecutive revision interval per namespace, including
+revisions whose payload lies outside the range. Matching original events and the
+covered cursors commit atomically. Selector identity is persisted with the cursors.
+Coverage never renumbers events or changes committed_at. Tick proves
 connection liveness only and cannot advance applied state. Customer kv is rejected.
 
 Replay is a disposable checksummed cache, never commit authority. Advertised ranges
@@ -24,13 +23,60 @@ only successful validation permits atomic installation. A bounded lease acquired
 with the view protects the subsequent tail from GC through catch-up. Expiry or
 disconnection aborts recovery. No readiness follows a partial or corrupt transfer.
 
+## Range streams
+
+#22 / B-21 (§4 decision 13, refined 2026-11-02; [membership.md](membership.md#range-handoff)).
+
+- **Selector.** A follow selects either a namespace (membership, whole) or a dataset hash range
+  `[start, end)` (`end` 0 meaning 2⁶⁴), never both. A range follow is one stream carrying every namespace of the
+  dataset. Events keep their namespace and per-namespace revision. Coverage is per namespace: a delivery notes how
+  far each namespace it touches is covered, so namespaces without writes add nothing. The subscriber keeps one
+  covered revision per namespace and resumes with that table. Each ranged dataset has a fixed namespace set in code
+  (`placement::namespaces`): `quicksilver` has `infrastructure`, `auth` has `keys` and `cdn` has `pages` and
+  `workers`. The writer rejects any other namespace of these datasets, so the list is complete. This is the
+  model's constant `Namespaces`.
+- **Pushed ranges.** A relay pushes each leaf subscriber its full owned range set per dataset, tagged with the
+  directory revision it was derived from. The subscriber follows the ranges added. A range dropped from the set is
+  the revoke: the subscriber confirms it against its own directory view, then unfollows and deletes the range, or
+  refuses and reports a mismatch. Narrowing a held range after a split keeps its coverage; a new range starts from
+  nothing and bootstraps where retained history does not reach.
+- **Bootstrap.** Each namespace of the range bootstraps at its own boundary under its own lease and installs
+  atomically. Readiness requires every namespace confirmed and caught up.
+- **Relays.** A relay follows a dataset whole (`[0, 2⁶⁴)`) from its upstream as soon as one subscriber follows it
+  by range, and never also by namespace. It starts each subscriber's range in every namespace of the dataset. A range
+  follow's `from_namespaces` entry of 0 asks for a fresh baseline; a namespace without an entry starts at 1.
+- **Readiness.** The relay reports a subscriber ready for a range only after it processed every pushed set and
+  then acknowledged through the head, so an acknowledgement from before a pending revoke never counts.
+- **Relay side.** On every reconciliation pass each cell relay pushes its own leaf members their ranges per dataset
+  from the published directory, only when a set changed. `Hub::ready` counts a member ready for a range once its
+  `RangesAck` covers the latest pushed set and, in every namespace of the dataset, the range's stream finished any
+  bootstrap (its recovered confirmation was sent) and was acknowledged through the head recorded when it first
+  qualified. Relays share these ready bits with their siblings each second; the publisher writes `ready` from its own
+  and its live siblings' bits (`placement::handoff`), then drops `leaving` owners. A namespace with no writes yet
+  counts too, so a member cannot be ready while it still lacks a namespace.
+- **Member side.** A member keeps only the latest pushed set per dataset and applies it once its own membership
+  view has reached the set's revision (`relays::ranges`): it follows added ranges, carries a split range's coverage
+  to the parts it keeps, and drops a revoked range only when its view no longer lists it there and lists another
+  `ready` owner. A drop deletes the range's span and its consumers' progress in one atomic batch, then compacts the
+  span. It acknowledges every set it applied with `RangesAck`, listing the revokes it refused and why; the relay
+  then forgets that set and pushes it again on its next publish pass. A range
+  held before a restart resumes until the relays push the current set.
+
+## Model
+
 relays.tla is a bounded safety abstraction: coverage is represented one revision at
-a time, with alternating revisions modeling selector matches and omissions. Its
+a time per namespace, with alternating revisions modeling range matches and omissions.
+One stream interleaves the namespaces' coverage. Its
 projection invariant requires all selected payloads through covered progress,
 while unselected revisions still advance coverage. `projected` is ghost history,
 not a physical snapshot log or tombstone set. Cached events are disposable and the
 writer history is abstracted as recoverable while pinned. It checks consecutive
 coverage, queue bounds and protected bootstrap installation through disconnects.
+`Assign` and `Revoke` push the range and its removal as ordered frames, which a
+disconnect loses and a reconnect resends as the current set. `Receive` follows the
+range or deletes it, restarting coverage from nothing. `Report` is the relay's
+readiness, kept by the directory until a revoke: `ReportedHolds` checks that a
+reported subscriber still follows the range.
 It does not prove payload routing, Rust correctness, disk checksums, fairness,
 resource limits, or the complete B-23 gate. Implementation tests must cover those.
 Run TLC with relays.cfg; record actual results separately.
@@ -48,13 +94,15 @@ Deploy at least three relays per cell (membership publication needs a majority),
 one relay per 500–1,000 nodes. Rotate the configured relay preference across nodes to distribute load;
 upper tiers need only a few relays. Provisioning is static configuration here.
 
-KV/CDN `[[subscriptions]]` entries explicitly name dataset, namespace and optional
-bucket IDs. Omitted/empty buckets follow the namespace. The KV binary permits
-Quicksilver/Auth; CDN permits only CDN metadata. Customer `kv` opens/reads do not
-create interests. Automatic ownership remains #19 / B-16 work; namespace interests here are explicit
-configuration. Leaf sessions also carry [cell membership](membership.md) (#15 / B-12).
-The leaf client stores values under namespace-NUL prefixes and persists its
-selector identity and covered revision in the same local atomic batch. Changing a
+No node configures subscriptions. `bedrock-quicksilver` and `bedrock-cdn` follow the ranges the
+relays push of each dataset they carry (`cdn` for the CDN, whose `ref/{sha256}/…` keys are placed
+by content hash, `feature-drafts.md` §4 decision 14); `Session::join` maps those datasets to their engines.
+Every node also follows its own membership namespace whole. Customer
+`kv` opens/reads do not create interests. Leaf sessions also carry [cell membership](membership.md)
+(#15 / B-12). The leaf client stores a whole namespace under its namespace-NUL prefix and a
+range in the hash-first L2 layout (`l2/{hash}/{namespace}\0{key}`, `storage::l2_key`), and
+persists its selector identity and covered revision in the same local atomic batch. A range
+consumer also marks its namespace, so a restart resumes every namespace it held. Changing a
 selector restarts recovery from validated state rather than reusing coverage.
 Call `Session::stop().await` before replacing or reusing its local storage; it
 aborts and joins the applying task. Dropping the session requests cancellation.
@@ -65,7 +113,7 @@ continues. Tick/progress alone never advances data or a revision. A receiver que
 is capped at 1,024 records and 4 MiB of serialized frames; control frames also have
 a bounded channel. Outstanding revision coverage has a separate 1,024 window.
 Full queues disconnect only that subscriber; exhausted acknowledgement windows
-wait up to the idle deadline before disconnection. Encoded events and bucket hashes
+wait up to the idle deadline before disconnection. Encoded events and key hashes
 are shared across recipients in a bounded 4 MiB/4,096-record recent cache.
 
 Replay persistence has its own 1,024-record/4 MiB input queue and commits batches
@@ -184,7 +232,12 @@ The simulation lint allowances match the workspace's documented harness checks;
 normal lint retains the disallowed API checks. All checks above passed on
 2026-10-30, including 165 native / 118 simulation shared-core unit tests and the
 ten relay protocol integration tests in both builds. Opt-in load and real-S3
-tests remain ignored by the ordinary workspace test command.
+tests remain ignored by the ordinary workspace test command. With range streams
+(2026-11-02, #22 / B-21 phase 2), every check above passed again: 235 native and
+195 simulation tests in 28 suites each, including the range-follow integration test
+in both builds. With member-side pushed ranges and per-dataset directories (phase 3,
+same day), they passed again: 239 native and 199 simulation tests. With relay-side pushes and readiness (phase 4,
+same day): 240 native and 200 simulation tests.
 For cleanup validation, native lint reused a cached RocksDB archive through the
 dependency's supported `ROCKSDB_LIB_DIR` / `ROCKSDB_STATIC` settings; native tests
 built RocksDB normally. This avoids rebuilding C++ for the Rust-only lint step.
@@ -202,6 +255,27 @@ revision 2 (2026-10-30), and dropping `~pending` from `BecomeReady` makes
 readiness, at depth 3 (2026-10-31). Dropping `~lost` from `Confirm`, so a lost receiver
 could confirm without a fresh install, makes `ReadyNotLost` fail at depth 11 (2026-11-03).
 
+With range streams, pushed ranges and revokes, TLC `2026.10.28.014557` (rev `56d37a9`)
+checked on 2026-11-02 with `QueueLimit=2` and every invariant above plus `ReportedHolds`:
+
+| Namespaces | `MaxRevision` | Generated states | Distinct states | Depth | Result |
+|---|---:|---:|---:|---:|---|
+| `{"a", "b"}` (`relays.cfg`) | 2 | 15,397,970 | 1,679,867 | 28 | no violation (11 s) |
+| `{"a"}` | 4 | 3,218,130 | 368,329 | 28 | no violation (3 s) |
+
+Negative checks in ignored temporary copies, 2026-11-02, with `relays.cfg`: letting
+`Report` count acknowledgements while pushed frames are unprocessed violates
+`ReportedHolds` at depth 7, as does letting `Revoke` keep the reported readiness. The
+earlier checks still fail on the new model: a no-op selected-payload application
+violates `FilteredCoverage` at depth 10, dropping `~pending` from `BecomeReady`
+violates `ReadyAfterConfirmation` at depth 9, and letting `Commit` keep readiness
+violates it at depth 8.
+
+With local storage loss merged into the range model (#23 / B-22, 2026-11-03), TLC 1.8.0 checked `relays.cfg` with
+every invariant above plus `ReadyNotLost`: 26,865,595 generated states, 2,705,822 distinct, depth 28, no violation
+(31 s). A revoke deletes the range, so it also clears `lost`. Letting `LoseLocal` keep `pending` unchanged violates
+`ReadyNotLost` (840 distinct states).
+
 With the [official TLA+ release](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0)
 jar saved as `.codex-tmp/tla2tools.jar`, run from `docs/spec`:
 
@@ -211,7 +285,11 @@ java -XX:+UseParallelGC -cp ../../.codex-tmp/tla2tools.jar tlc2.TLC -workers 1 -
 
 The focused suites cover selector changes, filtered coverage, corruption, restart,
 eviction, storage failure/rebuild, subscription cancellation, two-tier forwarding,
-pruned-cursor bootstrap, and GC protection. `tests/sim/tests/relays.rs` runs seeds
+pruned-cursor bootstrap, and GC protection. A range follow through a writer, a top
+relay and a cell relay receives only its hashes in every namespace, picks up a
+namespace created after it followed, and resumes after a restart
+(`range_follow_streams_every_namespace_and_only_its_hashes_through_two_tiers`).
+`tests/sim/tests/relays.rs` runs seeds
 1, 2 and 42 twice and compares committed application traces through idle partitions,
 node kills, all-open routing and a KV-only process-task abort on a relay machine.
 Replay one seed with `BEDROCK_RELAY_SEED=42` and the documented simulation flags.
@@ -225,7 +303,7 @@ Run the opt-in native benchmark with:
 BEDROCK_RELAY_LOAD_SECONDS=60 cargo test --release -p bedrock-lib --test relay_load -- --ignored --nocapture
 ```
 
-It uses 1,000 independent loopback subscribers, exactly distributed bucket selectors,
+It uses 1,000 independent loopback subscribers, each following one of 1,000 equal hash ranges,
 256-byte values, a committed-log fixture paced at 10,000 events/second, and a real
 RocksDB replay store capped at 16 MiB. This isolates relay capacity from writer
 persistence. `BEDROCK_RELAY_LOAD_WRITER=1` instead exercises the materialized memory
@@ -235,7 +313,8 @@ overload probes. It reports actual rates, lag, RSS, catch-up and errors.
 Neither mode establishes real-S3 writer throughput or WAN capacity. Normal tests
 leave this hardware measurement ignored.
 
-Measured on 2026-10-30 in WSL Ubuntu, optimized build, eight runtime workers:
+Measured on 2026-10-30 in WSL Ubuntu, optimized build, eight runtime workers, with the earlier bucket selectors (#22 /
+B-21 replaced them with hash ranges on 2026-11-02; the benchmark has not been rerun since):
 
 | Source | Injection window | Source events/s | Delivered events/s, including final drain | p99 lag | Subscriber errors |
 |---|---:|---:|---:|---:|---:|

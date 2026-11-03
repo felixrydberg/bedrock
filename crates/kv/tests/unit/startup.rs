@@ -26,12 +26,10 @@ fn config(extra: &str) -> ServiceConfig {
 }
 
 #[test]
-fn hosts_no_datasets_or_subscriptions() {
+fn hosts_no_datasets() {
     assert!(check_hosts_nothing_pushed(&config("")).is_ok());
     for dataset in ["quicksilver", "auth", "cdn"] {
         let with_dataset = config(&format!("datasets = [\"{dataset}\"]"));
         assert!(check_hosts_nothing_pushed(&with_dataset).is_err());
     }
-    let subscribed = config("subscriptions = [{ dataset = \"quicksilver\", namespace = \"n\" }]");
-    assert!(check_hosts_nothing_pushed(&subscribed).is_err());
 }

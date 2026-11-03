@@ -262,24 +262,32 @@ fn directory_entries_sit_beside_members_in_one_namespace() {
         },
     ];
     engine
-        .put(&at("range/0000000000000000"), &encode(&owners[..1]))
+        .put(&at("range/cdn/0000000000000000"), &encode(&owners[..1]))
         .unwrap();
     engine
-        .put(&at("range/8000000000000000"), &encode(&owners))
+        .put(&at("range/cdn/8000000000000000"), &encode(&owners))
+        .unwrap();
+    engine
+        .put(&at("range/other/0000000000000000"), &encode(&owners))
         .unwrap();
     assert_eq!(
         view.members().unwrap().into_keys().collect::<Vec<_>>(),
         ["cdn-1"]
     );
-    let directory = view.directory().unwrap();
+    let directory = view.directory("cdn").unwrap();
+    assert_eq!(directory.len(), 2, "each dataset has its own ranges");
     assert_eq!(directory[&0], owners[..1]);
     assert_eq!(directory[&(1 << 63)], owners);
-    engine
-        .put(&at("range/000000000000000A"), &encode(&owners[..1]))
-        .unwrap();
-    assert_eq!(view.members().unwrap().len(), 1);
-    assert_eq!(view.directory().unwrap_err().code(), tonic::Code::DataLoss);
-    engine.delete(&at("range/000000000000000A")).unwrap();
+    assert!(view.directory("absent").unwrap().is_empty());
+    for invalid in ["range/cdn/000000000000000A", "range/0000000000000000"] {
+        engine.put(&at(invalid), &encode(&owners[..1])).unwrap();
+        assert_eq!(view.members().unwrap().len(), 1);
+        assert_eq!(
+            view.directory("cdn").unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+        engine.delete(&at(invalid)).unwrap();
+    }
     // An owner state this build does not know is corruption, not an empty range.
     let unknown = pb::Range {
         owners: vec![pb::range::Owner {
@@ -288,34 +296,65 @@ fn directory_entries_sit_beside_members_in_one_namespace() {
         }],
     };
     engine
-        .put(&at("range/0000000000000000"), &unknown.encode_to_vec())
+        .put(&at("range/cdn/0000000000000000"), &unknown.encode_to_vec())
         .unwrap();
-    assert_eq!(view.directory().unwrap_err().code(), tonic::Code::DataLoss);
+    assert_eq!(
+        view.directory("cdn").unwrap_err().code(),
+        tonic::Code::DataLoss
+    );
 }
 
-/// The publisher's directory passes for `service` until nothing changes; returns the number of passes.
-fn settle(service: &str, actual: &Members, directory: &mut Directory) -> usize {
+/// Every owner in `directories` as its relay would report it once its handoff completed.
+fn all_ready(service: &str, directories: &Directories) -> siblings::Ready {
+    let mut ready = siblings::Ready::new();
+    for (dataset, directory) in directories {
+        for (start, owners) in directory {
+            for owner in owners {
+                ready
+                    .entry(((service.into(), owner.node.clone()), dataset.clone()))
+                    .or_default()
+                    .push((*start, 0));
+            }
+        }
+    }
+    ready
+}
+
+/// The publisher's directory passes for `service` until nothing changes, with every relay reporting its members
+/// ready; returns the number of passes.
+fn settle(service: &str, actual: &Members, directories: &mut Directories) -> usize {
     for pass in 0..100 {
-        let changes = place(service, actual, directory);
+        let ready = all_ready(service, directories);
+        let changes = place(service, actual, directories, &ready);
         if changes.is_empty() {
             return pass;
         }
         for change in changes {
-            let Change::Range { start, owners, .. } = change else {
+            let Change::Range {
+                dataset,
+                start,
+                owners,
+                ..
+            } = change
+            else {
                 panic!("placement wrote {change:?}");
             };
-            directory.insert(start, owners);
+            directories
+                .entry(dataset)
+                .or_default()
+                .insert(start, owners);
         }
     }
     panic!("placement did not settle");
 }
 
 #[test]
-fn placement_promotes_then_assigns_only_its_own_service() {
+fn placement_completes_handoffs_then_assigns_only_its_own_service() {
     let node = |id: &str, service: &str, domain: &str| pb::Member {
         service: service.into(),
         roles: vec!["l2".into()],
         failure_domain: domain.into(),
+        datasets: vec![service.into()],
         ..ready(id)
     };
     let actual = members(&[
@@ -323,19 +362,33 @@ fn placement_promotes_then_assigns_only_its_own_service() {
         node("cdn-2", "cdn", "b"),
         node("cdn-3", "cdn", "c"),
         node("cdn-4", "cdn", "a"),
+        // Carries no dataset, so it owns nothing.
+        pb::Member {
+            datasets: Vec::new(),
+            ..node("cdn-0", "cdn", "d")
+        },
         node("qs-1", "quicksilver", "d"),
     ]);
-    let mut directory = Directory::new();
-    let first = place("cdn", &actual, &directory);
-    let Some(Change::Range { owners, .. }) = first.first() else {
+    let mut directories = Directories::new();
+    let first = place("cdn", &actual, &directories, &siblings::Ready::new());
+    let Some(Change::Range {
+        dataset, owners, ..
+    }) = first.first()
+    else {
         panic!("nothing assigned: {first:?}");
     };
+    assert_eq!(dataset, "cdn");
     assert!(owners.iter().all(|o| o.state == State::Populating));
-    assert!(settle("cdn", &actual, &mut directory) >= 2);
-    for owners in directory.values() {
+    assert!(settle("cdn", &actual, &mut directories) >= 2);
+    assert_eq!(directories.len(), 1);
+    for owners in directories["cdn"].values() {
         assert_eq!(owners.len(), REPLICAS);
         assert!(owners.iter().all(|o| o.state == State::Ready));
-        assert!(owners.iter().all(|o| o.node.starts_with("cdn-")));
+        assert!(
+            owners
+                .iter()
+                .all(|o| o.node.starts_with("cdn-") && o.node != "cdn-0")
+        );
     }
     // A member announcing unhealthy storage gets nothing new but keeps what it holds.
     let mut sick = actual.clone();
@@ -347,11 +400,11 @@ fn placement_promotes_then_assigns_only_its_own_service() {
         ("cdn".to_string(), "cdn-5".to_string()),
         node("cdn-5", "cdn", "b"),
     );
-    let mut after = directory.clone();
+    let mut after = directories.clone();
     settle("cdn", &joined, &mut after);
     // Ranges may split, but every hash cdn-4 held stays with it and it gains none.
-    for (start, owners) in &after {
-        let before = placement::owners(&directory, *start);
+    for (start, owners) in &after["cdn"] {
+        let before = placement::owners(&directories["cdn"], *start);
         let held = |owners: &[Owner]| owners.iter().any(|o| o.node == "cdn-4");
         assert_eq!(held(owners), held(before), "range {start:x}");
     }
@@ -359,8 +412,8 @@ fn placement_promotes_then_assigns_only_its_own_service() {
     // A removed member's ranges are reassigned, still within the service.
     let mut removed = actual.clone();
     removed.remove(&("cdn".to_string(), "cdn-2".to_string()));
-    settle("cdn", &removed, &mut directory);
-    for owners in directory.values() {
+    settle("cdn", &removed, &mut directories);
+    for owners in directories["cdn"].values() {
         assert_eq!(owners.len(), REPLICAS);
         assert!(
             owners
@@ -368,4 +421,153 @@ fn placement_promotes_then_assigns_only_its_own_service() {
                 .all(|o| o.node != "cdn-2" && o.state == State::Ready)
         );
     }
+}
+
+#[test]
+fn placement_filters_members_and_health_per_dataset() {
+    let node = |id: &str, datasets: &[&str], unhealthy: &[&str]| pb::Member {
+        service: "quicksilver".into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: datasets.iter().map(|d| (*d).into()).collect(),
+        unhealthy: unhealthy.iter().map(|d| (*d).into()).collect(),
+        ..ready(id)
+    };
+    let actual = members(&[
+        node("both-sick-auth", &["auth", "quicksilver"], &["auth"]),
+        node("auth-only", &["auth"], &[]),
+        node("qs-only", &["quicksilver"], &[]),
+        node("both", &["auth", "quicksilver"], &[]),
+        pb::Member {
+            service: "cdn".into(),
+            ..node("foreign", &["auth", "quicksilver"], &[])
+        },
+    ]);
+    let changes = place(
+        "quicksilver",
+        &actual,
+        &Directories::new(),
+        &siblings::Ready::new(),
+    );
+    let assigned = |dataset: &str| -> BTreeSet<String> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Range {
+                    dataset: d, owners, ..
+                } if d == dataset => Some(owners),
+                _ => None,
+            })
+            .flatten()
+            .map(|owner| {
+                assert_eq!(owner.state, State::Populating);
+                owner.node.clone()
+            })
+            .collect()
+    };
+    assert_eq!(
+        assigned("quicksilver"),
+        ["both-sick-auth", "qs-only", "both"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        assigned("auth"),
+        ["auth-only", "both"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+    assert!(place("kv", &actual, &Directories::new(), &siblings::Ready::new()).is_empty());
+}
+
+#[test]
+fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
+    let owner = |node: &str, state| Owner {
+        node: node.into(),
+        state,
+    };
+    let node = |id: &str, status: pb::member::Status| pb::Member {
+        service: "quicksilver".into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: vec!["auth".into(), "quicksilver".into()],
+        status: status as i32,
+        ..ready(id)
+    };
+    let actual = members(&[
+        node("old", pb::member::Status::Draining),
+        node("a", pb::member::Status::Ready),
+        node("b", pb::member::Status::Ready),
+        node("c", pb::member::Status::Ready),
+    ]);
+    let initial = vec![
+        owner("old", State::Leaving),
+        owner("a", State::Populating),
+        owner("b", State::Populating),
+        owner("c", State::Populating),
+    ];
+    let directories = Directories::from([
+        ("auth".into(), Directory::from([(0, initial.clone())])),
+        (
+            "quicksilver".into(),
+            Directory::from([(0, initial.clone())]),
+        ),
+    ]);
+    let ready = siblings::Ready::from([
+        (
+            (("quicksilver".into(), "a".into()), "auth".into()),
+            vec![(0, 0)],
+        ),
+        ((("cdn".into(), "b".into()), "auth".into()), vec![(0, 0)]),
+        (
+            (("quicksilver".into(), "c".into()), "auth".into()),
+            vec![(1, 0)],
+        ),
+    ]);
+    assert_eq!(
+        place("quicksilver", &actual, &directories, &ready),
+        vec![Change::Range {
+            service: "quicksilver".into(),
+            dataset: "auth".into(),
+            start: 0,
+            owners: vec![
+                owner("old", State::Leaving),
+                owner("a", State::Ready),
+                owner("b", State::Populating),
+                owner("c", State::Populating),
+            ],
+        }]
+    );
+}
+
+#[test]
+fn malformed_dataset_range_entries_are_reported_as_data_loss() {
+    let (view, _) = View::new("quicksilver", "eu-1a");
+    let engine = &view.published.engine;
+    let prefix = b"quicksilver.eu-1a\0";
+    for suffix in [
+        "range//0000000000000000",
+        "range/auth!/0000000000000000",
+        "range/auth/000000000000000",
+        "range/auth/00000000000000000",
+        "range/auth/000000000000000g",
+        "range/auth/0000000000000000/extra",
+    ] {
+        let key = [prefix.as_slice(), suffix.as_bytes()].concat();
+        engine.put(&key, &encode(&[])).unwrap();
+        assert_eq!(
+            view.directory("auth").unwrap_err().code(),
+            tonic::Code::DataLoss,
+            "{suffix}"
+        );
+        engine.delete(&key).unwrap();
+    }
+    let key = [prefix.as_slice(), b"range/auth/0000000000000000"].concat();
+    engine.put(&key, &[0xff]).unwrap();
+    assert_eq!(
+        view.directory("auth").unwrap_err().code(),
+        tonic::Code::DataLoss
+    );
 }

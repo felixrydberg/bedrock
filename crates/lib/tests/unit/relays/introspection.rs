@@ -106,8 +106,11 @@ fn stalled(hub: &Hub, id: u64) -> mpsc::Receiver<Result<pb::RelayFrame, tonic::S
             events: Arc::new(AtomicUsize::new(0)),
             closed: Arc::new(Watched::new(false)),
             follows: BTreeMap::new(),
+            ranges: Default::default(),
             changed: Arc::new(Watched::new(0)),
             member: None,
+            pushed: BTreeMap::new(),
+            ranges_acked: BTreeMap::new(),
         },
     );
     rx
@@ -138,7 +141,8 @@ async fn stalled_subscriber_shows_rising_lag_and_queue_depth() {
         dataset: "auth".into(),
         namespace: "users".into(),
         from: 1,
-        buckets: Vec::new(),
+        span: None,
+        from_namespaces: Default::default(),
     };
     hub.follow(1, follow, Vec::new(), false).await;
     let before = subscriber_state(&hub, 10).await;

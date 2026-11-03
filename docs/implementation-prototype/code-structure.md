@@ -28,7 +28,7 @@ bedrock/crates/
 └── cdn/                  # bedrock-cdn: cdn dataset and artifact bytes
     ├── artifact_storage
     ├── artifact_transfer
-    ├── manifests
+    ├── paths
     └── retention
 
 Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-quicksilver`, `bedrock-kv`, `bedrock-cdn`) runs as its own process, depends on

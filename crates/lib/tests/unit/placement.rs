@@ -1,5 +1,4 @@
 use super::*;
-use crate::buckets::hash_of;
 
 const R: usize = 3;
 
@@ -28,10 +27,14 @@ fn cell(n: usize, domains: usize) -> BTreeMap<String, pb::Member> {
         .collect()
 }
 
-/// Completes every handoff, as the publisher's next pass does.
+/// Completes every handoff, as the publisher's next pass does once every new owner's relay reports it ready.
 fn settle(directory: &mut Directory, members: &BTreeMap<String, pb::Member>) {
-    let promoted = promote(directory, members);
-    directory.extend(promoted);
+    let ready = directory
+        .iter()
+        .flat_map(|(start, owners)| owners.iter().map(move |o| (o.node.clone(), *start)))
+        .collect();
+    let done = handoff(directory, members, &ready);
+    directory.extend(done);
 }
 
 /// Plans, writes and completes handoffs until nothing changes.
@@ -333,7 +336,7 @@ fn balances_ten_thousand_weighted_members() {
 }
 
 #[test]
-fn promotion_never_leaves_a_range_without_a_holder() {
+fn handoff_marks_only_reported_owners_ready_and_never_leaves_a_range_without_a_holder() {
     let owner = |node: &str, state| Owner {
         node: node.into(),
         state,
@@ -350,12 +353,31 @@ fn promotion_never_leaves_a_range_without_a_holder() {
         ("a".into(), node("a", "a", 4.0, 1000)),
         ("b".into(), node("b", "b", 4.0, 1000)),
     ]);
+    let ready = BTreeSet::from([("b".to_string(), 10)]);
     assert_eq!(
-        promote(&directory, &members),
+        handoff(&directory, &members, &ready),
         Directory::from([(10, vec![owner("b", State::Ready)])])
     );
-    let no_populating_member = BTreeMap::from([("a".into(), members["a"].clone())]);
-    assert!(promote(&directory, &no_populating_member).is_empty());
+    // Until its relay reports it ready, nothing moves and the leaving owner keeps the range.
+    assert!(handoff(&directory, &members, &BTreeSet::new()).is_empty());
+    assert!(
+        handoff(
+            &directory,
+            &members,
+            &BTreeSet::from([("b".to_string(), 0)])
+        )
+        .is_empty(),
+        "readiness is per range"
+    );
+    // A ready owner that left the membership does not release the leaving one.
+    let gone = BTreeMap::from([("a".into(), members["a"].clone())]);
+    assert_eq!(
+        handoff(&directory, &gone, &ready),
+        Directory::from([(
+            10,
+            vec![owner("a", State::Leaving), owner("b", State::Ready)]
+        )])
+    );
 }
 
 #[test]
@@ -379,6 +401,12 @@ fn a_stale_route_is_rejected_and_the_retry_succeeds() {
     for start in moving.keys() {
         for owner in owners(&stale, *start) {
             assert!(serves(&during_handoff, &owner.node, *start));
+        }
+    }
+    // A populating owner may not hold the data yet.
+    for (start, owners) in &moving {
+        for owner in owners.iter().filter(|o| o.state == State::Populating) {
+            assert!(!serves(&during_handoff, &owner.node, *start));
         }
     }
     // Routed by the old view to the owner `new` replaced, the request is rejected; the next old owner serves it.
@@ -450,4 +478,74 @@ fn measure_ranking_ten_thousand_readers() {
         "rank over 10,000 readers: {:?} per request",
         start.elapsed() / rounds as u32
     );
+}
+
+#[test]
+fn hash_has_a_stable_cross_platform_vector() {
+    assert_eq!(hash_of("auth", "users", b"key"), 0x65d9_029d_77ca_9355);
+    assert_ne!(hash_of("ab", "c", b"key"), hash_of("a", "bc", b"key"));
+    assert_ne!(
+        hash_of("auth", "users", b"key"),
+        hash_of("cdn", "users", b"key")
+    );
+}
+
+#[test]
+fn spans_are_half_open_and_end_zero_is_the_top() {
+    let span = |start, end| pb::Span { start, end };
+    assert!(in_span(&span(10, 20), 10) && !in_span(&span(10, 20), 20));
+    assert!(in_span(&span(10, 0), u64::MAX) && !in_span(&span(10, 0), 9));
+    assert!(valid_span(&span(0, 0)) && valid_span(&span(1, 2)));
+    assert!(!valid_span(&span(2, 2)) && !valid_span(&span(3, 2)));
+}
+
+#[test]
+fn handoff_keeps_leaving_owner_until_all_replacements_are_ready() {
+    let owner = |node: &str, state| Owner {
+        node: node.into(),
+        state,
+    };
+    let members = BTreeMap::from([
+        ("old".into(), node("old", "a", 4.0, 1000)),
+        ("new-1".into(), node("new-1", "b", 4.0, 1000)),
+        ("new-2".into(), node("new-2", "c", 4.0, 1000)),
+    ]);
+    let mut directory = Directory::from([(
+        10,
+        vec![
+            owner("old", State::Leaving),
+            owner("new-1", State::Populating),
+            owner("new-2", State::Populating),
+        ],
+    )]);
+    let first = handoff(
+        &directory,
+        &members,
+        &BTreeSet::from([("new-1".into(), 10)]),
+    );
+    assert_eq!(
+        first[&10],
+        vec![
+            owner("old", State::Leaving),
+            owner("new-1", State::Ready),
+            owner("new-2", State::Populating),
+        ]
+    );
+    directory.extend(first);
+    assert!(serves(&directory, "old", 10));
+    assert!(serves(&directory, "new-1", 10));
+    assert!(!serves(&directory, "new-2", 10));
+
+    let second = handoff(
+        &directory,
+        &members,
+        &BTreeSet::from([("new-2".into(), 10)]),
+    );
+    assert_eq!(
+        second[&10],
+        vec![owner("new-1", State::Ready), owner("new-2", State::Ready)]
+    );
+    directory.extend(second);
+    assert!(!serves(&directory, "old", 10));
+    assert!(serves(&directory, "new-2", 10));
 }

@@ -149,6 +149,40 @@ impl KeyRange {
     }
 }
 
+/// Pushed L2 data in the hash-first layout (#22 / B-21): `l2/{8-byte big-endian hash}/{namespace}\0{key}`. A hash
+/// range is one contiguous span across namespaces, dropped with one `delete_range` and reclaimed by `compact`.
+/// Namespace IDs must not contain NUL.
+pub fn l2_key(hash: u64, namespace: &str, key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + namespace.len() + key.len());
+    out.extend_from_slice(b"l2/");
+    out.extend_from_slice(&hash.to_be_bytes());
+    out.push(b'/');
+    out.extend_from_slice(namespace.as_bytes());
+    out.push(0);
+    out.extend_from_slice(key);
+    out
+}
+
+/// Every [`l2_key`] whose hash lies in `[start, end)`, `end` 0 meaning 2⁶⁴.
+pub fn l2_span(start: u64, end: u64) -> KeyRange {
+    let at = |hash: u64| [b"l2/".as_slice(), &hash.to_be_bytes()].concat();
+    match end {
+        0 => KeyRange {
+            start: at(start),
+            end: KeyRange::prefix(*b"l2/").end,
+        },
+        end => KeyRange::new(at(start), at(end)),
+    }
+}
+
+/// The namespace and key slices of an [`l2_key`]. Returns `None` if the `l2/` prefix, the following nine bytes, or
+/// the namespace's NUL separator are missing. Does not validate the byte after the hash or the namespace encoding.
+pub fn l2_parts(physical: &[u8]) -> Option<(&[u8], &[u8])> {
+    let rest = physical.strip_prefix(b"l2/")?.get(9..)?;
+    let nul = rest.iter().position(|b| *b == 0)?;
+    Some((&rest[..nul], &rest[nul + 1..]))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOp {
     Put {
@@ -256,6 +290,12 @@ pub trait StorageEngine: Send + Sync {
         let mut batch = WriteBatch::default();
         batch.delete_range(range);
         self.write(batch)
+    }
+
+    /// Requests reclamation of space occupied by deleted keys in `range`, such as a revoked L2 range (#22 / B-21).
+    /// The default implementation does nothing.
+    fn compact(&self, _range: &KeyRange) -> StorageResult<()> {
+        Ok(())
     }
 }
 

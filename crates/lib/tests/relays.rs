@@ -103,24 +103,24 @@ fn relay(id: &str, tier: u32, upstream: &str) -> Hub {
 
 fn targets(engine: &Arc<MemoryEngine>) -> Vec<Target> {
     [
-        ("quicksilver", "site", b"q/".as_slice()),
-        ("auth", "accounts", b"a/".as_slice()),
+        ("quicksilver", "infrastructure", b"q/".as_slice()),
+        ("auth", "keys", b"a/".as_slice()),
     ]
     .into_iter()
     .map(|(dataset, namespace, prefix)| Target {
         selection: Selection {
             dataset: dataset.into(),
             namespace: namespace.into(),
-            buckets: Vec::new(),
         },
         engine: engine.clone(),
         prefix: prefix.to_vec(),
+        span: None,
     })
     .collect()
 }
 
 async fn caught_up(session: &Session, revision: u64) {
-    for (dataset, namespace) in [("quicksilver", "site"), ("auth", "accounts")] {
+    for (dataset, namespace) in [("quicksilver", "infrastructure"), ("auth", "keys")] {
         tokio::time::timeout(DEADLINE, session.wait_for(dataset, namespace, revision))
             .await
             .unwrap_or_else(|_| {
@@ -146,7 +146,7 @@ async fn two_scopes_cross_writer_top_cell_and_resume_durable_local_state() {
         commit(
             &writer,
             "quicksilver",
-            "site",
+            "infrastructure",
             Operation::Set(b"configuration".to_vec())
         )
         .await,
@@ -156,7 +156,7 @@ async fn two_scopes_cross_writer_top_cell_and_resume_durable_local_state() {
         commit(
             &writer,
             "auth",
-            "accounts",
+            "keys",
             Operation::Set(b"credential".to_vec())
         )
         .await,
@@ -173,17 +173,11 @@ async fn two_scopes_cross_writer_top_cell_and_resume_durable_local_state() {
     assert_eq!(local.get(b"a/key").unwrap(), Some(b"credential".to_vec()));
     drop(session);
     assert_eq!(
-        commit(&writer, "quicksilver", "site", Operation::Delete).await,
+        commit(&writer, "quicksilver", "infrastructure", Operation::Delete).await,
         2
     );
     assert_eq!(
-        commit(
-            &writer,
-            "auth",
-            "accounts",
-            Operation::Set(b"rotated".to_vec())
-        )
-        .await,
+        commit(&writer, "auth", "keys", Operation::Set(b"rotated".to_vec())).await,
         2
     );
     let resumed =
@@ -240,10 +234,11 @@ async fn frame(stream: &mut tonic::Streaming<pb::RelayFrame>) -> pb::relay_frame
 
 fn follow(namespace: &str, from: u64) -> pb::RelayRequest {
     request(pb::relay_request::Kind::Follow(pb::Follow {
-        dataset: "auth".into(),
+        dataset: "cdn".into(),
         namespace: namespace.into(),
         from,
-        buckets: Vec::new(),
+        span: None,
+        from_namespaces: Default::default(),
     }))
 }
 
@@ -251,17 +246,11 @@ fn follow(namespace: &str, from: u64) -> pb::RelayRequest {
 async fn namespace_unfollow_preserves_the_other_namespace_on_the_same_session() {
     let writer = writer().await;
     let server = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17201).await;
-    for namespace in ["one", "two"] {
-        commit(
-            &writer,
-            "auth",
-            namespace,
-            Operation::Set(b"first".to_vec()),
-        )
-        .await;
+    for namespace in ["pages", "workers"] {
+        commit(&writer, "cdn", namespace, Operation::Set(b"first".to_vec())).await;
     }
     let (tx, mut stream) = raw(&server.address, 0).await;
-    for namespace in ["one", "two"] {
+    for namespace in ["pages", "workers"] {
         tx.send(follow(namespace, 1)).await.unwrap();
     }
     let mut seen = std::collections::BTreeSet::new();
@@ -269,47 +258,49 @@ async fn namespace_unfollow_preserves_the_other_namespace_on_the_same_session() 
         if let pb::relay_frame::Kind::Delivery(delivery) = frame(&mut stream).await {
             seen.insert(delivery.namespace.clone());
             tx.send(request(pb::relay_request::Kind::Ack(pb::Ack {
-                dataset: "auth".into(),
+                dataset: "cdn".into(),
                 namespace: delivery.namespace,
                 applied: delivery.through,
+                span: None,
             })))
             .await
             .unwrap();
         }
     }
     tx.send(request(pb::relay_request::Kind::Unfollow(pb::Unfollow {
-        dataset: "auth".into(),
-        namespace: "one".into(),
+        dataset: "cdn".into(),
+        namespace: "pages".into(),
+        span: None,
     })))
     .await
     .unwrap();
     // This later follow's range is a protocol barrier: the earlier unfollow was processed.
-    tx.send(follow("two", 2)).await.unwrap();
+    tx.send(follow("workers", 2)).await.unwrap();
     loop {
         if let pb::relay_frame::Kind::Range(range) = frame(&mut stream).await
-            && range.namespace == "two"
+            && range.namespace == "workers"
         {
             break;
         }
     }
     commit(
         &writer,
-        "auth",
-        "one",
+        "cdn",
+        "pages",
         Operation::Set(b"unfollowed".to_vec()),
     )
     .await;
     commit(
         &writer,
-        "auth",
-        "two",
+        "cdn",
+        "workers",
         Operation::Set(b"still followed".to_vec()),
     )
     .await;
     loop {
         if let pb::relay_frame::Kind::Delivery(delivery) = frame(&mut stream).await {
-            assert_ne!(delivery.namespace, "one");
-            if delivery.namespace == "two" && delivery.through == 2 {
+            assert_ne!(delivery.namespace, "pages");
+            if delivery.namespace == "workers" && delivery.through == 2 {
                 break;
             }
         }
@@ -342,7 +333,8 @@ async fn invalid_tier_and_customer_kv_subscriptions_are_rejected() {
         dataset: "kv".into(),
         namespace: "customer".into(),
         from: 1,
-        buckets: Vec::new(),
+        span: None,
+        from_namespaces: Default::default(),
     })))
     .await
     .unwrap();
@@ -358,34 +350,28 @@ async fn recovery_leases_are_bounded_and_release_capacity_on_drop() {
     commit(
         &writer,
         "auth",
-        "accounts",
+        "keys",
         Operation::Set(b"baseline".to_vec()),
     )
     .await;
     let mut leases = Vec::new();
     for _ in 0..4 {
-        let (view, lease) = writer.begin_recovery("auth", "accounts").await.unwrap();
+        let (view, lease) = writer.begin_recovery("auth", "keys").await.unwrap();
         assert_eq!(view.sequence, 1);
         leases.push(lease);
     }
-    assert!(writer.begin_recovery("auth", "accounts").await.is_err());
+    assert!(writer.begin_recovery("auth", "keys").await.is_err());
     leases.pop();
-    let (_, lease) = writer.begin_recovery("auth", "accounts").await.unwrap();
+    let (_, lease) = writer.begin_recovery("auth", "keys").await.unwrap();
     assert!(
         writer
-            .recovery_events("auth", "accounts", 1, &lease)
+            .recovery_events("auth", "keys", 1, &lease)
             .await
             .is_err()
     );
-    commit(
-        &writer,
-        "auth",
-        "accounts",
-        Operation::Set(b"tail".to_vec()),
-    )
-    .await;
+    commit(&writer, "auth", "keys", Operation::Set(b"tail".to_vec())).await;
     let events = writer
-        .recovery_events("auth", "accounts", 2, &lease)
+        .recovery_events("auth", "keys", 2, &lease)
         .await
         .unwrap();
     assert_eq!(events.len(), 1);
@@ -399,17 +385,17 @@ async fn recovery_leases_are_bounded_and_release_capacity_on_drop() {
 #[cfg_attr(madsim, tokio::test)]
 async fn recovery_lease_renews_on_progress_up_to_its_deadline() {
     let writer = writer().await;
-    commit(&writer, "auth", "accounts", Operation::Set(b"a".to_vec())).await;
-    let (_, lease) = writer.begin_recovery("auth", "accounts").await.unwrap();
+    commit(&writer, "auth", "keys", Operation::Set(b"a".to_vec())).await;
+    let (_, lease) = writer.begin_recovery("auth", "keys").await.unwrap();
     for _ in 0..3 {
         tokio::time::sleep(Duration::from_secs(50)).await;
         lease.renew();
     }
     // 150s exceeds the 60s base lease; progress kept it alive.
-    commit(&writer, "auth", "accounts", Operation::Set(b"b".to_vec())).await;
+    commit(&writer, "auth", "keys", Operation::Set(b"b".to_vec())).await;
     assert_eq!(
         writer
-            .recovery_events("auth", "accounts", 2, &lease)
+            .recovery_events("auth", "keys", 2, &lease)
             .await
             .unwrap()
             .len(),
@@ -440,15 +426,9 @@ async fn pruned_authoritative_cursor_bootstraps_through_two_tiers_then_applies_d
     )
     .await
     .unwrap();
-    commit(
-        &writer,
-        "auth",
-        "accounts",
-        Operation::Set(b"state".to_vec()),
-    )
-    .await;
+    commit(&writer, "auth", "keys", Operation::Set(b"state".to_vec())).await;
     CLOCK.store(2000, Ordering::SeqCst);
-    writer.cleanup("auth", "accounts").await.unwrap();
+    writer.cleanup("auth", "keys").await.unwrap();
     let source = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17401).await;
     let top = relay("top", 3, &source.address);
     let top_task = top.start();
@@ -463,20 +443,20 @@ async fn pruned_authoritative_cursor_bootstraps_through_two_tiers_then_applies_d
         vec![Target {
             selection: Selection {
                 dataset: "auth".into(),
-                namespace: "accounts".into(),
-                buckets: Vec::new(),
+                namespace: "keys".into(),
             },
             engine: local.clone(),
             prefix: b"a/".to_vec(),
+            span: None,
         }],
     )
     .unwrap();
-    tokio::time::timeout(DEADLINE, session.wait_for("auth", "accounts", 1))
+    tokio::time::timeout(DEADLINE, session.wait_for("auth", "keys", 1))
         .await
         .unwrap_or_else(|_| panic!("bootstrap: {:?}", session.error()));
     assert_eq!(local.get(b"a/key").unwrap(), Some(b"state".to_vec()));
-    commit(&writer, "auth", "accounts", Operation::Delete).await;
-    tokio::time::timeout(DEADLINE, session.wait_for("auth", "accounts", 2))
+    commit(&writer, "auth", "keys", Operation::Delete).await;
+    tokio::time::timeout(DEADLINE, session.wait_for("auth", "keys", 2))
         .await
         .unwrap_or_else(|_| panic!("tail: {:?}", session.error()));
     assert_eq!(local.get(b"a/key").unwrap(), None);
@@ -505,29 +485,29 @@ async fn gc_protects_the_bootstrap_tail_until_lease_is_released() {
     commit(
         &writer,
         "auth",
-        "accounts",
+        "keys",
         Operation::Set(b"baseline".to_vec()),
     )
     .await;
-    let (view, lease) = writer.begin_recovery("auth", "accounts").await.unwrap();
-    commit(&writer, "auth", "accounts", Operation::Delete).await;
+    let (view, lease) = writer.begin_recovery("auth", "keys").await.unwrap();
+    commit(&writer, "auth", "keys", Operation::Delete).await;
     CLOCK.store(3000, Ordering::SeqCst);
-    writer.cleanup("auth", "accounts").await.unwrap();
+    writer.cleanup("auth", "keys").await.unwrap();
     let tail = writer
-        .recovery_events("auth", "accounts", view.sequence + 1, &lease)
+        .recovery_events("auth", "keys", view.sequence + 1, &lease)
         .await
         .unwrap();
     assert_eq!(tail.len(), 1);
     assert_eq!(tail[0].operation, Operation::Delete);
     assert!(
         writer
-            .recovery_events("quicksilver", "accounts", view.sequence + 1, &lease)
+            .recovery_events("quicksilver", "keys", view.sequence + 1, &lease)
             .await
             .is_err()
     );
     drop(lease);
-    writer.cleanup("auth", "accounts").await.unwrap();
-    let (new_view, _) = writer.begin_recovery("auth", "accounts").await.unwrap();
+    writer.cleanup("auth", "keys").await.unwrap();
+    let (new_view, _) = writer.begin_recovery("auth", "keys").await.unwrap();
     assert_eq!(new_view.pruned_through, 2);
     assert!(new_view.values.is_empty());
     writer.close().await.unwrap();
@@ -548,15 +528,15 @@ async fn empty_authoritative_bootstrap_is_confirmed_through_relays_before_readin
         vec![Target {
             selection: Selection {
                 dataset: "auth".into(),
-                namespace: "accounts".into(),
-                buckets: Vec::new(),
+                namespace: "keys".into(),
             },
             engine: local.clone(),
             prefix: b"a/".to_vec(),
+            span: None,
         }],
     )
     .unwrap();
-    tokio::time::timeout(DEADLINE, session.wait_for("auth", "accounts", 0))
+    tokio::time::timeout(DEADLINE, session.wait_for("auth", "keys", 0))
         .await
         .unwrap_or_else(|_| panic!("empty bootstrap was not confirmed: {:?}", session.error()));
     assert!(session.ready());
@@ -609,7 +589,7 @@ async fn failed_auth_recovery_does_not_starve_quicksilver_on_the_same_connection
     commit(
         &writer,
         "quicksilver",
-        "site",
+        "infrastructure",
         Operation::Set(b"healthy".to_vec()),
     )
     .await;
@@ -617,14 +597,17 @@ async fn failed_auth_recovery_does_not_starve_quicksilver_on_the_same_connection
     let local = Arc::new(MemoryEngine::new("local"));
     local.put(b"a/key", b"requires recovery").unwrap();
     let session = Session::start(peers(), vec![source.address.clone()], targets(&local)).unwrap();
-    tokio::time::timeout(DEADLINE, session.wait_for("quicksilver", "site", 1))
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        DEADLINE,
+        session.wait_for("quicksilver", "infrastructure", 1),
+    )
+    .await
+    .unwrap();
     assert_eq!(local.get(b"q/key").unwrap(), Some(b"healthy".to_vec()));
     assert!(
         tokio::time::timeout(
             Duration::from_millis(50),
-            session.wait_for("auth", "accounts", 0)
+            session.wait_for("auth", "keys", 0)
         )
         .await
         .is_err()
@@ -632,13 +615,16 @@ async fn failed_auth_recovery_does_not_starve_quicksilver_on_the_same_connection
     commit(
         &writer,
         "quicksilver",
-        "site",
+        "infrastructure",
         Operation::Set(b"still healthy".to_vec()),
     )
     .await;
-    tokio::time::timeout(DEADLINE, session.wait_for("quicksilver", "site", 2))
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        DEADLINE,
+        session.wait_for("quicksilver", "infrastructure", 2),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         local.get(b"q/key").unwrap(),
         Some(b"still healthy".to_vec())
@@ -661,7 +647,7 @@ async fn restarted_relay_serves_validated_persisted_replay_while_parent_is_unava
                 .append(
                     &bedrock_lib::replication::Event {
                         dataset: "auth".into(),
-                        namespace: "accounts".into(),
+                        namespace: "keys".into(),
                         stream: "auth-0".into(),
                         sequence,
                         epoch: 1,
@@ -675,7 +661,7 @@ async fn restarted_relay_serves_validated_persisted_replay_while_parent_is_unava
         }
     }
     let reopened = Arc::new(Replay::open(persisted, ReplayConfig::default()).unwrap());
-    assert_eq!(reopened.ranges("auth", "accounts"), vec![(1, 3)]);
+    assert_eq!(reopened.ranges("auth", "keys"), vec![(1, 3)]);
 
     // Reserve a native port without serving gRPC, so the unavailable parent cannot accidentally be another service.
     #[cfg(not(madsim))]
@@ -702,15 +688,15 @@ async fn restarted_relay_serves_validated_persisted_replay_while_parent_is_unava
         vec![Target {
             selection: Selection {
                 dataset: "auth".into(),
-                namespace: "accounts".into(),
-                buckets: Vec::new(),
+                namespace: "keys".into(),
             },
             engine: local.clone(),
             prefix: b"a/".to_vec(),
+            span: None,
         }],
     )
     .unwrap();
-    tokio::time::timeout(DEADLINE, session.wait_for("auth", "accounts", 3))
+    tokio::time::timeout(DEADLINE, session.wait_for("auth", "keys", 3))
         .await
         .unwrap_or_else(|_| {
             panic!(
@@ -733,13 +719,7 @@ async fn stale_recovery_candidate_falls_back_to_the_writer_with_required_history
     let stale = writer().await;
     for writer in [&authoritative, &stale] {
         assert_eq!(
-            commit(
-                writer,
-                "auth",
-                "accounts",
-                Operation::Set(b"baseline".to_vec())
-            )
-            .await,
+            commit(writer, "auth", "keys", Operation::Set(b"baseline".to_vec())).await,
             1
         );
     }
@@ -757,27 +737,27 @@ async fn stale_recovery_candidate_falls_back_to_the_writer_with_required_history
     let target = || Target {
         selection: Selection {
             dataset: "auth".into(),
-            namespace: "accounts".into(),
-            buckets: Vec::new(),
+            namespace: "keys".into(),
         },
         engine: local.clone(),
         prefix: b"a/".to_vec(),
+        span: None,
     };
     let first =
         Session::start(peers(), vec![writer_server.address.clone()], vec![target()]).unwrap();
-    tokio::time::timeout(DEADLINE, first.wait_for("auth", "accounts", 1))
+    tokio::time::timeout(DEADLINE, first.wait_for("auth", "keys", 1))
         .await
         .unwrap();
     drop(first);
     assert_eq!(
-        commit(&authoritative, "auth", "accounts", Operation::Delete).await,
+        commit(&authoritative, "auth", "keys", Operation::Delete).await,
         2
     );
     assert_eq!(
         commit(
             &authoritative,
             "auth",
-            "accounts",
+            "keys",
             Operation::Set(b"latest".to_vec())
         )
         .await,
@@ -794,13 +774,13 @@ async fn stale_recovery_candidate_falls_back_to_the_writer_with_required_history
     );
     let third = authoritative
         .log()
-        .read("auth", "accounts", 3, 1)
+        .read("auth", "keys", 3, 1)
         .await
         .unwrap()
         .pop()
         .unwrap();
     cache.append(&third, third.committed_at).unwrap();
-    assert_eq!(cache.ranges("auth", "accounts"), vec![(3, 3)]);
+    assert_eq!(cache.ranges("auth", "keys"), vec![(3, 3)]);
     let relay = Hub::relay(
         "cell".into(),
         1,
@@ -812,7 +792,7 @@ async fn stale_recovery_candidate_falls_back_to_the_writer_with_required_history
     // Keep the aggregate live pump stopped so the missing event must traverse the temporary recovery chain.
     let cell = serve(relay, 17803).await;
     let resumed = Session::start(peers(), vec![cell.address.clone()], vec![target()]).unwrap();
-    tokio::time::timeout(DEADLINE, resumed.wait_for("auth", "accounts", 3))
+    tokio::time::timeout(DEADLINE, resumed.wait_for("auth", "keys", 3))
         .await
         .unwrap_or_else(|_| {
             panic!(
@@ -825,6 +805,101 @@ async fn stale_recovery_candidate_falls_back_to_the_writer_with_required_history
     drop(resumed);
     authoritative.close().await.unwrap();
     stale.close().await.unwrap();
+}
+
+async fn put(writer: &Arc<Writer>, namespace: &str, key: &[u8], operation: Operation) {
+    writer
+        .commit(Write {
+            dataset: "cdn".into(),
+            namespace: namespace.into(),
+            key: key.to_vec(),
+            operation,
+            idempotency_key: None,
+        })
+        .await
+        .unwrap();
+}
+
+async fn until(what: &str, done: impl Fn() -> bool) {
+    tokio::time::timeout(DEADLINE, async {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+#[tokio::test]
+async fn range_follow_streams_every_namespace_and_only_its_hashes_through_two_tiers() {
+    use bedrock_lib::placement::hash_of;
+    use bedrock_lib::storage::{KeyRange, l2_key};
+    const HALF: u64 = 1 << 63;
+    let writer = writer().await;
+    let keys: Vec<Vec<u8>> = (0u8..16).map(|i| vec![b'k', i]).collect();
+    // `workers` has no writes yet when the range is first followed.
+    for key in &keys {
+        put(&writer, "pages", key, Operation::Set(b"pages".to_vec())).await;
+    }
+    let source = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17501).await;
+    let top = relay("top", 3, &source.address);
+    let top_task = top.start();
+    let top = serve(top, 17502).await;
+    let cell = relay("cell", 1, &top.address);
+    let cell_task = cell.start();
+    let cell = serve(cell, 17503).await;
+    let local = Arc::new(MemoryEngine::new("local"));
+    let target = || Target {
+        selection: Selection {
+            dataset: "cdn".into(),
+            namespace: String::new(),
+        },
+        engine: local.clone(),
+        prefix: Vec::new(),
+        span: Some((0, HALF)),
+    };
+    let stored = |namespace: &str, key: &[u8]| {
+        local
+            .get(&l2_key(hash_of("cdn", namespace, key), namespace, key))
+            .unwrap()
+    };
+    let inside = |namespace: &str, key: &[u8]| hash_of("cdn", namespace, key) < HALF;
+    let session = Session::start(peers(), vec![cell.address.clone()], vec![target()]).unwrap();
+    let complete = |namespace: &'static str, value: &'static [u8]| {
+        let keys = keys.clone();
+        let stored = &stored;
+        move || {
+            keys.iter()
+                .filter(|key| inside(namespace, key))
+                .all(|key| stored(namespace, key).as_deref() == Some(value))
+        }
+    };
+    until("namespace pages", complete("pages", b"pages")).await;
+    assert!(keys.iter().filter(|key| inside("pages", key)).count() > 0);
+    // Nothing outside the range arrives, in any namespace.
+    for entry in local.scan(&KeyRange::prefix(*b"l2/")).unwrap() {
+        let (key, _) = entry.unwrap();
+        let hash = u64::from_be_bytes(key[3..11].try_into().unwrap());
+        assert!(hash < HALF, "key outside the followed range");
+    }
+    // A fixed namespace first written after the follow streams too.
+    for key in &keys {
+        put(&writer, "workers", key, Operation::Set(b"workers".to_vec())).await;
+    }
+    until("namespace workers", complete("workers", b"workers")).await;
+    drop(session);
+    for key in &keys {
+        put(&writer, "pages", key, Operation::Delete).await;
+    }
+    let resumed = Session::start(peers(), vec![cell.address.clone()], vec![target()]).unwrap();
+    until("deletes after restart", || {
+        keys.iter().all(|key| stored("pages", key).is_none()) && complete("workers", b"workers")()
+    })
+    .await;
+    drop(resumed);
+    top_task.abort();
+    cell_task.abort();
+    writer.close().await.unwrap();
 }
 
 async fn admin_get(admin: &Arc<Admin>, path: &str) -> String {
@@ -873,11 +948,11 @@ async fn introspection_matches_the_leaf_and_lag_is_reported_at_every_tier() {
         commit(
             &writer,
             "quicksilver",
-            "site",
+            "infrastructure",
             Operation::Set(value.to_vec()),
         )
         .await;
-        commit(&writer, "auth", "accounts", Operation::Set(value.to_vec())).await;
+        commit(&writer, "auth", "keys", Operation::Set(value.to_vec())).await;
     }
     let local = Arc::new(MemoryEngine::new("consumer"));
     let session =
@@ -889,7 +964,7 @@ async fn introspection_matches_the_leaf_and_lag_is_reported_at_every_tier() {
         loop {
             let body = admin_get(
                 &cell_admin,
-                "/introspect/namespaces?dataset=quicksilver&prefix=si",
+                "/introspect/namespaces?dataset=quicksilver&prefix=inf",
             )
             .await;
             let view: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -903,11 +978,11 @@ async fn introspection_matches_the_leaf_and_lag_is_reported_at_every_tier() {
     .expect("replay range reaches the applied revision");
     let item = &view["items"][0];
     assert_eq!(view["items"].as_array().unwrap().len(), 1, "{view}");
-    assert_eq!(item["namespace"], "site");
+    assert_eq!(item["namespace"], "infrastructure");
     assert_eq!(item["subscribers"], 1);
     assert_eq!(
         item["latest"],
-        session.applied("quicksilver", "site").unwrap()
+        session.applied("quicksilver", "infrastructure").unwrap()
     );
     assert_eq!(item["head"], 2);
     assert_eq!(item["lag_ms"], 250);
@@ -981,14 +1056,14 @@ async fn quarantined_dataset_rebuilds_from_a_verified_bootstrap_while_the_other_
     commit(
         &writer,
         "quicksilver",
-        "site",
+        "infrastructure",
         Operation::Set(b"configuration".to_vec()),
     )
     .await;
     commit(
         &writer,
         "auth",
-        "accounts",
+        "keys",
         Operation::Set(b"credential".to_vec()),
     )
     .await;
@@ -1020,9 +1095,9 @@ async fn quarantined_dataset_rebuilds_from_a_verified_bootstrap_while_the_other_
     caught_up(&session, 1).await;
 
     // While auth's storage is damaged its key is deleted and the history that carried the delete expires.
-    commit(&writer, "auth", "accounts", Operation::Delete).await;
+    commit(&writer, "auth", "keys", Operation::Delete).await;
     CLOCK.store(2000, Ordering::SeqCst);
-    writer.cleanup("auth", "accounts").await.unwrap();
+    writer.cleanup("auth", "keys").await.unwrap();
     health.report(
         "auth",
         "engine",
@@ -1046,13 +1121,16 @@ async fn quarantined_dataset_rebuilds_from_a_verified_bootstrap_while_the_other_
     commit(
         &writer,
         "quicksilver",
-        "site",
+        "infrastructure",
         Operation::Set(b"rotated".to_vec()),
     )
     .await;
-    tokio::time::timeout(DEADLINE, session.wait_for("quicksilver", "site", 2))
-        .await
-        .expect("the healthy dataset keeps applying during the rebuild");
+    tokio::time::timeout(
+        DEADLINE,
+        session.wait_for("quicksilver", "infrastructure", 2),
+    )
+    .await
+    .expect("the healthy dataset keeps applying during the rebuild");
     tokio::time::timeout(DEADLINE, async {
         while health.get("auth", "engine").unwrap().state != State::Healthy {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1073,7 +1151,7 @@ async fn quarantined_dataset_rebuilds_from_a_verified_bootstrap_while_the_other_
         None,
         "the damaged instance was recreated"
     );
-    session.wait_for("auth", "accounts", 2).await;
+    session.wait_for("auth", "keys", 2).await;
     assert_eq!(
         raw["quicksilver"].get(b"q/key").unwrap(),
         Some(b"rotated".to_vec())

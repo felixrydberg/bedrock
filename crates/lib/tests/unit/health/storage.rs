@@ -50,6 +50,12 @@ impl StorageEngine for Flaky {
     fn health(&self) -> StorageResult<()> {
         self.inner.health()
     }
+    fn compact(&self, _range: &KeyRange) -> StorageResult<()> {
+        if self.failing.load(Ordering::Relaxed) {
+            return Err(io());
+        }
+        Ok(())
+    }
 }
 
 #[test]
@@ -172,4 +178,16 @@ fn rebuild_tracks_attempts_and_restores_service() {
     let report = health.get("a", ENGINE).unwrap();
     assert_eq!((report.state, report.recoveries), (State::Healthy, 2));
     assert!(health.unhealthy().is_empty());
+}
+
+#[test]
+fn compaction_reaches_the_wrapped_engine() {
+    let health = StorageHealth::new(&Admin::new());
+    let flaky = Arc::new(Flaky {
+        inner: MemoryEngine::new("a"),
+        failing: AtomicBool::new(true),
+    });
+    let engine = health.wrap("a", ENGINE, flaky);
+    // The trait's default would succeed without asking the adapter.
+    assert_eq!(engine.compact(&KeyRange::all()), Err(io()));
 }

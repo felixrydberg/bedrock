@@ -351,16 +351,23 @@ async fn full_queues_and_malformed_writes_are_refused() {
         commit.await.unwrap().unwrap();
     }
 
+    // A ranged dataset accepts only its fixed namespaces (#22 / B-21).
+    let auth = |namespace: &str| Write {
+        dataset: "auth".into(),
+        ..set(namespace, "k", "v", None)
+    };
     for write in [
         set("a/b", "k", "v", None),
         set("", "k", "v", None),
         set("a", "", "v", None),
+        auth("users"),
     ] {
         assert!(matches!(
             writer.commit(write).await,
             Err(CommitError::Invalid(_))
         ));
     }
+    assert_eq!(writer.commit(auth("keys")).await, Ok(1));
 }
 
 #[tokio::test]

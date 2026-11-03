@@ -1,8 +1,9 @@
 //! Quicksilver/Auth keyspaces inside a dataset's engine instance (`kv.md` §7). Eviction lands here later (B-28).
 //!
 //! Namespace IDs contain `/` (`customer-123/store-A`), so a NUL byte ends the namespace instead: with `/` the prefix
-//! of namespace `a` would also cover every key of namespace `a/b`. Namespace IDs must not contain NUL. L2 keys start
-//! with the big-endian `buckets::hash_of`, so an L2 hash range (#19 / B-16) is one contiguous span.
+//! of namespace `a` would also cover every key of namespace `a/b`. Namespace IDs must not contain NUL. L2 keys use the
+//! shared hash-first layout ([`bedrock_lib::storage::l2_key`]) the relay client writes, so an L2 hash range is one
+//! contiguous span (#22 / B-21).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keyspace {
@@ -15,7 +16,8 @@ pub enum Keyspace {
 }
 
 impl Keyspace {
-    /// Every key of `namespace` in this keyspace starts with this; use it with `KeyRange::prefix`.
+    /// Returns a prefix for `namespace` in this keyspace; for L2, it selects only keys with the chosen hash. Use it
+    /// with `KeyRange::prefix`.
     ///
     /// # Panics
     /// Panics if `namespace` contains NUL.
@@ -23,7 +25,7 @@ impl Keyspace {
         assert!(!namespace.contains('\0'), "namespace ID contains NUL");
         let mut out = match self {
             Keyspace::L1 => b"l1/".to_vec(),
-            Keyspace::L2 { hash } => [b"l2/".as_slice(), &hash.to_be_bytes(), b"/"].concat(),
+            Keyspace::L2 { hash } => return bedrock_lib::storage::l2_key(hash, namespace, b""),
             Keyspace::Meta => b"meta/".to_vec(),
         };
         out.extend_from_slice(namespace.as_bytes());

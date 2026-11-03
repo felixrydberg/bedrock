@@ -20,13 +20,7 @@ cpus = 2.0
 memory_mb = 4096
 disk_mb = 102400
 
-[[subscriptions]]
-dataset = "cdn"
-namespace = "workers"
-
-[[subscriptions]]
-dataset = "cdn"
-namespace = "pages"
+# The node follows all `cdn` retention metadata, every namespace, without configuration (#22 / B-21).
 
 # Mutual TLS between nodes (B-55); unset means plaintext. Issuing the files: docs/deployment/security.md.
 # [tls]

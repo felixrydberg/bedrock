@@ -20,7 +20,7 @@ use prometheus_client::registry::Registry;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 
-use super::{Hub, Key, MemberKey};
+use super::{Hub, Key, MemberKey, StreamKey};
 use crate::membership::Publisher;
 use crate::placement::State;
 use crate::replication::log::Log;
@@ -242,7 +242,7 @@ impl Hub {
 struct Subscription {
     id: u64,
     member: Option<pb::Member>,
-    follows: Vec<(Key, u64)>,
+    follows: Vec<(StreamKey, u64)>,
     events: usize,
     bytes: usize,
 }
@@ -441,7 +441,7 @@ impl prometheus_client::collector::Collector for Collector {
         let now_ms = hub.now_ms().unwrap_or(u64::MAX);
         let followed: BTreeSet<&Key> = subs
             .iter()
-            .flat_map(|s| s.follows.iter().map(|(k, _)| k))
+            .flat_map(|s| s.follows.iter().map(|((k, _), _)| k))
             .collect();
         let mut coverage = BTreeMap::<&str, (u64, u64)>::new();
         for key in followed {
@@ -468,13 +468,13 @@ impl prometheus_client::collector::Collector for Collector {
         };
         let mut ranges = Vec::new();
         if let Ok(views) = publisher.views() {
-            for (service, _, directory) in &views {
+            for (service, _, directories) in &views {
                 let mut counts = [0u64; 3];
-                for owners in directory.values() {
+                for owners in directories.values().flat_map(|d| d.values()) {
                     counts[range_state(owners) as usize] += 1;
                 }
                 for (state, n) in ["populating", "ready", "leaving"].into_iter().zip(counts) {
-                    if !directory.is_empty() {
+                    if !directories.is_empty() {
                         ranges.push(([("service", *service), ("state", state)], n as f64));
                     }
                 }
@@ -677,7 +677,7 @@ fn served(subs: &[Subscription], query: &Query) -> Option<BTreeSet<Key>> {
     Some(
         subs.iter()
             .filter(|s| s.service() == service)
-            .flat_map(|s| s.follows.iter().map(|(k, _)| k.clone()))
+            .flat_map(|s| s.follows.iter().map(|((k, _), _)| k.clone()))
             .collect(),
     )
 }
@@ -706,13 +706,16 @@ fn upstream(hub: &Hub, query: &Query) -> Value {
     value
 }
 
-/// Per namespace: subscribers, latest sequence received and head, replay ranges and rates.
+/// Per namespace: subscribers, latest sequence received and head, replay ranges and rates. A subscriber following
+/// multiple ranges of a namespace is counted once.
 fn namespaces(hub: &Hub, query: &Query) -> Value {
     let subs = hub.snapshot();
     let served = served(&subs, query);
     let mut subscribers = BTreeMap::<Key, u64>::new();
     for sub in &subs {
-        for (key, _) in &sub.follows {
+        // A subscriber following a namespace in several ranges counts once.
+        let keys: BTreeSet<&Key> = sub.follows.iter().map(|((key, _), _)| key).collect();
+        for key in keys {
             *subscribers.entry(key.clone()).or_default() += 1;
         }
     }
@@ -751,7 +754,7 @@ fn namespaces(hub: &Hub, query: &Query) -> Value {
     page(items, query.after_key(), query.limit, namespace_cursor)
 }
 
-/// Per session: identity, follows with acknowledged revision and lag, queue depth and the member's disconnects.
+/// Per session: identity, follows with range, acknowledged revision and lag, queue depth and the member's disconnects.
 fn subscribers(hub: &Hub, query: &Query) -> Value {
     let disconnects = hub.0.stats.disconnects.lock().unwrap().clone();
     let filtered = query.dataset.is_some() || !query.prefix.is_empty();
@@ -762,11 +765,12 @@ fn subscribers(hub: &Hub, query: &Query) -> Value {
         let follows: Vec<Value> = sub
             .follows
             .iter()
-            .filter(|(key, _)| query.matches(key))
-            .map(|(key, acked)| {
+            .filter(|((key, _), _)| query.matches(key))
+            .map(|((key, range), acked)| {
                 json!({
                     "dataset": key.0,
                     "namespace": key.1,
+                    "range": range.map(|(start, end)| [format!("{start:016x}"), format!("{end:016x}")]),
                     "acked": acked,
                     "lag": hub.known_head(key).unwrap_or(0).saturating_sub(*acked),
                 })
@@ -792,7 +796,8 @@ fn subscribers(hub: &Hub, query: &Query) -> Value {
     page(items, after, query.limit, u64::to_string)
 }
 
-/// The cell view this relay publishes, with each member's status, and the placement directory.
+/// The cell view this relay publishes, with each member's status and per-dataset placement directories. A failed view
+/// read is returned in the JSON error field.
 fn membership(publisher: Option<&Publisher>, query: &Query) -> Value {
     let Some(publisher) = publisher else {
         return json!({ "publishing": false, "services": [] });
@@ -801,7 +806,7 @@ fn membership(publisher: Option<&Publisher>, query: &Query) -> Value {
         Ok(views) => views
             .into_iter()
             .filter(|(service, ..)| query.service.as_ref().is_none_or(|s| s == service))
-            .map(|(service, members, directory)| {
+            .map(|(service, members, directories)| {
                 let members: Vec<Value> = members
                     .values()
                     .map(|m| {
@@ -810,14 +815,16 @@ fn membership(publisher: Option<&Publisher>, query: &Query) -> Value {
                         json!({ "node": m.node_id, "status": status, "address": m.address })
                     })
                     .collect();
-                let ranges: Vec<Value> = directory
+                let ranges: Vec<Value> = directories
                     .iter()
-                    .map(|(start, owners)| {
-                        let owners: Vec<Value> = owners
-                            .iter()
-                            .map(|o| json!({ "node": o.node, "state": state_name(&o.state) }))
-                            .collect();
-                        json!({ "start": format!("{start:016x}"), "owners": owners })
+                    .flat_map(|(dataset, directory)| {
+                        directory.iter().map(move |(start, owners)| {
+                            let owners: Vec<Value> = owners
+                                .iter()
+                                .map(|o| json!({ "node": o.node, "state": state_name(&o.state) }))
+                                .collect();
+                            json!({ "dataset": dataset, "start": format!("{start:016x}"), "owners": owners })
+                        })
                     })
                     .collect();
                 json!({ "service": service, "members": members, "ranges": ranges })

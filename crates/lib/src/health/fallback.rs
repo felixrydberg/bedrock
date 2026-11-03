@@ -155,9 +155,18 @@ pub type Locate<K> = Box<dyn Fn(&K) -> (String, Vec<u8>) + Send + Sync>;
 
 const HEADER: usize = 8 + 32;
 
+/// SHA-256 over an entry's big-endian revision and value, so a damaged revision is caught like a damaged value.
+fn checksum(revision: &[u8], value: &[u8]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(revision)
+        .chain_update(value)
+        .finalize()
+        .into()
+}
+
 /// An on-demand local cache over a [`StorageHealth::wrap`]ped engine, e.g. an L1 keyspace. Each entry stores the view
-/// revision it was answered at and a SHA-256 of its value, so a read verifies it and a minimum-revision read can reject
-/// it as stale. Absences are not cached: not-found records belong to the KV read path (B-27).
+/// revision it was answered at and a SHA-256 of that revision and its value, so a read verifies both and a
+/// minimum-revision read can reject it as stale. Absences are not cached: not-found records belong to the KV read path (B-27).
 ///
 /// A fill is accepted only from a source at least as far along as the namespace's newest accepted fill, kept as the
 /// `fill:{namespace}` revision in the same batch. So an old fill never replaces a newer value, and never resurrects a
@@ -205,7 +214,7 @@ impl<K: ?Sized + Sync> Tier<K> for CacheTier<K> {
         };
         let verified = (stored.len() >= HEADER)
             .then(|| stored.split_at(HEADER))
-            .filter(|(header, value)| header[8..] == Sha256::digest(value)[..]);
+            .filter(|(header, value)| header[8..] == checksum(&header[..8], value));
         let Some((header, value)) = verified else {
             // The engine read cleanly, so the damage is past its own checks; quarantine as B-14 does for any
             // corruption, and the chain refetches from the next tier.
@@ -239,12 +248,8 @@ impl<K: ?Sized + Sync> Tier<K> for CacheTier<K> {
         let mut batch = WriteBatch::default();
         match &found.value {
             Some(value) => {
-                let entry = [
-                    found.revision.to_be_bytes().as_slice(),
-                    &Sha256::digest(value),
-                    value,
-                ]
-                .concat();
+                let revision = found.revision.to_be_bytes();
+                let entry = [&revision[..], &checksum(&revision, value), value].concat();
                 batch.put(physical, entry)
             }
             None => batch.delete(physical),

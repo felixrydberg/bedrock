@@ -6,9 +6,10 @@
 //! off exponentially with seeded jitter and is planned again on later passes; nothing about a repair is persisted, so
 //! one interrupted by a restart shows up in the next diff and runs again. Users carry no product logic into this module.
 //!
-//! Repairs should start or advance a step and return, leaving progress to show in `actual()`: L2 handoff (#22 / B-21)
-//! plans "push interest and bootstrap" for a `populating` owner with no interest, "mark ready" once its bootstrap is
-//! acknowledged through the head, and "revoke" for a `leaving` owner once every new owner is `ready`.
+//! Repairs should start or advance a step and return, leaving progress to show in `actual()`, as CDN artifact replica
+//! repair will (B-34: desired = retained artifacts in my ranges, actual = local inventory, repair = fetch). L2 range
+//! handoff (#22 / B-21) does not use it: its steps are directory writes that only the cell relays' majority publisher
+//! may make, so they run in that publisher's pass (`membership::Cell`), which already freezes without a majority.
 //! [`rebuild`] (#23 / B-22) plans "rebuild" for each quarantined storage source.
 
 pub mod rebuild;
