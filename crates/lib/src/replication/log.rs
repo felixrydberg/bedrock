@@ -26,6 +26,7 @@ pub trait Log: Send + Sync + 'static {
 
 /// A value whose changes can be awaited. `tokio::sync::watch` spreads its waiters over shards picked by an RNG the
 /// simulation does not seed, so a seed would not replay; this is a lock and a [`Notify`].
+#[derive(Default)]
 pub struct Watched<T> {
     value: Mutex<T>,
     changed: Notify,
