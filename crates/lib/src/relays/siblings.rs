@@ -166,6 +166,7 @@ impl Siblings {
         (this, task)
     }
 
+    /// The latest synced member view per sibling, or `None` before sync or while its stream is down.
     pub fn state(&self) -> BTreeMap<String, Option<Members>> {
         self.state
             .lock()

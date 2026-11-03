@@ -21,6 +21,7 @@ fn end(range: Range) -> u128 {
     }
 }
 
+/// Whether `inner` lies within `outer`, using half-open bounds and treating end 0 as 2⁶⁴.
 pub fn within(inner: Range, outer: Range) -> bool {
     inner.0 >= outer.0 && end(inner) <= end(outer)
 }
@@ -95,7 +96,8 @@ pub fn plan(held: &[Range], spans: &[pb::Span]) -> Result<Plan, Status> {
 }
 
 /// Whether `node`'s own directory view confirms dropping `range`: every directory range overlapping it no longer lists
-/// the node, in any state, and has another owner `ready`. Otherwise the reason to refuse.
+/// the node, in any state, and has another owner `ready`. At least one entry must overlap; otherwise returns a reason
+/// to refuse, as it does when the directory is absent or an overlapping entry fails either check.
 pub fn confirms(directory: Option<&Directory>, node: &str, range: Range) -> Result<(), String> {
     let directory = directory.ok_or("the directory view has no ranges for the dataset")?;
     let mut entries = directory.iter().peekable();

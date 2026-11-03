@@ -140,6 +140,8 @@ pub struct Session {
 }
 
 impl Session {
+    /// Starts a reconnecting background session without waiting for a relay connection. Returns an error for missing
+    /// upstreams, invalid or duplicate targets, unreadable storage, or corrupt stored selector state.
     pub fn start(
         peers: Arc<Peers>,
         upstreams: Vec<String>,
@@ -151,7 +153,8 @@ impl Session {
     /// Like [`Session::start`], announcing `member` to the relays, which makes this process a cell member (B-12).
     /// Relays push the member the L2 ranges it owns per dataset; `ranged` maps each dataset it carries to the engine
     /// those ranges are stored in (#22 / B-21). `targets` must include the member's own membership view
-    /// ([`crate::membership::View`]), which confirms revokes.
+    /// ([`crate::membership::View`]), which confirms revokes. Returns the errors from `start` and rejects an invalid
+    /// or non-ready member. Without a validated membership view, pushed range sets remain pending.
     pub fn join(
         peers: Arc<Peers>,
         upstreams: Vec<String>,
@@ -326,7 +329,8 @@ impl Session {
         let _ = (&mut self.task).await;
     }
 
-    /// The caller supplies its read deadline. Only durable coverage satisfies the wait.
+    /// Waits for validated durable coverage of `revision` in a whole-namespace scope. The caller supplies its read
+    /// deadline; an absent or unvalidated scope cannot satisfy the wait.
     pub async fn wait_for(&self, dataset: &str, namespace: &str, revision: u64) {
         let scope = (dataset.to_owned(), namespace.to_owned(), None);
         loop {
@@ -667,7 +671,8 @@ impl Consumer {
         Ok(events)
     }
 
-    /// Returns false for a gap: the caller reissues Follow at the committed cursor.
+    /// Applies a delivery or accepts an already applied duplicate. Returns false for a gap, so the caller reissues
+    /// Follow at the committed cursor; malformed deliveries and storage failures return an error.
     fn delivery(&mut self, delivery: pb::Delivery) -> Result<bool, Status> {
         let events = self.delivery_events(&delivery)?;
         if self.bootstrap.is_some() || self.recover {
@@ -695,6 +700,8 @@ impl Consumer {
         Ok(true)
     }
 
+    /// Stages a bootstrap chunk and atomically installs the validated snapshot at its boundary. Returns false until
+    /// the final chunk is installed, or an error for invalid chunks or storage failures.
     fn bootstrap(&mut self, chunk: pb::Bootstrap) -> Result<bool, Status> {
         if chunk.dataset != self.target.selection.dataset
             || chunk.namespace != self.target.selection.namespace
@@ -1166,7 +1173,8 @@ async fn connected(
 
 /// Applies each pushed range set whose revision the member's own directory view has reached: follows new ranges,
 /// narrows split ones, drops revoked ones the view confirms and refuses the rest, then acknowledges the set. The
-/// relay counts acknowledgements toward readiness only after that (`docs/spec/handoff.tla`, `ReadyFor`).
+/// relay counts acknowledgements toward readiness only after that (`docs/spec/handoff.tla`, `ReadyFor`). Sets for
+/// datasets without a local engine are acknowledged without following them.
 async fn settle(
     requests: &mpsc::Sender<pb::RelayRequest>,
     consumers: &mut BTreeMap<Scope, Consumer>,
@@ -1259,7 +1267,8 @@ async fn settle(
 }
 
 /// Carries a held range's coverage to the parts a split kept and deletes the dropped parts in one atomic batch, then
-/// compacts them. Returns the requests that move the relay's streams to the kept parts.
+/// attempts to compact them. Returns the requests that move the relay's streams to the kept parts. Write and consumer
+/// initialization errors propagate, possibly after the batch committed; compaction errors do not.
 fn narrow(
     dataset: &str,
     engine: &Arc<dyn StorageEngine>,

@@ -167,7 +167,8 @@ impl Published {
 }
 
 /// Node ID → entry, and the placement directories, as stored under `prefix` by a subscription to the membership
-/// namespace. An undecodable entry is corruption, never a missing one.
+/// namespace. Malformed keys, undecodable entries or unknown owner states return a data-loss status; storage scan
+/// failures return an internal status.
 pub(crate) fn read(
     engine: &dyn StorageEngine,
     prefix: &[u8],
@@ -269,7 +270,8 @@ impl View {
     }
 
     /// One dataset's L2 placement directory in this cell: route with [`placement::owners`], and serve only what
-    /// [`placement::serves`] allows. Empty for customer KV and before the first write.
+    /// [`placement::serves`] allows. Empty if the dataset has no directory, including for customer KV and before
+    /// the first write. Returns an error if any membership or directory entry cannot be read or decoded.
     pub fn directory(&self, dataset: &str) -> Result<Directory, Status> {
         Ok(self.published.read()?.1.remove(dataset).unwrap_or_default())
     }
@@ -457,7 +459,8 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Each service's published members and placement directory, as this relay's subscription applied them.
+    /// Each service's published members and per-dataset placement directories, as this relay's subscription applied
+    /// them. Returns an error if a published view cannot be read or decoded.
     #[allow(clippy::type_complexity)]
     pub fn views(
         &self,
@@ -681,7 +684,8 @@ impl Cell {
         }
     }
 
-    /// One write through `bedrock-api`; returns the committed revision.
+    /// One write through `bedrock-api`; returns the committed revision or an error for connection, request, response
+    /// or revision parsing failures.
     async fn write(&self, change: &Change) -> Result<u64, String> {
         let (method, (service, key), body) = match change {
             Change::Set(member) => (hyper::Method::PUT, key(member), member.encode_to_vec()),

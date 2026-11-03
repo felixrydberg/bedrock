@@ -40,6 +40,9 @@ const fn dataset(
 }
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
+///
+/// If an enabled dataset cannot open or is unhealthy at startup, the node skips following its ranges and stays
+/// unready until restart. Invalid configuration, admin listener failures and session setup failures return an error.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-quicksilver");

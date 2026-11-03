@@ -117,6 +117,7 @@ impl MemoryLog {
             .collect()
     }
 
+    /// A generation that advances, wrapping on overflow, whenever a namespace is first added to any dataset.
     pub fn added(&self) -> &Watched<u64> {
         &self.added
     }
@@ -135,7 +136,8 @@ impl MemoryLog {
             })
     }
 
-    /// Initializes an empty log at an already-installed state boundary.
+    /// Initializes an empty log at an already-installed state boundary. Returns an error if it has events or a
+    /// nonzero head. A previously unknown namespace is added to the log.
     pub fn reset(&self, dataset: &str, namespace: &str, boundary: u64) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
         let log = self.entry(&mut namespaces, dataset, namespace);
@@ -169,7 +171,8 @@ impl MemoryLog {
         Ok(())
     }
 
-    /// Commits `event`, which must carry its namespace's next sequence.
+    /// Commits `event`, which must carry its namespace's next sequence. Returns an error for a different sequence
+    /// or sequence overflow. An unknown namespace is added even if the append fails.
     pub fn append(&self, event: Event) -> Result<(), String> {
         let mut namespaces = self.namespaces.lock().unwrap();
         let log = self.entry(&mut namespaces, &event.dataset, &event.namespace);

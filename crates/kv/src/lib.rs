@@ -3,7 +3,8 @@
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, ConfigError, ServiceConfig};
 
-/// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
+/// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here. Returns an error for invalid
+/// configuration, a failed admin listener, or a failed session setup.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     check_hosts_nothing_pushed(&config)?;
@@ -44,7 +45,8 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// Customer KV has no pushed data: quicksilver, auth and cdn belong to other binaries.
+/// Customer KV has no pushed data: quicksilver, auth and cdn belong to other binaries. Returns an error if any
+/// datasets are configured.
 fn check_hosts_nothing_pushed(config: &ServiceConfig) -> Result<(), ConfigError> {
     if config.datasets.is_empty() {
         return Ok(());

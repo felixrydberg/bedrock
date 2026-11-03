@@ -175,7 +175,8 @@ pub fn l2_span(start: u64, end: u64) -> KeyRange {
     }
 }
 
-/// The namespace and key of an [`l2_key`], or `None` for any other key.
+/// Extracts the namespace and key from an [`l2_key`]. Returns `None` if the prefix, fixed-length header, or
+/// namespace terminator is missing; it does not validate the separator after the hash.
 pub fn l2_parts(physical: &[u8]) -> Option<(&[u8], &[u8])> {
     let rest = physical.strip_prefix(b"l2/")?.get(9..)?;
     let nul = rest.iter().position(|b| *b == 0)?;

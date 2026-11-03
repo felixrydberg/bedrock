@@ -743,7 +743,8 @@ impl Hub {
             sub.changed.update(|v| *v = v.wrapping_add(1));
         }
     }
-    /// An empty namespace with a range unfollows that range in every namespace of the dataset.
+    /// An empty namespace with a range unfollows that range in every namespace of the dataset. Otherwise removes only
+    /// the matching dataset, namespace and range interest.
     fn unfollow(&self, id: u64, unfollow: pb::Unfollow) {
         let range = range(unfollow.span.as_ref());
         if let Some(sub) = self.0.subscribers.lock().unwrap().get_mut(&id) {
@@ -893,6 +894,8 @@ impl Hub {
         }
         Err(Status::out_of_range("local replay does not cover cursor"))
     }
+    /// Starts a subscription for one namespace or, with an empty namespace and a span, the range in every namespace.
+    /// Invalid scopes receive an invalid-argument error frame.
     async fn follow(&self, id: u64, follow: pb::Follow, visited: Vec<String>, force: bool) {
         let key = (
             (follow.dataset.clone(), follow.namespace.clone()),
@@ -931,7 +934,8 @@ impl Hub {
             .collect()
     }
 
-    /// Follows `range` in every namespace of the dataset, including namespaces that appear later.
+    /// Follows `range` in every namespace of the dataset, including namespaces that appear later. Cursors come from
+    /// `follow.from_namespaces`: missing entries start at 1 and 0 requests a fresh baseline.
     // ponytail: one stream task per subscriber, namespace and range; drive idle namespaces from one task per range if
     // namespace counts grow. The wire protocol carries no namespace list, so that change stays inside the relay.
     fn follow_range(&self, id: u64, follow: pb::Follow, range: (u64, u64), visited: Vec<String>) {
@@ -990,6 +994,8 @@ impl Hub {
         });
     }
 
+    /// Replaces the subscriber's interest in `key` and starts delivery. `force` requests a fresh baseline; delivery
+    /// failures are sent to the subscriber as error frames.
     fn follow_stream(&self, id: u64, key: StreamKey, from: u64, visited: Vec<String>, force: bool) {
         // Seed the validated cache's lower bound before upstream traffic can arrive.
         self.source_head(&key.0);
