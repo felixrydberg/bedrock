@@ -211,6 +211,22 @@ async fn stale_cache_entry_is_refetched_for_a_minimum_revision_read() {
     assert_eq!(cached(&tier).await, Read::Found(at(Some(b"new"), 20)));
 }
 
+#[tokio::test]
+async fn damaged_cache_revision_fails_verification_instead_of_looking_fresh() {
+    let admin = Admin::new();
+    let (health, raw, tier) = cache(&admin);
+    tier.fill("k", &at(Some(b"x"), 10)).await.unwrap();
+    // Revision 10 becomes 2^56 + 10, which would pass any minimum-revision read.
+    let mut damaged = raw.get(b"k").unwrap().unwrap();
+    damaged[0] ^= 1;
+    raw.put(b"k", &damaged).unwrap();
+    assert!(matches!(
+        tier.read("k", 20).await,
+        Err(StorageError::Corruption(_))
+    ));
+    assert_eq!(health.get("cdn", "l1").unwrap().state, State::Unhealthy);
+}
+
 #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
 #[cfg_attr(madsim, tokio::test)]
 async fn corrupted_cache_entry_is_quarantined_refetched_and_rebuilt_before_use() {
