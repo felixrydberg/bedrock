@@ -1673,8 +1673,9 @@ announces, so a host that reaches a relay can join membership under another node
   acceptor and on the client through the custom connector, so new handshakes pick up renewed files. Files are polled
   every 10 seconds and compared by content, which also catches Kubernetes' atomic symlink swap of mounted Secrets. A
   renewal that fails to parse, has expired or does not match the node keeps the previous certificate and raises an
-  error metric. Existing connections keep their handshake identity; servers close connections after 24 hours
-  (`max_connection_age`) so peers re-handshake.
+  error metric. Existing connections keep their handshake identity: gRPC servers begin a graceful close after 24
+  hours (`max_connection_age`, no grace limit), so long-lived relay sessions keep running, and the write listener has
+  no age limit.
 - **Admin endpoint** stays plain HTTP without client certificates. Deployments bind it to loopback or a private
   interface (B-54).
 - **Metrics.** `transport_tls_enabled`, inbound handshake failures, reload failures and seconds until the local
@@ -1729,9 +1730,9 @@ keep traffic private.
   | Local / tests | No `tls` section, or a test CA from a script | — |
 
 - **OpenBao reference setup**: a PKI intermediate with one role per service (`client_flag`,
-  `server_flag`, IP/DNS SANs allowed, URI SANs limited by `allowed_uri_sans_template` to the machine's own `cell` and
-  `node_id` from its entity metadata, 7-day TTL, `generate_lease` set). One AppRole per machine, whose `secret_id` is
-  delivered once, response-wrapped, at provisioning, with a policy allowing only `issue/{service}` for the services it
+  `server_flag`, URI SANs limited by `allowed_uri_sans_template` to the machine's own `cell` and `node_id`, DNS SANs
+  by `allowed_domains_template` to its own host, IP SANs off, 7-day TTL, `generate_lease` set). One AppRole per
+  machine, whose response-wrapped `secret_id` is delivered before every agent start, with a policy allowing only `issue/{service}` for the services it
   runs. Agent templates use `secret`: OpenBao's docs describe `pkiCert` re-fetching only at startup or after expiry,
   and leased secrets at 85% of their TTL. The setup is run once against an OpenBao dev server to confirm this.
 - **Nebula**, for machines spanning several networks:

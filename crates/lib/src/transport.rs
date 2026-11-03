@@ -28,7 +28,8 @@ use tls::Tls;
 /// HTTP/2 pings on idle connections, so a dead peer behind a quiet persistent stream is noticed (B-13).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
-/// TLS servers close older connections, so a peer whose certificate expired or was not renewed handshakes again.
+/// TLS servers begin a graceful close of older connections, so peers whose calls finish handshake again with current
+/// certificates. Without a grace limit, long-lived streams such as relay sessions keep running.
 const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 3600);
 
 /// Traffic class. Each class has its own connection per peer, so bulk transfers fill their own HTTP/2 flow-control
@@ -158,7 +159,8 @@ impl Peers {
 pub trait Io: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> Io for T {}
 
-/// A gRPC server builder; with TLS, connections are recycled after [`MAX_CONNECTION_AGE`]. Serve it with [`serve`].
+/// A gRPC server builder; with TLS, connections start a graceful close after [`MAX_CONNECTION_AGE`]. Serve it with
+/// [`serve`].
 pub fn server(tls: Option<&Arc<Tls>>) -> Server {
     let server = Server::builder();
     match tls {

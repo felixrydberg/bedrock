@@ -483,7 +483,16 @@ fn sessions_are_authorized_by_the_callers_certificate() {
         0,
         Some(&member),
     ));
-    denied(authorize(&caller("relay", "c1", "r1"), 1, "c1", 0, None));
+    // A relay reads published views as a leaf without a member, through relays of any tier and cell.
+    authorize(&caller("relay", "c2", "r1"), 1, "c1", 0, None).unwrap();
+    authorize(&caller("relay", "c1", "r1"), 2, "dc", 0, None).unwrap();
+    denied(authorize(
+        &caller("relay", "c1", "r1"),
+        1,
+        "c1",
+        0,
+        Some(&member),
+    ));
     // The announced member must be the caller.
     denied(authorize(
         &caller("kv", "c1", "n8"),

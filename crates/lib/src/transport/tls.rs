@@ -319,7 +319,9 @@ mod adapter {
                 let tcp = match listener.accept().await {
                     Ok((tcp, _)) => tcp,
                     Err(error) => {
+                        // Out of file descriptors and similar; back off instead of spinning.
                         tracing::warn!(%error, "accepting a connection failed");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };

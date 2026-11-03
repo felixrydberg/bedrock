@@ -1557,8 +1557,8 @@ impl Hub {
 }
 
 /// Who may open a session with tier `tier` to a relay of tier `own_tier` (B-55): relays reach the writer and upper
-/// tiers; Quicksilver, KV and CDN processes are leaves of their own cell's relays, and a leaf's announced member must
-/// be the caller itself.
+/// tiers, and any relay as a leaf without a member; Quicksilver, KV and CDN processes are leaves of their own cell's
+/// relays, and a leaf's announced member must be the caller itself.
 pub fn authorize(
     caller: &Caller,
     own_tier: u32,
@@ -1566,7 +1566,8 @@ pub fn authorize(
     tier: u32,
     member: Option<&pb::Member>,
 ) -> Result<(), Status> {
-    if own_tier == WRITER || tier > 0 {
+    // A relay also reads published views through its upstreams as a leaf without a member (B-12).
+    if own_tier == WRITER || tier > 0 || (caller.service == "relay" && member.is_none()) {
         return caller.require(&["relay"], None);
     }
     if own_cell.is_empty() {
