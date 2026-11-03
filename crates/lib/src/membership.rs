@@ -322,15 +322,7 @@ pub fn plan(
     for key in actual.keys().filter(|key| !held.contains_key(*key)) {
         absent.entry(key.clone()).or_insert(now);
     }
-    let live: Vec<&str> = std::iter::once(seen.me)
-        .chain(
-            seen.remote
-                .iter()
-                .filter(|(_, list)| list.is_some())
-                .map(|(relay, _)| relay.as_str()),
-        )
-        .collect();
-    if live.len() * 2 <= seen.relays.len() || live.iter().any(|relay| *relay < seen.me) {
+    if !majority(seen) || live(seen).any(|relay| relay < seen.me) {
         return None;
     }
     let mut changes: Vec<_> = held
@@ -348,6 +340,21 @@ pub fn plan(
             .map(|key| Change::Delete(key.clone())),
     );
     Some(changes)
+}
+
+/// This relay and its synced siblings.
+fn live<'a>(seen: &Observed<'a>) -> impl Iterator<Item = &'a str> {
+    std::iter::once(seen.me).chain(
+        seen.remote
+            .iter()
+            .filter(|(_, list)| list.is_some())
+            .map(|(relay, _)| relay.as_str()),
+    )
+}
+
+/// Whether this relay's live side is a strict majority of the cell's relays; without one, nothing is written.
+pub fn majority(seen: &Observed) -> bool {
+    live(seen).count() * 2 > seen.relays.len()
 }
 
 /// One ranged service's directory writes from the published `actual` members: promote what the last pass assigned,
@@ -379,8 +386,45 @@ pub fn place(service: &str, actual: &Members, directory: &Directory) -> Vec<Chan
         .collect()
 }
 
+/// What a cell relay's publisher sees and does, for relay introspection (#17 / B-18b).
+pub struct Publisher {
+    published: Vec<(&'static str, Published)>,
+    frozen_since: Mutex<Option<Instant>>,
+    directory_writes: Mutex<BTreeMap<String, u64>>,
+}
+
+impl Publisher {
+    /// Each service's published members and placement directory, as this relay's subscription applied them.
+    #[allow(clippy::type_complexity)]
+    pub fn views(
+        &self,
+    ) -> Result<Vec<(&'static str, BTreeMap<String, pb::Member>, Directory)>, Status> {
+        self.published
+            .iter()
+            .map(|(service, view)| {
+                view.read()
+                    .map(|(members, directory)| (*service, members, directory))
+            })
+            .collect()
+    }
+
+    /// How long this relay has been without a live majority, so membership and placement are frozen.
+    pub fn frozen(&self) -> Option<Duration> {
+        self.frozen_since
+            .lock()
+            .unwrap()
+            .map(|since| crate::monotonic_now().duration_since(since))
+    }
+
+    /// Successful placement-directory writes by service.
+    pub fn directory_writes(&self) -> BTreeMap<String, u64> {
+        self.directory_writes.lock().unwrap().clone()
+    }
+}
+
 /// A cell relay's membership publisher.
 pub struct Cell {
+    publisher: Arc<Publisher>,
     hub: Hub,
     siblings: Arc<Siblings>,
     me: String,
@@ -393,7 +437,7 @@ pub struct Cell {
 
 impl Cell {
     /// Publishes from this relay's members and its watched siblings; abort the returned task on shutdown. `me` is this
-    /// relay's advertised address, as its siblings list it.
+    /// relay's advertised address, as its siblings list it. The [`Publisher`] serves introspection.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         hub: Hub,
@@ -404,7 +448,7 @@ impl Cell {
         me: String,
         cell: String,
         write_token: String,
-    ) -> Result<tokio::task::JoinHandle<()>, Status> {
+    ) -> Result<(tokio::task::JoinHandle<()>, Arc<Publisher>), Status> {
         let mut published = Vec::new();
         let mut targets = Vec::new();
         for service in SERVICES {
@@ -417,7 +461,13 @@ impl Cell {
         let relays = std::iter::once(me.clone())
             .chain(siblings.state().into_keys())
             .collect();
+        let publisher = Arc::new(Publisher {
+            published,
+            frozen_since: Mutex::default(),
+            directory_writes: Mutex::default(),
+        });
         let cell = Self {
+            publisher: publisher.clone(),
             hub,
             siblings,
             me,
@@ -427,12 +477,14 @@ impl Cell {
             api: settings.api.clone(),
             write_token,
         };
-        Ok(tokio::spawn(async move {
-            cell.publish(session, published).await
-        }))
+        Ok((
+            tokio::spawn(async move { cell.publish(session).await }),
+            publisher,
+        ))
     }
 
-    async fn publish(&self, session: Session, published: Vec<(&'static str, Published)>) {
+    async fn publish(&self, session: Session) {
+        let published = &self.publisher.published;
         let version = self.hub.member_version();
         let mut absent = BTreeMap::new();
         // After a successful write, plan again at once: placement takes a pass per step.
@@ -478,6 +530,14 @@ impl Cell {
                 local: &local,
                 remote: &remote,
             };
+            {
+                let mut frozen = self.publisher.frozen_since.lock().unwrap();
+                match (majority(&seen), *frozen) {
+                    (true, _) => *frozen = None,
+                    (false, None) => *frozen = Some(crate::monotonic_now()),
+                    (false, Some(_)) => {}
+                }
+            }
             let Some(mut changes) = plan(
                 &seen,
                 &actual,
@@ -503,6 +563,15 @@ impl Cell {
                 };
                 match tokio::time::timeout(TIMEOUT, self.write(&change)).await {
                     Ok(Ok(revision)) => {
+                        if matches!(change, Change::Range { .. }) {
+                            *self
+                                .publisher
+                                .directory_writes
+                                .lock()
+                                .unwrap()
+                                .entry(service.clone())
+                                .or_default() += 1;
+                        }
                         let latest = written.entry(service).or_insert(revision);
                         *latest = revision.max(*latest);
                     }
