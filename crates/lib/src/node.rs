@@ -32,6 +32,19 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     #[serde(default)]
     pub budget: Budget,
+    /// Mutual TLS for node-to-node traffic (B-55); unset means plaintext.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// PEM files from any CA; the certificate contract is in [`crate::transport::tls`].
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TlsConfig {
+    /// This node's certificate chain, leaf first.
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    /// The CA certificates that issue node certificates.
+    pub ca: PathBuf,
 }
 
 impl NodeConfig {

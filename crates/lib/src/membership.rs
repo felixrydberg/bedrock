@@ -486,6 +486,7 @@ pub struct Cell {
     grace: Duration,
     api: String,
     write_token: String,
+    peers: Arc<Peers>,
 }
 
 impl Cell {
@@ -510,7 +511,7 @@ impl Cell {
             targets.push(target);
         }
         // The relay reads the published view through its own upstreams, like any subscriber.
-        let session = Session::start(peers, upstreams, targets)?;
+        let session = Session::start(peers.clone(), upstreams, targets)?;
         let relays = std::iter::once(me.clone())
             .chain(siblings.state().into_keys())
             .collect();
@@ -529,6 +530,7 @@ impl Cell {
             grace: Duration::from_millis(settings.grace_ms),
             api: settings.api.clone(),
             write_token,
+            peers,
         };
         Ok((
             tokio::spawn(async move { cell.publish(session).await }),
@@ -688,7 +690,9 @@ impl Cell {
             ),
         };
         let uri = format!("/v1/{DATASET}/{}/{key}", namespace(&service, &self.cell));
-        let stream = tokio::net::TcpStream::connect(self.api.as_str())
+        let stream = self
+            .peers
+            .dial(&self.api)
             .await
             .map_err(|e| e.to_string())?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))

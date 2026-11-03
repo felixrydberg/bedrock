@@ -1032,3 +1032,135 @@ async fn introspection_matches_the_leaf_and_lag_is_reported_at_every_tier() {
     cell_task.abort();
     writer.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn quarantined_dataset_rebuilds_from_a_verified_bootstrap_while_the_other_keeps_applying() {
+    use bedrock_lib::health::storage::{State, StorageHealth};
+    use bedrock_lib::storage::{ErrorContext, StorageError};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CLOCK: AtomicU64 = AtomicU64::new(1000);
+    let writer = Writer::open(
+        || CLOCK.load(Ordering::SeqCst),
+        Persistence {
+            factory: Arc::new(MemoryFactory::default()),
+            retention: Retention {
+                event_retention_ms: 1,
+                retry_retention_ms: 1000,
+            },
+            metrics: PersistenceMetrics::default(),
+        },
+    )
+    .await
+    .unwrap();
+    commit(
+        &writer,
+        "quicksilver",
+        "infrastructure",
+        Operation::Set(b"configuration".to_vec()),
+    )
+    .await;
+    commit(
+        &writer,
+        "auth",
+        "keys",
+        Operation::Set(b"credential".to_vec()),
+    )
+    .await;
+    let source = serve(Hub::writer("writer".into(), writer.clone(), peers()), 18001).await;
+    let cell = relay("cell", 1, &source.address);
+    let cell_task = cell.start();
+    let cell = serve(cell, 18002).await;
+
+    let admin = Admin::new();
+    let health = StorageHealth::new(&admin);
+    let raw: BTreeMap<&'static str, Arc<MemoryEngine>> = BTreeMap::from([
+        ("quicksilver", Arc::new(MemoryEngine::new("quicksilver"))),
+        ("auth", Arc::new(MemoryEngine::new("auth"))),
+    ]);
+    let replication: BTreeMap<&'static str, Arc<dyn StorageEngine>> = raw
+        .iter()
+        .map(|(dataset, engine)| {
+            (
+                *dataset,
+                health.wrap_replication(dataset, "engine", engine.clone()),
+            )
+        })
+        .collect();
+    let mut targets = targets(&raw["auth"]);
+    for target in &mut targets {
+        target.engine = replication[target.selection.dataset.as_str()].clone();
+    }
+    let session = Session::start(peers(), vec![cell.address.clone()], targets).unwrap();
+    caught_up(&session, 1).await;
+
+    // While auth's storage is damaged its key is deleted and the history that carried the delete expires.
+    commit(&writer, "auth", "keys", Operation::Delete).await;
+    CLOCK.store(2000, Ordering::SeqCst);
+    writer.cleanup("auth", "keys").await.unwrap();
+    health.report(
+        "auth",
+        "engine",
+        &StorageError::Corruption(ErrorContext {
+            engine: "test",
+            instance: "auth".into(),
+            file: None,
+            partition: None,
+            detail: "bad block".into(),
+        }),
+    );
+    raw["auth"].put(b"a/ghost", b"leftover").unwrap();
+    let rebuilding = bedrock_lib::reconciliation::rebuild::start(
+        &admin,
+        &health,
+        &session,
+        "engine",
+        &replication,
+        1,
+    );
+    commit(
+        &writer,
+        "quicksilver",
+        "infrastructure",
+        Operation::Set(b"rotated".to_vec()),
+    )
+    .await;
+    tokio::time::timeout(
+        DEADLINE,
+        session.wait_for("quicksilver", "infrastructure", 2),
+    )
+    .await
+    .expect("the healthy dataset keeps applying during the rebuild");
+    tokio::time::timeout(DEADLINE, async {
+        while health.get("auth", "engine").unwrap().state != State::Healthy {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("auth was not rebuilt: {:?}", session.error()));
+    rebuilding.abort();
+
+    let auth = health.wrap("auth", "engine", raw["auth"].clone());
+    assert_eq!(
+        auth.get(b"a/key").unwrap(),
+        None,
+        "the expired delete stays applied"
+    );
+    assert_eq!(
+        auth.get(b"a/ghost").unwrap(),
+        None,
+        "the damaged instance was recreated"
+    );
+    session.wait_for("auth", "keys", 2).await;
+    assert_eq!(
+        raw["quicksilver"].get(b"q/key").unwrap(),
+        Some(b"rotated".to_vec())
+    );
+    assert_eq!(
+        health.get("quicksilver", "engine").unwrap().state,
+        State::Healthy
+    );
+    drop(session);
+    cell_task.abort();
+    writer.close().await.unwrap();
+}

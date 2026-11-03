@@ -123,6 +123,10 @@ forwarding continues. The worker holds at most one additional bounded batch.
 Scoped recovery/storage errors gate only the affected namespace; healthy datasets
 keep receiving updates and satisfying revision waits. Failed scopes retry recovery
 on the existing progress interval rather than restarting healthy streams.
+A storage rebuild (#23 / B-22) recreates a quarantined dataset's engine empty and asks
+the session to recover that dataset's scopes at once (`Rebuilder`). Like a local failure,
+the scope drains its old subscription; it is ready again only after a fresh validated
+bootstrap and its recovered confirmation (`LoseLocal`, `ReadyNotLost`).
 
 `[replay]` overrides `max_bytes`, `window_ms`, and dataset `priorities` (higher values
 retain data longer). Defaults are 1 GiB and 5/15/60 minutes at cell/DC/region tiers;
@@ -237,8 +241,8 @@ For cleanup validation, native lint reused a cached RocksDB archive through the
 dependency's supported `ROCKSDB_LIB_DIR` / `ROCKSDB_STATIC` settings; native tests
 built RocksDB normally. This avoids rebuilding C++ for the Rust-only lint step.
 
-TLC 1.8.0 checked `MaxRevision=4`, `QueueLimit=2` on 2026-10-31: 436,101 generated
-states, 59,694 distinct states, depth 24, no invariant violation. The model separates
+TLC 1.8.0 checked `MaxRevision=4`, `QueueLimit=2` on 2026-11-03, with local storage loss: 776,387
+generated states, 95,010 distinct states, depth 24, no invariant violation. The model separates
 validated installation from the source's recovered confirmation, keeps pending
 confirmation across disconnects and lease expiry, and checks `ReadyAfterConfirmation`:
 readiness requires confirmation and coverage through head, and a new commit clears it.
@@ -247,7 +251,8 @@ liveness proof. As negative checks in ignored temporary copies, replacing
 selected-payload application with a no-op makes `FilteredCoverage` fail at covered
 revision 2 (2026-10-30), and dropping `~pending` from `BecomeReady` makes
 `ReadyAfterConfirmation` fail at depth 4 (2026-10-31), as does letting `Commit` keep
-readiness, at depth 3 (2026-10-31).
+readiness, at depth 3 (2026-10-31). Dropping `~lost` from `Confirm`, so a lost receiver
+could confirm without a fresh install, makes `ReadyNotLost` fail at depth 11 (2026-11-03).
 
 With range streams, pushed ranges and revokes, TLC `2026.10.28.014557` (rev `56d37a9`)
 checked on 2026-11-02 with `QueueLimit=2` and every invariant above plus `ReportedHolds`:
@@ -264,6 +269,11 @@ earlier checks still fail on the new model: a no-op selected-payload application
 violates `FilteredCoverage` at depth 10, dropping `~pending` from `BecomeReady`
 violates `ReadyAfterConfirmation` at depth 9, and letting `Commit` keep readiness
 violates it at depth 8.
+
+With local storage loss merged into the range model (#23 / B-22, 2026-11-03), TLC 1.8.0 checked `relays.cfg` with
+every invariant above plus `ReadyNotLost`: 26,865,595 generated states, 2,705,822 distinct, depth 28, no violation
+(31 s). A revoke deletes the range, so it also clears `lost`. Letting `LoseLocal` keep `pending` unchanged violates
+`ReadyNotLost` (840 distinct states).
 
 With the [official TLA+ release](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0)
 jar saved as `.codex-tmp/tla2tools.jar`, run from `docs/spec`:

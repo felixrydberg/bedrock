@@ -52,6 +52,7 @@ fn node(name: &str, ip: &str, cell: &str) -> NodeConfig {
         admin_listen: format!("{ip}:7001").parse().unwrap(),
         data_dir: format!("/data/{name}").into(),
         budget: Budget::default(),
+        tls: None,
     }
 }
 

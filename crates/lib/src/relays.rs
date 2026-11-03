@@ -9,7 +9,7 @@ pub mod sources;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ use crate::replication::Event;
 use crate::replication::log::{Log, Watched};
 use crate::replication::pb;
 use crate::replication::writer::{RecoveryLease, Writer};
-use crate::transport::{Class, Peers};
+use crate::transport::{Caller, Class, Peers, host_of};
 use replay::Replay;
 
 pub const PROGRESS: Duration = Duration::from_secs(10);
@@ -66,6 +66,9 @@ pub fn pushed(dataset: &str) -> bool {
     )
 }
 
+/// The writer's tier rank, above every relay tier.
+pub const WRITER: u32 = 4;
+
 pub fn tier_rank(tier: crate::node::Tier) -> u32 {
     match tier {
         crate::node::Tier::Cell => 1,
@@ -80,6 +83,8 @@ pub struct Hub(Arc<Inner>);
 struct Inner {
     id: String,
     tier: u32,
+    /// The relay's cell; with TLS, leaf callers must belong to it (B-55).
+    cell: OnceLock<String>,
     peers: Arc<Peers>,
     upstreams: Vec<String>,
     replay_peers: Vec<String>,
@@ -174,7 +179,15 @@ fn queued_events(frame: &pb::RelayFrame) -> usize {
 
 impl Hub {
     pub fn writer(id: String, writer: Arc<Writer>, peers: Arc<Peers>) -> Self {
-        Self::new(id, 4, peers, Vec::new(), Vec::new(), Some(writer), None)
+        Self::new(
+            id,
+            WRITER,
+            peers,
+            Vec::new(),
+            Vec::new(),
+            Some(writer),
+            None,
+        )
     }
     pub fn relay(
         id: String,
@@ -199,6 +212,7 @@ impl Hub {
         Self(Arc::new(Inner {
             id,
             tier,
+            cell: OnceLock::new(),
             peers,
             upstreams,
             replay_peers,
@@ -222,6 +236,13 @@ impl Hub {
     pub fn with_clock(self, clock: fn() -> u64) -> Self {
         *self.0.clock.lock().unwrap() = Some(clock);
         self
+    }
+    pub fn with_cell(self, cell: String) -> Self {
+        let _ = self.0.cell.set(cell);
+        self
+    }
+    fn cell(&self) -> &str {
+        self.0.cell.get().map_or("", String::as_str)
     }
     /// Caller owns and aborts the upstream task on shutdown.
     pub fn start(&self) -> tokio::task::JoinHandle<()> {
@@ -1778,6 +1799,44 @@ impl Hub {
     }
 }
 
+/// Who may open a session with tier `tier` to a relay of tier `own_tier` (B-55): relays reach the writer and upper
+/// tiers, and any relay as a leaf without a member; Quicksilver, KV and CDN processes are leaves of their own cell's
+/// relays, and a leaf's announced member must be the caller itself.
+pub fn authorize(
+    caller: &Caller,
+    own_tier: u32,
+    own_cell: &str,
+    tier: u32,
+    member: Option<&pb::Member>,
+) -> Result<(), Status> {
+    // A relay also reads published views through its upstreams as a leaf without a member (B-12).
+    if own_tier == WRITER || tier > 0 || (caller.service == "relay" && member.is_none()) {
+        return caller.require(&["relay"], None);
+    }
+    if own_cell.is_empty() {
+        return Err(Status::permission_denied(
+            "this relay has no cell for leaves",
+        ));
+    }
+    caller.require(&crate::membership::SERVICES, Some(own_cell))?;
+    match member {
+        Some(m)
+            if (m.service.as_str(), m.cell.as_str(), m.node_id.as_str())
+                != (
+                    caller.service.as_str(),
+                    caller.cell.as_str(),
+                    caller.node_id.as_str(),
+                )
+                || !caller.has_host(host_of(&m.address)) =>
+        {
+            Err(Status::permission_denied(
+                "announced member does not match the caller's certificate",
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[tonic::async_trait]
 impl pb::relay_server::Relay for Hub {
     type SessionStream = Frames;
@@ -1785,6 +1844,7 @@ impl pb::relay_server::Relay for Hub {
         &self,
         request: Request<Streaming<pb::RelayRequest>>,
     ) -> Result<Response<Frames>, Status> {
+        let caller = Caller::of(&request).cloned();
         let mut requests = request.into_inner();
         let first = tokio::time::timeout(Duration::from_secs(5), requests.message())
             .await
@@ -1805,6 +1865,10 @@ impl pb::relay_server::Relay for Hub {
                 ));
             }
         };
+        if let Some(caller) = &caller {
+            authorize(caller, self.0.tier, self.cell(), tier, member.as_ref())
+                .inspect_err(|status| tracing::warn!(?caller, %status, "relay session rejected"))?;
+        }
         let (tx, rx) = mpsc::channel(MAX_EVENTS);
         let bytes = Arc::new(AtomicUsize::new(0));
         let events = Arc::new(AtomicUsize::new(0));

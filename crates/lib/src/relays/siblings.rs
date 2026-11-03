@@ -14,7 +14,7 @@ use super::{Hub, IDLE, MemberKey, PROGRESS};
 use crate::membership::key;
 use crate::replication::log::Watched;
 use crate::replication::pb;
-use crate::transport::{Class, Peers};
+use crate::transport::{Caller, Class, Peers};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(1);
@@ -35,8 +35,11 @@ impl pb::siblings_server::Siblings for Server {
 
     async fn watch(
         &self,
-        _: Request<pb::SiblingWatch>,
+        request: Request<pb::SiblingWatch>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        if let Some(caller) = Caller::of(&request) {
+            caller.require(&["relay"], Some(self.0.cell()))?;
+        }
         let (tx, rx) = mpsc::channel(16);
         let hub = self.0.clone();
         tokio::spawn(async move {

@@ -21,3 +21,9 @@ memory_mb = 4096
 disk_mb = 102400
 
 # The relays push the L2 ranges this node owns of each dataset it carries (#22 / B-21).
+
+# Mutual TLS between nodes (B-55); unset means plaintext. Issuing the files: docs/deployment/security.md.
+# [tls]
+# cert = "/etc/bedrock/tls/tls.crt"
+# key = "/etc/bedrock/tls/tls.key"
+# ca = "/etc/bedrock/tls/ca.crt"

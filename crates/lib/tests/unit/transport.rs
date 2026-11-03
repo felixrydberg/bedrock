@@ -61,3 +61,45 @@ async fn stale_call_cannot_complete_another_calls_probe() {
     stale.unwrap();
     probe.unwrap();
 }
+
+#[test]
+fn identities_parse_only_the_exact_form() {
+    assert_eq!(
+        parse_identity("bedrock://kv/eu-1a/node-7"),
+        Some(("kv", "eu-1a", "node-7"))
+    );
+    for bad in [
+        "https://kv/eu-1a/node-7",
+        "bedrock://kv/eu-1a",
+        "bedrock://kv/eu-1a/node-7/extra",
+        "bedrock://kv//node-7",
+        "bedrock://kv/eu 1a/node-7",
+    ] {
+        assert_eq!(parse_identity(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn hosts_match_by_address_or_name() {
+    assert_eq!(host_of("10.0.0.1:7000"), "10.0.0.1");
+    assert_eq!(host_of("[::1]:7000"), "::1");
+    assert_eq!(host_of("relay.example:7000"), "relay.example");
+    let caller = Caller {
+        service: "kv".into(),
+        cell: "c1".into(),
+        node_id: "n1".into(),
+        hosts: vec!["::1".into(), "node.example".into()],
+    };
+    assert!(caller.has_host("0:0:0:0:0:0:0:1"));
+    assert!(caller.has_host("NODE.example"));
+    assert!(!caller.has_host("10.0.0.1"));
+    assert!(caller.require(&["kv", "cdn"], Some("c1")).is_ok());
+    assert_eq!(
+        caller.require(&["relay"], None).unwrap_err().code(),
+        Code::PermissionDenied
+    );
+    assert_eq!(
+        caller.require(&["kv"], Some("c2")).unwrap_err().code(),
+        Code::PermissionDenied
+    );
+}

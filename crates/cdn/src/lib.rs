@@ -30,15 +30,21 @@ pub const DATASETS: &[Dataset] = &[Dataset {
 }];
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
-/// If the enabled CDN engine cannot open or is unhealthy at startup, its subscription is skipped and the node stays
+/// If the enabled CDN engine cannot open or is unhealthy at startup, its ranges are not followed and the node stays
 /// unready until restart. Configuration, admin startup, registry and relay session initialization errors are returned.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-cdn");
     let admin = node::start_admin(&config.node).await?;
     let storage = StorageHealth::new(&admin);
+    // Pushed ranges apply through the replication handles, which keep working while B-22 rebuilds a dataset.
+    let mut replication = std::collections::BTreeMap::new();
     let datasets = Registry::open(DATASETS, &config.datasets, |d| {
         let engine = datasets::open_engine(&config.node.data_dir, d)?;
+        replication.insert(
+            d.name,
+            storage.wrap_replication(d.name, "engine", engine.clone()),
+        );
         Ok(storage.wrap(d.name, "engine", engine))
     })?;
     // ponytail: role subsystems don't exist yet; each starts here as its issue lands.
@@ -51,7 +57,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         let name = instance.dataset.name;
         match &instance.engine {
             Ok(engine) if engine.health().is_ok() => {
-                ranged.insert(name.to_owned(), engine.clone());
+                ranged.insert(name.to_owned(), replication[name].clone());
             }
             _ => tracing::warn!(
                 dataset = name,
@@ -63,7 +69,10 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     // recovery matters.
     let skipped = ranged.len() != datasets.iter().count();
     let (members, target) = membership::View::new("cdn", &config.node.location.cell);
-    let peers = std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin));
+    let peers = std::sync::Arc::new(
+        bedrock_lib::transport::Peers::new(&admin)
+            .with_tls(bedrock_lib::transport::tls::start(&config.node, "cdn", &admin).await?),
+    );
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
@@ -72,6 +81,14 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         ranged,
     )
     .map_err(|e| ConfigError(e.to_string()))?;
+    let rebuilding = bedrock_lib::reconciliation::rebuild::start(
+        &admin,
+        &storage,
+        &session,
+        "engine",
+        &replication,
+        bedrock_lib::placement::hash_of("rebuild", &config.node.node_id, b""),
+    );
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
@@ -89,6 +106,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         }
     }
     admin.set_ready(false);
+    rebuilding.abort();
     session.drain().await;
     tracing::info!("shutting down");
     Ok(())
