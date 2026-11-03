@@ -1062,7 +1062,7 @@ The CDN is a backing service: it knows keys and artifacts, never deployments, Wo
   2. Bulk-write (B-09c) every `path/{deployment_id}/{path}` row and one `ref/{sha256}/{deployment_id}` per distinct sha256,
      split into bulks under the size cap. A Worker writes only the ref key of its bundle.
   3. Return the revision of the last bulk once steps 1-2 have succeeded.
-- `release(namespace, deployment_id, files)` bulk-deletes the same keys.
+- `release(namespace, deployment_id, files)` deletes the same keys in bulks under the size cap; a failed bulk is retried.
 - **Contract for callers:** after `publish` returns, the deployment's rows are readable at that revision and their artifacts are
   retained until `release`. Callers write their own references to the deployment (for example in Quicksilver) only after
   publishing, and remove them before releasing. The deploy control plane (B-50) is the first such caller.
@@ -1390,6 +1390,9 @@ Retention state must also recover cleanly after node and relay failures, without
     written its ref keys yet (B-33 step 1) are never candidates, and
   - it is older than the grace period, and no `ref/` key for it exists at deletion time (re-checked by the holders, since a
     new deploy can retain the same content hash again).
+- Deletion is version-protected: the bucket is versioned, and GC deletes only the object version it found released and past
+  the grace period. A publish always uploads (B-33 step 1), creating a newer version that a concurrent GC never deletes, so
+  re-checking ref keys is not the only guard.
 - S3 GC runs in one designated cell: its holders of a range see every ref key of the artifacts in it.
 - Orphans from failed publishes (uploaded, never retained) are swept separately, only after a much longer grace period than any publish takes.
 - Recovery of ref keys after relay and node loss through range bootstrap (B-21), using B-11's consistent materialized-state view and subsequent retained database events, resuming the stream boundary.
@@ -1812,7 +1815,8 @@ Labels: enhancement
       exactly its ref keys and `workers` and `pages` share one holder set. Path rows use the normal `(dataset, namespace, key)` hash.
     - **Writes:** a publish uploads the bytes to S3 by sha256, then writes every path row and ref key of the deployment in bulk
       (B-09c): one revision for all of them. A deployment larger than one bulk is split; the caller records the last bulk's
-      revision. Release is the same keys as one bulk delete. Rerunning either converges.
+      revision. Release starts only after the control plane removed its references to the deployment, then deletes the same
+      keys in bulks under the cap, retrying any that fail. Rerunning either converges.
     - **Reads (Gateway, B-51):** host or project → `deployment_id` → `deployment/{id}` in Quicksilver says Worker or Pages. A Worker
       goes to compute, and its record holds the bundle's sha256. Pages reads `path/{id}/{path}` at the recorded minimum revision,
       then the artifact from its sha256's holders. Both are point reads of immutable data, so a warm Gateway does neither.

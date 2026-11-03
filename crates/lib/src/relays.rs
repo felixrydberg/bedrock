@@ -396,7 +396,10 @@ impl Hub {
                 ..
             } = subscribers.get_mut(&id).unwrap();
             for (dataset, frame) in frames.iter() {
-                let namespaces = &heads[dataset];
+                // A dataset pushed since `heads` was read is not ready this pass.
+                let Some(namespaces) = heads.get(dataset) else {
+                    continue;
+                };
                 if ranges_acked
                     .get(dataset)
                     .is_none_or(|r| *r < frame.revision)

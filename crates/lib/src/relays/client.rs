@@ -50,6 +50,8 @@ struct Pushed {
     me: Option<(String, Scope)>,
     /// The latest pushed set per dataset, applied once the member's view reaches its revision.
     pending: BTreeMap<String, pb::Ranges>,
+    /// Ranges unfollowed on this connection; frames the relay sent before the unfollow are dropped.
+    retired: BTreeSet<(String, Range)>,
 }
 
 fn span(range: Option<(u64, u64)>) -> Option<pb::Span> {
@@ -234,6 +236,7 @@ impl Session {
                 )
             }),
             pending: BTreeMap::new(),
+            retired: BTreeSet::new(),
         };
         let progress = Arc::new(Mutex::new(state));
         let changes = Arc::new(Watched::new(0));
@@ -871,6 +874,7 @@ async fn run(
             });
             // A new session starts with the relay's current set.
             pushed.pending.clear();
+            pushed.retired.clear();
             let error = connection(
                 &peers,
                 upstream,
@@ -1113,9 +1117,14 @@ async fn connected(
             });
             consumers.insert(scope.clone(), consumer);
         }
-        let consumer = consumers
-            .get_mut(&scope)
-            .ok_or_else(|| Status::data_loss("unsolicited relay scope"))?;
+        let Some(consumer) = consumers.get_mut(&scope) else {
+            if let (dataset, _, Some(range)) = &scope
+                && pushed.retired.contains(&(dataset.clone(), *range))
+            {
+                continue;
+            }
+            return Err(Status::data_loss("unsolicited relay scope"));
+        };
         let effect = intake.apply(&scope, consumer, action)?;
         changed(progress, changes, |state| {
             let entry = state.scopes.get_mut(&scope).unwrap();
@@ -1284,6 +1293,7 @@ fn narrow(
         }
     }
     pushed.groups.remove(&(dataset.to_owned(), change.held));
+    pushed.retired.insert((dataset.to_owned(), change.held));
     for scope in &scopes {
         consumers.remove(scope);
     }

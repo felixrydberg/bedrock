@@ -854,6 +854,7 @@ async fn pushed_revokes_wait_for_the_view_are_refused_unless_it_confirms_then_dr
         ranged: BTreeMap::from([("quicksilver".into(), engine)]),
         me: Some(("n1".into(), me.clone())),
         pending: BTreeMap::new(),
+        retired: BTreeSet::new(),
     };
     let progress = Mutex::new(Progress::default());
     let changes = Watched::new(0);
@@ -933,6 +934,8 @@ async fn pushed_revokes_wait_for_the_view_are_refused_unless_it_confirms_then_dr
     }
     assert_eq!(stored(&high), None);
     assert_eq!(stored(&low), Some(b"low".to_vec()));
+    // Frames of the unfollowed range still in flight are dropped, not fatal.
+    assert!(pushed.retired.contains(&("quicksilver".into(), whole)));
     let kept = &consumers[&("quicksilver".into(), "site".into(), Some((0, HALF)))];
     assert_eq!((kept.applied, kept.validated()), (7, true));
     assert_eq!(

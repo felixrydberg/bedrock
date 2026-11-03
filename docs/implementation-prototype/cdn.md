@@ -68,10 +68,13 @@ Reuse KV's replication and sequencing system (§8).
 
 - Introduce a `cdn` dataset with global retention namespaces, replicated to every region. The deploy control plane uses
   `workers` and `pages`; the CDN treats namespace names and deployment IDs as opaque. Its records are never evicted.
-- There are no manifests. A deployment is two kinds of keys, written in one bulk (`feature-drafts.md` §4 decision 14):
+- There are no manifests. A deployment is two kinds of keys, written in bulk (B-09c) and split into several bulks when it
+  exceeds the size cap. Callers reference the deployment only after the last bulk succeeds (`feature-drafts.md` §4
+  decision 14, B-33):
   - `path/{deployment_id}/{path}` → `{sha256, content type, size}`: which artifact a URL path serves.
   - `ref/{sha256}/{deployment_id}`: keeps the artifact. Two deployments sharing a file write two ref keys and share one copy.
-- An artifact is retained while any `ref/` key for it exists; release is a bulk delete of the same keys.
+- An artifact is retained while any `ref/` key for it exists. Release deletes the same keys in bulks under the cap, after
+  callers removed their references to the deployment.
 - Reconcile desired replica counts against local inventories.
 - Recover rows and ref keys through range bootstrap; there is no derived state.
 - Avoid globally tracking individual artifact locations.
