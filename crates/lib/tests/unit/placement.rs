@@ -498,3 +498,54 @@ fn spans_are_half_open_and_end_zero_is_the_top() {
     assert!(valid_span(&span(0, 0)) && valid_span(&span(1, 2)));
     assert!(!valid_span(&span(2, 2)) && !valid_span(&span(3, 2)));
 }
+
+#[test]
+fn handoff_keeps_leaving_owner_until_all_replacements_are_ready() {
+    let owner = |node: &str, state| Owner {
+        node: node.into(),
+        state,
+    };
+    let members = BTreeMap::from([
+        ("old".into(), node("old", "a", 4.0, 1000)),
+        ("new-1".into(), node("new-1", "b", 4.0, 1000)),
+        ("new-2".into(), node("new-2", "c", 4.0, 1000)),
+    ]);
+    let mut directory = Directory::from([(
+        10,
+        vec![
+            owner("old", State::Leaving),
+            owner("new-1", State::Populating),
+            owner("new-2", State::Populating),
+        ],
+    )]);
+    let first = handoff(
+        &directory,
+        &members,
+        &BTreeSet::from([("new-1".into(), 10)]),
+    );
+    assert_eq!(
+        first[&10],
+        vec![
+            owner("old", State::Leaving),
+            owner("new-1", State::Ready),
+            owner("new-2", State::Populating),
+        ]
+    );
+    directory.extend(first);
+    assert!(serves(&directory, "old", 10));
+    assert!(serves(&directory, "new-1", 10));
+    assert!(!serves(&directory, "new-2", 10));
+
+    let second = handoff(
+        &directory,
+        &members,
+        &BTreeSet::from([("new-2".into(), 10)]),
+    );
+    assert_eq!(
+        second[&10],
+        vec![owner("new-1", State::Ready), owner("new-2", State::Ready)]
+    );
+    directory.extend(second);
+    assert!(!serves(&directory, "old", 10));
+    assert!(serves(&directory, "new-2", 10));
+}
