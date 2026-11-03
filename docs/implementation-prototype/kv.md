@@ -428,14 +428,16 @@ The earlier origin-cell and regional-tier design is superseded by `feature-draft
 12 (2026-10-31). In short:
 
 - **Storage.** Each namespace is its own database in S3, written by one logical `bedrock-api` writer. No cell or node owns it.
-- **Readers.** `bedrock-kv`, a separate binary from `bedrock-quicksilver`, runs read-only namespace readers that cache hot
-  blocks/entries. A miss walks optional L1 → preferred healthy reader in the cell → its local blocks → S3.
-- **Routing.** The preferred reader is the rendezvous-hash winner of `(namespace, key)` over the cell's healthy `bedrock-kv`
-  members. There are no virtual buckets, ownership table, owner checks or bucket moves for customer KV; any eligible reader
-  may serve, and losing one only cools caches.
+- **Readers.** Only the namespace's home region runs its read-only SlateDB namespace reader. It keeps an engine handle and
+  may cache blocks locally. Other regions do not open SlateDB databases for that namespace; they cache returned values
+  for at most 60 seconds.
+- **Routing.** Hash `(namespace, key)` over healthy `bedrock-kv` nodes in the request's region to select a preferred value
+  cache. On a miss, resolve the home region through Quicksilver and forward to its namespace reader. There are no virtual
+  buckets or durable cache ownership; another eligible local cache may serve.
 - **Freshness.** Minimum-revision reads need a sufficiently new namespace view, including for absence and `LIST`; a lagging
   S3 view waits or uses the writer's recent committed state.
-- **Adding capacity** adds readers; nothing moves. A drain closes readers and releases caches, never S3 data.
+- **Adding capacity** adds regional value-cache capacity. A home-region reader may be reopened after eviction; a drain
+  releases local handles/cache state, never S3 data.
 
 The L1/L2 bucket model in the rest of this document applies to pushed datasets (Quicksilver, Auth) and CDN.
 
@@ -523,8 +525,9 @@ Relays must accurately advertise which contiguous revision ranges are available.
 
 #### B. Cache Fills
 
-There is no separate cache-fill broadcast channel. Customer KV fills come from S3 into the preferred `bedrock-kv` reader
-and from it into the requester's L1 (§9). Fills never travel up the relay tree.
+There is no separate cache-fill broadcast channel. For customer KV, the home-region SlateDB reader fetches blocks from S3
+and returns values to the preferred regional `bedrock-kv` cache; the regional cache may fill the requester's L1 (§9).
+Fills never travel up the relay tree.
 
 An older cache fill must never overwrite a newer value or an applied delete. A fill carries the sequence its source
 had applied, which must be at least the receiver's own applied sequence for the namespace. The receiver inserts it
@@ -565,6 +568,10 @@ Critical ownership transitions use fencing epochs.
 
 ## 12. Customer KV Write Sequence
 
+Customer KV request-rate limits are out of scope at this stage, including Cloudflare's request-rate policies. A future
+shared platform rate-limit infrastructure (B-56 in `feature-drafts.md`) will provide this functionality for KV and other
+services. Current size/storage quotas, bounded queues, coalescing and backpressure still protect service capacity.
+
 Example: a namespace homed in Europe is cached in America.
 
 1. The request reaches any API node.
@@ -578,13 +585,17 @@ No relay carries customer-KV events.
 
 ## 13. Customer KV Read Sequence
 
-Example: a US node requests a European customer's key.
+Example: a Frankfurt node requests a key whose namespace is homed in Paris.
 
-1. Check the optional local L1.
-2. On a miss, ask the cell's preferred reader: the rendezvous-hash winner of `(namespace, key)` over the cell's healthy
-   `bedrock-kv` members. If it fails, try the next-ranked reader.
-3. The reader serves from its cached blocks, or opens the namespace database and reads the needed blocks from S3.
-4. Validate the returned value, expiration and namespace-view revision.
+1. Check authorization and namespace deletion state, then check the optional Frankfurt L1 and route a miss to the
+   preferred healthy Frankfurt value-cache node selected by rendezvous hash of `(namespace, key)`.
+2. On a regional cache miss, resolve the home region through Quicksilver and forward the request to the Paris namespace
+   reader. Only that home-region reader opens the namespace's SlateDB database; it serves cached blocks or fetches needed
+   ranges from S3.
+3. Return the value to Frankfurt, cache it there for at most 60 seconds, and return it to the requester. If the home
+   reader was evicted, reopen it on demand.
+4. Validate expiration and the namespace-view revision. A minimum-revision read must bypass cached values that cannot
+   prove the requested revision.
 
 A minimum-revision read requires a namespace view at least that new, including for an absence or `LIST`. No subscription
 is created on read.

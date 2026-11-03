@@ -183,6 +183,8 @@ Rules this implies:
 | **M — Node security** (parent [#44](https://github.com/felixrydberg/bedrock/issues/44); scope amended 2026-11-03, drafts not yet issues) |||||
 | B-55 | Mutual TLS and caller identity for node-to-node traffic, enabled by config | Shared core | `lib/transport` + every bin | B-03, B-12, B-17 |
 | B-54 | Deployment guide: private networking and node certificates (Kubernetes, Docker, bare metal) | Foundation (docs) | `docs/deployment/` + `deploy/` | B-02, B-55 |
+| **N — Shared platform infrastructure (future)** |||||
+| B-56 | Shared API rate-limit infrastructure | Shared infrastructure | shared contracts in `lib`; API integration | To be agreed; does not gate initial KV |
 
 ### Parallel work inside the shared core
 
@@ -661,7 +663,8 @@ directory must locate that storage without assigning an origin cell or tracking 
 **Describe the solution you'd like**
 - Customer `kv` is a logical dataset using B-11 materialized storage through B-39 readers, not a relay subscription or a local replicated engine instance.
 - Namespace directory in Quicksilver: stable ID → home region/writer, canonical S3 storage identity and format version,
-  quotas, permissions, cache/read-residency policy and deletion state. Writer fencing is separate from cache placement.
+  quotas, permissions, cache/read-residency policy and deletion state. The home region is the only region that opens the
+  namespace's SlateDB reader; other regions hold returned-value caches with a fixed 60-second TTL. Writer fencing is separate from cache placement.
 - Create, delete and list namespaces. An empty namespace needs only its directory entry; create engine objects on first write.
   No `origin_cell`, global active/dormant state, cached-key inventory or per-namespace membership heartbeat.
 - Deletion first prevents new authorized opens through the directory, then retires the namespace through B-39's safe
@@ -701,13 +704,17 @@ protocol already belong to B-11; customer-KV reader integration follows the full
   Reuse structured error semantics: absent key is `Ok(None)`; corruption/unavailability/unsupported operations are errors.
   Preserve the local `StorageEngine`, its existing adapters and their contract suite for pushed datasets.
 - One engine database per customer namespace under a canonical namespace-derived S3 prefix. No per-node authoritative
-  shard, database per virtual bucket or segment per namespace inside one global database. Readers load only databases
-  requested on that node. Shared caches have process-wide budgets and namespace isolation; no cache allocation per dormant
-  namespace. A single large namespace remains one writer/database; splitting it is future work, not claimed linear scaling.
+  shard, database per virtual bucket or segment per namespace inside one global database. Only the namespace's home
+  region opens its SlateDB reader; remote regions cache returned values and never open that namespace's database. Shared
+  caches have process-wide budgets and namespace isolation; no cache allocation per dormant namespace. A single large
+  namespace remains one writer/database; splitting it is future work, not claimed linear scaling.
 - Consume B-11's generic materialized namespace state without changing its commit authority. Preserve namespace revisions,
   deletes, metadata, expiration and `committed_at`; engine sequence numbers are not Bedrock namespace revisions.
-- Respect separate committed, applied, S3-published and reader-visible positions. Use a coherent recent-state read/wait
-  path for minimum-revision requests while S3 readers lag. B-11 owns validated durable-database recovery, retry expiry
+- Open the namespace's read-only SlateDB handle only in its home region, with one logical home-region reader per active
+  namespace. Its connection may be evicted under B-28's handle/memory pressure or idle timeout and reopened on demand.
+  Other regions do not open the database; they cache values returned by the home reader for at most 60 seconds.
+  Respect separate committed, applied, S3-published and reader-visible positions. Use a coherent recent-state read/wait
+  path for minimum-revision requests while the home reader's S3 view lags. B-11 owns validated durable-database recovery, retry expiry
   and stale-publisher fencing; future Raft additionally retains its committed not-yet-durable tail. Native checkpoints are
   distinct from namespace progress; portable export is optional separate work.
 - Reuse B-11's `lib/s3` range-I/O and conditional publication adapter, extending only for demonstrated reader needs. Do not implement a block read by
@@ -755,12 +762,15 @@ S3 database without customer-KV relay delivery.
 
 **Describe the solution you'd like**
 - Operations: `PUT`, `DELETE` and bulk/batch operations; preserve value metadata and TTL/expiration.
+- Match Cloudflare Workers KV write-binding behavior for `put` and `delete`, including option names, metadata, expiration semantics and success/error behavior.
 - Look up the home writer through the directory, then forward to it.
 - Commit through B-11 atomic persistence and remote flush (or majority-fsynced B-09b when implemented); B-39 integrates KV readers. The write API remains generic over
   datasets and opaque payloads; it never imports the `kv` binary. No customer `kv` event is published to a relay stream.
 - Return the committed namespace revision. S3 publication and reader visibility can lag a future Raft acknowledgement;
   expose the recent-state read/wait path rather than weakening minimum-revision reads.
 - Values are validated against quota and size limits.
+- Customer KV request-rate limiting is out of scope at this stage. Implement it later through B-56's shared infrastructure,
+  rather than a KV-specific limiter. Size/storage quotas, bounded queues and backpressure remain current requirements.
 - Bound the active writer pool and persistence work; open its engine before standalone persistence. Future Raft may
   commit before namespace persistence, but must bound and backpressure its committed not-yet-durable tail.
 - Metrics: commit latency, publication lag, forwarding, rejected/busy writes and pending materialization bytes.
@@ -784,19 +794,23 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-Reads should reuse cached blocks and open namespace readers without loading a whole namespace or subscribing to its writes.
-Every eligible KV reader can reach the same S3 state; hashing chooses cache affinity, not ownership of authoritative data.
+Reads should reuse short-lived regional value caches and read the namespace database only in its home region, without
+loading a whole namespace or subscribing to its writes.
 
 **Describe the solution you'd like**
-- `GET`, metadata-aware get and bulk reads: optional local L1 → preferred healthy KV cache reader in the cell → that reader's
-  B-39 namespace view and block cache → S3 range reads. Coalesce identical misses and namespace opens. No mandatory regional
-  cache tier, origin cell or cold namespace restore. B-22's generic freshness/fallback helpers remain reusable after §5 amendments.
-- Pick the preferred reader with `relays::sources::readers` (#20 / B-19), which ranks over `(namespace, original key)`. A routing change only changes the
-  preferred cache: another eligible reader may serve, and no bucket copy, replica-completeness check or relay handoff is needed.
-  Keep original keys in the namespace database; hashes must not replace the index needed for prefix listing.
-- Resolve the namespace's home writer/storage identity from the Quicksilver namespace directory (B-25) for S3 access and
-  the recent-committed-state path. Deferred here from #20 / B-19, with its test: another reader serves through S3, or
-  waits or uses recent committed state when the S3 view lags.
+- `GET`, metadata-aware get and bulk reads: optional local L1 → preferred healthy KV value-cache reader in the request's
+  region, selected by rendezvous hash of `(namespace, original key)`. On a miss, resolve the home region through the
+  Quicksilver namespace directory, then forward to that namespace's home-region reader. That reader owns the SlateDB
+  handle and reads cached blocks or fetches needed ranges from S3. It returns the value to the requesting region, whose
+  selected cache stores it for at most 60 seconds before returning it to the caller. Remote-region KV nodes never open
+  that namespace's SlateDB database. Coalesce identical local misses and home-reader opens.
+- A routing change only changes the preferred regional value cache: another eligible local cache may serve, and no bucket
+  copy, replica-completeness check or relay handoff is needed. Keep original keys in the namespace database; hashes must
+  not replace the index needed for prefix listing.
+- Resolve the namespace's home writer and storage identity from the Quicksilver namespace directory (B-25) only after a
+  regional value-cache miss. The home-region reader uses that identity for S3 access and the recent-committed-state path.
+  If its S3 view lags a required revision, it waits or reads coherent recent committed state; a remote cache must not
+  disguise that lag as a fresh result.
 - `LIST` scans the namespace database's complete ordered view, never the incomplete entry/block caches. One reader can
   execute a list without scattering to cache holders. Use an opaque cursor bound to namespace, prefix and last returned
   original key; it must not encode a physical node. Default pages do not promise a snapshot spanning multiple requests.
@@ -804,13 +818,24 @@ Every eligible KV reader can reach the same S3 state; hashing chooses cache affi
   at revision 5 may be valid in a namespace view at revision 100. Enforce minimum revision against the view that proves the
   result, including an absence, not merely against the key's last mutation. Never let an older fill replace a newer verified
   result; a stale reader must not reset cache freshness indefinitely by re-serving old state.
-- Preserve configurable entry `cache_ttl` (default 60 seconds, with the agreed floor). Immutable SST blocks are retained by
-  cache budgets; a block's age is not proof that the namespace view is current. Publication/reader-refresh limits are separate.
-- Refresh/pin namespace views through B-11's manifest/checkpoint protocol integrated by B-39. For data newer than the S3 view, use a coherent
-  committed recent-state read path or wait for publication; this includes updates, deletes and listing, not just misses.
+- Customer KV request-rate limiting, including Cloudflare's request-rate limits, is excluded from current API compatibility
+  acceptance. Add it later through B-56's shared infrastructure. Existing coalescing, source-capacity protection and bounded
+  concurrency/backpressure remain required.
+- Regional value-cache entries use a fixed 60-second TTL. A cache fill is eligible until expiry or earlier eviction;
+  hits do not renew its expiry. Configurable read-cache TTL is deferred. This controls regional cache residence,
+  not freshness of a lagging home-region view. Minimum-revision requests bypass or reject cached entries below the
+  requested revision. Home-region SlateDB block residency is governed separately by B-28 budgets and reader lifecycle.
+- Target Cloudflare Workers KV namespace binding compatibility: `get`, `getWithMetadata`, `put`, `delete` and `list`.
+  Match supported value types, option names, result shapes, metadata, expiration and cursor pagination. Configurable
+  read-cache `cacheTtl` support is deferred; regional caching currently uses the fixed 60-second policy. Keep key
+  expiration (`expiration` / `expirationTtl`) separate from regional cache expiry.
+- The home-region reader refreshes/pins namespace views through B-11's manifest/checkpoint protocol integrated by B-39.
+  For data newer than the S3 view, use a coherent committed recent-state read path or wait for publication; this includes
+  updates, deletes and listing, not just misses.
   No customer-KV relay subscription, Raft feed to every reader, or cache-fill broadcast is created.
-- Cache not-found results at a proven namespace view revision with a bounded TTL. Enforce key expiration at read time
-  using the recorded expiration, rather than waiting for compaction. Authorization/deletion checks precede serving caches.
+- Cache positive and not-found results for at most 60 seconds at a proven namespace view revision; eviction may happen earlier.
+  Key expiration takes precedence over cache TTL. Enforce key expiration at read time using the recorded expiration,
+  rather than waiting for compaction. Authorization/deletion checks precede serving caches.
 - Metrics: cache hit/miss and negative-hit rates, source-read latency/bytes, coalescing, reader lag, freshness waits,
   errors and reopen latency. Namespace/key/cursor details stay in introspection/top-N.
 
@@ -818,10 +843,17 @@ Every eligible KV reader can reach the same S3 state; hashing chooses cache affi
 - **Implementation:** KV.
 - **Module:** `kv/operations`, `kv/storage`, B-39's shared asynchronous read contract.
 - **Doc reference:** §4 decision 11; the origin/tier portions of `kv.md` §9 and §13 are superseded.
+  [Cloudflare Workers KV read API](https://developers.cloudflare.com/kv/api/read-key-value-pairs/) and
+  [limits](https://developers.cloudflare.com/kv/platform/limits/).
 - **Depends on:** B-26.
-- **Acceptance criteria:** A cold cross-region read opens only its namespace and fetches relevant blocks; a repeat hits
-  cache. Killing the preferred cache reader succeeds through another reader without authoritative data movement.
-  Minimum-revision get/list/not-found checks work across delayed S3 publication, reopen and node changes. Deletes cannot
+- **Acceptance criteria:** A cold cross-region read opens the namespace reader only in its home region and fetches relevant
+  blocks; the requesting region caches the returned value for at most 60 seconds.
+  A repeat can hit it until expiry or eviction.
+  No non-home region opens a SlateDB database for the namespace. Killing the preferred regional cache reader succeeds
+  through another local cache or by falling back to the home reader, without authoritative data movement.
+  TTL tests cover fixed 60-second expiry, hits that do not extend expiry, and early eviction for
+  positive and negative cache entries. Minimum-revision get/list/not-found checks work across delayed S3 publication,
+  reopen and node changes. Deletes cannot
   be resurrected by an old fill; expired data is not served. Pagination survives cache eviction and routing changes.
   Concurrent identical misses/opens cause one operation per receiving coalescer, and freshness bounds include publication
   and reader-refresh lag rather than claiming cache TTL alone bounds all staleness.
@@ -851,9 +883,10 @@ home region, so many dormant applications cost only directory metadata and S3 ob
   need not discard useful blocks, and evicting blocks need not close a reader. Quicksilver/Auth local stores have separate budgets.
 - Finish in-flight operations before closing a reader and release its checkpoint/reference protection safely. Coalesce
   concurrent reopens. Failure to open one namespace is isolated; process readiness does not require opening every namespace.
-- All KV nodes, including home-region nodes, make these decisions locally. No global dormant/rehydrating directory state,
-  eviction announcement, customer-KV subscription, whole-database restore or authoritative data migration. Persistent TTL
-  and S3 GC must never be triggered merely because a cache/reader became idle.
+- Regional cache nodes make value-cache decisions locally. Home-region nodes make SlateDB block and reader residency
+  decisions locally. No global dormant/rehydrating directory state, eviction announcement, customer-KV subscription,
+  whole-database restore or authoritative data migration. Persistent TTL and S3 GC must never be triggered merely because
+  a cache/reader became idle.
 - B-21b drain hook stops new cache routing, lets reads finish, closes the selected readers and releases local cache state.
   It never deletes the S3 namespace database. API writer-handle retention is separate and must preserve the committed tail.
 - Metrics: open readers, opens/evictions by reason, coalesced reopens, disk/RAM usage against budgets and cache churn.
@@ -1775,6 +1808,40 @@ keep traffic private.
 
 ---
 
+### N — Shared platform infrastructure (future)
+
+#### B-56 — Shared API rate-limit infrastructure
+
+```
+Title:  Feature 🚀: Shared API rate-limit infrastructure across services
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+Request-rate limits should use shared platform functionality that services can integrate, rather than separate product
+implementations. Customer KV request-rate limiting is deferred until this infrastructure is available; it does not block
+initial KV delivery.
+
+**Describe the solution you'd like**
+- Provide reusable rate-limit contracts and implementation in `lib`, with service API integration. KV consumes the shared
+  functionality later; it does not implement its own rate-limit system in B-25 through B-29 or B-39.
+- Agree policy configuration, caller/scope identity, accounting scope and behavior during failures before implementation.
+  The algorithm, deployment topology and distributed coordination remain design decisions for this draft.
+- Keep customer request-rate policies separate from storage/size quotas and existing overload protection such as bounded
+  queues, coalescing, source-capacity limits and backpressure.
+- Use low-cardinality metrics for allowed/rejected requests and limiter failures; expose caller/namespace details through
+  introspection rather than metric labels.
+
+**Additional context**
+- **Implementation:** Future shared infrastructure; draft only, no GitHub issue created.
+- **Module:** Shared contracts in `lib` and service API integration; final placement to be agreed.
+- **Depends on:** To be agreed before implementation. This draft is not a prerequisite for initial KV acceptance.
+- **Acceptance criteria:** The same limiter supports multiple service integrations with isolated scopes and consistent
+  decisions/errors. Validate policy enforcement, failure behavior and scope isolation through shared contract tests and
+  applicable normal/simulation checks when implemented. KV adoption follows this shared work.
+
+---
+
 ## 4. Open decisions
 
 ### Decided
@@ -1835,21 +1902,25 @@ keep traffic private.
       not-yet-durable tail for retry/recovery. Truncation requires a recoverable native checkpoint covering every namespace
       in the prefix plus cutoff index/term/membership; a progress record alone is insufficient. Keep committed, buffered,
       durable and reader-visible positions distinct. Fence stale engine publishers. Portable live-key export is optional.
-    - **Readers and routing:** ordinary `bedrock-kv` nodes read the same namespace databases and cache hot blocks/entries.
-      HRW over `(namespace, key)` selects a preferred reader to reuse cache (no ranges or buckets, decisions 12, 13); it does not shard persistent
-      data or impose durable ownership. Another eligible reader may serve. Adding/removing a cache node needs no namespace
+    - **Readers and routing:** only the namespace's home region opens its SlateDB database through a dedicated read-only
+      namespace reader. Other regions do not open that database. HRW over `(namespace, key)` selects the preferred regional
+      value-cache node (no ranges or buckets, decisions 12, 13); it does not shard persistent data or impose durable ownership.
+      On a regional cache miss, resolve the home region from Quicksilver and forward there. The home reader returns the
+      value, and the requesting region may cache it for at most 60 seconds. Adding/removing a cache node needs no namespace
       move, replica rebuild or customer-KV relay subscription. Membership still comes from the Quicksilver/Auth connection.
       One logical writer remains a write-throughput limit even when readers scale out.
-    - **Read semantics:** optional L1 → preferred healthy cell reader → local blocks → S3. No mandatory regional tier or
-      origin cell. `LIST` scans one namespace's full ordered database view; pagination uses original keys and a logical cursor,
-      not cache-node locations or a scatter/merge over cache holders. A minimum-revision read requires a sufficiently new
-      namespace view, including for an absence. Wait for publication or read coherent recent committed state if the S3 view
-      lags; do not fetch only not-found cases. Cache TTL alone does not bound publication/reader-refresh lag.
-    - **Local residency:** every KV node, including the home region, independently bounds disk cache, memory/manifest
-      overhead, open readers and in-flight opens. Soft per-namespace cached-byte shares may borrow free capacity; quotas on
-      total persistent namespace size are separate. Disk pressure evicts cold blocks; handle/memory pressure and idle timeout
-      close idle readers. Finish in-flight reads, coalesce reopen and release checkpoint protection safely. An open reader
-      need not keep all blocks, and useful blocks can outlive a reader. No global dormant/rehydrating state or eviction broadcasts.
+    - **Read semantics:** optional local L1 → preferred healthy regional value cache → on miss, Quicksilver home-region
+      lookup → home-region SlateDB reader → its block cache/S3 ranges or coherent recent committed state. `LIST` runs against
+      the home namespace's full ordered database view; pagination uses original keys and a logical cursor, not cache-node
+      locations or a scatter/merge over cache holders. A minimum-revision read requires a sufficiently new namespace view,
+      including for an absence. Wait for publication or read coherent recent committed state if the home S3 view lags; a
+      regional value cache must not satisfy a minimum revision it cannot prove. The fixed 60-second TTL bounds regional cache
+      residence, not publication lag.
+    - **Local residency:** regional KV nodes independently bound value-cache bytes, RAM and in-flight fetches. Only home-
+      region nodes manage SlateDB block cache, memory/manifest overhead, open readers and in-flight opens. Soft per-namespace
+      cache shares may borrow free capacity; quotas on total persistent namespace size are separate. Pressure can evict
+      regional values or cold home-region blocks; idle timeout closes home readers. Finish in-flight reads, coalesce reopen
+      and release checkpoint protection safely. No global dormant/rehydrating state or eviction broadcasts.
     - **Lifecycle and retention:** closing/evicting a local reader never deletes S3 data or expires customer keys. TTL and
       namespace deletion are explicit data semantics; KV enforces expiration on reads, and background compaction/GC reclaims
       obsolete physical data with reader protection. API writer handles have a separate retention policy and recovery duty.
