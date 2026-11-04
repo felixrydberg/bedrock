@@ -231,7 +231,11 @@ impl StorageHealth {
             StorageError::Corruption(_) => ("corruption", true),
             StorageError::IoError(_) => ("io", false),
             StorageError::Unavailable(_) => ("unavailable", false),
-            StorageError::Fenced(_) | StorageError::Unsupported(_) => return,
+            StorageError::Fenced(_)
+            | StorageError::Unsupported(_)
+            | StorageError::Overloaded(_) => {
+                return;
+            }
         };
         let quarantine = quarantine
             || source.consecutive.fetch_add(1, Ordering::Relaxed) + 1 >= CONSECUTIVE_FAILURES;

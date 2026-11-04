@@ -419,7 +419,7 @@ A cell is a self-contained cluster: its own membership, placement directory, L2 
 - Each cell has its own placement directory. Cells do not know each other's ranges.
 - Reads stay inside the cell, except customer KV misses (below).
 - Cells apply revisions independently. A client moved between cells uses minimum-revision reads so it never sees an older value.
-- Losing a cell moves its traffic to cold caches elsewhere. Misses are coalesced at every tier and shared read capacity (S3, recent-state reads) is rate-limited per cell to absorb it.
+- Losing a cell moves its traffic to cold caches elsewhere. Misses are coalesced at each receiving node, and shared read capacity (S3, namespace opens, recent-state reads) has bounded concurrency and queues per cell to absorb it; there is no global deduplication across nodes.
 - Moving client traffic between cells is out of scope for now.
 
 ### Customer KV: S3 Namespace Readers

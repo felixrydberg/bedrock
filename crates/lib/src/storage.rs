@@ -45,6 +45,9 @@ pub enum StorageError {
     Fenced(ErrorContext),
     /// The adapter does not provide this capability. Adapters report it rather than approximate it.
     Unsupported(ErrorContext),
+    /// The source is healthy but at its limit for this caller, who should retry with backoff (#24 / B-22b). It proves
+    /// nothing about the key or the source's health.
+    Overloaded(ErrorContext),
 }
 
 /// Where a storage error happened, as far as the adapter can tell.
@@ -67,7 +70,8 @@ impl StorageError {
             | StorageError::Corruption(c)
             | StorageError::Unavailable(c)
             | StorageError::Fenced(c)
-            | StorageError::Unsupported(c) => c,
+            | StorageError::Unsupported(c)
+            | StorageError::Overloaded(c) => c,
         }
     }
 }
@@ -80,6 +84,7 @@ impl fmt::Display for StorageError {
             StorageError::Unavailable(_) => "unavailable",
             StorageError::Fenced(_) => "writer fenced",
             StorageError::Unsupported(_) => "unsupported",
+            StorageError::Overloaded(_) => "overloaded",
         };
         let c = self.context();
         write!(f, "{kind} in {} instance {}", c.engine, c.instance)?;

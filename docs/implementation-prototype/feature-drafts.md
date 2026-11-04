@@ -145,7 +145,7 @@ Rules this implies:
 | [B-21](https://github.com/felixrydberg/bedrock/issues/22) | Relay-driven L2 range handoff: assign, bootstrap, ready, revoke | Shared core | `lib/relays` + `lib/buckets` + `lib/reconciliation` | B-19, B-20 |
 | B-21b | Drain nodes, cells and namespaces for every dataset | Shared core | `lib/reconciliation` + `lib/placement` | B-15, B-20, B-21 |
 | [B-22](https://github.com/felixrydberg/bedrock/issues/23) | Tiered read fallback and cache rebuild | Shared core | `lib/health` + `lib/reconciliation` | B-14, B-19, B-11 |
-| [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Read protection: coalescing and per-cell limits (amendment pending, §5) | Shared core | `lib/reconciliation` + callers | B-22 |
+| [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Read protection: coalescing and per-cell limits | Shared core | `lib/health` + callers | B-22 |
 | [B-23](https://github.com/felixrydberg/bedrock/issues/25) | Hardening gate: TLA+ model, deterministic simulation, real-binary crash tests | Shared core | `lib` (test support), `docs/spec/` | B-23a, created B-01 … B-22b; excludes later B-09b/B-21b |
 | **H — First KV** |||||
 | [B-24](https://github.com/felixrydberg/bedrock/issues/55) | Quicksilver dataset | KV | `quicksilver/namespaces` | B-23 |
@@ -624,6 +624,18 @@ Created: [#23](https://github.com/felixrydberg/bedrock/issues/23) — Feature �
 #### B-22b — Origin read protection: coalescing and per-cell limits
 
 Created: [#24](https://github.com/felixrydberg/bedrock/issues/24) — Feature 🚀: Request coalescing at every tier and per-cell rate limits on origin reads
+
+Limits per source on each node (`lib/health/protection`). They are starting values, not measurements; B-53 tunes them.
+
+| Source | Total running | Running per cell | Queued per cell |
+|---|---|---|---|
+| S3 fetches | 64 | 16 | 64 |
+| Namespace opens | 8 | 2 | 8 |
+| Recent committed state | 32 | 8 | 32 |
+
+A request over its cell's queue fails at once with a retryable `Overloaded`. Fairness comes from the first-come shared
+queue: a cell can have at most its per-cell share in it. New read paths must wrap these sources: B-27 (S3 reads, recent
+state), B-28 (`NamespaceOpens`) and B-31/B-34 (artifact fetches; warming uses its own lane, e.g. `{cell}/warm`).
 
 ---
 

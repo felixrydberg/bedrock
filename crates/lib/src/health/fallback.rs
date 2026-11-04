@@ -11,6 +11,11 @@
 //!   fails `Unavailable`; an unavailable source never proves a key missing.
 //! - **Fills.** The answer is offered to the tiers above it that missed or were stale. A receiver accepts it only if it
 //!   is not further along itself ([`CacheTier`] does this atomically).
+//! - **Coalescing.** Identical concurrent reads share one walk of the chain, fills included (#24 / B-22b), so a read
+//!   arriving just after finds the filled cache. A waiter never takes an answer that does not apply to it: one too old
+//!   for its minimum revision, a failure from a stricter read, or another cell's overload. It reads again instead.
+//! - **Overload.** Wrap shared sources in [`Limited`]. An overloaded tier is skipped like a failed one, but when no tier
+//!   answers, the read fails `Overloaded` rather than `Unavailable`, so the caller knows to back off.
 //!
 //! Tiers verify what they read (checksums, content hashes) and report corruption to storage health themselves.
 
@@ -21,6 +26,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use sha2::{Digest, Sha256};
 
+use super::protection::{self, Coalescer, Limiter};
 use super::storage::StorageHealth;
 use crate::storage::{ErrorContext, StorageEngine, StorageError, StorageResult, WriteBatch};
 use crate::transport::admin::Admin;
@@ -38,6 +44,17 @@ pub enum Read {
     /// This tier does not hold the key; it proves nothing.
     Miss,
     Found(Found),
+}
+
+/// What a product's read key tells the protection layer. An artifact read might be
+/// `Get { cell: "cell-a", namespace: "workers", key: hash }`.
+pub trait ReadKey: Sync {
+    /// The caller's cell, which pays for the read in any [`Limited`] tier. Background work names its own lane; see
+    /// [`Limiter::acquire`].
+    fn cell(&self) -> &str;
+
+    /// Namespace and key. Equal values are the same read, whichever cell asks, so `cell` must not be part of them.
+    fn identity(&self) -> (String, Vec<u8>);
 }
 
 /// One tier of a product's read path. `K` is whatever the product reads by.
@@ -80,25 +97,52 @@ impl Metrics {
     }
 }
 
+/// A finished read: the cell that led it, the minimum revision it asked for, and its answer.
+type Landed = (String, u64, StorageResult<Found>);
+
 pub struct SourceChain<K: ?Sized> {
     dataset: String,
     tiers: Vec<Arc<dyn Tier<K>>>,
     metrics: Metrics,
+    reads: Coalescer<(String, Vec<u8>), Landed>,
 }
 
-impl<K: ?Sized + Sync> SourceChain<K> {
-    pub fn new(dataset: &str, tiers: Vec<Arc<dyn Tier<K>>>, metrics: &Metrics) -> Self {
+impl<K: ?Sized + ReadKey> SourceChain<K> {
+    pub fn new(
+        dataset: &str,
+        tiers: Vec<Arc<dyn Tier<K>>>,
+        metrics: &Metrics,
+        protection: &protection::Metrics,
+    ) -> Self {
         SourceChain {
             dataset: dataset.to_owned(),
             tiers,
             metrics: metrics.clone(),
+            reads: Coalescer::new(dataset, protection),
         }
     }
 
     /// The first answer at least `min_revision` new, after filling the tiers above it that missed or were stale.
+    /// Concurrent reads of one key share a single walk of the chain.
     pub async fn read(&self, key: &K, min_revision: u64) -> StorageResult<Found> {
+        let accept = |(leader, asked, answer): &Landed| match answer {
+            Ok(found) => found.revision >= min_revision,
+            // It is the leader's cell that is over its limit; this caller may have room in its own.
+            Err(StorageError::Overloaded(_)) => leader == key.cell(),
+            // A stricter read failing says nothing about this one.
+            Err(_) => *asked <= min_revision,
+        };
+        let walk = || async {
+            let answer = self.walk(key, min_revision).await;
+            (key.cell().to_owned(), min_revision, answer)
+        };
+        self.reads.run(key.identity(), accept, walk).await.2
+    }
+
+    async fn walk(&self, key: &K, min_revision: u64) -> StorageResult<Found> {
         let mut behind: Vec<&Arc<dyn Tier<K>>> = Vec::new();
         let mut failures = Vec::new();
+        let mut overloaded = false;
         for tier in &self.tiers {
             match tier.read(key, min_revision).await {
                 Ok(Read::Found(found)) if found.revision >= min_revision => {
@@ -121,12 +165,17 @@ impl<K: ?Sized + Sync> SourceChain<K> {
                     behind.push(tier);
                 }
                 Err(error) => {
-                    self.count(tier.name(), "error");
+                    let is_overload = matches!(error, StorageError::Overloaded(_));
+                    overloaded |= is_overload;
+                    self.count(
+                        tier.name(),
+                        if is_overload { "overloaded" } else { "error" },
+                    );
                     failures.push(format!("{}: {error}", tier.name()));
                 }
             }
         }
-        Err(StorageError::Unavailable(ErrorContext {
+        let context = ErrorContext {
             engine: "fallback",
             instance: self.dataset.clone(),
             file: None,
@@ -135,7 +184,12 @@ impl<K: ?Sized + Sync> SourceChain<K> {
                 "no tier answered at revision {min_revision} or newer ({})",
                 failures.join("; ")
             ),
-        }))
+        };
+        Err(if overloaded {
+            StorageError::Overloaded(context)
+        } else {
+            StorageError::Unavailable(context)
+        })
     }
 
     fn count(&self, tier: &'static str, outcome: &'static str) {
@@ -147,6 +201,35 @@ impl<K: ?Sized + Sync> SourceChain<K> {
                 outcome,
             })
             .inc();
+    }
+}
+
+/// Puts a [`Limiter`] in front of a shared source, e.g. S3 or recent committed state. Several chains on a node can
+/// share one limiter, and so one budget for that source.
+pub struct Limited<K: ?Sized> {
+    source: Arc<dyn Tier<K>>,
+    limiter: Arc<Limiter>,
+}
+
+impl<K: ?Sized> Limited<K> {
+    pub fn new(source: Arc<dyn Tier<K>>, limiter: Arc<Limiter>) -> Self {
+        Limited { source, limiter }
+    }
+}
+
+#[async_trait::async_trait]
+impl<K: ?Sized + ReadKey> Tier<K> for Limited<K> {
+    fn name(&self) -> &'static str {
+        self.source.name()
+    }
+
+    async fn read(&self, key: &K, min_revision: u64) -> StorageResult<Read> {
+        let _permit = self.limiter.acquire(key.cell()).await?;
+        self.source.read(key, min_revision).await
+    }
+
+    async fn fill(&self, key: &K, found: &Found) -> StorageResult<()> {
+        self.source.fill(key, found).await
     }
 }
 
