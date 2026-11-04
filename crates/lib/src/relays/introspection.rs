@@ -1,8 +1,8 @@
 //! Relay introspection API and low-cardinality metrics (#17 / B-18b).
 //!
 //! Metrics carry only `dataset` or `service`, plus the process's fixed `tier` and `cell` labels. Per-namespace and
-//! per-subscriber detail is served as paginated JSON on `/introspect/{upstream,namespaces,subscribers,membership}`,
-//! filtered by `dataset`, namespace `prefix` and `service`; the only per-namespace series are the top-[`TOP`] gauges.
+//! per-subscriber detail is served as paginated JSON on
+//! `/introspect/{upstream,namespaces,subscribers,membership,siblings}`, filtered by `dataset`, namespace `prefix` and `service`; the only per-namespace series are the top-[`TOP`] gauges.
 //! End-to-end lag is `now - committed_at` on the hub's runtime clock as each event enters a relay, at every tier.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +59,9 @@ pub(super) struct Stats {
     bytes_out: Family<Dataset, Counter>,
     lag: Lag,
     full: Family<Service, Counter>,
+    follows: Family<Dataset, Counter>,
+    recoveries: Family<Dataset, Counter>,
+    catch_up: Lag,
 }
 
 struct Namespace {
@@ -119,6 +122,9 @@ impl Default for Stats {
             bytes_out: Family::default(),
             lag: Family::new_with_constructor(lag_histogram),
             full: Family::default(),
+            follows: Family::default(),
+            recoveries: Family::default(),
+            catch_up: Family::new_with_constructor(lag_histogram),
         }
     }
 }
@@ -182,6 +188,27 @@ impl Stats {
         self.bytes_out.get_or_create(&labels).inc_by(bytes as u64);
     }
 
+    /// A subscriber asked for a live follow.
+    pub(super) fn followed(&self, dataset: &str) {
+        let dataset = dataset.to_owned();
+        self.follows.get_or_create(&Dataset { dataset }).inc();
+    }
+
+    /// A subscriber or a proxying relay asked for recovery.
+    pub(super) fn recovering(&self, dataset: &str) {
+        let dataset = dataset.to_owned();
+        self.recoveries.get_or_create(&Dataset { dataset }).inc();
+    }
+
+    /// A stream of a session that `opened` after leaving another relay reached the head.
+    pub(super) fn caught_up(&self, dataset: &str, opened: Instant) {
+        let dataset = dataset.to_owned();
+        let took = crate::monotonic_now().duration_since(opened);
+        self.catch_up
+            .get_or_create(&Dataset { dataset })
+            .observe(took.as_secs_f64());
+    }
+
     pub(super) fn disconnected(&self, member: &pb::Member) {
         *self
             .disconnects
@@ -193,6 +220,18 @@ impl Stats {
 }
 
 impl Hub {
+    /// The live follow and recovery requests subscribers have made of this hub for `dataset`.
+    pub fn requests(&self, dataset: &str) -> (u64, u64) {
+        let labels = Dataset {
+            dataset: dataset.to_owned(),
+        };
+        let stats = &self.0.stats;
+        (
+            stats.follows.get_or_create(&labels).get(),
+            stats.recoveries.get_or_create(&labels).get(),
+        )
+    }
+
     /// Disconnects a subscriber whose queue stayed full, counting it by service.
     pub(super) fn drop_full(&self, id: u64) {
         let service = self.0.subscribers.lock().unwrap().get(&id).map(|sub| {
@@ -295,6 +334,21 @@ pub fn register(
                 "Subscribers disconnected because their queue stayed full",
                 stats.full.clone(),
             );
+            registry.register(
+                "relay_follows",
+                "Live follows subscribers asked of this relay",
+                stats.follows.clone(),
+            );
+            registry.register(
+                "relay_recoveries",
+                "Recovery requests subscribers and proxying relays made of this relay",
+                stats.recoveries.clone(),
+            );
+            registry.register(
+                "relay_failover_catch_up_seconds",
+                "From a session arriving from another relay to each of its streams reaching the head",
+                stats.catch_up.clone(),
+            );
             registry.register_collector(Box::new(Collector {
                 hub: hub.clone(),
                 publisher: publisher.clone(),
@@ -309,6 +363,7 @@ pub fn register(
             "namespaces" => namespaces(&hub, &query),
             "subscribers" => subscribers(&hub, &query),
             "membership" => membership(publisher.as_deref(), &query),
+            "siblings" => siblings(&hub, &query),
             _ => return None,
         })
         .map(|value| value.to_string())
@@ -375,6 +430,44 @@ impl prometheus_client::collector::Collector for Collector {
                 .iter()
                 .map(|(service, n)| ([("service", *service)], *n as f64)),
         )?;
+
+        let shared = hub.0.shared.lock().unwrap();
+        let streams = shared.values().filter(|s| s.live.is_some()).count();
+        // `sibling_interests` below takes this lock.
+        drop(shared);
+        let labels: [(&str, &str); 0] = [];
+        gauges(
+            &mut encoder,
+            "relay_sibling_streams",
+            "Sibling streams currently synced",
+            [(labels, streams as f64)],
+        )?;
+        let (followed, cold) = hub.sibling_interests();
+        for (name, help, interests) in [
+            (
+                "relay_sibling_interests",
+                "Sibling interests followed beyond this relay's own",
+                &followed,
+            ),
+            (
+                "relay_sibling_interests_cold",
+                "Sibling interests left cold by the cap",
+                &cold,
+            ),
+        ] {
+            let mut counts = BTreeMap::<&str, u64>::new();
+            for follow in interests {
+                *counts.entry(follow.dataset.as_str()).or_default() += 1;
+            }
+            gauges(
+                &mut encoder,
+                name,
+                help,
+                counts
+                    .iter()
+                    .map(|(dataset, n)| ([("dataset", *dataset)], *n as f64)),
+            )?;
+        }
 
         let now = crate::monotonic_now();
         let (mut behind, mut rate, mut lagging) =
@@ -703,6 +796,48 @@ fn upstream(hub: &Hub, query: &Query) -> Value {
     let mut value = page(items, query.after_key(), query.limit, namespace_cursor);
     drop(namespaces);
     value["connected"] = json!(*hub.0.stats.upstream.lock().unwrap());
+    value
+}
+
+/// The interests siblings share beyond this relay's own, each `followed` or `cold`, and every sibling's stream.
+fn siblings(hub: &Hub, query: &Query) -> Value {
+    let (followed, cold) = hub.sibling_interests();
+    let states = followed
+        .iter()
+        .map(|follow| (follow, "followed"))
+        .chain(cold.iter().map(|follow| (follow, "cold")));
+    let mut interests = BTreeMap::new();
+    for (follow, state) in states {
+        let key = (follow.dataset.clone(), follow.namespace.clone());
+        if query.matches(&key) {
+            let value = json!({
+                "dataset": follow.dataset,
+                "namespace": follow.namespace,
+                "range": follow.span.map(|s| [format!("{:016x}", s.start), format!("{:016x}", s.end)]),
+                "state": state,
+            });
+            interests.insert(key, value);
+        }
+    }
+    let mut value = page(
+        interests.into_iter(),
+        query.after_key(),
+        query.limit,
+        namespace_cursor,
+    );
+    let shared = hub.0.shared.lock().unwrap();
+    let streams: BTreeMap<&String, Value> = shared
+        .iter()
+        .map(|(sibling, shared)| {
+            let stream = json!({
+                "connected": shared.live.is_some(),
+                "interests": shared.live.as_ref().map_or(0, BTreeMap::len),
+                "lingering": shared.lingering.len(),
+            });
+            (sibling, stream)
+        })
+        .collect();
+    value["streams"] = json!(streams);
     value
 }
 

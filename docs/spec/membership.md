@@ -18,10 +18,11 @@ A member is a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process that 
   identity, with each subscription's acknowledged revision for range readiness (#22 / B-21). When a
   draining member's stream closes, the relay keeps it as relay-local `LEFT` for 30 seconds.
 - **Siblings.** A cell's relays are each relay plus its `replay_peers`, listed by advertised address. Every relay
-  serves `Siblings.Watch`, and a cell relay with `[membership]` watches each sibling: a snapshot completed by
-  `synced`, then changes, with progress ticks every 10 seconds and the 30-second stream deadline. A relay shares
-  only its own leaf members, never what it learned from a sibling. A sibling counts as live only while its synced
-  stream is up. #41 / B-12b reuses this stream for subscriber interests at every tier.
+  serves `Siblings.Watch` and watches each sibling: a snapshot completed by `synced`, then changes, with progress
+  ticks every 10 seconds and the 30-second stream deadline. A relay shares only its own leaf members, never what it
+  learned from a sibling. A sibling counts as live only while its synced stream is up. The stream also carries
+  subscriber interests, at every tier ([relays.md](relays.md#sibling-interests)); above the cell tier it carries only
+  those.
 - **Publication.** Dataset `membership`, namespace `{service}.{cell}`, key node ID, value the encoded `Member`.
   Cell relays subscribe to every service namespace (`quicksilver`, `kv`, `cdn`) through their upstreams like any subscriber. Once that view is
   current, the relay with the lowest address among itself and its live siblings publishes, but only while they

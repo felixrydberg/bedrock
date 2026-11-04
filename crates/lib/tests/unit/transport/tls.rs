@@ -312,6 +312,30 @@ async fn servers_admit_only_authorized_callers() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn upper_tier_siblings_may_sit_in_different_cells() {
+    let ca = Ca::new();
+    let relay = tls(&ca, "relay", "c1", "r1").await;
+    let dc = Hub::relay(
+        "r1".into(),
+        2,
+        Arc::new(peers(Some(relay.clone()))),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .with_cell("c1".into());
+    let addr = serve(relay, dc).await;
+
+    watch(&peers(Some(tls(&ca, "relay", "c2", "r2").await)), &addr)
+        .await
+        .unwrap();
+    let status = watch(&peers(Some(tls(&ca, "kv", "c1", "x").await)), &addr)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn clients_reject_servers_that_are_not_relays() {
     let ca = Ca::new();
     let impostor = tls(&ca, "kv", "c1", "n1").await;
@@ -340,6 +364,7 @@ async fn a_leaf_may_announce_only_itself() {
                     address: "127.0.0.1:7000".into(),
                     ..Default::default()
                 }),
+                moved: false,
             })),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(1);

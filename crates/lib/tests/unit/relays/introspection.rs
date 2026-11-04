@@ -111,6 +111,7 @@ fn stalled(hub: &Hub, id: u64) -> mpsc::Receiver<Result<pb::RelayFrame, tonic::S
             member: None,
             pushed: BTreeMap::new(),
             ranges_acked: BTreeMap::new(),
+            moved: None,
         },
     );
     rx

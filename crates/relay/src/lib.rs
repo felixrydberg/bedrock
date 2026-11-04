@@ -63,13 +63,15 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
     .with_cell(config.node.location.cell.clone());
     let mut tasks = vec![hub.start()];
     let mut publisher = None;
-    // Every relay serves its siblings; only membership watches them so far (#41 / B-12b adds interests).
+    // Every relay serves and watches its siblings; only cell relays with membership also publish.
+    let (siblings, watching) = bedrock_lib::relays::siblings::Siblings::start(
+        hub.clone(),
+        peers.clone(),
+        config.replay_peers.clone(),
+        config.grace(),
+    );
+    tasks.push(watching);
     if let Some(settings) = &config.membership {
-        let (siblings, watching) = bedrock_lib::relays::siblings::Siblings::start(
-            peers.clone(),
-            config.replay_peers.clone(),
-        );
-        tasks.push(watching);
         let (publishing, published) = bedrock_lib::membership::Cell::start(
             hub.clone(),
             peers,

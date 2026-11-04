@@ -89,6 +89,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             member: None,
             pushed: BTreeMap::new(),
             ranges_acked: BTreeMap::new(),
+            moved: None,
         },
     );
     (

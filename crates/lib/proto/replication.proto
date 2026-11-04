@@ -26,8 +26,9 @@ message Span { uint64 start = 1; uint64 end = 2; }
 
 // V1 relay session. Tier rank: leaf=0, cell=1, dc=2,
 // region=3, writer=4. Zero on Welcome is invalid.
-// A kv/cdn process's leaf session carries its membership entry (B-12).
-message Hello { uint32 version = 1; uint32 tier = 2; Member member = 3; }
+// A kv/cdn process's leaf session carries its membership entry (B-12). `moved`: this session replaces one on a
+// different relay, so its catch-up counts as failover (#41 / B-12b).
+message Hello { uint32 version = 1; uint32 tier = 2; Member member = 3; bool moved = 4; }
 
 // B-12 cell membership entry, published under dataset `membership`, namespace `{service}.{cell}`.
 // Budgets of zero mean unlimited.
@@ -156,8 +157,8 @@ service Relay { rpc Session(stream RelayRequest) returns (stream RelayFrame); }
 
 // Sibling relays (`replay_peers`) watch each other: a snapshot completed by `synced`, then changes.
 // An empty update is a progress tick. A relay shares only what its own sessions hold, never what it
-// learned from a sibling. B-12 shares leaf members; #22 / B-21 adds their range readiness; #41 / B-12b adds
-// subscriber interests.
+// learned from a sibling. Cell relays share leaf members (B-12) and their range readiness (#22 / B-21); relays of every
+// tier share subscriber interests (#41 / B-12b).
 message SiblingWatch {}
 message SiblingUpdate {
   repeated Member members = 1;
@@ -166,6 +167,10 @@ message SiblingUpdate {
   bool synced = 3;
   // Replaces the member's ready ranges of `dataset`; no spans clears them.
   repeated Ready ready = 4;
+  // The follows this relay's own subscribers need from upstream. Their cursors tell a sibling with no history of its
+  // own where to start and are not updated as they advance.
+  repeated Follow interests = 5;
+  repeated Unfollow interests_removed = 6;
 }
 // The ranges of `dataset` a leaf member is ready for: its bootstrap is confirmed and it acknowledged through the head
 // after processing every pushed `Ranges` (#22 / B-21). Never the acknowledgements themselves.

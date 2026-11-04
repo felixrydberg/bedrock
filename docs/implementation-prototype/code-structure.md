@@ -42,10 +42,10 @@ simulators, and only on Linux or macOS (on Windows, use WSL). A normal `cargo te
 The exception is `tests/transport.rs` (B-03), which runs in both builds: over real HTTP/2 normally, where it also proves
 bulk/control isolation, and simulated under madsim, where tonic has no flow control. Its `build.rs` compiles
 `proto/sim.proto` with the vendored `protoc` in every build.
-CI does not run the madsim builds; run them locally before merging shared-core changes:
+CI runs the madsim builds too; run them locally before merging shared-core changes:
 `RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo test --workspace`, and lint the sim code with
-`cargo clippy --workspace --all-targets -- -D warnings -A clippy::disallowed_methods -A clippy::disallowed_types`
-under the same flags (madsim re-exports std's `Instant`, so the I/O rules only hold in the normal build).
+`cargo clippy --workspace --all-targets -- -D warnings` under the same flags (madsim re-exports std's `Instant`, so
+simulation code reads time through `monotonic_now`).
 The I/O rules in `clippy.toml` apply to every crate; adapters opt out with an explicit `#[allow]`.
 
 | Module           | Responsibility                                                        |

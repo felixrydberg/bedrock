@@ -181,6 +181,12 @@ pub struct ReplaySettings {
 }
 
 impl RelayConfig {
+    /// How long a lost sibling's interests stay: the membership grace, whose default upper tiers use (#41 / B-12b).
+    pub fn grace(&self) -> std::time::Duration {
+        let grace = self.membership.as_ref().map(|m| m.grace_ms);
+        std::time::Duration::from_millis(grace.unwrap_or_else(default_grace_ms))
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.upstreams.is_empty() {
             return Err(ConfigError("upstreams must not be empty".into()));

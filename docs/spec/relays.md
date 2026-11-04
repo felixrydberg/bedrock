@@ -81,6 +81,11 @@ It does not prove payload routing, Rust correctness, disk checksums, fairness,
 resource limits, or the complete B-23 gate. Implementation tests must cover those.
 Run TLC with relays.cfg; record actual results separately.
 
+The model has one subscriber stream and no relay subscription set, so [sibling interests](#sibling-interests) add no
+state or action to it (checked against the model, 2026-11-03; TLC not rerun, the model is unchanged). A sibling
+interest only makes a relay follow more, and a move to a warm sibling is `Disconnect` then `Reconnect` with a
+non-empty `cached`.
+
 ## Deployment and recovery
 
 `bedrock-relay` serves Relay.Session on `listen`. `upstreams` retains preference order;
@@ -128,6 +133,33 @@ A storage rebuild (#23 / B-22) recreates a quarantined dataset's engine empty an
 the session to recover that dataset's scopes at once (`Rebuilder`). Like a local failure,
 the scope drains its old subscription; it is ready again only after a fresh validated
 bootstrap and its recovered confirmation (`LoseLocal`, `ReadyNotLost`).
+
+### Sibling interests
+
+#41 / B-12b. Every relay shares its subscribers' interests with its `replay_peers`, so a sibling keeps the same streams
+live and in its replay log. When a relay dies, its subscribers arrive at a warm sibling: no new upstream follow and no
+recovery request, as long as their cursors fall within the sibling's replay window.
+
+- **Shape.** An interest is the `Follow` the relay would send upstream for its own subscribers alone, and its removal
+  the matching `Unfollow`. Whatever hash ranges subscribers follow, a relay follows that dataset whole, so one
+  interest (`[0, 2⁶⁴)`, every fixed namespace) stands for all of them. A cell shares at most six: three datasets and
+  three membership namespaces.
+- **Own only.** A relay shares what its own sessions need, never what a sibling shared. Upstream it follows the union
+  of the two, as one more subscriber, so the tier above sees nothing new. When the last real subscriber leaves, the
+  interest leaves with it.
+- **Where a shared stream starts.** After the relay's own history, or at the cursor in the interest if that is later.
+  An idle relay with no history therefore starts where its sibling's subscribers are, not at revision 1, which could
+  ask the writer for a bootstrap nobody uses. Cursors are sent once and not updated as they advance.
+- **Every tier.** Cell siblings share too, rather than deriving interests from the placement directory: DC and region
+  need sharing anyway, relays without `[membership]` never read the directory, and it holds no membership namespaces.
+  Above the cell tier the stream carries interests only, and the same-cell check on `Siblings.Watch` applies only at
+  the cell tier, because only its relays share one cell.
+- **Lost sibling.** Interests a sibling shared when its stream dropped stay for the grace period (`membership.grace_ms`,
+  otherwise its 20-second default), even if it returns sooner without them, because its subscribers are still moving.
+- **Cap.** A relay follows at most 4,096 sibling interests beyond its own, range follows first, then by selector. The
+  rest stay cold and are reported; they fail over as before. Own subscribers are never capped.
+
+A relay that cannot reach a sibling falls back to cold failover. Shared state changes within about a second.
 
 `[replay]` overrides `max_bytes`, `window_ms`, and dataset `priorities` (higher values
 retain data longer). Defaults are 1 GiB and 5/15/60 minutes at cell/DC/region tiers;
@@ -183,6 +215,7 @@ by `dataset`, namespace `prefix` and `service`, so one namespace can be inspecte
 | `namespaces` | per `(dataset, namespace)`: subscriber count, latest sequence received, head, replay ranges, events/s and bytes/s over 10-second windows, lag on arrival |
 | `subscribers` | per session: service, node and address of its member, follows with acknowledged revision and lag (head minus acknowledged), queued events and bytes, the member's disconnect count |
 | `membership` | the published members of each service with their status, the placement directory with every owner's state, and how long publication has been frozen |
+| `siblings` | the interests siblings share beyond this relay's own, each `followed` or `cold`, and per sibling (`streams`) whether it is connected and how many interests it shares or left lingering |
 
 The admin listener is unauthenticated and these views expose node IDs, addresses and namespace names, so
 `admin_listen` belongs on a trusted management network. A page seeks through the sorted namespace map, so its cost
@@ -193,7 +226,9 @@ Events carry one counter, so "revision" and "sequence" are the same number.
 Metrics carry the process's `tier` and `cell` plus at most `dataset`, `service` or placement `state`:
 events and bytes in (from upstream) and out (queued delivery frames), full-queue disconnects, the
 `relay_lag_seconds` histogram, subscribers by service, upstream revision lag (max and p99 across
-namespaces), replay coverage, placement ranges by state, directory writes and frozen seconds. The only
+namespaces), replay coverage, placement ranges by state, directory writes and frozen seconds, live follows and
+recovery requests received, sibling streams connected, sibling interests followed and left cold, and failover
+catch-up time: from a session announcing `Hello.moved` to each of its streams reaching the head. The only
 per-namespace series are the top 20 namespaces by event rate and by revision lag, so the series count does
 not grow with namespaces. Gauges are computed from the hub at scrape time.
 
@@ -225,11 +260,11 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo test --workspace
-RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo clippy --workspace --all-targets -- -D warnings -A clippy::disallowed_methods -A clippy::disallowed_types
+RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The simulation lint allowances match the workspace's documented harness checks;
-normal lint retains the disallowed API checks. All checks above passed on
+Both builds keep the disallowed API checks, as CI does; madsim re-exports std's `Instant`, so simulation code reads
+time through `monotonic_now`. Earlier simulation lint runs recorded here allowed those checks. All checks above passed on
 2026-10-30, including 165 native / 118 simulation shared-core unit tests and the
 ten relay protocol integration tests in both builds. Opt-in load and real-S3
 tests remain ignored by the ordinary workspace test command. With range streams
@@ -238,6 +273,10 @@ tests remain ignored by the ordinary workspace test command. With range streams
 in both builds. With member-side pushed ranges and per-dataset directories (phase 3,
 same day), they passed again: 239 native and 199 simulation tests. With relay-side pushes and readiness (phase 4,
 same day): 240 native and 200 simulation tests.
+With sibling interests (#41 / B-12b, 2026-11-04), every check above passed: 307 native and 260 simulation tests in
+29 suites each. In a temporary copy, each of these breaks failed at least one test: dropping the union, re-sharing
+learned interests, no grace period (the failover then reaches the upper tier), a grace period that never expires, no
+cap, and ignoring shared cursors.
 For cleanup validation, native lint reused a cached RocksDB archive through the
 dependency's supported `ROCKSDB_LIB_DIR` / `ROCKSDB_STATIC` settings; native tests
 built RocksDB normally. This avoids rebuilding C++ for the Rust-only lint step.
@@ -293,6 +332,9 @@ namespace created after it followed, and resumes after a restart
 1, 2 and 42 twice and compares committed application traces through idle partitions,
 node kills, all-open routing and a KV-only process-task abort on a relay machine.
 Replay one seed with `BEDROCK_RELAY_SEED=42` and the documented simulation flags.
+`tests/sim/tests/failover.rs` kills relays among three siblings at cell, DC and region tiers (seeds 1, 2 and 42, each
+twice), checks the upper tier sees no new follow or recovery, and that a crashed sibling's interests last the grace
+period. Replay one seed with `BEDROCK_FAILOVER_SEED=42`.
 `relay_idle.rs` separately verifies healthy idle operation and one-way request
 partition failover through the shared session client. The snapshot/concurrent-write
 and HTTP write suites also use this client; they do not keep a second test transport.
