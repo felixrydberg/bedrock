@@ -65,7 +65,10 @@ async fn serve(hub: Hub, _: u16) -> Server {
     let address = listener.local_addr().unwrap().to_string();
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(pb::relay_server::RelayServer::new(hub))
+            .add_service(pb::relay_server::RelayServer::new(hub.clone()))
+            .add_service(pb::siblings_server::SiblingsServer::new(
+                bedrock_lib::relays::siblings::Server(hub),
+            ))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -79,7 +82,10 @@ async fn serve(hub: Hub, port: u16) -> Server {
     let socket = address.parse().unwrap();
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(pb::relay_server::RelayServer::new(hub))
+            .add_service(pb::relay_server::RelayServer::new(hub.clone()))
+            .add_service(pb::siblings_server::SiblingsServer::new(
+                bedrock_lib::relays::siblings::Server(hub),
+            ))
             .serve(socket)
             .await
             .unwrap();
@@ -201,11 +207,23 @@ async fn raw(
     mpsc::Sender<pb::RelayRequest>,
     tonic::Streaming<pb::RelayFrame>,
 ) {
+    hello(address, tier, false).await
+}
+
+async fn hello(
+    address: &str,
+    tier: u32,
+    moved: bool,
+) -> (
+    mpsc::Sender<pb::RelayRequest>,
+    tonic::Streaming<pb::RelayFrame>,
+) {
     let (tx, rx) = mpsc::channel(16);
     tx.send(request(pb::relay_request::Kind::Hello(pb::Hello {
         version: 1,
         tier,
         member: None,
+        moved,
     })))
     .await
     .unwrap();
@@ -319,6 +337,7 @@ async fn invalid_tier_and_customer_kv_subscriptions_are_rejected() {
             version: 1,
             tier,
             member: None,
+            moved: false,
         })))
         .await
         .unwrap();
@@ -926,6 +945,113 @@ fn sample(metrics: &str, name: &str, labels: &[&str]) -> Option<String> {
             line.starts_with(&format!("{name}{{")) && labels.iter().all(|l| line.contains(l))
         })
         .map(|line| line.rsplit(' ').next().unwrap().to_owned())
+}
+
+#[tokio::test]
+async fn siblings_stay_warm_until_the_last_subscriber_leaves_and_a_moved_one_is_timed() {
+    use bedrock_lib::relays::{introspection, siblings::Siblings};
+    let grace = Duration::from_secs(20);
+    let writer = writer().await;
+    let source_hub = Hub::writer("writer".into(), writer.clone(), peers());
+    let source = serve(source_hub.clone(), 18001).await;
+    let (a, b) = (
+        relay("a", 1, &source.address),
+        relay("b", 1, &source.address),
+    );
+    let admin = Admin::new();
+    introspection::register(&admin, &b, "cell", "c1", None);
+    let (a_task, b_task) = (a.start(), b.start());
+    let a_server = serve(a.clone(), 18002).await;
+    let b_server = serve(b.clone(), 18003).await;
+    let (_, a_watch) = Siblings::start(a.clone(), peers(), vec![b_server.address.clone()], grace);
+    let (_, b_watch) = Siblings::start(b.clone(), peers(), vec![a_server.address.clone()], grace);
+
+    commit(&writer, "auth", "keys", Operation::Set(b"one".to_vec())).await;
+    commit(
+        &writer,
+        "quicksilver",
+        "infrastructure",
+        Operation::Set(b"one".to_vec()),
+    )
+    .await;
+    let local = Arc::new(MemoryEngine::new("consumer"));
+    let session = Session::start(peers(), vec![a_server.address.clone()], targets(&local)).unwrap();
+    caught_up(&session, 1).await;
+    until("the idle sibling to follow", || {
+        source_hub.requests("auth").0 == 2 && source_hub.requests("quicksilver").0 == 2
+    })
+    .await;
+    assert!(b.interests().is_empty(), "what it learned is not its own");
+    let view = admin_get(&admin, "/introspect/siblings?dataset=auth").await;
+    let view: serde_json::Value = serde_json::from_str(&view).unwrap();
+    assert_eq!(view["items"][0]["state"], "followed", "{view}");
+    assert_eq!(view["streams"][&a_server.address]["connected"], true);
+    let metrics = admin_get(&admin, "/metrics").await;
+    let auth = ["dataset=\"auth\""];
+    assert_eq!(
+        sample(&metrics, "bedrock_relay_sibling_streams", &[]).as_deref(),
+        Some("1.0")
+    );
+    assert_eq!(
+        sample(&metrics, "bedrock_relay_sibling_interests", &auth).as_deref(),
+        Some("1.0")
+    );
+
+    // A subscriber arriving from another relay finds the sibling warm.
+    let upstream = source_hub.requests("auth");
+    commit(&writer, "auth", "keys", Operation::Set(b"two".to_vec())).await;
+    let (tx, mut stream) = hello(&b_server.address, 0, true).await;
+    tx.send(request(pb::relay_request::Kind::Follow(pb::Follow {
+        dataset: "auth".into(),
+        namespace: "keys".into(),
+        from: 2,
+        span: None,
+        from_namespaces: Default::default(),
+    })))
+    .await
+    .unwrap();
+    let through = loop {
+        if let pb::relay_frame::Kind::Delivery(delivery) = frame(&mut stream).await {
+            break delivery.through;
+        }
+    };
+    assert_eq!(through, 2);
+    tx.send(request(pb::relay_request::Kind::Ack(pb::Ack {
+        dataset: "auth".into(),
+        namespace: "keys".into(),
+        applied: through,
+        span: None,
+    })))
+    .await
+    .unwrap();
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let metrics = admin_get(&admin, "/metrics").await;
+            let count = "bedrock_relay_failover_catch_up_seconds_count";
+            if sample(&metrics, count, &["dataset=\"auth\""]).as_deref() == Some("1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the moved subscriber's catch-up is measured");
+    assert_eq!(source_hub.requests("auth"), upstream);
+    assert_eq!(b.requests("auth"), (1, 0));
+    assert!(!b.interests().is_empty());
+
+    // With both subscribers gone, neither sibling keeps the other's interest alive.
+    drop((tx, stream));
+    session.stop().await;
+    let idle = |hub: &Hub| {
+        let (namespaces, datasets) = hub.desired();
+        namespaces.is_empty() && datasets.is_empty()
+    };
+    until("both siblings to drop the follows", || idle(&a) && idle(&b)).await;
+    for task in [a_task, b_task, a_watch, b_watch] {
+        task.abort();
+    }
+    writer.close().await.unwrap();
 }
 
 #[tokio::test]

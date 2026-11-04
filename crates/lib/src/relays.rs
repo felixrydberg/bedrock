@@ -37,6 +37,8 @@ type Key = (String, String);
 pub type StreamKey = (Key, Option<(u64, u64)>);
 /// The whole hash space: what a relay follows upstream for a dataset its subscribers follow by range.
 const WHOLE: (u64, u64) = (0, 0);
+/// The lowest cursor needed per namespace, and the datasets followed by range.
+pub type Wanted = (BTreeMap<Key, u64>, BTreeSet<String>);
 type Encoded = (u64, EncodedEvent);
 type ReplayItem = (Event, u64, usize);
 #[derive(Clone)]
@@ -64,6 +66,14 @@ pub fn pushed(dataset: &str) -> bool {
         dataset,
         "quicksilver" | "auth" | "cdn" | crate::membership::DATASET
     )
+}
+
+/// Whether a follow, or a sibling's interest, selects a pushed namespace or hash range.
+fn selectable(follow: &pb::Follow) -> bool {
+    pushed(&follow.dataset)
+        && !follow.namespace.contains('\0')
+        && follow.span.as_ref().is_none_or(valid_span)
+        && !(follow.namespace.is_empty() && follow.span.is_none())
 }
 
 /// The writer's tier rank, above every relay tier.
@@ -103,6 +113,8 @@ struct Inner {
     /// Draining members whose stream closed, kept as `LEFT` so cell relays remove them without grace (B-12).
     departed: Mutex<BTreeMap<MemberKey, (pb::Member, tokio::time::Instant)>>,
     members_changed: Arc<Watched<u64>>,
+    /// What each sibling shares, by address (#41 / B-12b).
+    shared: Mutex<BTreeMap<String, siblings::Shared>>,
     stats: introspection::Stats,
 }
 
@@ -129,6 +141,8 @@ struct Subscriber {
     /// The range set last pushed to this leaf member per dataset, and the latest one it acknowledged (#22 / B-21).
     pushed: BTreeMap<String, pb::Ranges>,
     ranges_acked: BTreeMap<String, u64>,
+    /// When a session that replaced one on another relay opened (#41 / B-12b).
+    moved: Option<tokio::time::Instant>,
 }
 struct Interest {
     from: u64,
@@ -230,6 +244,7 @@ impl Hub {
             replay_bytes: AtomicUsize::new(0),
             departed: Mutex::default(),
             members_changed: Arc::new(Watched::new(0)),
+            shared: Mutex::default(),
             stats: Default::default(),
         }))
     }
@@ -927,11 +942,7 @@ impl Hub {
             (follow.dataset.clone(), follow.namespace.clone()),
             range(follow.span.as_ref()),
         );
-        if !pushed(&follow.dataset)
-            || follow.namespace.contains('\0')
-            || follow.span.as_ref().is_some_and(|s| !valid_span(s))
-            || (follow.namespace.is_empty() && follow.span.is_none())
-        {
+        if !selectable(&follow) {
             self.error(
                 id,
                 &key,
@@ -1020,14 +1031,12 @@ impl Hub {
         visited: Vec<String>,
         force: bool,
     ) -> Result<(), Status> {
-        let Some(changes) = self
-            .0
-            .subscribers
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|s| s.changed.clone())
-        else {
+        let opened = crate::monotonic_now();
+        let Some((changes, mut moved)) = self.0.subscribers.lock().unwrap().get(&id).map(|s| {
+            // A stream followed long after the session opened is new work, not failover.
+            let moved = s.moved.filter(|at| opened.duration_since(*at) < IDLE);
+            (s.changed.clone(), moved)
+        }) else {
             return Ok(());
         };
         let mut announced = false;
@@ -1042,6 +1051,12 @@ impl Hub {
                 return Ok(());
             };
             let h = self.source_head(&key.0);
+            if let Some(at) = moved
+                && h.is_some_and(|head| acked >= head)
+            {
+                self.0.stats.caught_up(&key.0.0, at);
+                moved = None;
+            }
             if !announced && let Some(head) = h {
                 let ranges = self
                     .0
@@ -1381,6 +1396,7 @@ impl Hub {
                         version: 1,
                         tier: 0,
                         member: None,
+                        moved: false,
                     })),
                 })
                 .await
@@ -1566,9 +1582,10 @@ impl Hub {
         Err(last)
     }
 
-    /// What to follow upstream: the lowest cursor subscribers need per namespace, and the datasets some subscriber
-    /// follows by range. The relay follows such a dataset whole, in every namespace, and never also by namespace.
-    fn desired(&self) -> (BTreeMap<Key, u64>, BTreeSet<String>) {
+    /// What this relay's own subscribers need upstream: their lowest cursor per namespace, and the datasets some
+    /// subscriber follows by range. The relay follows such a dataset whole, in every namespace, and never also by
+    /// namespace.
+    fn own(&self) -> Wanted {
         let mut namespaces = BTreeMap::new();
         let mut datasets = BTreeSet::new();
         for sub in self.0.subscribers.lock().unwrap().values() {
@@ -1582,11 +1599,45 @@ impl Hub {
         }
         (namespaces, datasets)
     }
+
+    /// What to follow upstream: [`Hub::own`] plus the interests siblings share, which behave like one more subscriber
+    /// (#41 / B-12b). Such a stream starts after this relay's history, or at the sibling's cursor if that is later.
+    // ponytail: rebuilds the union on every upstream wake, like `own`; cache it per sibling update if region relays
+    // with thousands of interests show this in profiles.
+    pub fn desired(&self) -> Wanted {
+        let (mut namespaces, mut datasets) = self.own();
+        let (followed, _) = self.derived(&namespaces, &datasets);
+        for follow in followed {
+            let ranged = follow.namespace.is_empty();
+            let scopes = if ranged {
+                self.namespaces(&follow.dataset)
+            } else {
+                vec![follow.namespace.clone()]
+            };
+            for namespace in scopes {
+                let cursor = if ranged {
+                    follow.from_namespaces.get(&namespace).copied()
+                } else {
+                    Some(follow.from)
+                };
+                let key = (follow.dataset.clone(), namespace);
+                let next = self.source_head(&key).unwrap_or(0).saturating_add(1);
+                namespaces
+                    .entry(key)
+                    .or_insert(next.max(cursor.unwrap_or(1)));
+            }
+            if ranged {
+                datasets.insert(follow.dataset);
+            }
+        }
+        (namespaces, datasets)
+    }
     fn idle(&self) -> bool {
         let (namespaces, datasets) = self.desired();
         namespaces.is_empty() && datasets.is_empty()
     }
     async fn upstream(&self) {
+        let mut last = None;
         loop {
             if self.idle() {
                 let version = self.0.changed.get();
@@ -1596,7 +1647,7 @@ impl Hub {
                 }
             }
             for peer in self.0.peers.health().route(&self.0.upstreams) {
-                let result = self.upstream_session(peer).await;
+                let result = self.upstream_session(peer, &mut last).await;
                 self.0.stats.connected(None);
                 if let Err(error) = result {
                     tracing::warn!(%peer,%error,"relay upstream failed");
@@ -1606,13 +1657,15 @@ impl Hub {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
-    async fn upstream_session(&self, peer: &str) -> Result<(), Status> {
+    /// `last` is the upstream of the latest session that got through its handshake.
+    async fn upstream_session(&self, peer: &str, last: &mut Option<String>) -> Result<(), Status> {
         let (tx, rx) = mpsc::channel(1024);
         tx.send(pb::RelayRequest {
             kind: Some(pb::relay_request::Kind::Hello(pb::Hello {
                 version: 1,
                 tier: self.0.tier,
                 member: None,
+                moved: last.as_deref().is_some_and(|last| last != peer),
             })),
         })
         .await
@@ -1644,6 +1697,7 @@ impl Hub {
             ));
         }
         self.0.stats.connected(Some(peer));
+        *last = Some(peer.to_owned());
         // Next expected revision per namespace, from namespace follows and whole-dataset follows alike.
         let mut sent = BTreeMap::<Key, u64>::new();
         let mut sent_datasets = BTreeSet::<String>::new();
@@ -1857,7 +1911,7 @@ impl pb::relay_server::Relay for Hub {
         let first = tokio::time::timeout(Duration::from_secs(5), requests.message())
             .await
             .map_err(|_| Status::deadline_exceeded("hello timeout"))??;
-        let (tier, member) = match first.and_then(|r| r.kind) {
+        let (tier, member, moved) = match first.and_then(|r| r.kind) {
             Some(pb::relay_request::Kind::Hello(hello))
                 if hello.version == 1
                     && hello.tier < self.0.tier
@@ -1865,7 +1919,7 @@ impl pb::relay_server::Relay for Hub {
                         hello.tier == 0 && crate::membership::validate(member).is_ok()
                     }) =>
             {
-                (hello.tier, hello.member)
+                (hello.tier, hello.member, hello.moved)
             }
             _ => {
                 return Err(Status::failed_precondition(
@@ -1903,6 +1957,7 @@ impl pb::relay_server::Relay for Hub {
                 member,
                 pushed: BTreeMap::new(),
                 ranges_acked: BTreeMap::new(),
+                moved: moved.then(crate::monotonic_now),
             },
         );
         self.members_changed();
@@ -1926,10 +1981,10 @@ impl pb::relay_server::Relay for Hub {
                     _=tick.tick()=>if matches!(hub.enqueue(id,pb::RelayFrame{kind:Some(pb::relay_frame::Kind::Tick(true))},None),Ok(false)){break},
                     request=requests.message()=>match request {
                         Ok(Some(request))=>{received=crate::monotonic_now();match request.kind {
-                            Some(pb::relay_request::Kind::Follow(f))=>hub.follow(id,f,Vec::new(),false).await,
+                            Some(pb::relay_request::Kind::Follow(f))=>{hub.0.stats.followed(&f.dataset);hub.follow(id,f,Vec::new(),false).await},
                             Some(pb::relay_request::Kind::Recover(r))=>{
                                 if tier!=0 {break}
-                                if let Some(f)=r.follow {let force=f.from==0 && !f.namespace.is_empty();hub.follow(id,f,r.visited,force).await}
+                                if let Some(f)=r.follow {hub.0.stats.recovering(&f.dataset);let force=f.from==0 && !f.namespace.is_empty();hub.follow(id,f,r.visited,force).await}
                             }
                             Some(pb::relay_request::Kind::Unfollow(f))=>{
                                 hub.unfollow(id,f);

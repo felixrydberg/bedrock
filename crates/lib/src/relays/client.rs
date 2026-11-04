@@ -967,6 +967,7 @@ async fn run(
     member: Option<Membership>,
 ) {
     let drained = || member.as_ref().is_some_and(|m| draining(&m.get()));
+    let mut last = None;
     loop {
         for upstream in peers.health().route(&upstreams) {
             if drained() {
@@ -996,6 +997,7 @@ async fn run(
                 &changes,
                 &rebuilds,
                 member.as_ref(),
+                &mut last,
             )
             .await;
             if drained() {
@@ -1034,9 +1036,10 @@ async fn connection(
     changes: &Watched<u64>,
     rebuilds: &Rebuilds,
     member: Option<&Membership>,
+    last: &mut Option<String>,
 ) -> Status {
     match connected(
-        peers, upstream, consumers, pushed, progress, changes, rebuilds, member,
+        peers, upstream, consumers, pushed, progress, changes, rebuilds, member, last,
     )
     .await
     {
@@ -1055,6 +1058,7 @@ async fn connected(
     changes: &Watched<u64>,
     rebuilds: &Rebuilds,
     member: Option<&Membership>,
+    last: &mut Option<String>,
 ) -> Result<(), Status> {
     let (requests, receiver) = mpsc::channel(16);
     let mut sent = member.map(|m| m.get());
@@ -1065,6 +1069,7 @@ async fn connected(
                 version: 1,
                 tier: 0,
                 member: sent.clone(),
+                moved: last.as_deref().is_some_and(|last| last != upstream),
             })),
         },
     )
@@ -1089,6 +1094,7 @@ async fn connected(
         Some(pb::relay_frame::Kind::Welcome(w)) if w.version == 1 && w.tier > 0 && w.tier <= 4 => {}
         _ => return Err(Status::failed_precondition("invalid relay handshake")),
     }
+    *last = Some(upstream.to_owned());
     for consumer in consumers.values().filter(|c| c.target.span.is_none()) {
         send(&requests, consumer.request()).await?;
     }

@@ -106,6 +106,7 @@ async fn subscribe(
             version: 1,
             tier: 0,
             member: None,
+            moved: false,
         })),
     })
     .await

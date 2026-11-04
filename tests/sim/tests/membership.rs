@@ -936,10 +936,19 @@ async fn replication() -> Vec<String> {
     check_data("healed", &model, &q1, &holders).await;
     mark(&mut trace, "healed", &q1);
 
-    // A killed member's ranges are rebuilt elsewhere after the grace period.
+    // A killed member's ranges are rebuilt elsewhere after the grace period. The publishing relay dies mid-handoff, and
+    // its siblings finish from published state (#41 / B-12b).
     handle.kill(q4_node.id());
     let three = ["holder-1", "holder-2", "holder-3"];
+    until("a handoff to start", IDLE + GRACE, || {
+        entries(&q1.directory_of("cdn"))
+            .iter()
+            .any(|(_, owners)| owners.iter().any(|o| o.state == State::Populating))
+    })
+    .await;
+    handle.kill(relays[0].id());
     settled("killed", &q1, &three).await;
+    handle.restart(relays[0].id());
     check_data(
         "killed",
         &model,
