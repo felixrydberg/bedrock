@@ -57,6 +57,23 @@ fn selector(follow: &pb::Follow) -> StreamKey {
     )
 }
 
+/// Lowers `held` to the cursors of `other`, which has the same selector, so the stream covers every sibling's
+/// subscribers. A namespace missing from a whole-dataset follow starts at 1. Partial ranges keep the first follow.
+fn lowest(held: &mut pb::Follow, other: &pb::Follow) {
+    if held.span.is_none() {
+        held.from = held.from.min(other.from);
+    } else if held.namespace.is_empty() && range(held.span.as_ref()) == Some(WHOLE) {
+        for (namespace, from) in &mut held.from_namespaces {
+            let theirs = other.from_namespaces.get(namespace).copied();
+            *from = (*from).min(theirs.unwrap_or(1));
+        }
+        for (namespace, from) in &other.from_namespaces {
+            let ours = held.from_namespaces.entry(namespace.clone());
+            ours.or_insert((*from).min(1));
+        }
+    }
+}
+
 impl Hub {
     /// The follows this relay would send upstream for its own subscribers alone. Whatever hash ranges they follow, that
     /// is the whole dataset, so one interest stands for all of them. Never includes what siblings share.
@@ -103,10 +120,11 @@ impl Hub {
             if !datasets.contains(&key.0.0) && !namespaces.contains_key(&key.0) {
                 wanted
                     .entry((!follow.namespace.is_empty(), key))
-                    .or_insert(follow);
+                    .and_modify(|held| lowest(held, follow))
+                    .or_insert_with(|| follow.clone());
             }
         }
-        let mut followed: Vec<_> = wanted.into_values().cloned().collect();
+        let mut followed: Vec<_> = wanted.into_values().collect();
         let cold = followed.split_off(followed.len().min(MAX_INTERESTS));
         (followed, cold)
     }

@@ -162,6 +162,69 @@ fn a_shared_stream_starts_after_this_relays_history_or_at_the_siblings_cursor() 
 }
 
 #[test]
+fn siblings_sharing_a_selector_keep_the_lowest_cursor() {
+    let hub = hub();
+    let partial = |from| pb::Follow {
+        span: span(Some((0, 1 << 32))),
+        ..dataset("auth", &[("keys", from)])
+    };
+    hub.shared(
+        "a",
+        Some(interests([
+            namespace("membership", "kv.c1", 9),
+            dataset("cdn", &[("pages", 8), ("workers", 3)]),
+            partial(7),
+        ])),
+        LONG,
+    );
+    hub.shared(
+        "b",
+        Some(interests([
+            namespace("membership", "kv.c1", 5),
+            dataset("cdn", &[("pages", 4)]),
+            partial(2),
+        ])),
+        LONG,
+    );
+    hub.shared(
+        "c",
+        Some(interests([dataset(
+            "quicksilver",
+            &[("infrastructure", 6)],
+        )])),
+        LONG,
+    );
+    hub.shared(
+        "d",
+        Some(interests([dataset(
+            "quicksilver",
+            &[("infrastructure", 2), ("unseen", 6)],
+        )])),
+        LONG,
+    );
+    let (followed, _) = hub.sibling_interests();
+    let cursors = |dataset: &str| {
+        let follow = followed.iter().find(|f| f.dataset == dataset).unwrap();
+        follow.from_namespaces.clone()
+    };
+    assert_eq!(
+        cursors("cdn"),
+        BTreeMap::from([("pages".into(), 4), ("workers".into(), 1)]),
+        "a sibling without a namespace's cursor needs it from the start"
+    );
+    assert_eq!(
+        cursors("quicksilver"),
+        BTreeMap::from([("infrastructure".into(), 2), ("unseen".into(), 1)])
+    );
+    assert_eq!(
+        cursors("auth"),
+        BTreeMap::from([("keys".into(), 7)]),
+        "partial ranges keep the first follow"
+    );
+    assert_eq!(hub.desired().0[&key("membership", "kv.c1")], 5);
+}
+
+#[test]
 fn a_subscribers_own_cursor_wins_over_a_siblings() {
     let hub = hub();
     let _own = subscribe(&hub, 1, &[("membership", "kv.c1", None, 2)], &[]);

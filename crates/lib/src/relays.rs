@@ -1981,10 +1981,11 @@ impl pb::relay_server::Relay for Hub {
                     _=tick.tick()=>if matches!(hub.enqueue(id,pb::RelayFrame{kind:Some(pb::relay_frame::Kind::Tick(true))},None),Ok(false)){break},
                     request=requests.message()=>match request {
                         Ok(Some(request))=>{received=crate::monotonic_now();match request.kind {
-                            Some(pb::relay_request::Kind::Follow(f))=>{hub.0.stats.followed(&f.dataset);hub.follow(id,f,Vec::new(),false).await},
+                            // Only a valid scope counts: a dataset becomes a metric label, so the caller must not pick it.
+                            Some(pb::relay_request::Kind::Follow(f))=>{if selectable(&f){hub.0.stats.followed(&f.dataset)};hub.follow(id,f,Vec::new(),false).await},
                             Some(pb::relay_request::Kind::Recover(r))=>{
                                 if tier!=0 {break}
-                                if let Some(f)=r.follow {hub.0.stats.recovering(&f.dataset);let force=f.from==0 && !f.namespace.is_empty();hub.follow(id,f,r.visited,force).await}
+                                if let Some(f)=r.follow {if selectable(&f){hub.0.stats.recovering(&f.dataset)};let force=f.from==0 && !f.namespace.is_empty();hub.follow(id,f,r.visited,force).await}
                             }
                             Some(pb::relay_request::Kind::Unfollow(f))=>{
                                 hub.unfollow(id,f);

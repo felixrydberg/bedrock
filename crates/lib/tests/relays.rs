@@ -330,7 +330,8 @@ async fn namespace_unfollow_preserves_the_other_namespace_on_the_same_session() 
 #[tokio::test]
 async fn invalid_tier_and_customer_kv_subscriptions_are_rejected() {
     let writer = writer().await;
-    let server = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17301).await;
+    let hub = Hub::writer("writer".into(), writer.clone(), peers());
+    let server = serve(hub.clone(), 17301).await;
     for tier in [4, 5] {
         let (tx, rx) = mpsc::channel(1);
         tx.send(request(pb::relay_request::Kind::Hello(pb::Hello {
@@ -348,18 +349,26 @@ async fn invalid_tier_and_customer_kv_subscriptions_are_rejected() {
         assert!(matches!(result, Err(error) if error.code() == tonic::Code::FailedPrecondition));
     }
     let (tx, mut stream) = raw(&server.address, 0).await;
-    tx.send(request(pb::relay_request::Kind::Follow(pb::Follow {
+    let customer = pb::Follow {
         dataset: "kv".into(),
         namespace: "customer".into(),
         from: 1,
         span: None,
         from_namespaces: Default::default(),
-    })))
-    .await
-    .unwrap();
-    assert!(
-        matches!(frame(&mut stream).await, pb::relay_frame::Kind::Error(error) if error.code == tonic::Code::InvalidArgument as u32)
-    );
+    };
+    for kind in [
+        pb::relay_request::Kind::Follow(customer.clone()),
+        pb::relay_request::Kind::Recover(pb::Recover {
+            follow: Some(customer),
+            visited: Vec::new(),
+        }),
+    ] {
+        tx.send(request(kind)).await.unwrap();
+        assert!(
+            matches!(frame(&mut stream).await, pb::relay_frame::Kind::Error(error) if error.code == tonic::Code::InvalidArgument as u32)
+        );
+    }
+    assert_eq!(hub.requests("kv"), (0, 0), "a rejected dataset is no label");
     writer.close().await.unwrap();
 }
 
