@@ -7,6 +7,16 @@ use crate::reconciliation::rebuild::{Rebuild, Reinitialise, Restore};
 use crate::reconciliation::{Config, Metrics as ReconcileMetrics, Reconciler};
 use crate::storage::memory::MemoryEngine;
 
+impl ReadKey for str {
+    fn cell(&self) -> &str {
+        "cell-a"
+    }
+
+    fn identity(&self) -> (String, Vec<u8>) {
+        ("ns".into(), self.as_bytes().to_vec())
+    }
+}
+
 /// A scripted tier that records the fills it is offered.
 struct Fake {
     name: &'static str,
@@ -60,7 +70,12 @@ fn chain(admin: &Admin, tiers: &[&Arc<Fake>]) -> SourceChain<str> {
         .iter()
         .map(|tier| Arc::clone(*tier) as Arc<dyn Tier<str>>)
         .collect();
-    SourceChain::new("cdn", tiers, &Metrics::new(admin))
+    SourceChain::new(
+        "cdn",
+        tiers,
+        &Metrics::new(admin),
+        &protection::Metrics::new(admin),
+    )
 }
 
 fn fills(tier: &Fake) -> Vec<Found> {
@@ -205,7 +220,12 @@ async fn stale_cache_entry_is_refetched_for_a_minimum_revision_read() {
     tier.fill("k", &at(Some(b"x"), 10)).await.unwrap();
     let origin = fake("s3", found(Some(b"new"), 20));
     let tiers: Vec<Arc<dyn Tier<str>>> = vec![tier.clone(), origin];
-    let reads = SourceChain::new("cdn", tiers, &Metrics::new(&admin));
+    let reads = SourceChain::new(
+        "cdn",
+        tiers,
+        &Metrics::new(&admin),
+        &protection::Metrics::new(&admin),
+    );
     assert_eq!(reads.read("k", 0).await.unwrap().revision, 10);
     assert_eq!(reads.read("k", 15).await.unwrap().revision, 20);
     assert_eq!(cached(&tier).await, Read::Found(at(Some(b"new"), 20)));
@@ -240,7 +260,12 @@ async fn corrupted_cache_entry_is_quarantined_refetched_and_rebuilt_before_use()
 
     let origin = fake("s3", found(Some(b"x"), 10));
     let tiers: Vec<Arc<dyn Tier<str>>> = vec![tier.clone(), origin.clone()];
-    let reads = SourceChain::new("cdn", tiers, &Metrics::new(&admin));
+    let reads = SourceChain::new(
+        "cdn",
+        tiers,
+        &Metrics::new(&admin),
+        &protection::Metrics::new(&admin),
+    );
     let answer = reads.read("k", 0).await.unwrap();
     assert_eq!(
         answer.value.as_deref(),
@@ -291,4 +316,32 @@ async fn corrupted_cache_entry_is_quarantined_refetched_and_rebuilt_before_use()
     // Back in service, the cache refills from the next read and then answers on its own.
     reads.read("k", 0).await.unwrap();
     assert_eq!(cached(&tier).await, Read::Found(at(Some(b"x"), 10)));
+}
+
+#[tokio::test]
+async fn an_overloaded_source_stays_retryable_when_no_tier_answers() {
+    let overloaded = || {
+        Err(StorageError::Overloaded(ErrorContext {
+            engine: "test",
+            instance: "s3".into(),
+            file: None,
+            partition: None,
+            detail: "full".into(),
+        }))
+    };
+    let admin = Admin::new();
+    let (reader, s3) = (fake("reader", down("reader")), fake("s3", overloaded()));
+    assert!(matches!(
+        chain(&admin, &[&reader, &s3]).read("k", 0).await,
+        Err(StorageError::Overloaded(_))
+    ));
+
+    // A skipped overload is not a failed read when another tier answers.
+    let admin = Admin::new();
+    let (reader, s3) = (
+        fake("reader", overloaded()),
+        fake("s3", found(Some(b"v"), 7)),
+    );
+    let answer = chain(&admin, &[&reader, &s3]).read("k", 0).await.unwrap();
+    assert_eq!(answer.revision, 7);
 }

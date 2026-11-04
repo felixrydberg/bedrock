@@ -8,9 +8,11 @@
 //! - **half-open → closed** on success, otherwise **open** again with double the backoff, up to [`MAX_BACKOFF`].
 //!
 //! The view is local to this node and never shared; removing a node from the cell is B-12's decision. Local storage
-//! health is [`storage`] (B-14). Reads fall back across tiers through [`fallback`] (B-22).
+//! health is [`storage`] (B-14). Reads fall back across tiers through [`fallback`] (B-22), and [`protection`] (B-22b)
+//! keeps a surge of misses from overwhelming the sources behind them.
 
 pub mod fallback;
+pub mod protection;
 pub mod storage;
 
 use std::collections::BTreeMap;
