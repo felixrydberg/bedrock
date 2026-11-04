@@ -260,11 +260,11 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo test --workspace
-RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo clippy --workspace --all-targets -- -D warnings -A clippy::disallowed_methods -A clippy::disallowed_types
+RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim" cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The simulation lint allowances match the workspace's documented harness checks;
-normal lint retains the disallowed API checks. All checks above passed on
+Both builds keep the disallowed API checks, as CI does; madsim re-exports std's `Instant`, so simulation code reads
+time through `monotonic_now`. Earlier simulation lint runs recorded here allowed those checks. All checks above passed on
 2026-10-30, including 165 native / 118 simulation shared-core unit tests and the
 ten relay protocol integration tests in both builds. Opt-in load and real-S3
 tests remain ignored by the ordinary workspace test command. With range streams
