@@ -242,7 +242,7 @@ async fn scenario(tier: u32) -> Vec<String> {
 
         // Its subscribers move with no new upstream follow and no recovery request.
         let before = requests(&parent);
-        let killed = tokio::time::Instant::now();
+        let killed = bedrock_lib::monotonic_now();
         Handle::current().kill(first.id);
         commit(&writer, 11, 20).await;
         caught_up(&session, &engine, 20).await;
