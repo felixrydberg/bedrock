@@ -73,21 +73,22 @@ server runs every service, each service is its own process, and code is shared a
 |---|---|---|
 | `bedrock-api` | Authoritative writes and revisions; generic per-namespace materialized state across datasets (B-09, B-11) | — |
 | `bedrock-relay` | Relay tree, fan-out, replay log, cell membership, L2 placement directory and handoffs (§4 decision 13), regional directory | — (`tier` and `upstreams` in config) |
-| `bedrock-quicksilver` | Pushed `quicksilver` and `auth` over relay-assigned hash ranges (§4 decision 13) | `l1`, `l2` |
+| `bedrock-quicksilver` | Pushed `quicksilver` over relay-assigned hash ranges (§4 decision 13) | `l1`, `l2` |
 | `bedrock-kv` | Customer `kv`: S3-backed namespace readers and caches; no hash ranges or buckets (§4 decision 12) | `l1`, `l2` (only logged until B-39) |
 | `bedrock-cdn` | Dataset `cdn` (path rows and ref keys) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
+| `bedrock-gateway` (planned, B-57) | Public entry point, internal routing between cells, API-key checks and the local `auth` copy (§4 decision 15) | — (follows its relay's tier) |
 
 Rules this implies:
 
 - **Relays are their own binary.** `bedrock-relay` holds no product logic: it is generic over datasets and uses `lib`
   for everything (`lib/relays` for fan-out and tiers, `lib/replication` for streams, `lib/storage` RocksDB for its replay log,
   `lib/membership` for the cell view). A Quicksilver, KV or CDN crash never takes a relay with it, and relays deploy on their own schedule.
-- **`quicksilver`, `kv`, `cdn`, `relay` and `api` depend on `lib` only, never on each other.**
+- **`quicksilver`, `kv`, `cdn`, `relay`, `api` and `gateway` depend on `lib` only, never on each other.**
 - **KV and CDN share infrastructure, not data.** Writes use `bedrock-api` and its sequencing/durability system.
-  `bedrock-quicksilver` subscribes to `quicksilver` and `auth`; `bedrock-cdn` follows only the `cdn` ranges its relay pushes.
+  `bedrock-quicksilver` subscribes to `quicksilver`; `bedrock-cdn` follows only the `cdn` ranges its relay pushes.
   Customer `kv` has no relay subscriptions, replay queues or subscription-driven placement. Its readers use S3-backed
   namespace databases. `bedrock-kv` holds a relay connection only for its own `kv` membership, without another heartbeat,
-  and reads Quicksilver/Auth (namespace directory, credentials) from `bedrock-quicksilver` nodes, not from a local copy.
+  and reads the namespace directory from `bedrock-quicksilver` nodes, not from a local copy. Gateways check credentials (§4 decision 15).
 - **Customer KV is isolated from the control plane.** Tenant load (hot namespaces, cold-open storms, slow S3) can exhaust
   `bedrock-kv` without taking down Quicksilver/Auth, which Workers, CDN and deploy tooling depend on (§4 decision 12).
 - **CDN path rows and ref keys are plain `SET`/`DELETE` writes** to the `cdn` dataset, sent in bulk (B-09c). The write API and
@@ -96,7 +97,7 @@ Rules this implies:
 - **The CDN serves by key and hash and knows nothing about deployments.** A deployment ID is an opaque part of a key. Workers, Pages, deployments, revisions and which version is live
   belong to the Compute and deploy control plane (track L), a client of KV and the CDN (B-50, B-51).
 - **Each binary has its own service view.** Membership, health, the placement directory and the regional directory are
-  per service, and each binary reads only its own service's views. Relays assign L2 ranges per service (§4 decision 13). A node with a broken CDN cache disk is still a healthy KV node, and the reverse.
+  per service, and each binary reads only its own service's views, except that a Gateway and the shared client read the views of the services they call (§4 decision 15). Relays assign L2 ranges per service (§4 decision 13). A node with a broken CDN cache disk is still a healthy KV node, and the reverse.
 - **Shared storage implementations live in `lib/storage`.** Keep the existing synchronous local `StorageEngine` contract
   for pushed datasets. B-11 adds a separate asynchronous namespace persistence/recovery contract; B-39 adds customer-KV readers. Do not block on S3 inside
   the local trait or pretend a read-only handle can write/restore. Dataset identity and permissions remain independent of
@@ -168,7 +169,7 @@ Rules this implies:
 | B-38 | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
 | B-40 | `full_replica` placement and completeness | KV | `quicksilver/storage`, `lib/buckets` | B-24, B-21 |
 | B-41 | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
-| B-42 | Auth dataset | KV | `quicksilver/namespaces` | B-24, B-21b |
+| B-42 | Auth dataset | Shared infrastructure | `gateway` | B-57 |
 | B-53 | Namespace residency fairness and cold-open tuning at scale | KV | `kv/storage`, `kv/namespaces` | B-29 |
 | **K — CDN refinements** (parallel with J) |||||
 | B-43 | Artifact replica repair and range migration | CDN | `cdn/retention` | B-36 |
@@ -179,7 +180,7 @@ Rules this implies:
 | B-49 | Large-object and range transfers | CDN | `cdn/artifact_transfer` | B-36 |
 | **L — Compute and deploy control plane (future)** |||||
 | B-50 | Deploy control plane: publish, activate, roll back, delete | Compute | not decided | B-24, B-33, B-45 |
-| B-51 | Gateway: Worker and Pages request routing | Compute | not decided | B-35, B-50 |
+| B-51 | Gateway: Worker and Pages request routing | Compute | `gateway` | B-35, B-50, B-57 |
 | B-48 | Compiled Worker artifact caching | Compute | not decided | B-51 |
 | B-52 | Deploy end-to-end acceptance | Compute | not decided | B-29, B-36, B-50, B-51 |
 | **M — Node security** (parent [#44](https://github.com/felixrydberg/bedrock/issues/44); scope amended 2026-11-03, drafts not yet issues) |||||
@@ -187,6 +188,7 @@ Rules this implies:
 | B-54 | Deployment guide: private networking and node certificates (Kubernetes, Docker, bare metal) | Foundation (docs) | `docs/deployment/` + `deploy/` | B-02, B-55 |
 | **N — Shared platform infrastructure (future)** |||||
 | B-56 | Shared API rate-limit infrastructure | Shared infrastructure | shared contracts in `lib`; API integration | To be agreed; does not gate initial KV |
+| B-57 | Gateway binary and shared cluster client | Shared infrastructure | `gateway`, `lib` client, `lib/relays` | B-19, B-22, B-55 |
 
 ### Parallel work inside the shared core
 
@@ -590,7 +592,7 @@ Quicksilver is retained in every cell, while CDN artifacts have their own holder
   |---|---|---|---|
   | `quicksilver` (`full_replica`) | Ranges move to other nodes in the cell (B-21) | Nothing to move: every cell holds it | `Unsupported`: it must be in every cell |
   | `kv` | Stop new reads, finish in-flight reads, close readers and release caches | Apply the same reader/cache drain on its nodes; S3 data stays in place | Close that namespace's readers and release its local cache |
-  | `auth` (`on_demand`) | Ranges move to other nodes | Nothing to move: each cell subscribes on its own | `Unsupported` |
+  | `auth` | Nothing to move: every cell-tier Gateway holds the whole namespace | Nothing to move: each cell subscribes on its own | `Unsupported` |
   | `cdn` | Artifact holders move within the cell (B-21, B-43) | Nothing to move: each cell keeps its own holders; the cells taking its traffic can prewarm (B-45) | `Unsupported` until the CDN defines one |
 
 - **Progress and completion:** each dataset reports the units left on the target. The drain is complete when every selected
@@ -1055,20 +1057,24 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-`notes.md` lists an Auth dataset (API key hashes, permissions, status) replicated `on_demand`. It is not in the main architecture doc yet.
+`notes.md` lists an Auth dataset (API key hashes, permissions, status). §4 decision 15 places it on the Gateways.
 
 **Describe the solution you'd like**
-- An `auth` dataset with a `keys` namespace (§4 decision 13, fixed namespaces), using the `on_demand` policy (push on first
-  read). It never uses the `cached` TTL model: a revocation must not wait for a TTL.
-- Fail-closed behaviour for revocations: revocation must be enforced authoritatively, not only eventually.
-- Drain hook (B-21b): a node drain moves its ranges; a cell drain has nothing to move; a namespace drain is `Unsupported`.
+- An `auth` dataset with a `keys` namespace (§4 decision 13, fixed namespaces). Every cell-tier Gateway follows the whole
+  namespace into local durable storage and is not ready until it has caught up. It never uses the `cached` TTL model: a
+  revocation must not wait for a TTL.
+- Fail-closed behaviour for revocations: a Gateway rejects keys once it has gone 30 seconds without proof that its copy is
+  current (decision 15).
+- Each key record holds its permissions, status, allowed IP ranges and expiry, evaluated locally on the Gateway.
+- Proposed key format, to settle before the first key is issued: a recognizable prefix and a checksum, so secret scanners can
+  find leaked keys and malformed ones are rejected without a lookup.
 
 **Additional context**
-- **Implementation:** KV refinement (new dataset). Needs scoping before work starts.
-- **Module:** `quicksilver/namespaces` (binary `bedrock-quicksilver`, decision 12).
+- **Implementation:** Shared infrastructure (new dataset).
+- **Module:** `crates/gateway` (binary `bedrock-gateway`, decision 15).
 - **Doc reference:** `notes.md`; `kv.md` §17 Freshness Guarantees ("access revocations require fencing… or fail-closed").
-- **Depends on:** B-24, B-21b.
-- **Acceptance criteria:** A revoked key is rejected in every region within the agreed bound, or the check fails closed.
+- **Depends on:** B-57.
+- **Acceptance criteria:** A revoked key is rejected in every region within 30 seconds, or the check fails closed.
 
 ---
 
@@ -1349,9 +1355,9 @@ point lookups; the CDN and Quicksilver only answer for keys and artifacts.
 - Content type, caching headers and not-found handling for deployments.
 
 **Additional context**
-- **Implementation:** Compute / deploy control plane.
-- **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §4 Phase 1 ("Basic Worker and Pages artifact retrieval"); §4 decision 14.
-- **Depends on:** B-35, B-50.
+- **Implementation:** Compute / deploy control plane, running in `bedrock-gateway` (B-57).
+- **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §4 Phase 1 ("Basic Worker and Pages artifact retrieval"); §4 decisions 14, 15.
+- **Depends on:** B-35, B-50, B-57.
 - **Acceptance criteria:** A Pages request resolves to the active deployment's file. Switching `active` changes the served
   version in every region once Quicksilver has propagated. A Pages request never sees a row behind its deployment's
   `cdn_revision`.
@@ -1613,6 +1619,38 @@ initial KV delivery.
 
 ---
 
+#### B-57 — Gateway binary and shared cluster client
+
+```
+Title:  Feature 🚀: Gateway binary and shared client for routing between nodes and cells
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+Services have no standard way to reach each other. Each binary wires up its own member view and source selection, a node
+cannot reach another cell, and public requests have no entry point.
+
+**Describe the solution you'd like**
+- A shared client in `lib` built from `membership::View`, `relays::sources`, `transport::Peers` and `SourceChain`. Services call
+  it by service and key and never touch member lists, addresses or breakers.
+- `bedrock-gateway`, with its role taken from the tier of the relay it subscribes to (§4 decision 15): a cell tier authenticates
+  and routes to nodes, a DC or region tier picks a cell. Separate public and internal listeners with separate limits.
+- A `gateway` service identity in `authorize`, including a way to read from upper-tier relays, which accept only `relay` today.
+- Reading other services' views: `{service}.{cell}` for each service the Gateway calls. This is untested.
+- The list of cells below an upper tier, which relays do not know today.
+- The freshness request of decision 15 on the relay session, with its reply's age accumulated at each tier.
+
+**Additional context**
+- **Implementation:** Shared infrastructure; draft only, no GitHub issue created.
+- **Module:** new `crates/gateway`; the client in `lib`; `lib/relays` and `replication.proto` for the freshness request.
+- **Doc reference:** §4 decision 15.
+- **Depends on:** B-19, B-22, B-55. The freshness request updates the TLA+ specification first and meets the B-23 checks.
+- **Acceptance criteria:** A read inside a cell takes no extra hop. A node reaches another cell with no member list for it. A
+  relay cut off from its parent cannot make a Gateway look fresh: simulation shows the Gateway failing closed within 30 seconds
+  and recovering afterwards, replayable per seed. Metric labels stay low-cardinality.
+
+---
+
 ## 4. Open decisions
 
 ### Decided
@@ -1674,23 +1712,23 @@ initial KV delivery.
       in the prefix plus cutoff index/term/membership; a progress record alone is insufficient. Keep committed, buffered,
       durable and reader-visible positions distinct. Fence stale engine publishers. Portable live-key export is optional.
     - **Readers and routing:** only the namespace's home region opens its SlateDB database through a dedicated read-only
-      namespace reader. Other regions do not open that database. HRW over `(namespace, key)` selects the preferred regional
+      namespace reader. Other regions do not open that database. HRW over `(namespace, key)` selects the cell's preferred
       value-cache node (no ranges or buckets, decisions 12, 13); it does not shard persistent data or impose durable ownership.
-      On a regional cache miss, resolve the home region from Quicksilver and forward there. The home reader returns the
-      value, and the requesting region may cache it for at most 60 seconds. Adding/removing a cache node needs no namespace
+      On a cell cache miss, resolve the home region from Quicksilver and forward there. The home reader returns the
+      value, and the requesting cell may cache it for at most 60 seconds. Adding/removing a cache node needs no namespace
       move, replica rebuild or customer-KV relay subscription. Membership still comes from the Quicksilver/Auth connection.
       One logical writer remains a write-throughput limit even when readers scale out.
-    - **Read semantics:** optional local L1 → preferred healthy regional value cache → on miss, Quicksilver home-region
+    - **Read semantics:** optional local L1 → preferred healthy cell value cache → on miss, Quicksilver home-region
       lookup → home-region SlateDB reader → its block cache/S3 ranges or coherent recent committed state. `LIST` runs against
       the home namespace's full ordered database view; pagination uses original keys and a logical cursor, not cache-node
       locations or a scatter/merge over cache holders. A minimum-revision read requires a sufficiently new namespace view,
       including for an absence. Wait for publication or read coherent recent committed state if the home S3 view lags; a
-      regional value cache must not satisfy a minimum revision it cannot prove. The fixed 60-second TTL bounds regional cache
+      cell value cache must not satisfy a minimum revision it cannot prove. The fixed 60-second TTL bounds cell cache
       residence, not publication lag.
-    - **Local residency:** regional KV nodes independently bound value-cache bytes, RAM and in-flight fetches. Only home-
+    - **Local residency:** KV nodes independently bound value-cache bytes, RAM and in-flight fetches. Only home-
       region nodes manage SlateDB block cache, memory/manifest overhead, open readers and in-flight opens. Soft per-namespace
       cache shares may borrow free capacity; quotas on total persistent namespace size are separate. Pressure can evict
-      regional values or cold home-region blocks; idle timeout closes home readers. Finish in-flight reads, coalesce reopen
+      cached values or cold home-region blocks; idle timeout closes home readers. Finish in-flight reads, coalesce reopen
       and release checkpoint protection safely. No global dormant/rehydrating state or eviction broadcasts.
     - **Lifecycle and retention:** closing/evicting a local reader never deletes S3 data or expires customer keys. TTL and
       namespace deletion are explicit data semantics; KV enforces expiration on reads, and background compaction/GC reclaims
@@ -1821,10 +1859,45 @@ initial KV delivery.
       `cdn`, about 1 GB per cell for a 10,000-file publish on 1,000 nodes) or on the request path. Per-file rows make every lookup
       a point read and send each record only to its 2 owners per cell.
     - **Cost:** two keys per file in the log, and bulk writes become a shared-core prerequisite (B-09c).
+15. **Gateway, routing between nodes and cells, and API-key checks.** Decided 2026-11-04. Replaces decision 11's regional value
+    cache with a per-cell one, moves `auth` out of `bedrock-quicksilver` (decisions 1, 6, 12 and 13 still describe it there) and
+    replaces B-42's `on_demand` policy.
+    - **One Gateway binary.** `bedrock-gateway` (B-57) is both the public entry point and the internal routing layer. It runs on
+      its own machines, not beside relays, so an attack from the internet never lands on the hosts that replicate data, and it
+      subscribes to a relay like any other process. Its role follows that relay's tier: at the cell tier it authenticates and
+      routes to nodes; at a DC or region tier it picks a cell, with no authentication and no Quicksilver. Public and internal
+      (mTLS) traffic use separate listeners with separate limits, so a public flood cannot starve internal reads.
+    - **Reads inside a cell go direct.** The caller hashes the key against its own member list and connects to the node. One
+      shared client in `lib` hides member lists, hashing, connections, breakers and tier fallback, so a service only says what
+      it wants. A process holds lists only for the services it calls.
+    - **Reads between cells go through a Gateway.** A node needs its own cell's list and the target's Gateway address, not
+      another cell's members.
+    - **Public entry.** Anycast reaches a DC; a connection-level layer that never sees keys spreads connections across Gateways.
+      Off-the-shelf ECMP or L4 balancing comes first. It is not designed yet (Still open).
+    - **Caches and coalescing.** Customer-KV value caches are per cell, matching decision 12's routing. A read never searches
+      other cells. Coalescing stays on the serving node and S3 and open limits stay on the reader (B-22b), because that is where
+      a key's requests meet and where a miss is known. An upper-tier Gateway only sees misses, so it may also coalesce across
+      cells, and one hash-picked DC or region stop may become an extra `SourceChain` tier. Neither is required (decision 5).
+    - **Authentication.** Cell-tier Gateways check API keys and pass the tenant with the request. `bedrock-kv` accepts reads only
+      from Gateway and Compute identities and still checks namespace deletion. Compute's host runtime, outside the Worker
+      sandbox, checks bindings, and a Worker's KV reads skip the Gateway.
+    - **Auth data.** Every cell-tier Gateway follows the whole `auth/keys` namespace into local durable storage and is not ready
+      until it has loaded and caught up. A revocation never waits for confirmation from every Gateway. Quicksilver reads go
+      straight to Quicksilver nodes, never through another Gateway. If anything else must check keys, revisit where `auth` lives.
+    - **Freshness.** A Gateway accepts keys for at most 30 seconds without proof that its copy is current, then fails closed. The
+      writer stays event driven, with no timed writes. A Gateway pulls the latest `auth/keys` sequence from its relay, and each
+      relay asks upward to the writer's live head, because a relay's own head cannot reveal a stopped parent. Relays merge and
+      briefly reuse answers, and each answer carries its age. The Gateway accepts while it has applied that sequence and the
+      confirmation is under 30 seconds old. Starting values: a 5-second poll and up to 5 seconds of reuse per tier. A head that
+      moves while the Gateway's stream does not also sends it to a sibling relay.
+    - **Cost:** a writer outage over 30 seconds rejects API-key requests everywhere, until B-09b replicates the writer; losing
+      every route through the relays does the same. Public Pages and Worker traffic needs no API key. The freshness request is a
+      relay protocol change, so the TLA+ specification comes first, and like `Tick` it can never advance applied state.
 
 ### Still open
 
-1. **Auth dataset scope (B-42).** It is only mentioned in `notes.md`, so it needs a short design before it becomes an issue.
+1. **Gateway entry and placement (B-57).** The DNS, anycast and L4 layer in front of Gateways, how traffic moves between cells,
+   and how a Worker is assigned to a Compute node. Decision 15 assumes these and does not design them.
 2. **Publication and reader-refresh budgets (B-39/B-27).** Choose measured bounds and overload behavior for publication lag,
    manifest refresh, recent-state reads/waits and cold namespace opens. The Frankfurt/R2-EU 100–300 ms goal is a measurement
    target, not a guaranteed S3 latency. An unavailable source is an error, never proof that a key is missing.

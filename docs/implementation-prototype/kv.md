@@ -14,6 +14,8 @@ Both datasets share the **write API and sequence system**, but run as separate b
 (customer KV, read from S3 by cache readers with no virtual buckets or dataset subscriptions; it uses the cell's relays
 only for membership). See `feature-drafts.md` §4 decisions 11 and 12, and §9
 "Customer KV: S3 Namespace Readers". Where this document still describes customer-KV origin cells, those decisions win.
+Decision 15 moves Auth and API-key checks to `bedrock-gateway`, and it wins where this document places them in
+`bedrock-quicksilver`.
 
 Storage engines are interchangeable through a common Rust abstraction.
 
@@ -105,7 +107,7 @@ policies described an origin cell and are superseded.
 
 **Global** means all eligible datacenters receive updates, but older, unpinned data may be evicted.
 
-**On-demand** means only active subscribers receive updates, starting from their first read. Auth uses it, because a revocation must not wait for a TTL.
+**On-demand** means only active subscribers receive updates, starting from their first read. Auth does not use it: Gateways follow the whole namespace (decision 15).
 
 **Full-replica** requires every eligible datacenter to retain the entire namespace distributed across L2 nodes.
 
@@ -431,12 +433,12 @@ The earlier origin-cell and regional-tier design is superseded by `feature-draft
 - **Readers.** Only the namespace's home region runs its read-only SlateDB namespace reader. It keeps an engine handle and
   may cache blocks locally. Other regions do not open SlateDB databases for that namespace; they cache returned values
   for at most 60 seconds.
-- **Routing.** Hash `(namespace, key)` over healthy `bedrock-kv` nodes in the request's region to select a preferred value
+- **Routing.** Hash `(namespace, key)` over healthy `bedrock-kv` nodes in the request's cell to select a preferred value
   cache. On a miss, resolve the home region through Quicksilver and forward to its namespace reader. There are no virtual
   buckets or durable cache ownership; another eligible local cache may serve.
 - **Freshness.** Minimum-revision reads need a sufficiently new namespace view, including for absence and `LIST`; a lagging
   S3 view waits or uses the writer's recent committed state.
-- **Adding capacity** adds regional value-cache capacity. A home-region reader may be reopened after eviction; a drain
+- **Adding capacity** adds value-cache capacity to a cell. A home-region reader may be reopened after eviction; a drain
   releases local handles/cache state, never S3 data.
 
 The L1/L2 bucket model in the rest of this document applies to pushed datasets (Quicksilver, Auth) and CDN.
@@ -526,7 +528,7 @@ Relays must accurately advertise which contiguous revision ranges are available.
 #### B. Cache Fills
 
 There is no separate cache-fill broadcast channel. For customer KV, the home-region SlateDB reader fetches blocks from S3
-and returns values to the preferred regional `bedrock-kv` cache; the regional cache may fill the requester's L1 (§9).
+and returns values to the cell's preferred `bedrock-kv` cache; that cache may fill the requester's L1 (§9).
 Fills never travel up the relay tree.
 
 An older cache fill must never overwrite a newer value or an applied delete. A fill carries the sequence its source
@@ -587,9 +589,9 @@ No relay carries customer-KV events.
 
 Example: a Frankfurt node requests a key whose namespace is homed in Paris.
 
-1. Check authorization and namespace deletion state, then check the optional Frankfurt L1 and route a miss to the
-   preferred healthy Frankfurt value-cache node selected by rendezvous hash of `(namespace, key)`.
-2. On a regional cache miss, resolve the home region through Quicksilver and forward the request to the Paris namespace
+1. The Gateway or Compute host has already checked the caller. Check namespace deletion state, then the optional L1, and route a miss to the
+   preferred healthy value-cache node in the Frankfurt cell, selected by rendezvous hash of `(namespace, key)`.
+2. On a cell cache miss, resolve the home region through Quicksilver and forward the request to the Paris namespace
    reader. Only that home-region reader opens the namespace's SlateDB database; it serves cached blocks or fetches needed
    ranges from S3.
 3. Return the value to Frankfurt, cache it there for at most 60 seconds, and return it to the requester. If the home
