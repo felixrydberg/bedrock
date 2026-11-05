@@ -15,6 +15,8 @@ use crate::placement::{hash_of, in_span, valid_span};
 use crate::replication::log::Watched;
 use crate::replication::pb;
 use crate::storage::{KeyRange, StorageEngine, WriteBatch, l2_key, l2_parts, l2_span};
+#[cfg(madsim)]
+use crate::storage::{Snapshot, StorageResult};
 use crate::transport::{Class, Peers};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,17 +78,62 @@ fn held(engine: &dyn StorageEngine, dataset: &str) -> Result<BTreeSet<Range>, St
         .map_err(storage)?
         .revisions()
         .map_err(storage)?;
-    let parse = |rest: &str| {
-        let start = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
-        let end = u64::from_str_radix(rest.get(17..33)?, 16).ok()?;
-        (rest.get(16..17)? == "-" && rest.get(33..34)? == ":").then_some((start, end))
-    };
     revisions
         .iter()
         .filter(|(_, value)| **value == 1)
         .filter_map(|(name, _)| name.strip_prefix(&prefix))
-        .map(|rest| parse(rest).ok_or_else(|| Status::data_loss("invalid relay range marker")))
+        .map(|rest| {
+            marker_range(rest).ok_or_else(|| Status::data_loss("invalid relay range marker"))
+        })
         .collect()
+}
+
+/// The range at the start of a marker, after its `relay:range:{dataset}:` prefix.
+fn marker_range(rest: &str) -> Option<Range> {
+    let start = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
+    let end = u64::from_str_radix(rest.get(17..33)?, 16).ok()?;
+    (rest.get(16..17)? == "-" && rest.get(33..34)? == ":").then_some((start, end))
+}
+
+/// One consumer's validated position in `snapshot`: what the snapshot holds for this scope is the stream's state at that
+/// revision. `None` until it has validated progress. For the simulation's checkers (#25 / B-23).
+#[cfg(madsim)]
+pub fn applied_at(
+    snapshot: &dyn Snapshot,
+    dataset: &str,
+    namespace: &str,
+    prefix: &[u8],
+    span: Option<Range>,
+) -> StorageResult<Option<u64>> {
+    let names = Names::of(dataset, namespace, prefix, span);
+    let revisions = snapshot.revisions()?;
+    let validated =
+        revisions.get(&names.active) == Some(&1) && revisions.get(&names.pending) != Some(&1);
+    Ok(validated
+        .then(|| revisions.get(&names.revision).copied())
+        .flatten())
+}
+
+/// `(namespace, range, revision)` of every range consumer of `dataset` with validated progress in `snapshot`.
+#[cfg(madsim)]
+pub fn applied_ranges(
+    snapshot: &dyn Snapshot,
+    dataset: &str,
+) -> StorageResult<Vec<(String, Range, u64)>> {
+    let prefix = format!("relay:range:{dataset}:");
+    let mut applied = Vec::new();
+    for (name, value) in snapshot.revisions()? {
+        let Some(rest) = name.strip_prefix(&prefix).filter(|_| value == 1) else {
+            continue;
+        };
+        let (Some(range), Some(namespace)) = (marker_range(rest), rest.get(34..)) else {
+            continue;
+        };
+        if let Some(revision) = applied_at(snapshot, dataset, namespace, &[], Some(range))? {
+            applied.push((namespace.to_owned(), range, revision));
+        }
+    }
+    Ok(applied)
 }
 
 /// The revision names of one consumer's progress.
@@ -193,10 +240,18 @@ impl Session {
         if upstreams.is_empty() {
             return Err(Status::invalid_argument("upstreams are required"));
         }
-        // Ranges held before a restart resume where they left off until the relays push the current set.
+        // Ranges held before a restart resume where they left off until the relays push the current set. One that cannot
+        // be read waits for that push: the session must start, because storage is rebuilt through it (#23 / B-22).
         for (dataset, engine) in &ranged {
-            for range in held(engine.as_ref(), dataset)? {
-                targets.push(Target {
+            let ranges = match held(engine.as_ref(), dataset) {
+                Err(error) if local(&error) => {
+                    tracing::warn!(%dataset, %error, "held ranges unreadable; waiting for the relays");
+                    continue;
+                }
+                ranges => ranges?,
+            };
+            for range in ranges {
+                let target = Target {
                     selection: Selection {
                         dataset: dataset.clone(),
                         namespace: String::new(),
@@ -204,7 +259,16 @@ impl Session {
                     engine: engine.clone(),
                     prefix: Vec::new(),
                     span: Some(range),
-                });
+                };
+                match Consumer::resumed(&target, range) {
+                    Err(error) if local(&error) => {
+                        tracing::warn!(%dataset, %error, "held range unreadable; waiting for the relays");
+                    }
+                    resumed => {
+                        resumed?;
+                        targets.push(target);
+                    }
+                }
             }
         }
         let mut consumers = BTreeMap::new();
@@ -456,6 +520,11 @@ struct Consumer {
     rebuild: u64,
 }
 
+/// Whether `status` came from this process's own storage, as [`storage`] marks it.
+fn local(status: &Status) -> bool {
+    status.metadata().get("bedrock-local-error").is_some()
+}
+
 fn storage(error: crate::storage::StorageError) -> Status {
     let mut status = Status::internal(error.to_string());
     status
@@ -588,6 +657,13 @@ impl Consumer {
         !self.recover && !self.awaiting_confirmation && self.bootstrap.is_none()
     }
 
+    /// Nothing this consumer has applied counts until a fresh baseline installs.
+    fn distrust(&mut self) {
+        self.recover = true;
+        self.awaiting_confirmation = true;
+        self.bootstrap = None;
+    }
+
     fn reconnect(&mut self) {
         self.bootstrap = None;
         self.recover |= self.awaiting_confirmation;
@@ -670,20 +746,54 @@ impl Consumer {
         }
     }
 
+    /// Retires cursors on parts of this range. A split that committed but reported failure leaves them behind while this
+    /// consumer carries on, and this batch moves the data past what they claim.
+    fn overtake(&self, revisions: &BTreeMap<String, u64>, batch: &mut WriteBatch) {
+        let Some(span) = self.target.span else {
+            return;
+        };
+        let s = &self.target.selection;
+        let prefix = format!("relay:range:{}:", s.dataset);
+        for rest in revisions
+            .iter()
+            .filter(|(_, value)| **value == 1)
+            .filter_map(|(name, _)| name.strip_prefix(&prefix))
+        {
+            let (Some(part), Some(namespace)) = (marker_range(rest), rest.get(34..)) else {
+                continue;
+            };
+            if namespace == s.namespace && part != span && ranges::within(part, span) {
+                let names = Names::of(&s.dataset, namespace, &[], Some(part));
+                batch
+                    .set_revision(&names.active, 0)
+                    .set_revision(&names.pending, 0);
+                if let Some(marker) = &names.marker {
+                    batch.set_revision(marker, 0);
+                }
+            }
+        }
+    }
+
+    /// Records that `range`, a part of this consumer's range a split kept, is held: its data stays either way.
+    fn mark(&self, batch: &mut WriteBatch, range: Range) {
+        let s = &self.target.selection;
+        let names = Names::of(&s.dataset, &s.namespace, &[], Some(range));
+        if let Some(marker) = &names.marker {
+            batch.set_revision(marker, 1);
+        }
+    }
+
     /// Hands this range consumer's coverage to `range`, a part of its range a split kept: every revision applied for
     /// the whole range is applied for the part. Unvalidated progress is not handed on; the part bootstraps.
     fn carry(&self, batch: &mut WriteBatch, range: Range) {
-        if !self.validated() {
-            return;
-        }
+        self.mark(batch, range);
         let s = &self.target.selection;
         let names = Names::of(&s.dataset, &s.namespace, &[], Some(range));
-        batch
-            .set_revision(&names.active, 1)
-            .set_revision(&names.revision, self.applied)
-            .set_revision(&names.pending, 0);
-        if let Some(marker) = &names.marker {
-            batch.set_revision(marker, 1);
+        if self.validated() {
+            batch
+                .set_revision(&names.active, 1)
+                .set_revision(&names.revision, self.applied)
+                .set_revision(&names.pending, 0);
         }
     }
 
@@ -702,6 +812,12 @@ impl Consumer {
     }
 
     fn commit(&mut self, mut batch: WriteBatch, boundary: u64) -> Result<(), Status> {
+        assert!(self.bootstrap.is_none(), "committed during a bootstrap");
+        // Only a recovery, which abandoned its coverage, may land behind it.
+        assert!(
+            self.recover || boundary >= self.applied,
+            "applied revision moved backwards"
+        );
         let revisions = self
             .target
             .engine
@@ -715,6 +831,7 @@ impl Consumer {
         {
             batch.set_revision(name, 0);
         }
+        self.overtake(&revisions, &mut batch);
         if let Some(marker) = &self.marker {
             batch.set_revision(marker, 1);
         }
@@ -1330,8 +1447,8 @@ async fn settle(
     if due.is_empty() {
         return Ok(());
     }
-    let directories =
-        crate::membership::read(membership.target.engine.as_ref(), &membership.target.prefix)?.1;
+    let (members, directories) =
+        crate::membership::read(membership.target.engine.as_ref(), &membership.target.prefix)?;
     for dataset in due {
         let frame = pushed.pending.remove(&dataset).unwrap();
         let mut refused = Vec::new();
@@ -1343,20 +1460,29 @@ async fn settle(
                 .filter(|(d, _)| *d == dataset)
                 .map(|(_, range)| *range)
                 .collect();
-            let plan = ranges::plan(&held, &frame.spans)?;
-            for change in plan.changed {
-                let confirmed = change
-                    .dropped
-                    .iter()
-                    .try_for_each(|d| ranges::confirms(directories.get(&dataset), &node, *d));
-                if let Err(reason) = confirmed {
-                    tracing::warn!(%dataset, held = ?change.held, %reason, "refused a revoke the directory view does not confirm");
-                    refused.extend(change.dropped.iter().filter_map(|d| span(Some(*d))));
-                    reasons.push(reason);
-                    continue;
-                }
+            // A range unreadable when the session started has no group, and only this can still drop it. A failure here
+            // reconnects for a new push; a rebuild empties storage that stays unreadable.
+            let stored: Vec<Range> = self::held(engine.as_ref(), &dataset)?.into_iter().collect();
+            let plan = ranges::plan(&held, &stored, &frame.spans)?;
+            for change in &plan.changed {
+                let unhealthy = members
+                    .values()
+                    .filter(|member| member.unhealthy.contains(&dataset))
+                    .map(|member| member.node_id.clone())
+                    .collect();
+                let confirmed =
+                    ranges::confirm(directories.get(&dataset), &node, change, &unhealthy);
+                let confirmed = match confirmed {
+                    Ok(confirmed) => confirmed,
+                    Err(reason) => {
+                        tracing::warn!(%dataset, held = ?change.held, %reason, "refused a revoke the directory view does not confirm");
+                        refused.extend(change.dropped.iter().filter_map(|d| span(Some(*d))));
+                        reasons.push(reason);
+                        continue;
+                    }
+                };
                 for kind in narrow(
-                    &dataset, &engine, &change, consumers, pushed, progress, changes,
+                    &dataset, &engine, confirmed, consumers, pushed, progress, changes,
                 )? {
                     send(requests, pb::RelayRequest { kind: Some(kind) }).await?;
                 }
@@ -1404,20 +1530,44 @@ async fn settle(
 fn narrow(
     dataset: &str,
     engine: &Arc<dyn StorageEngine>,
-    change: &ranges::Change,
+    confirmed: ranges::Confirmed<'_>,
     consumers: &mut BTreeMap<Scope, Consumer>,
     pushed: &mut Pushed,
     progress: &Mutex<Progress>,
     changes: &Watched<u64>,
 ) -> Result<Vec<pb::relay_request::Kind>, Status> {
+    let change = confirmed.change();
     let scopes: Vec<Scope> = consumers
         .keys()
         .filter(|(d, _, range)| d == dataset && *range == Some(change.held))
         .cloned()
         .collect();
+    let group = Target {
+        selection: Selection {
+            dataset: dataset.to_owned(),
+            namespace: String::new(),
+        },
+        engine: engine.clone(),
+        prefix: Vec::new(),
+        span: None,
+    };
     let mut batch = WriteBatch::default();
     for &(start, end) in &change.dropped {
         batch.delete_range(l2_span(start, end));
+    }
+    // Left behind, stored progress would resume over deleted or replaced data. It may have no consumer yet, and an earlier
+    // attempt that committed but reported failure can have left it on parts of the range, which no group follows.
+    let stored = held(engine.as_ref(), dataset)?;
+    let followed = |range: &Range| pushed.groups.contains_key(&(dataset.to_owned(), *range));
+    for range in stored.into_iter().filter(|range| {
+        *range == change.held || (ranges::overlaps(*range, change.held) && !followed(range))
+    }) {
+        for consumer in Consumer::resumed(&group, range)? {
+            consumer.retire(&mut batch);
+            for &kept in &change.kept {
+                consumer.mark(&mut batch, kept);
+            }
+        }
     }
     for scope in &scopes {
         let consumer = &consumers[scope];
@@ -1426,7 +1576,13 @@ fn narrow(
             consumer.carry(&mut batch, kept);
         }
     }
-    engine.write(batch).map_err(storage)?;
+    if let Err(error) = engine.write(batch) {
+        // The batch may have committed, so these cursors may now describe deleted data.
+        for scope in &scopes {
+            consumers.get_mut(scope).unwrap().distrust();
+        }
+        return Err(storage(error));
+    }
     for &(start, end) in &change.dropped {
         // ponytail: compacts inline on the session task; move it to a blocking task if it stalls deliveries.
         if let Err(error) = engine.compact(&l2_span(start, end)) {
@@ -1448,16 +1604,11 @@ fn narrow(
         namespace: String::new(),
         span: span(Some(change.held)),
     })];
-    let group = Target {
-        selection: Selection {
-            dataset: dataset.to_owned(),
-            namespace: String::new(),
-        },
-        engine: engine.clone(),
-        prefix: Vec::new(),
-        span: None,
-    };
     for &kept in &change.kept {
+        // A stored range can surround a part already followed.
+        if pushed.groups.contains_key(&(dataset.to_owned(), kept)) {
+            continue;
+        }
         pushed
             .groups
             .insert((dataset.to_owned(), kept), engine.clone());
@@ -1514,15 +1665,14 @@ impl Intake {
     }
 
     fn fail(&mut self, scope: &Scope, consumer: &mut Consumer, error: Status) -> Effect {
-        consumer.recover = true;
-        consumer.awaiting_confirmation = true;
-        consumer.bootstrap = None;
+        consumer.distrust();
         let mut batch = WriteBatch::default();
         batch.set_revision(&consumer.pending_confirmation, 1);
         // A failed engine may reject this marker too; the in-process gate still isolates that scope.
         let _ = consumer.target.engine.write(batch);
         self.failed.insert(scope.clone());
         self.retries.insert(scope.clone());
+        assert!(!consumer.validated(), "a failed scope still counts");
         Effect {
             error: Some(error),
             ..Effect::default()
@@ -1575,9 +1725,7 @@ impl Intake {
             Action::Error(_) => unreachable!(),
         };
         match result {
-            Err(error) if error.metadata().get("bedrock-local-error").is_some() => {
-                Ok(self.fail(scope, consumer, error))
-            }
+            Err(error) if local(&error) => Ok(self.fail(scope, consumer, error)),
             Err(error) => Err(error),
             Ok(effect) => {
                 if consumer.validated() {

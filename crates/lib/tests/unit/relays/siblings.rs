@@ -305,3 +305,25 @@ fn siblings_must_share_a_selector_a_relay_would_serve() {
         assert!(!crate::relays::selectable(&invalid), "{invalid:?}");
     }
 }
+
+/// Found by the simulation (#25 / B-23): a recovery source was lost after a bootstrap reached the subscriber but before its
+/// confirmation. The next source was asked for a plain catch-up, which never confirms, so the subscriber waited forever.
+#[test]
+fn a_bootstrap_still_unconfirmed_makes_the_next_source_a_full_recovery() {
+    let hub = hub();
+    let _own = subscribe(&hub, 1, &[("auth", "keys", None, 13)], &[]);
+    let stream = (key("auth", "keys"), None);
+    assert_eq!(hub.recovery_start(1, &stream, 1, false), Some((13, false)));
+    assert_eq!(hub.recovery_start(1, &stream, 1, true), Some((0, true)));
+
+    let mut subscribers = hub.0.subscribers.lock().unwrap();
+    let interest = subscribers.get_mut(&1).unwrap().follows.get_mut(&stream);
+    interest.unwrap().confirming = true;
+    drop(subscribers);
+    assert_eq!(hub.recovery_start(1, &stream, 1, false), Some((0, true)));
+    assert_eq!(
+        hub.recovery_start(1, &stream, 2, false),
+        None,
+        "a newer follow"
+    );
+}

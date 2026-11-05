@@ -8,7 +8,10 @@ EXTENDS Naturals, FiniteSets, Sequences, TLC
 \* and a connect. Points are possible range starts; a range ends where the next start begins.
 \* With Capped, a run has at most MaxCuts disconnects and MaxFlips quorum changes, which lets
 \* TLC reach deeper directory histories; uncapped configs check unlimited ones.
-CONSTANTS Nodes, Points, Carriers, MaxRev, Faulty, Capped, MaxCuts, MaxFlips
+\* pub is "sick" for a published member reporting this dataset unhealthy (#13 / B-14). Its copy may be
+\* damaged, so with Strict it never counts as the ready owner that lets another copy go. Strict =
+\* FALSE is the deliberate bug: any ready owner counts.
+CONSTANTS Nodes, Points, Carriers, MaxRev, Faulty, Capped, MaxCuts, MaxFlips, Strict
 VARIABLES pub, conn, quorum, starts, own, rev, told, chan, follow, copy, view, cuts, flips
 \* rev: directory revision. told: what the relays last pushed a node for a point
 \* ("unknown" after its session ends). chan: pushed frames the node has not processed; `ok`
@@ -25,8 +28,10 @@ Entry(h) == own[Cover(h)]
 \* The points of the range starting at p when the starts are S.
 Span(S, p) == {h \in Points : h >= p /\ \A s \in S : s <= h => s <= p}
 \* Node n's view of the current directory.
+Counts(m) == ~Strict \/ pub[m] = "ready"
 Current(n) == [h \in Points |-> [mine |-> Entry(h)[n],
-                                 other |-> \E m \in Nodes \ {n} : Entry(h)[m] = "ready"]]
+                                 other |-> \E m \in Nodes \ {n} :
+                                     Entry(h)[m] = "ready" /\ Counts(m)]]
 Count(c) == IF Capped THEN c + 1 ELSE c
 
 Init == /\ pub = [n \in Nodes |-> "absent"] /\ conn = [n \in Nodes |-> FALSE] /\ quorum = TRUE
@@ -51,6 +56,10 @@ Publish(n) == /\ quorum /\ conn[n] /\ pub[n] = "absent" /\ pub' = [pub EXCEPT ![
               /\ UNCHANGED <<conn, quorum, starts, own, rev, nvars, cuts, flips>>
 \* After the grace period, or at once after a graceful leave.
 Remove(n) == /\ quorum /\ ~conn[n] /\ pub[n] # "absent" /\ pub' = [pub EXCEPT ![n] = "absent"]
+             /\ UNCHANGED <<conn, quorum, starts, own, rev, nvars, cuts, flips>>
+\* A member's storage turns unhealthy, or its rebuild finishes.
+Sicken(n) == /\ pub[n] # "absent"
+             /\ pub' = [pub EXCEPT ![n] = IF pub[n] = "ready" THEN "sick" ELSE "ready"]
              /\ UNCHANGED <<conn, quorum, starts, own, rev, nvars, cuts, flips>>
 Partition == /\ quorum' = ~quorum /\ flips' = Count(flips)
              /\ UNCHANGED <<pub, conn, starts, own, rev, nvars, cuts>>
@@ -78,7 +87,7 @@ Write(p, o) ==
         /\ (o[n] = "none" /\ cur[n] # "none") =>
             \/ pub[n] = "absent"
             \/ cur[n] = "leaving" /\ (\A m \in Nodes : o[m] # "populating")
-                                  /\ (\E m \in Nodes : o[m] = "ready")
+                                  /\ (\E m \in Nodes : o[m] = "ready" /\ Counts(m))
     /\ starts' = starts \cup {p}
     /\ own' = [own EXCEPT ![p] = o]
     /\ rev' = rev + 1
@@ -126,7 +135,7 @@ Copy(n, h) == /\ conn[n] /\ follow[n][h] /\ ~copy[n][h]
 
 Next == \/ Partition
         \/ \E n \in Nodes : Connect(n) \/ Disconnect(n) \/ Publish(n) \/ Remove(n)
-                            \/ Observe(n)
+                            \/ Observe(n) \/ Sicken(n)
         \/ \E p \in Points, o \in [Nodes -> {"none", "populating"} \cup Holds] : Write(p, o)
         \/ \E n \in Nodes, h \in Points : Push(n, h) \/ BadRevoke(n, h) \/ Receive(n, h) \/ Copy(n, h)
 Spec == Init /\ [][Next]_vars
@@ -136,7 +145,7 @@ Bound == /\ rev <= MaxRev /\ cuts <= MaxCuts /\ flips <= MaxFlips
 \* Nodes are interchangeable model values when every node carries the dataset.
 NodePerms == Permutations(Nodes)
 
-TypeOK == /\ pub \in [Nodes -> {"absent", "ready"}] /\ quorum \in BOOLEAN
+TypeOK == /\ pub \in [Nodes -> {"absent", "ready", "sick"}] /\ quorum \in BOOLEAN
           /\ starts \subseteq Points
           /\ own \in [Points -> [Nodes -> {"none", "populating"} \cup Holds]]
           /\ told \in [Nodes -> [Points -> {"on", "off", "unknown"}]]
@@ -156,6 +165,11 @@ NewOwnersPublished == [][\A h \in Points, n \in Nodes :
 NoEarlyDrop == [][\A h \in Points :
                     (\E n \in Nodes : Entry(h)[n] \in Holds /\ pub[n] # "absent")
                         => \E n \in Nodes : Entry(h)'[n] \in Holds]_vars
+\* A directory write never lets go of a range's last healthy holder, even when an unhealthy owner
+\* is listed as ready.
+KeepsHealthyHolder == [][(pub' = pub) => \A h \in Points :
+                            (\E n \in Nodes : Entry(h)[n] \in Holds /\ pub[n] = "ready")
+                                => \E n \in Nodes : Entry(h)'[n] \in Holds /\ pub[n] = "ready"]_vars
 \* Without a relay majority nothing becomes ready, moves or is revoked by the directory.
 Freeze == [][~quorum => <<starts, own>>' = <<starts, own>>]_vars
 =============================================================================

@@ -11,7 +11,7 @@ use bedrock_lib::replication::pb;
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
 use bedrock_lib::storage::StorageEngine;
 use bedrock_lib::storage::memory::MemoryEngine;
-use bedrock_lib::storage::namespace::memory::MemoryFactory;
+use bedrock_lib::storage::sim::MemoryFactory;
 use bedrock_lib::transport::admin::Admin;
 use bedrock_lib::transport::{Class, Peers};
 use tokio::sync::mpsc;
@@ -44,6 +44,7 @@ async fn commit(writer: &Arc<Writer>, dataset: &str, namespace: &str, operation:
             key: b"key".to_vec(),
             operation,
             idempotency_key: None,
+            expected: None,
         })
         .await
         .unwrap()
@@ -574,7 +575,7 @@ async fn empty_authoritative_bootstrap_is_confirmed_through_relays_before_readin
 }
 
 #[derive(Default)]
-struct AuthUnavailable(bedrock_lib::storage::namespace::memory::MemoryFactory);
+struct AuthUnavailable(bedrock_lib::storage::sim::MemoryFactory);
 #[async_trait::async_trait]
 impl bedrock_lib::storage::namespace::NamespaceFactory for AuthUnavailable {
     async fn namespaces(&self) -> bedrock_lib::storage::StorageResult<Vec<(String, String)>> {
@@ -843,6 +844,7 @@ async fn put(writer: &Arc<Writer>, namespace: &str, key: &[u8], operation: Opera
             key: key.to_vec(),
             operation,
             idempotency_key: None,
+            expected: None,
         })
         .await
         .unwrap();

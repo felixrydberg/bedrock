@@ -156,6 +156,7 @@ Rules this implies:
 | [B-27](https://github.com/felixrydberg/bedrock/issues/59) | KV reads through cache-affinity routing and S3 namespace readers | KV | `kv/operations`, `kv/storage` | B-26 |
 | [B-28](https://github.com/felixrydberg/bedrock/issues/60) | Namespace reader residency, cache budgets and basic eviction | KV | `kv/storage`, `kv/namespaces` | B-27 |
 | [B-29](https://github.com/felixrydberg/bedrock/issues/61) | KV end-to-end acceptance | KV | `kv`, `api`, storage integration tests | B-24 … B-28, B-39 |
+| B-58 | Simulation load: KV reads, listing and namespaces | KV | `tests/sim` | B-23, B-29 |
 | **I — First CDN** (parallel with H; no dependency on KV drafts) |||||
 | B-30 | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
 | B-31 | Artifact transfer | CDN | `cdn/artifact_transfer` | B-30 |
@@ -164,6 +165,7 @@ Rules this implies:
 | B-34 | Regional L2 with two-replica artifact placement | CDN | `cdn/retention`, `cdn/artifact_storage` | B-31, B-32 |
 | B-35 | Artifact retrieval interface | CDN | `cdn/artifact_transfer` | B-33, B-34 |
 | B-36 | CDN end-to-end acceptance | CDN | `cdn` | B-30 … B-35 |
+| B-59 | Simulation load: publishing and artifact retrieval | CDN | `tests/sim` | B-23, B-36 |
 | **J — KV refinements** |||||
 | ~~B-37~~ | ~~Cache-fill broadcast queue~~ (dropped, decision 11) | — | — | — |
 | B-38 | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
@@ -183,6 +185,7 @@ Rules this implies:
 | B-51 | Gateway: Worker and Pages request routing | Compute | `gateway` | B-35, B-50, B-57 |
 | B-48 | Compiled Worker artifact caching | Compute | not decided | B-51 |
 | B-52 | Deploy end-to-end acceptance | Compute | not decided | B-29, B-36, B-50, B-51 |
+| B-60 | Simulation load: Workers, Pages and deploys | Compute | `tests/sim` | B-23, B-52 |
 | **M — Node security** (parent [#44](https://github.com/felixrydberg/bedrock/issues/44); scope amended 2026-11-03, drafts not yet issues) |||||
 | B-55 | Mutual TLS and caller identity for node-to-node traffic, enabled by config | Shared core | `lib/transport` + every bin | B-03, B-12, B-17 |
 | B-54 | Deployment guide: private networking and node certificates (Kubernetes, Docker, bare metal) | Foundation (docs) | `docs/deployment/` + `deploy/` | B-02, B-55 |
@@ -708,6 +711,38 @@ Created: [#61](https://github.com/felixrydberg/bedrock/issues/61) — Feature �
 
 ---
 
+#### B-58 — Simulation load: KV reads, listing and namespaces
+
+```
+Title:  Feature 🚀: Add customer KV traffic to the simulation's load
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+The simulation (#25 / B-23) only sends `PUT` and `DELETE`, because reads do not exist yet, so it proves `MinRevisionReads` by
+inspecting engine state rather than through a served read.
+
+**Describe the solution you'd like**
+- Add to the fixed load: KV reads with minimum revisions, listing, and namespace create and delete.
+- Prove `MinRevisionReads` through served reads, including absence and listing as #25 requires.
+- Run real `bedrock-kv` readers under faults: reader loss, pressure and idle eviction, reopen, and publication lag.
+- Add real reads to the simulation. Damage is found today by those and by the scrubber (`health::scrub`, #25 / B-23).
+- Partial quarantine: once an adapter can prove damage is limited to a hash range, use the range the scrubber's walk reports
+  instead of quarantining the whole engine.
+
+**Additional context**
+The simulation sends the same load for every seed, and the seed decides only how it arrives: timing, bursts at the same
+average rate, which keys are hot, and value sizes. That keeps the load realistic, so long runs (`scripts/vopr.sh soak`) can
+find what only appears under real traffic over time. It keeps working without this task, but cannot reach what the load
+does not include. Add to the fixed load, never as a per-seed option, and give each request type its own expected result in
+`tests/sim/src/history.rs`: a request nothing checks only creates load.
+- **Implementation:** KV.
+- **Depends on:** B-23, B-29.
+- **Acceptance criteria:** Every new request type has an expected result and a deliberate bug that breaks it. The sweep and a
+  long soak pass with the new load.
+
+---
+
 ### I — First CDN implementation
 
 ---
@@ -955,6 +990,36 @@ Labels: enhancement
 - **Doc reference:** `cdn.md` §3, §4 Phases 1–2.
 - **Depends on:** B-30 … B-35.
 - **Acceptance criteria:** Every scenario passes in CI or in a nightly job.
+
+---
+
+#### B-59 — Simulation load: publishing and artifact retrieval
+
+```
+Title:  Feature 🚀: Add CDN traffic to the simulation's load
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+The simulation (#25 / B-23) writes keys to the `pages` and `workers` namespaces of the `cdn` dataset. Those are plain key
+writes, so nothing exercises publishing, path rows or artifact bytes.
+
+**Describe the solution you'd like**
+- Add to the fixed load: bulk publishes writing path rows and ref keys, and artifact retrieval, including many concurrent cold
+  requests for one artifact.
+- Add `CacheStorage` and S3 artifact faults to `tests/sim/src/storage.rs`.
+- Check that a retrieved artifact matches what was published, and that retention never removes a referenced artifact.
+
+**Additional context**
+The simulation sends the same load for every seed, and the seed decides only how it arrives: timing, bursts at the same
+average rate, which keys are hot, and value sizes. That keeps the load realistic, so long runs (`scripts/vopr.sh soak`) can
+find what only appears under real traffic over time. It keeps working without this task, but cannot reach what the load
+does not include. Add to the fixed load, never as a per-seed option, and give each request type its own expected result in
+`tests/sim/src/history.rs`: a request nothing checks only creates load.
+- **Implementation:** CDN.
+- **Depends on:** B-23, B-36.
+- **Acceptance criteria:** Every new request type has an expected result and a deliberate bug that breaks it. The sweep and a
+  long soak pass with the new load.
 
 ---
 
@@ -1408,6 +1473,35 @@ Labels: enhancement
 - **Implementation:** Compute / deploy control plane.
 - **Depends on:** B-29, B-36, B-50, B-51.
 - **Acceptance criteria:** Every scenario passes in CI or in a nightly job.
+
+---
+
+#### B-60 — Simulation load: Workers, Pages and deploys
+
+```
+Title:  Feature 🚀: Add Worker, Pages and deploy traffic to the simulation's load
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+Deploys span KV, CDN and the control plane, and a Worker or Pages site is made of several writes. Random key writes cannot
+show that a deployment is ever half-visible.
+
+**Describe the solution you'd like**
+- Add to the fixed load: create, activate, roll back and delete for Workers and Pages sites, alongside the KV and CDN traffic.
+- Run the Gateway and control plane binaries in the simulation with the others.
+- Check that a request is served by exactly one complete deployment, and that a rollback restores the previous one.
+
+**Additional context**
+The simulation sends the same load for every seed, and the seed decides only how it arrives: timing, bursts at the same
+average rate, which keys are hot, and value sizes. That keeps the load realistic, so long runs (`scripts/vopr.sh soak`) can
+find what only appears under real traffic over time. It keeps working without this task, but cannot reach what the load
+does not include. Add to the fixed load, never as a per-seed option, and give each request type its own expected result in
+`tests/sim/src/history.rs`: a request nothing checks only creates load.
+- **Implementation:** Compute / deploy control plane.
+- **Depends on:** B-23, B-52.
+- **Acceptance criteria:** Every new request type has an expected result and a deliberate bug that breaks it. The sweep and a
+  long soak pass with the new load.
 
 ---
 

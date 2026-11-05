@@ -10,6 +10,10 @@ pub mod memory;
 pub mod namespace;
 #[cfg(not(madsim))]
 pub mod rocksdb;
+/// Simulated storage, which lives with the simulation tests and never reaches production builds (#25 / B-23).
+#[cfg(any(test, madsim, feature = "test-support"))]
+#[path = "../../../tests/sim/src/storage.rs"]
+pub mod sim;
 #[cfg(not(madsim))]
 pub mod slate;
 

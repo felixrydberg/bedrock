@@ -103,3 +103,31 @@ fn hosts_match_by_address_or_name() {
         Code::PermissionDenied
     );
 }
+
+/// Found by the simulation (#25 / B-23): waits on an idle stream are cancelled by keepalive ticks. A cancelled wait kept the
+/// probe, and the next one claimed it again, so a healthy idle upstream stayed out of routing and recovery never reached it.
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn a_cancelled_call_gives_back_its_probe() {
+    let peers = Peers::new(&Admin::new());
+    peers.health().trip("a");
+    tokio::time::sleep(crate::health::BASE_BACKOFF).await;
+    let wait = peers.call(
+        "a",
+        Class::Control,
+        Duration::from_secs(30),
+        std::future::pending::<Result<(), Status>>(),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .is_err()
+    );
+    assert_eq!(peers.health().route(&["a", "b"]), [&"a", &"b"]);
+
+    let answered = peers.call("a", Class::Control, Duration::from_secs(30), async {
+        Ok::<_, Status>(())
+    });
+    answered.await.unwrap();
+    assert_eq!(peers.health().state("a"), crate::health::State::Closed);
+}

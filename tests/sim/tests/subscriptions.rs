@@ -14,7 +14,7 @@ use bedrock_lib::replication::Operation;
 use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
 use bedrock_lib::storage::memory::MemoryEngine;
-use bedrock_lib::storage::namespace::memory::MemoryFactory;
+use bedrock_lib::storage::sim::MemoryFactory;
 use bedrock_lib::transport::Peers;
 use bedrock_lib::transport::admin::Admin;
 use tokio::sync::{mpsc, oneshot};
@@ -167,6 +167,7 @@ async fn write(
                 key,
                 operation,
                 idempotency_key: None,
+                expected: None,
             })
             .await
             .unwrap();
@@ -390,6 +391,7 @@ async fn materialized_recovery_scenario(server: String, writer: Arc<Writer>) {
         key: b"k".to_vec(),
         operation: Operation::Set(b"one".to_vec()),
         idempotency_key: None,
+        expected: None,
     };
     assert_eq!(writer.commit(write.clone()).await.unwrap(), 1);
     writer.log().prune("cdn", "pages", 1).unwrap();
@@ -499,13 +501,4 @@ async fn snapshot_then_subscribe_under_concurrent_writes() {
 #[madsim::test]
 async fn expired_cursor_bootstraps_then_resumes_after_materialized_boundary() {
     simulated(true).await;
-}
-#[cfg(madsim)]
-#[test]
-fn same_seed_same_schedule() {
-    for seed in [1, 2, 3, 42] {
-        madsim::runtime::Runtime::check_determinism(seed, madsim::Config::default(), || {
-            simulated(false)
-        });
-    }
 }

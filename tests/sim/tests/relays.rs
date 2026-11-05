@@ -15,7 +15,7 @@ use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::pb;
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
 use bedrock_lib::storage::memory::MemoryEngine;
-use bedrock_lib::storage::namespace::memory::MemoryFactory;
+use bedrock_lib::storage::sim::MemoryFactory;
 use bedrock_lib::storage::{
     KeyRange, Scan, Snapshot, StorageEngine, StorageResult, StorageStats, WriteBatch,
 };
@@ -154,7 +154,8 @@ async fn phase(writer: &Arc<Writer>, session: &Session, first: u64, last: u64) -
                     namespace: "keys".into(),
                     key: b"key".to_vec(),
                     operation,
-                    idempotency_key: None
+                    idempotency_key: None,
+                    expected: None,
                 })
                 .await
                 .unwrap(),

@@ -203,17 +203,14 @@ impl Registry {
 pub fn open_engine(data_dir: &Path, dataset: &Dataset) -> StorageResult<Arc<dyn StorageEngine>> {
     // ponytail: RocksDB defaults; map the resolved dataset budget onto `RocksDbOptions` when budgets are enforced.
     #[cfg(not(madsim))]
-    let engine = crate::storage::rocksdb::RocksDbAdapter::open(
+    let engine = Arc::new(crate::storage::rocksdb::RocksDbAdapter::open(
         &data_dir.join(dataset.name),
         dataset.name,
         &Default::default(),
-    )?;
+    )?);
     #[cfg(madsim)]
-    let engine = {
-        let _ = data_dir;
-        crate::storage::memory::MemoryEngine::new(dataset.name)
-    };
-    Ok(Arc::new(engine))
+    let engine = crate::sim::engine(data_dir, dataset.name);
+    Ok(engine)
 }
 
 #[cfg(test)]

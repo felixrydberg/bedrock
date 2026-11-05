@@ -170,14 +170,19 @@ impl Drop for Frames {
         }
     }
 }
+/// Gives back `amount` of a queue budget. Taking more than was added would wrap and hold backpressure on forever.
+fn release(counter: &AtomicUsize, amount: usize) {
+    let before = counter.fetch_sub(amount, Ordering::Relaxed);
+    assert!(before >= amount, "queue accounting underflowed");
+}
+
 impl Stream for Frames {
     type Item = Result<pb::RelayFrame, Status>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = Pin::new(&mut self.rx).poll_next(cx);
         if let Poll::Ready(Some(Ok(ref frame))) = item {
-            self.bytes.fetch_sub(frame.encoded_len(), Ordering::Relaxed);
-            self.events
-                .fetch_sub(queued_events(frame), Ordering::Relaxed);
+            release(&self.bytes, frame.encoded_len());
+            release(&self.events, queued_events(frame));
             self.changed.update(|v| *v = v.wrapping_add(1));
         }
         item
@@ -277,13 +282,13 @@ impl Hub {
     async fn persist_replay(&self, mut pending: mpsc::Receiver<ReplayItem>) {
         let mut rebuild_after = crate::monotonic_now();
         while let Some((event, mut now, size)) = pending.recv().await {
-            self.0.replay_bytes.fetch_sub(size, Ordering::Relaxed);
+            release(&self.0.replay_bytes, size);
             let mut events = vec![event];
             while events.len() < 256 {
                 let Ok((event, at, size)) = pending.try_recv() else {
                     break;
                 };
-                self.0.replay_bytes.fetch_sub(size, Ordering::Relaxed);
+                release(&self.0.replay_bytes, size);
                 now = now.max(at);
                 events.push(event);
             }
@@ -504,7 +509,9 @@ impl Hub {
         self.head(key)
             .update(|head| *head = Some(head.unwrap_or(0).max(sequence)));
     }
-    /// Live subscriptions start after the contiguous prefix the relay can already serve.
+    /// Live subscriptions start after the contiguous prefix the relay can already serve. A cursor proves what precedes it
+    /// exists, so the head moves up to it: a stream started past this relay's history, as one for a sibling's subscribers
+    /// is, delivers nothing from before the cursor, and a subscriber behind it must see it is behind to fetch the rest.
     fn resume_from(&self, key: &Key, from: u64) -> u64 {
         let mut ranges = self
             .0
@@ -542,6 +549,9 @@ impl Hub {
             if last >= next {
                 next = last.saturating_add(1);
             }
+        }
+        if next > 1 {
+            self.observe_head(key, next - 1);
         }
         next
     }
@@ -702,8 +712,8 @@ impl Hub {
                 Ok(true)
             }
             Err(error) => {
-                sub.bytes.fetch_sub(len, Ordering::Relaxed);
-                sub.events.fetch_sub(events, Ordering::Relaxed);
+                release(&sub.bytes, len);
+                release(&sub.events, events);
                 drop(subscribers);
                 match error {
                     mpsc::error::TrySendError::Full(Ok(frame)) => Err(Box::new(frame)),
@@ -726,6 +736,27 @@ impl Hub {
             .filter(|f| f.generation == generation)
             .map(|f| (f.from, f.acked))
     }
+    /// Where a recovery asks its next source to start, and whether that is a full recovery. A bootstrap sent but not yet
+    /// confirmed makes it one: only a full recovery ends in the confirmation the subscriber is waiting for.
+    fn recovery_start(
+        &self,
+        id: u64,
+        key: &StreamKey,
+        generation: u64,
+        force: bool,
+    ) -> Option<(u64, bool)> {
+        let subscribers = self.0.subscribers.lock().unwrap();
+        let interest = subscribers
+            .get(&id)?
+            .follows
+            .get(key)
+            .filter(|interest| interest.generation == generation)?;
+        Some(if force || interest.confirming {
+            (0, true)
+        } else {
+            (interest.from, false)
+        })
+    }
     fn advance(&self, id: u64, key: &StreamKey, generation: u64, through: u64) {
         if let Some(interest) = self
             .0
@@ -736,7 +767,9 @@ impl Hub {
             .and_then(|sub| sub.follows.get_mut(key))
             .filter(|f| f.generation == generation)
         {
-            interest.from = through.saturating_add(1);
+            let next = through.saturating_add(1);
+            assert!(next >= interest.from, "a subscription moved backwards");
+            interest.from = next;
         }
     }
     fn baseline(&self, id: u64, key: &StreamKey, generation: u64, boundary: u64) {
@@ -876,7 +909,7 @@ impl Hub {
                     .try_send((event.clone(), now, size))
                     .is_err()
             {
-                self.0.replay_bytes.fetch_sub(size, Ordering::Relaxed);
+                release(&self.0.replay_bytes, size);
             }
         }
         let committed_at = event.committed_at;
@@ -1401,16 +1434,13 @@ impl Hub {
                 })
                 .await
                 .unwrap();
+                let (from, force) = self
+                    .recovery_start(id, key, generation, force)
+                    .ok_or_else(|| Status::cancelled("subscription closed"))?;
                 let request = pb::Follow {
                     dataset: key.0.0.clone(),
                     namespace: key.0.1.clone(),
-                    from: if force {
-                        0
-                    } else {
-                        self.current(id, key, generation)
-                            .ok_or_else(|| Status::cancelled("subscription closed"))?
-                            .0
-                    },
+                    from,
                     span: span(key.1),
                     from_namespaces: Default::default(),
                 };

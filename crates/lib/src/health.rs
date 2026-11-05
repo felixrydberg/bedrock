@@ -13,6 +13,7 @@
 
 pub mod fallback;
 pub mod protection;
+pub mod scrub;
 pub mod storage;
 
 use std::collections::BTreeMap;
@@ -198,6 +199,23 @@ impl Health {
             _ => None,
         });
         probe
+    }
+
+    /// The call owning `probe` was cancelled and has no outcome: the next call probes at once. Waiting for the probe to expire
+    /// would leave a peer out of routing while another wait on its stream claims the probe the same way.
+    pub(crate) fn abandon(&self, peer: &str, probe: &Arc<()>) {
+        let now = now();
+        self.update(peer, |b| match b {
+            Breaker::HalfOpen {
+                probe: active,
+                backoff,
+                ..
+            } if Arc::ptr_eq(active, probe) => Some(Breaker::Open {
+                until: now,
+                backoff: *backoff,
+            }),
+            _ => None,
+        });
     }
 
     /// The outcome of a call to `peer`. Outcomes while open come from calls started before it opened, or from fail-open

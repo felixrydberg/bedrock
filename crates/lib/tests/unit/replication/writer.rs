@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::replication::log::Log;
-use crate::storage::namespace::memory::MemoryFactory;
 use crate::storage::namespace::{Changes, NamespaceDatabase, NamespaceFactory};
+use crate::storage::sim::MemoryFactory;
 use crate::storage::{Entry, ErrorContext, StorageError, StorageResult};
 use async_trait::async_trait;
 
@@ -120,6 +120,7 @@ fn set(namespace: &str, key: &str, value: &str, idempotency_key: Option<&str>) -
         key: key.into(),
         operation: Operation::Set(value.into()),
         idempotency_key: idempotency_key.map(Into::into),
+        expected: None,
     }
 }
 

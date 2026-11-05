@@ -7,7 +7,7 @@ use super::*;
 use crate::health::fallback::{self, Found, Limited, Read, ReadKey, SourceChain, Tier};
 use crate::monotonic_now;
 use crate::reconciliation::{self, Reconcile, Reconciler};
-use crate::storage::namespace::memory::MemoryFactory;
+use crate::storage::sim::MemoryFactory;
 
 const OP: Duration = Duration::from_millis(80);
 /// Timer and scheduling noise. Waiting for capacity would cost a whole [`OP`].

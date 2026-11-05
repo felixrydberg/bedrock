@@ -111,6 +111,8 @@ impl Peers {
 
     /// A raw connection to `addr` for non-gRPC protocols (the B-12 membership writes), over TLS when configured.
     pub async fn dial(&self, addr: &str) -> std::io::Result<Box<dyn Io>> {
+        #[cfg(madsim)]
+        crate::sim::rpc(addr).await.map_err(std::io::Error::other)?;
         match &self.tls {
             Some(tls) => tls.dial(addr).await,
             None => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
@@ -135,7 +137,13 @@ impl Peers {
         timeout: Duration,
         fut: impl Future<Output = Result<T, Status>>,
     ) -> Result<T, Status> {
-        let probe = self.health.begin(addr, timeout);
+        let mut probe = Probe {
+            health: &self.health,
+            peer: addr,
+            owned: self.health.begin(addr, timeout),
+        };
+        #[cfg(madsim)]
+        let fut = crate::sim::around(addr, fut);
         let (outcome, result) = match tokio::time::timeout(timeout, fut).await {
             Ok(Ok(v)) => (Outcome::Ok, Ok(v)),
             Ok(Err(status)) => (Outcome::Error, Err(status)),
@@ -149,9 +157,27 @@ impl Peers {
         self.calls
             .get_or_create(&CallLabels { class, outcome })
             .inc();
-        self.health
-            .record(addr, probe, !result.as_ref().is_err_and(peer_failed));
+        self.health.record(
+            addr,
+            probe.owned.take(),
+            !result.as_ref().is_err_and(peer_failed),
+        );
         result
+    }
+}
+
+/// A call's claim on its peer's probe, given back if the call is dropped before it has an outcome.
+struct Probe<'a> {
+    health: &'a Health,
+    peer: &'a str,
+    owned: Option<Arc<()>>,
+}
+
+impl Drop for Probe<'_> {
+    fn drop(&mut self) {
+        if let Some(probe) = &self.owned {
+            self.health.abandon(self.peer, probe);
+        }
     }
 }
 

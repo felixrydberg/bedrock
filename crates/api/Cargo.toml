@@ -15,5 +15,8 @@ tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+bedrock-lib = { workspace = true, features = ["test-support"] }
+
 [lints]
 workspace = true

@@ -571,3 +571,84 @@ fn malformed_dataset_range_entries_are_reported_as_data_loss() {
         tonic::Code::DataLoss
     );
 }
+
+/// Found reviewing #25 / B-23, and shown by `handoff.tla`: a ready owner reporting the dataset unhealthy may hold damage, so
+/// it must not be what lets the last healthy copy go.
+#[test]
+fn a_leaving_owner_stays_while_the_only_ready_owner_is_unhealthy() {
+    let node = |id: &str, unhealthy: &[&str]| pb::Member {
+        service: "cdn".into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: vec!["cdn".into()],
+        unhealthy: unhealthy.iter().map(|d| (*d).into()).collect(),
+        ..ready(id)
+    };
+    let owners = vec![
+        Owner {
+            node: "good".into(),
+            state: State::Leaving,
+        },
+        Owner {
+            node: "sick".into(),
+            state: State::Ready,
+        },
+    ];
+    let directories = Directories::from([("cdn".into(), Directory::from([(0, owners)]))]);
+    let actual = members(&[node("good", &[]), node("sick", &["cdn"])]);
+    let leaves = |changes: Vec<Change>| {
+        changes.iter().any(|change| {
+            matches!(change, Change::Range { owners, .. }
+                if !owners.iter().any(|owner| owner.node == "good"))
+        })
+    };
+    let changes = place("cdn", &actual, &directories, &siblings::Ready::new());
+    assert!(!leaves(changes), "the only healthy copy was let go");
+
+    let actual = members(&[node("good", &[]), node("sick", &[])]);
+    let changes = place("cdn", &actual, &directories, &siblings::Ready::new());
+    assert!(leaves(changes), "a healthy ready owner lets it go");
+}
+
+/// Found by the simulation (#25 / B-23): a write that never reached the API left its base valid, so the plan's later writes
+/// landed without it. With the range at 0 missing, part of the hash space had no owner.
+#[tokio::test]
+async fn a_failed_write_abandons_the_rest_of_its_services_plan() {
+    let range = |service: &str, start| Change::Range {
+        service: service.into(),
+        dataset: service.into(),
+        start,
+        owners: Vec::new(),
+    };
+    let plan = vec![
+        range("a", 0),
+        range("b", 0),
+        range("a", 1),
+        range("b", 1),
+        range("a", 2),
+    ];
+    let based = BTreeMap::from([("a".to_string(), 5), ("b".to_string(), 7)]);
+    let attempts = Mutex::new(Vec::new());
+    let written = commit(plan, based, |change, base| {
+        let Change::Range { service, start, .. } = change else {
+            unreachable!()
+        };
+        let landed = !(service == "a" && start == 1);
+        attempts.lock().unwrap().push((service, start, base));
+        async move { landed.then_some(base + 1) }
+    })
+    .await;
+    assert_eq!(
+        *attempts.lock().unwrap(),
+        [
+            ("a".to_string(), 0, 5),
+            ("b".to_string(), 0, 7),
+            ("a".to_string(), 1, 6),
+            ("b".to_string(), 1, 8),
+        ]
+    );
+    assert_eq!(
+        written,
+        BTreeMap::from([("a".to_string(), 6), ("b".to_string(), 9)])
+    );
+}

@@ -90,6 +90,17 @@ impl NamespaceLog {
     }
 }
 
+impl NamespaceLog {
+    /// [`Log::read`] indexes `events` by sequence, which holds only while they exactly fill `base_sequence..=head`.
+    fn assert_contiguous(&self) {
+        assert_eq!(
+            self.base_sequence + self.events.len() as u64,
+            self.head.get(),
+            "the log has a hole"
+        );
+    }
+}
+
 impl MemoryLog {
     /// Enforces the writer's event window on reads, independently of physical GC.
     pub fn with_retention(clock: fn() -> u64, retention_ms: u64) -> Self {
@@ -141,6 +152,7 @@ impl MemoryLog {
         }
         log.base_sequence = boundary;
         log.head.update(|head| *head = boundary);
+        log.assert_contiguous();
         Ok(())
     }
 
@@ -163,6 +175,7 @@ impl MemoryLog {
             .min(log.events.len());
         log.events.drain(..drop_count);
         log.base_sequence = log.base_sequence.max(through);
+        log.assert_contiguous();
         Ok(())
     }
 
@@ -181,6 +194,7 @@ impl MemoryLog {
         }
         log.events.push(event);
         log.head.update(|head| *head = next);
+        log.assert_contiguous();
         Ok(())
     }
 }
@@ -205,6 +219,7 @@ impl Log for MemoryLog {
             if expired > 0 {
                 log.base_sequence = log.events[expired - 1].sequence;
                 log.events.drain(..expired);
+                log.assert_contiguous();
             }
         }
         let first = log.base_sequence.saturating_add(1);
@@ -217,6 +232,9 @@ impl Log for MemoryLog {
         }
         let start = usize::try_from(from.max(first) - first).unwrap_or(usize::MAX);
         let events = log.events.get(start..).unwrap_or_default();
+        if let Some(event) = events.first() {
+            assert_eq!(event.sequence, from.max(first), "read started elsewhere");
+        }
         Ok(events.iter().take(limit).cloned().collect())
     }
 

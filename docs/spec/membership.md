@@ -59,7 +59,10 @@ all membership changes until it returns.
 - **Assignment.** Only the membership publisher writes, and only once membership has nothing left to write, so it
   plans from applied membership. Each pass runs `placement::assign` (#18 / B-15) per dataset, over the members whose
   `datasets` include it, with 3 replicas and at most 16 ranges moving, and applies the handoff steps below. It then
-  waits for its subscription to apply the writes, as for membership. `bedrock-quicksilver` places `quicksilver` and
+  waits for its subscription to apply the writes, as for membership. Every write carries the revision its plan was read
+  at (`If-Match`), so a publisher planning from a stale view cannot overwrite newer state, and a failed write abandons
+  the rest of its plan: only a prefix of a plan may land, since a later write alone can leave part of the hash space
+  unowned. `bedrock-quicksilver` places `quicksilver` and
   `auth`; `bedrock-cdn` places `cdn`, whose ref keys sit at their artifact's content hash (B-34, §4 decision 14). A
   member announcing a dataset as unhealthy (#13 / B-14) gets no new ranges of it. It keeps what it holds, for B-22
   to rebuild, and source selection skips it for the unhealthy datasets only.
@@ -83,12 +86,14 @@ all membership changes until it returns.
    pushed set. It shares that ready bit with its siblings, never the acknowledgements; the publisher writes the
    owner `ready`.
 4. A `leaving` owner keeps following and serving. Once every other owner of the entry is `ready`, the publisher
-   removes it.
+   removes it. An owner reporting the dataset unhealthy does not count: its copy may be the damaged one.
 5. The relay then pushes a set without the range: that is the revoke. The member waits until its own view has
    reached the pushed revision, then confirms that the view no longer lists it for the range and lists another
    `ready` owner. It stops serving and following the range, deletes it with one `delete_range` over the hash span
    and compacts that span. A revoke that does not match its view is refused and reported, and the relay pushes the
-   set again on its next pass.
+   set again on its next pass. What it drops comes from its stored range markers as well as its live consumers, and a
+   split marks every part it keeps, so a range unreadable at startup, or left by a write that committed but reported
+   failure, is still found.
 
 Relays act only on the published directory. A relay that dies mid-handoff loses nothing: the member's next relay
 pushes the full set again and the publisher continues from published state. Without a majority nothing is
@@ -225,6 +230,16 @@ revokes enabled and no caps:
 
 With a refused revoke making the relay push again (2026-11-03), TLC 1.8.0 checked `handoff.cfg` with 4 workers:
 124,714,070 generated and 11,769,576 distinct states, depth 49, no violation (6 min 32 s).
+
+With `Strict` and the `Sicken` action, which lets a member turn unhealthy, TLC checked on 2026-11-05 (4 workers):
+`handoff.cfg`: 396,310,318 generated and 34,143,510 distinct states, depth 51, no violation (23 min 44 s). With
+`MaxRev = 4`: 143,956,394 generated and 12,408,194 distinct states, no violation (8 min 13 s). `Strict = FALSE`, the
+deliberate bug where any ready owner counts, violates `KeepsHealthyHolder`.
+
+`publisher.tla` covers what these models cannot: `membership.tla` writes atomically, but a real directory write is
+planned from a view and lands later, and any relay may plan. With `Conditional = TRUE` (`publisher.cfg`) TLC passes 436
+states; `Conditional = FALSE`, the deliberate bug, violates `NoLostUpdate` and `NoRegression`. Run it from `docs/spec`
+with `-config publisher.cfg`.
 
 With two points ranges split. Faulty revokes act per point, so the one-point runs cover them; leaving them out keeps
 the two-point run small enough to finish. Capped two-point runs with deeper revisions have not finished on this machine.

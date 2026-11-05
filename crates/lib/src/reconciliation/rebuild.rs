@@ -46,6 +46,14 @@ impl Rebuild {
     pub fn new(health: Arc<StorageHealth>, sources: BTreeMap<Source, Arc<dyn Restore>>) -> Self {
         Rebuild { health, sources }
     }
+
+    /// Returns once the source stops `Rebuilding`.
+    async fn quarantined_again(&self, dataset: &str, layer: &'static str) {
+        while self.health.get(dataset, layer).map(|report| report.state) == Some(State::Rebuilding)
+        {
+            tokio::time::sleep(INTERVAL).await;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -89,7 +97,13 @@ impl Reconcile for Rebuild {
         if self.health.get(dataset, layer).map(|r| r.state) != Some(State::Rebuilding) {
             return Err(failed("is not rebuilding"));
         }
-        match self.sources[source].restore().await {
+        let outcome = tokio::select! {
+            outcome = self.sources[source].restore() => outcome,
+            // A new failure quarantines the source, which then refuses the installs a resubscribe waits for, so waiting
+            // on could only end at the repair timeout. Start again instead.
+            () = self.quarantined_again(dataset, layer) => Err(failed("failed again while rebuilding")),
+        };
+        match outcome {
             Ok(()) if self.health.recovered(dataset, layer) => {
                 tracing::info!(dataset, layer, "local storage rebuilt");
                 Ok(())

@@ -51,12 +51,12 @@ async fn reconnect_resumes_after_only_the_contiguous_cached_prefix() {
     assert_eq!(hub.resume_from(&key, 1), 4);
     hub.encoded(replay_event(4));
     assert_eq!(hub.resume_from(&key, 1), 7);
-    assert_eq!(hub.resume_from(&key, 8), 8);
     assert_eq!(hub.source_head(&key), Some(6));
     hub.observe_head(&key, 2);
     assert_eq!(hub.source_head(&key), Some(6));
     hub.observe_head(&key, 7);
     assert_eq!(hub.source_head(&key), Some(7));
+    assert_eq!(hub.resume_from(&key, 8), 8);
 }
 
 fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>>) {
@@ -311,7 +311,7 @@ async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
     let writer = Writer::open(
         || 1_700_000_000_000,
         Persistence {
-            factory: Arc::new(crate::storage::namespace::memory::MemoryFactory::default()),
+            factory: Arc::new(crate::storage::sim::MemoryFactory::default()),
             retention: Retention::default(),
             metrics: PersistenceMetrics::default(),
         },
@@ -326,6 +326,7 @@ async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
                 key: key.to_be_bytes().to_vec(),
                 operation: crate::replication::Operation::Set(vec![42]),
                 idempotency_key: None,
+                expected: None,
             })
             .await
             .unwrap();
@@ -687,4 +688,23 @@ async fn a_refused_push_is_pushed_again_on_the_next_pass() {
     hub.push_ranges(&me, ranges(9));
     let again = tokio::time::timeout(std::time::Duration::from_secs(1), next());
     assert_eq!(again.await.expect("the refused set is pushed again"), 9);
+}
+
+/// Found by the simulation (#25 / B-23): a stream started at a sibling's cursor skipped two revisions, and the relay kept
+/// reporting its old head, so a subscriber arriving behind the cursor looked caught up and never fetched them.
+#[test]
+fn a_stream_started_past_this_relays_history_moves_its_head_to_the_cursor() {
+    let hub = hub();
+    let key = ("cdn".to_owned(), "workers".to_owned());
+    hub.observe_head(&key, 124);
+    assert_eq!(hub.resume_from(&key, 127), 127);
+    assert_eq!(hub.source_head(&key), Some(126));
+
+    let fresh = ("cdn".to_owned(), "pages".to_owned());
+    assert_eq!(hub.resume_from(&fresh, 1), 1);
+    assert_eq!(
+        hub.source_head(&fresh),
+        None,
+        "a first follow proves nothing"
+    );
 }

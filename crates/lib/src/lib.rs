@@ -9,6 +9,8 @@ pub mod reconciliation;
 pub mod relays;
 pub mod replication;
 pub mod s3;
+#[cfg(madsim)]
+pub mod sim;
 pub mod storage;
 pub mod transport;
 

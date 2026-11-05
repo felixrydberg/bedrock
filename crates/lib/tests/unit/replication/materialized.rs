@@ -1,7 +1,7 @@
 use super::*;
 use crate::storage::StorageEngine;
 use crate::storage::memory::MemoryEngine;
-use crate::storage::namespace::memory::MemoryFactory;
+use crate::storage::sim::MemoryFactory;
 
 #[test]
 fn namespace_metadata_and_retry_format_v2_golden_bytes() {
@@ -290,12 +290,14 @@ struct ScanCountingFactory {
     inner: MemoryFactory,
     value_scans: Arc<std::sync::atomic::AtomicUsize>,
     event_scans: Arc<std::sync::atomic::AtomicUsize>,
+    retry_scans: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct ScanCountingDatabase {
     inner: Arc<dyn NamespaceDatabase>,
     value_scans: Arc<std::sync::atomic::AtomicUsize>,
     event_scans: Arc<std::sync::atomic::AtomicUsize>,
+    retry_scans: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -312,6 +314,7 @@ impl NamespaceFactory for ScanCountingFactory {
             inner: self.inner.open(dataset, namespace).await?,
             value_scans: self.value_scans.clone(),
             event_scans: self.event_scans.clone(),
+            retry_scans: self.retry_scans.clone(),
         }))
     }
 }
@@ -323,6 +326,10 @@ impl NamespaceDatabase for ScanCountingDatabase {
     }
 
     async fn scan(&self, prefix: &[u8]) -> StorageResult<Vec<Entry>> {
+        if prefix == b"r" {
+            self.retry_scans
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if prefix == b"e" {
             self.event_scans
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -524,4 +531,85 @@ async fn bounded_event_range_rejects_pruned_history() {
     assert_eq!(view.cleanup(300, &retention).await.unwrap(), 1);
     assert!(view.events_from(1, 256).await.is_err());
     assert_eq!(view.events_from(2, 256).await.unwrap().len(), 1);
+}
+
+/// Found by the simulation (#25 / B-23): every commit read all live retries back, twice, so a namespace slowed down with
+/// every write until its retries expired, 24 hours by default. What it remembers instead must match what is stored.
+#[tokio::test]
+async fn commits_do_not_rescan_retries_and_match_a_reopen() {
+    use std::sync::atomic::Ordering;
+
+    let factory = ScanCountingFactory::default();
+    let materialized = Materialized::open(&factory, "kv", "one").await.unwrap();
+    let first = committed(1, 100, b"a", Some(b"1"), Some(("short", 150)));
+    materialized.persist(&[first], None).await.unwrap();
+    factory.retry_scans.store(0, Ordering::SeqCst);
+    for sequence in 2..=5 {
+        let retry = format!("long-{sequence}");
+        let entry = committed(
+            sequence,
+            sequence * 100,
+            b"a",
+            Some(b"v"),
+            Some((retry.as_str(), 10_000)),
+        );
+        materialized.persist(&[entry], None).await.unwrap();
+        materialized
+            .cleanup(sequence * 100, &Retention::default())
+            .await
+            .unwrap();
+    }
+    assert_eq!(factory.retry_scans.load(Ordering::SeqCst), 0);
+
+    let remembered = materialized.progress().await.unwrap();
+    assert!(!remembered.retries.contains_key("short"));
+    assert_eq!(remembered.retries.len(), 4);
+    materialized.close().await.unwrap();
+    let reopened = Materialized::open(&factory, "kv", "one").await.unwrap();
+    let stored = reopened.progress().await.unwrap();
+    assert_eq!(remembered.retries, stored.retries);
+    assert_eq!(remembered.sequence, stored.sequence);
+    assert_eq!(remembered.committed_at, stored.committed_at);
+    assert_eq!(remembered.pruned_through, stored.pruned_through);
+}
+
+/// A failed write may or may not have reached the store, so nothing remembered about it can be trusted.
+#[tokio::test]
+async fn a_failed_write_is_read_back_from_storage() {
+    use crate::storage::sim::{SimFactory, StoreAccess, StoreFault};
+    use std::sync::Mutex;
+
+    let next = Arc::new(Mutex::new(None));
+    let fault = next.clone();
+    let factory = SimFactory::new(Arc::new(move |access| {
+        (access == StoreAccess::Write)
+            .then(|| fault.lock().unwrap().take())
+            .flatten()
+    }));
+    let materialized = Materialized::open(&factory, "kv", "one").await.unwrap();
+    let first = committed(1, 100, b"a", Some(b"1"), Some(("first", 500)));
+    let second = committed(2, 200, b"a", Some(b"2"), Some(("second", 500)));
+    materialized
+        .persist(std::slice::from_ref(&first), None)
+        .await
+        .unwrap();
+
+    // It never reached the store.
+    *next.lock().unwrap() = Some(StoreFault::Unavailable);
+    let failed = materialized.persist(std::slice::from_ref(&second), None);
+    assert!(failed.await.is_err());
+    assert_eq!(materialized.progress().await.unwrap().sequence, 1);
+
+    // It did, and only the answer was lost. Retrying finds it instead of writing it again.
+    *next.lock().unwrap() = Some(StoreFault::Ambiguous);
+    let lost = materialized.persist(std::slice::from_ref(&second), None);
+    assert!(lost.await.is_err());
+    let progress = materialized.progress().await.unwrap();
+    assert_eq!(progress.sequence, 2);
+    assert!(progress.retries.contains_key("second"));
+    materialized
+        .persist(std::slice::from_ref(&second), None)
+        .await
+        .unwrap();
+    assert_eq!(materialized.progress().await.unwrap().sequence, 2);
 }

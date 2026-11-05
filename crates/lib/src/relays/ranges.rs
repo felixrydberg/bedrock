@@ -5,6 +5,8 @@
 //! contains only parts of was split: the member keeps those parts with their coverage and drops the rest. One the set
 //! no longer touches is revoked. A pushed range inside no held range is new. Every drop needs confirmation.
 
+use std::collections::BTreeSet;
+
 use tonic::Status;
 
 use crate::placement::{Directory, State, valid_span};
@@ -26,7 +28,7 @@ pub fn within(inner: Range, outer: Range) -> bool {
     inner.0 >= outer.0 && end(inner) <= end(outer)
 }
 
-fn overlaps(a: Range, b: Range) -> bool {
+pub(super) fn overlaps(a: Range, b: Range) -> bool {
     u128::from(a.0) < end(b) && u128::from(b.0) < end(a)
 }
 
@@ -61,9 +63,11 @@ pub struct Plan {
     pub added: Vec<Range>,
 }
 
-/// What the pushed `spans` mean for the `held` ranges. Malformed or overlapping spans and a pushed range that
-/// straddles a held one return a data-loss status: assignment only ever splits ranges.
-pub fn plan(held: &[Range], spans: &[pb::Span]) -> Result<Plan, Status> {
+/// What the pushed `spans` mean for the `held` ranges and the durably `stored` ones. A stored range outside every held one
+/// has data but no consumer. If the set still has it whole it is new; otherwise the parts still pushed are kept, and the rest
+/// drop. Malformed or overlapping spans and a pushed range that straddles a held or stored one return a data-loss status:
+/// assignment only ever splits ranges.
+pub fn plan(held: &[Range], stored: &[Range], spans: &[pb::Span]) -> Result<Plan, Status> {
     if spans.iter().any(|s| !valid_span(s)) {
         return Err(Status::data_loss("invalid pushed range"));
     }
@@ -73,17 +77,44 @@ pub fn plan(held: &[Range], spans: &[pb::Span]) -> Result<Plan, Status> {
         return Err(Status::data_loss("overlapping pushed ranges"));
     }
     let mut plan = Plan::default();
+    let parts = |h: Range| -> Vec<Range> {
+        let parts = pushed.iter().copied().filter(|p| within(*p, h));
+        parts.collect()
+    };
+    let stored: Vec<Range> = stored
+        .iter()
+        .copied()
+        .filter(|s| !held.iter().any(|h| within(*s, *h)))
+        .collect();
     for &p in &pushed {
-        match held.iter().find(|h| overlaps(p, **h)) {
-            Some(h) if !within(p, *h) => {
-                return Err(Status::data_loss("pushed range straddles a held range"));
-            }
-            Some(_) => {}
-            None => plan.added.push(p),
+        let overlapping = held.iter().chain(&stored).find(|h| overlaps(p, **h));
+        if overlapping.is_some_and(|h| !within(p, *h)) {
+            return Err(Status::data_loss("pushed range straddles a held range"));
+        }
+        let split = stored.iter().any(|s| within(p, *s) && parts(*s) != [*s]);
+        if !split && !held.iter().any(|h| overlaps(p, *h)) {
+            plan.added.push(p);
         }
     }
     for &h in held {
         let kept: Vec<Range> = pushed.iter().copied().filter(|p| within(*p, h)).collect();
+        if kept != [h] {
+            let dropped = minus(h, &kept);
+            let size = |range: &Range| end(*range) - u128::from(range.0);
+            assert_eq!(
+                kept.iter().chain(&dropped).map(size).sum::<u128>(),
+                size(&h),
+                "kept and dropped parts must exactly fill the held range"
+            );
+            plan.changed.push(Change {
+                held: h,
+                dropped,
+                kept,
+            });
+        }
+    }
+    for &h in &stored {
+        let kept = parts(h);
         if kept != [h] {
             plan.changed.push(Change {
                 held: h,
@@ -98,7 +129,12 @@ pub fn plan(held: &[Range], spans: &[pb::Span]) -> Result<Plan, Status> {
 /// Whether `node`'s own directory view confirms dropping `range`: every directory range overlapping it no longer lists
 /// the node, in any state, and has another owner `ready`. Returns a reason to refuse if the directory is missing,
 /// no directory range overlaps, or an overlapping range fails those checks.
-pub fn confirms(directory: Option<&Directory>, node: &str, range: Range) -> Result<(), String> {
+fn confirms(
+    directory: Option<&Directory>,
+    node: &str,
+    range: Range,
+    unhealthy: &BTreeSet<String>,
+) -> Result<(), String> {
     let directory = directory.ok_or("the directory view has no ranges for the dataset")?;
     let mut entries = directory.iter().peekable();
     let mut covered = false;
@@ -111,7 +147,11 @@ pub fn confirms(directory: Option<&Directory>, node: &str, range: Range) -> Resu
         if owners.iter().any(|o| o.node == node) {
             return Err(format!("still an owner of range {start:016x}"));
         }
-        if !owners.iter().any(|o| o.state == State::Ready) {
+        // An unhealthy owner's copy may be the damaged one, so it cannot be why this one goes.
+        if !owners
+            .iter()
+            .any(|o| o.state == State::Ready && !unhealthy.contains(&o.node))
+        {
             return Err(format!("range {start:016x} has no ready owner"));
         }
     }
@@ -120,6 +160,29 @@ pub fn confirms(directory: Option<&Directory>, node: &str, range: Range) -> Resu
     } else {
         Err("the directory view does not cover the range".into())
     }
+}
+
+/// Proof that the directory view allows `change`'s deletions. Only [`confirm`] makes one, and deleting a range requires it.
+pub struct Confirmed<'a>(&'a Change);
+
+impl<'a> Confirmed<'a> {
+    pub fn change(&self) -> &'a Change {
+        self.0
+    }
+}
+
+/// Whether the directory view allows every deletion in `change`; the error says why it does not.
+pub fn confirm<'a>(
+    directory: Option<&Directory>,
+    node: &str,
+    change: &'a Change,
+    unhealthy: &BTreeSet<String>,
+) -> Result<Confirmed<'a>, String> {
+    change
+        .dropped
+        .iter()
+        .try_for_each(|dropped| confirms(directory, node, *dropped, unhealthy))?;
+    Ok(Confirmed(change))
 }
 
 #[cfg(test)]

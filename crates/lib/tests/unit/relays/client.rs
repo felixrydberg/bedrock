@@ -1,4 +1,5 @@
 use super::*;
+use crate::placement::{Owner, State};
 use crate::storage::memory::MemoryEngine;
 
 #[tokio::test]
@@ -85,7 +86,7 @@ fn target(engine: Arc<MemoryEngine>) -> Target {
 }
 
 /// The consumer of namespace `users` in a range of `auth`.
-fn ranged(engine: Arc<MemoryEngine>, range: (u64, u64)) -> Consumer {
+fn ranged(engine: Arc<dyn StorageEngine>, range: (u64, u64)) -> Consumer {
     let group = Target {
         selection: Selection {
             dataset: "auth".into(),
@@ -518,14 +519,20 @@ fn splitting_unconfirmed_coverage_requires_the_kept_range_to_recover() {
     };
     let progress = Mutex::new(Progress::default());
     let changes = Watched::new(0);
+    let change = ranges::Change {
+        held: whole,
+        kept: vec![kept],
+        dropped: vec![(0, kept.0), (kept.1, 0)],
+    };
+    let owners = vec![Owner {
+        node: "other".into(),
+        state: State::Ready,
+    }];
+    let directory = BTreeMap::from([(0, owners)]);
     let requests = narrow(
         "auth",
         &engine,
-        &ranges::Change {
-            held: whole,
-            kept: vec![kept],
-            dropped: vec![(0, kept.0), (kept.1, 0)],
-        },
+        ranges::confirm(Some(&directory), "me", &change, &BTreeSet::new()).unwrap(),
         &mut consumers,
         &mut pushed,
         &progress,
@@ -548,7 +555,11 @@ fn splitting_unconfirmed_coverage_requires_the_kept_range_to_recover() {
     assert!(!replacement.validated());
     assert_eq!(replacement.resume(), 0);
     assert_eq!(data.get(&stored_at(b"k")).unwrap(), Some(b"value".to_vec()));
-    assert!(held(data.as_ref(), "auth").unwrap().is_empty());
+    // Found by the simulation (#25 / B-23): the data stays, so a restart has to know the part is held or a revoke misses it.
+    assert_eq!(held(data.as_ref(), "auth").unwrap(), BTreeSet::from([kept]));
+    let resumed = Consumer::resumed(&replacement.target, kept).unwrap();
+    assert!(!resumed[0].validated());
+    assert_eq!(resumed[0].resume(), 0);
 }
 
 fn range(head: u64, recovered: bool) -> pb::ReplayRange {
@@ -1195,5 +1206,298 @@ async fn a_member_announces_only_the_ranged_datasets_it_follows() {
     assert_eq!(
         session.member.as_ref().unwrap().get().datasets,
         ["quicksilver"]
+    );
+}
+
+/// Found by the simulation (#25 / B-23): the session refused to start on a damaged record, so the process exited on every
+/// restart before the rebuild that repairs it could run.
+#[tokio::test]
+async fn a_damaged_engine_does_not_stop_the_session_starting() {
+    let engine = Arc::new(crate::storage::sim::SimEngine::new(
+        "quicksilver",
+        Arc::new(|_| None),
+        None,
+        false,
+    ));
+    let key = l2_key(1, "infrastructure", b"k");
+    let mut batch = WriteBatch::default();
+    batch
+        .put(key.clone(), "v")
+        .set_revision(marker_prefix("quicksilver", (0, 0)) + "infrastructure", 1);
+    engine.write(batch).unwrap();
+    engine.damage(&key);
+    let member = pb::Member {
+        node_id: "q1".into(),
+        service: "quicksilver".into(),
+        cell: "c1".into(),
+        status: pb::member::Status::Ready as i32,
+        datasets: vec!["quicksilver".into()],
+        ..Default::default()
+    };
+    let engine: Arc<dyn StorageEngine> = engine;
+    let ranged = BTreeMap::from([("quicksilver".to_string(), engine)]);
+    let (_, view) = crate::membership::View::new("quicksilver", "c1");
+    let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
+    let relays = vec!["10.0.0.1:7000".to_string()];
+    Session::join(peers, relays, vec![view], member, ranged).unwrap();
+}
+
+/// `narrow`'s other arguments, for a member holding `whole` of `auth`, with `engine` as its storage.
+fn revoke_state(engine: &Arc<dyn StorageEngine>, whole: Range) -> Pushed {
+    Pushed {
+        groups: Groups::from([(("auth".into(), whole), engine.clone())]),
+        ranged: BTreeMap::from([("auth".into(), engine.clone())]),
+        me: None,
+        pending: BTreeMap::new(),
+        retired: BTreeSet::new(),
+    }
+}
+
+/// A directory in which another node holds everything, so a revoke is allowed.
+fn replaced() -> crate::placement::Directory {
+    let owner = Owner {
+        node: "other".into(),
+        state: State::Ready,
+    };
+    BTreeMap::from([(0, vec![owner])])
+}
+
+/// Found by the simulation (#25 / B-23): a revoke's write can commit and still report failure. The consumer must not keep
+/// trusting a cursor whose data may be gone, or it applies deliveries over the hole and claims full coverage.
+#[test]
+fn a_revoke_with_an_unknown_outcome_stops_trusting_the_consumer() {
+    use crate::storage::sim::{Access, Fault, SimEngine};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let failing = Arc::new(AtomicBool::new(false));
+    let write_fails = failing.clone();
+    let data = Arc::new(SimEngine::new(
+        "auth",
+        Arc::new(move |access| {
+            (access == Access::Write && write_fails.load(Ordering::SeqCst))
+                .then_some(Fault::Ambiguous)
+        }),
+        None,
+        false,
+    ));
+    let whole = (0, 0);
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    consumer.awaiting_confirmation = false;
+    assert!(consumer.validated());
+    let scope = consumer.scope();
+    let mut consumers = BTreeMap::from([(scope.clone(), consumer)]);
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: Vec::new(),
+        dropped: vec![whole],
+    };
+    failing.store(true, Ordering::SeqCst);
+    let revoked = narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut consumers,
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    );
+    assert!(revoked.is_err());
+    assert!(!consumers[&scope].validated());
+}
+
+/// A range can be revoked before its consumer exists, when its progress could not be read at startup. Deleting the data
+/// must retire that stored progress too, or a later push resumes the cursor over nothing.
+#[test]
+fn a_revoke_retires_stored_progress_no_consumer_holds() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let whole = (0, 0);
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    let active = consumer.active.clone();
+    assert_eq!(data.revision(&active).unwrap(), Some(1));
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: Vec::new(),
+        dropped: vec![whole],
+    };
+    narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut BTreeMap::new(),
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    )
+    .unwrap();
+    assert_eq!(data.revision(&active).unwrap(), Some(0));
+    assert!(held(data.as_ref(), "auth").unwrap().is_empty());
+}
+
+/// Found by the simulation (#25 / B-23): a split whose write committed but reported failure left progress on the parts. A
+/// later revoke of one part deleted its data and retired only the whole range, so a later push resumed the part's cursor
+/// over nothing.
+#[test]
+fn a_revoke_retires_progress_stored_for_part_of_the_range() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let (whole, part) = ((0, 0), only(b"k"));
+    let mut consumer = ranged(data.clone(), part);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            part,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    let active = consumer.active.clone();
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: Vec::new(),
+        dropped: vec![whole],
+    };
+    narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut BTreeMap::new(),
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    )
+    .unwrap();
+    assert_eq!(data.revision(&active).unwrap(), Some(0));
+    assert!(held(data.as_ref(), "auth").unwrap().is_empty());
+}
+
+/// Found by the simulation (#25 / B-23): a read failure while creating a split part's consumer left a group with none. A
+/// further split then retired the stored marker and left the parts it kept unmarked, so a restart or revoke missed them.
+#[test]
+fn a_split_without_a_consumer_still_marks_what_it_keeps() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let (whole, kept) = ((0, 0), only(b"k"));
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: vec![kept],
+        dropped: vec![(0, kept.0), (kept.1, 0)],
+    };
+    narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut BTreeMap::new(),
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    )
+    .unwrap();
+    assert_eq!(held(data.as_ref(), "auth").unwrap(), BTreeSet::from([kept]));
+}
+
+/// Found by the simulation (#25 / B-23): a split that committed but reported failure left a trusted cursor on a part. The
+/// retry dropped nothing, so that cursor stayed active over data newer bootstraps replaced.
+#[test]
+fn a_retried_split_retires_progress_an_earlier_attempt_left_on_a_part() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let whole = (0, 0);
+    let (first, part) = ((0, 1 << 63), (1 << 63, 0));
+    let parts = [(1 << 63, 3 << 62), (3 << 62, 0)];
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    consumer
+        .range(&in_range(range(9, true), whole, |r, s| r.span = s))
+        .unwrap();
+    assert!(consumer.validated());
+    let mut left = WriteBatch::default();
+    consumer.carry(&mut left, part);
+    data.write(left).unwrap();
+    consumer.distrust();
+
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut consumers = BTreeMap::from([(consumer.scope(), consumer)]);
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: vec![first, parts[0], parts[1]],
+        dropped: Vec::new(),
+    };
+    narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut consumers,
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    )
+    .unwrap();
+    assert_eq!(
+        held(data.as_ref(), "auth").unwrap(),
+        BTreeSet::from([first, parts[0], parts[1]])
+    );
+}
+
+/// Found by the simulation (#25 / B-23): after a split that committed but reported failure, the whole range's consumer
+/// installed newer data while the cursors left on its parts still claimed the old revision.
+#[test]
+fn a_commit_retires_cursors_an_unknown_split_left_on_parts_of_its_range() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let (whole, part) = ((0, 0), (1 << 63, 0));
+    let mut consumer = ranged(data.clone(), whole);
+    let baseline = |boundary| {
+        in_range(
+            bootstrap(boundary, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        )
+    };
+    consumer.bootstrap(baseline(9)).unwrap();
+    consumer
+        .range(&in_range(range(9, true), whole, |r, s| r.span = s))
+        .unwrap();
+    let mut left = WriteBatch::default();
+    consumer.carry(&mut left, part);
+    data.write(left).unwrap();
+    consumer.distrust();
+    assert!(held(data.as_ref(), "auth").unwrap().contains(&part));
+
+    consumer.bootstrap(baseline(12)).unwrap();
+    assert_eq!(
+        held(data.as_ref(), "auth").unwrap(),
+        BTreeSet::from([whole])
     );
 }
