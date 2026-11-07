@@ -1,0 +1,84 @@
+[package]
+name = "madsim"
+version = "0.2.34"
+edition = "2021"
+authors = ["Runji Wang <wangrunji0408@163.com>"]
+description = "Deterministic Simulator for distributed systems."
+readme = "../README.md"
+homepage = "https://github.com/madsim-rs/madsim"
+repository = "https://github.com/madsim-rs/madsim"
+license = "Apache-2.0"
+keywords = ["distributed-systems", "async", "deterministic", "simulation"]
+categories = ["asynchronous", "simulation"]
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["macros", "rpc"]
+ucx = ["async-ucx"]
+rpc = ["bincode"]
+macros = ["madsim-macros", "tokio/macros"]
+# erpc = ["rpc"] # "mad_rpc"
+
+[dependencies]
+bincode = { version = "1", optional = true }
+bytes = "1"
+futures-util = "0.3"
+lazy_static = "1.4"
+madsim-macros = { version = "0.2", path = "../madsim-macros", optional = true }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+spin = "0.9.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[target.'cfg(madsim)'.dependencies]
+ahash = "0.8"
+async-channel = "2"
+async-stream = "0.3"
+async-task = "4.4"
+downcast-rs = "1.2"
+errno = "0.3"
+libc = "0.2"
+naive-timer = "0.2"
+panic-message = "0.3"
+rand_xoshiro = "0.6"
+rustversion = "1"
+tokio = { version = "1", features = ["rt", "sync"] }
+toml = { version = "0.9" }
+
+[target.'cfg(not(madsim))'.dependencies]
+async-ucx = { version = "0.1", features = ["event"], optional = true }
+tokio = { version = "1", features = [
+    "rt",
+    "fs",
+    "net",
+    "time",
+    "io-util",
+    "sync",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["codec"] }
+# mad_rpc = { git = "https://github.com/madsys-dev/madrpc", rev = "2be4b02", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+hostname = "0.4.1"
+structopt = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
+getrandom = "=0.2.13"
+
+[[bench]]
+name = "rpc"
+harness = false
+
+[[example]]
+name = "erpc"
+required-features = ["erpc"]
+
+[package.metadata.docs.rs]
+# all-features = true
+rustc-args = ["--cfg", "madsim"]
+rustdoc-args = ["--cfg", "madsim", "--cfg", "docsrs"]
+
+[lints]
+workspace = true
