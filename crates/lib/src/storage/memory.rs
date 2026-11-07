@@ -120,7 +120,13 @@ impl StorageEngine for MemoryEngine {
                 WriteOp::DeleteRange(range) => data.retain(|key, _| !range.contains(key)),
             }
         }
-        Arc::make_mut(&mut view.revisions).extend(batch.revisions);
+        let revisions = Arc::make_mut(&mut view.revisions);
+        for (name, revision) in batch.revisions {
+            match revision {
+                Some(revision) => revisions.insert(name, revision),
+                None => revisions.remove(&name),
+            };
+        }
         Ok(())
     }
 

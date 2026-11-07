@@ -704,7 +704,7 @@ impl Consumer {
             && !self.recover
         {
             let mut batch = WriteBatch::default();
-            batch.set_revision(&self.pending_confirmation, 0);
+            batch.delete_revision(&self.pending_confirmation);
             self.target.engine.write(batch).map_err(storage)?;
             self.awaiting_confirmation = false;
         }
@@ -737,12 +737,15 @@ impl Consumer {
     }
 
     /// Stops holding this stream: a restart no longer resumes it.
+    /// Deletes this consumer's names. Setting them to 0 instead would keep every retired name, and each commit reads them
+    /// all, so a node would slow with its range history (B-61). Nothing reads a cursor without its active flag.
     fn retire(&self, batch: &mut WriteBatch) {
         batch
-            .set_revision(&self.active, 0)
-            .set_revision(&self.pending_confirmation, 0);
+            .delete_revision(&self.active)
+            .delete_revision(&self.revision)
+            .delete_revision(&self.pending_confirmation);
         if let Some(marker) = &self.marker {
-            batch.set_revision(marker, 0);
+            batch.delete_revision(marker);
         }
     }
 
@@ -765,10 +768,11 @@ impl Consumer {
             if namespace == s.namespace && part != span && ranges::within(part, span) {
                 let names = Names::of(&s.dataset, namespace, &[], Some(part));
                 batch
-                    .set_revision(&names.active, 0)
-                    .set_revision(&names.pending, 0);
+                    .delete_revision(&names.active)
+                    .delete_revision(&names.revision)
+                    .delete_revision(&names.pending);
                 if let Some(marker) = &names.marker {
-                    batch.set_revision(marker, 0);
+                    batch.delete_revision(marker);
                 }
             }
         }
@@ -793,7 +797,7 @@ impl Consumer {
             batch
                 .set_revision(&names.active, 1)
                 .set_revision(&names.revision, self.applied)
-                .set_revision(&names.pending, 0);
+                .delete_revision(&names.pending);
         }
     }
 
@@ -829,7 +833,7 @@ impl Consumer {
             .keys()
             .filter(|name| name.starts_with(&self.active_prefix))
         {
-            batch.set_revision(name, 0);
+            batch.delete_revision(name);
         }
         self.overtake(&revisions, &mut batch);
         if let Some(marker) = &self.marker {
@@ -837,11 +841,12 @@ impl Consumer {
         }
         batch
             .set_revision(&self.active, 1)
-            .set_revision(&self.revision, boundary)
-            .set_revision(
-                &self.pending_confirmation,
-                u64::from(self.awaiting_confirmation),
-            );
+            .set_revision(&self.revision, boundary);
+        if self.awaiting_confirmation {
+            batch.set_revision(&self.pending_confirmation, 1);
+        } else {
+            batch.delete_revision(&self.pending_confirmation);
+        }
         self.target.engine.write(batch).map_err(storage)?;
         self.applied = boundary;
         self.recover = false;

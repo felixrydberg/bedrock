@@ -13,7 +13,9 @@
 # Each failing seed is rerun with logs and a stack trace, and a report goes to VOPR_REPORTS, by default ~/bedrock-vopr/reports.
 # Long runs also sample time and memory into VOPR_REPORTS and print whether they climb. The VOPR binary uses mimalloc, so
 # memory figures are its, not glibc's: judge growth by its trend.
-# Builds go to CARGO_TARGET_DIR, by default ~/bedrock-target-madsim-release: off the Windows drive, and apart from normal builds.
+# Each command builds what it runs. soak and watch use the `sim` profile, whose link-time optimisation runs seeds about 16%
+# faster but takes about a minute longer to build; the rest use `release`. VOPR_PROFILE overrides the choice. Builds go to
+# CARGO_TARGET_DIR, by default ~/bedrock-target-madsim-release: off the Windows drive, and apart from normal builds.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -22,7 +24,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/bedrock-target-madsim-release
 export VOPR_REPORTS="${VOPR_REPORTS:-$HOME/bedrock-vopr/reports}"
 
 binary() {
-    cargo test --release -p bedrock-sim --test vopr --no-run 2>&1 |
+    cargo test --profile "${VOPR_PROFILE:-release}" -p bedrock-sim --test vopr --no-run 2>&1 |
         sed -n 's/.*Executable .*(\(.*\))$/\1/p'
 }
 
@@ -181,7 +183,7 @@ watch() {
     home="${VOPR_WATCH_DIR:-$HOME/bedrock-vopr}"
     mkdir -p "$home/reports"
     [ -d "$home/repo" ] || git clone -q "$url" "$home/repo"
-    export VOPR_REPORTS="$home/reports" CARGO_TARGET_DIR="$home/target"
+    export VOPR_REPORTS="$home/reports" CARGO_TARGET_DIR="$home/target" VOPR_PROFILE="${VOPR_PROFILE:-sim}"
     while true; do
         git -C "$home/repo" fetch -q origin "$branch"
         git -C "$home/repo" checkout -q --detach FETCH_HEAD
@@ -196,7 +198,7 @@ case "${1:-}" in
     watch) shift; watch "$@" ;;
     sweep) shift; sweep "$@" ;;
     soak)
-        export BEDROCK_VOPR_SECONDS="$2" VOPR_TIMEOUT="${VOPR_TIMEOUT:-0}"
+        export BEDROCK_VOPR_SECONDS="$2" VOPR_TIMEOUT="${VOPR_TIMEOUT:-0}" VOPR_PROFILE="${VOPR_PROFILE:-sim}"
         shift 2
         sweep "$@"
         ;;

@@ -43,6 +43,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
 panic = "abort"
 overflow-checks = true
 
+# Simulation runs (`scripts/vopr.sh`): whole-program optimisation, for faster seeds at the cost of slower builds (B-61).
+[profile.sim]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
 # madsim 0.2.34 with bedrock's changes, each marked `bedrock:` in vendor/madsim: a `Sleep` sets one timer, not one per poll
 # (B-61). Remove a change once upstream has it.
 [patch.crates-io]

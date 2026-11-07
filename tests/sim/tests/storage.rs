@@ -66,6 +66,11 @@ fn a_crash_returns_to_the_state_before_each_lost_commit() {
         },
         |e| {
             let mut batch = WriteBatch::default();
+            batch.delete_revision("m").delete_revision("absent");
+            e.write(batch).unwrap();
+        },
+        |e| {
+            let mut batch = WriteBatch::default();
             batch.delete_range(KeyRange::new("a", "c")).put("b", "3");
             batch.set_revision("n", 4);
             e.write(batch).unwrap();

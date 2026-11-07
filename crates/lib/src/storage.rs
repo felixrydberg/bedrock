@@ -210,8 +210,8 @@ pub enum WriteOp {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WriteBatch {
     pub ops: Vec<WriteOp>,
-    /// Applied replication revision per name (namespace or stream), set together with the data.
-    pub revisions: BTreeMap<String, u64>,
+    /// Applied replication revision per name (namespace or stream), set together with the data. `None` deletes the name.
+    pub revisions: BTreeMap<String, Option<u64>>,
 }
 
 impl WriteBatch {
@@ -234,7 +234,13 @@ impl WriteBatch {
     }
 
     pub fn set_revision(&mut self, name: impl Into<String>, revision: u64) -> &mut Self {
-        self.revisions.insert(name.into(), revision);
+        self.revisions.insert(name.into(), Some(revision));
+        self
+    }
+
+    /// Removes `name`, so it reads as never set. The last call for a name in a batch wins.
+    pub fn delete_revision(&mut self, name: impl Into<String>) -> &mut Self {
+        self.revisions.insert(name.into(), None);
         self
     }
 }

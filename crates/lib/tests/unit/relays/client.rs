@@ -633,7 +633,7 @@ async fn installed_bootstrap_and_tail_wait_for_source_confirmation_before_reads_
     assert!(consumer.validated());
     assert_eq!(
         engine.revision(&consumer.pending_confirmation).unwrap(),
-        Some(0)
+        None
     );
     changed(&progress, &changes, |state| {
         state
@@ -1347,8 +1347,20 @@ fn a_revoke_retires_stored_progress_no_consumer_holds() {
         &Watched::new(0),
     )
     .unwrap();
-    assert_eq!(data.revision(&active).unwrap(), Some(0));
+    assert_eq!(data.revision(&active).unwrap(), None);
     assert!(held(data.as_ref(), "auth").unwrap().is_empty());
+    // B-61: retiring deletes the names, so a node's revisions do not grow with its range history.
+    let left: Vec<_> = data
+        .snapshot()
+        .unwrap()
+        .revisions()
+        .unwrap()
+        .into_keys()
+        .collect();
+    assert!(
+        left.iter().all(|name| !name.starts_with("relay:")),
+        "{left:?}"
+    );
 }
 
 /// Found by the simulation (#25 / B-23): a split whose write committed but reported failure left progress on the parts. A
@@ -1384,7 +1396,7 @@ fn a_revoke_retires_progress_stored_for_part_of_the_range() {
         &Watched::new(0),
     )
     .unwrap();
-    assert_eq!(data.revision(&active).unwrap(), Some(0));
+    assert_eq!(data.revision(&active).unwrap(), None);
     assert!(held(data.as_ref(), "auth").unwrap().is_empty());
 }
 

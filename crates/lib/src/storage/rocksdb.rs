@@ -299,7 +299,10 @@ impl StorageEngine for RocksDbAdapter {
             }
         }
         for (name, revision) in batch.revisions {
-            rocks.put_cf(&revisions, name, revision.to_be_bytes());
+            match revision {
+                Some(revision) => rocks.put_cf(&revisions, name, revision.to_be_bytes()),
+                None => rocks.delete_cf(&revisions, name),
+            }
         }
         self.commit(rocks)
     }
