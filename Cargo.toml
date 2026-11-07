@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "tests/sim"]
+exclude = ["vendor"]
 
 [workspace.package]
 # Matches deploy/Dockerfile; resolver 3 picks dependency versions that support it.
@@ -36,3 +37,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
+
+# madsim 0.2.34, vendored so bedrock can patch it for simulation speed (B-61). Mark each change `bedrock:` in
+# vendor/madsim, and drop it once upstream has it.
+[patch.crates-io]
+madsim = { path = "vendor/madsim" }
