@@ -11,7 +11,8 @@
 # BEDROCK_VOPR_FAULTS=storage,rpc restricts the fault classes. BEDROCK_VOPR_SECONDS sets the simulated run length; a seed
 # only reproduces at the commit and length it ran with. VOPR_TIMEOUT caps one seed in wall-clock seconds, 0 for no limit.
 # Each failing seed is rerun with logs and a stack trace, and a report goes to VOPR_REPORTS, by default ~/bedrock-vopr/reports.
-# Long runs also sample time and memory into VOPR_REPORTS and print whether they climb.
+# Long runs also sample time and memory into VOPR_REPORTS and print whether they climb. The VOPR binary uses mimalloc, so
+# memory figures are its, not glibc's: judge growth by its trend.
 # Builds go to CARGO_TARGET_DIR, by default ~/bedrock-target-madsim-release: off the Windows drive, and apart from normal builds.
 set -euo pipefail
 

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "tests/sim"]
+exclude = ["vendor"]
 
 [workspace.package]
 # Matches deploy/Dockerfile; resolver 3 picks dependency versions that support it.
@@ -41,3 +42,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(madsim)"] }
 [profile.release]
 panic = "abort"
 overflow-checks = true
+
+# madsim 0.2.34 with bedrock's changes, each marked `bedrock:` in vendor/madsim: a `Sleep` sets one timer, not one per poll
+# (B-61). Remove a change once upstream has it.
+[patch.crates-io]
+madsim = { path = "vendor/madsim" }

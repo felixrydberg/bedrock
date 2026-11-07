@@ -35,6 +35,7 @@ fn subscribe(
             baseline: from - 1,
             confirming: false,
             target: None,
+            woken: Default::default(),
         };
         (key, interest)
     });

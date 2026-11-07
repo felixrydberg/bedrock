@@ -155,6 +155,9 @@ struct Interest {
     confirming: bool,
     /// The head this stream must be acknowledged through to count as ready, fixed when it first could.
     target: Option<u64>,
+    /// Wakes this stream's pump: its acknowledgements and its end. A subscriber-wide signal would wake every stream the
+    /// subscriber follows on each acknowledgement, a cost that grows with the square of its ranges (B-61).
+    woken: Arc<Watched<u64>>,
 }
 
 /// Accounts serialized queue bytes when tonic drains a subscriber's bounded queue.
@@ -562,6 +565,9 @@ impl Hub {
         if let Some(sub) = removed {
             sub.closed.update(|v| *v = true);
             sub.changed.update(|v| *v = v.wrapping_add(1));
+            for interest in sub.follows.values() {
+                interest.woken.update(|v| *v = v.wrapping_add(1));
+            }
             if let Some(mut member) = sub.member {
                 self.0.stats.disconnected(&member);
                 if member.status == pb::member::Status::Draining as i32 {
@@ -814,12 +820,12 @@ impl Hub {
     fn acknowledge(&self, id: u64, ack: pb::Ack) {
         if let Some(sub) = self.0.subscribers.lock().unwrap().get_mut(&id) {
             let key = ((ack.dataset, ack.namespace), range(ack.span.as_ref()));
-            if let Some(interest) = sub.follows.get_mut(&key)
-                && ack.applied < interest.from
-            {
-                interest.acked = interest.acked.max(ack.applied);
+            if let Some(interest) = sub.follows.get_mut(&key) {
+                if ack.applied < interest.from {
+                    interest.acked = interest.acked.max(ack.applied);
+                }
+                interest.woken.update(|v| *v = v.wrapping_add(1));
             }
-            sub.changed.update(|v| *v = v.wrapping_add(1));
         }
     }
     /// An empty namespace with a range unfollows that range in every namespace of the dataset.
@@ -829,13 +835,21 @@ impl Hub {
             match range.filter(|_| unfollow.namespace.is_empty()) {
                 Some(range) => {
                     sub.ranges.remove(&(unfollow.dataset.clone(), range));
-                    sub.follows.retain(|((dataset, _), r), _| {
-                        *dataset != unfollow.dataset || *r != Some(range)
+                    sub.follows.retain(|((dataset, _), r), interest| {
+                        let kept = *dataset != unfollow.dataset || *r != Some(range);
+                        if !kept {
+                            interest.woken.update(|v| *v = v.wrapping_add(1));
+                        }
+                        kept
                     });
                 }
                 None => {
-                    sub.follows
-                        .remove(&((unfollow.dataset, unfollow.namespace), range));
+                    if let Some(interest) = sub
+                        .follows
+                        .remove(&((unfollow.dataset, unfollow.namespace), range))
+                    {
+                        interest.woken.update(|v| *v = v.wrapping_add(1));
+                    }
                 }
             }
             sub.changed.update(|v| *v = v.wrapping_add(1));
@@ -1027,7 +1041,7 @@ impl Hub {
             let Some(sub) = subscribers.get_mut(&id) else {
                 return;
             };
-            sub.follows.insert(
+            let replaced = sub.follows.insert(
                 key.clone(),
                 Interest {
                     from: from.max(1),
@@ -1036,8 +1050,12 @@ impl Hub {
                     baseline: from.max(1) - 1,
                     confirming: false,
                     target: None,
+                    woken: Arc::default(),
                 },
             );
+            if let Some(replaced) = replaced {
+                replaced.woken.update(|v| *v = v.wrapping_add(1));
+            }
             sub.changed.update(|v| *v = v.wrapping_add(1));
         }
         self.changed();
@@ -1067,11 +1085,14 @@ impl Hub {
         force: bool,
     ) -> Result<(), Status> {
         let opened = crate::monotonic_now();
-        let Some((changes, mut moved)) = self.0.subscribers.lock().unwrap().get(&id).map(|s| {
-            // A stream followed long after the session opened is new work, not failover.
-            let moved = s.moved.filter(|at| opened.duration_since(*at) < IDLE);
-            (s.changed.clone(), moved)
-        }) else {
+        let Some((changes, mut moved)) =
+            self.0.subscribers.lock().unwrap().get(&id).and_then(|s| {
+                // A stream followed long after the session opened is new work, not failover.
+                let moved = s.moved.filter(|at| opened.duration_since(*at) < IDLE);
+                let interest = s.follows.get(&key).filter(|i| i.generation == generation)?;
+                Some((interest.woken.clone(), moved))
+            })
+        else {
             return Ok(());
         };
         let mut announced = false;
@@ -1079,6 +1100,8 @@ impl Hub {
         let mut lease: Option<Arc<RecoveryLease>> = None;
         let mut renewed_through = 0;
         let mut recovery_permit = None;
+        // One timer for the whole stream: a new sleep on every pass leaves one behind per event, for its full length (B-61).
+        let mut recheck = std::pin::pin!(tokio::time::sleep(PROGRESS));
         loop {
             let version = self.0.changed.get();
             let local_version = changes.get();
@@ -1381,13 +1404,13 @@ impl Hub {
                     _=self.0.changed.wait_until(|v|*v!=version)=>{},
                     _=changes.wait_until(|v|*v!=local_version)=>{},
                     _=head.wait_until(|v|Some(*v)!=h)=>{},
-                    _=tokio::time::sleep(PROGRESS)=>{},
+                    _=recheck.as_mut()=>recheck.as_mut().reset(crate::monotonic_now()+PROGRESS),
                 }
             } else {
                 tokio::select! {biased;
                     _=self.0.changed.wait_until(|v|*v!=version)=>{},
                     _=changes.wait_until(|v|*v!=local_version)=>{},
-                    _=tokio::time::sleep(PROGRESS)=>{},
+                    _=recheck.as_mut()=>recheck.as_mut().reset(crate::monotonic_now()+PROGRESS),
                 }
             }
         }
@@ -1743,6 +1766,8 @@ impl Hub {
         let mut sent_datasets = BTreeSet::<String>::new();
         let mut progress = tokio::time::interval(PROGRESS);
         let mut received = crate::monotonic_now();
+        // Re-armed when it fires rather than per message, which would leave a timer behind for each one (B-61).
+        let mut idle = std::pin::pin!(tokio::time::sleep_until(received + IDLE));
         loop {
             let version = self.0.changed.get();
             let (namespaces, datasets) = self.desired();
@@ -1820,7 +1845,13 @@ impl Hub {
             }
             let message = tokio::select! {biased;
                 _=self.0.changed.wait_until(|v|*v!=version)=>continue,
-                _=tokio::time::sleep_until(received+IDLE)=>return Err(Status::deadline_exceeded("upstream idle")),
+                _=idle.as_mut()=>{
+                    if received+IDLE>crate::monotonic_now() {
+                        idle.as_mut().reset(received+IDLE);
+                        continue;
+                    }
+                    return Err(Status::deadline_exceeded("upstream idle"));
+                },
                 _=progress.tick()=>{
                     tx.send(pb::RelayRequest{kind:Some(pb::relay_request::Kind::Progress(true))}).await.map_err(|_|Status::unavailable("upstream requests closed"))?;
                     continue;
@@ -2013,10 +2044,12 @@ impl pb::relay_server::Relay for Hub {
             let mut tick = tokio::time::interval(PROGRESS);
             tick.tick().await;
             let mut received = crate::monotonic_now();
+            // Re-armed when it fires rather than per message, which would leave a timer behind for each one (B-61).
+            let mut idle = std::pin::pin!(tokio::time::sleep_until(received + IDLE));
             loop {
                 tokio::select! {biased;
                     _=closed.wait_until(|v|*v)=>break,
-                    _=tokio::time::sleep_until(received+IDLE)=>break,
+                    _=idle.as_mut()=>if received+IDLE>crate::monotonic_now() {idle.as_mut().reset(received+IDLE)} else {break},
                     // A full queue skips the tick; stalled readers are disconnected by scoped sends after IDLE.
                     _=tick.tick()=>if matches!(hub.enqueue(id,pb::RelayFrame{kind:Some(pb::relay_frame::Kind::Tick(true))},None),Ok(false)){break},
                     request=requests.message()=>match request {

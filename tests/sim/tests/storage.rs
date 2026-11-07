@@ -38,6 +38,61 @@ fn crash_takes_back_data_and_revision_together() {
     assert_eq!(engine.revision("n").unwrap(), Some(1));
 }
 
+/// B-61: commits keep only what undoes them, and a crash must still land exactly where a full copy before each commit would.
+#[test]
+fn a_crash_returns_to_the_state_before_each_lost_commit() {
+    let steps: Vec<fn(&SimEngine)> = vec![
+        |e| {
+            let mut batch = WriteBatch::default();
+            batch
+                .put("a", "1")
+                .put("b", "1")
+                .put("c", "1")
+                .put("a", "2");
+            batch.set_revision("n", 1);
+            e.write(batch).unwrap();
+        },
+        |e| {
+            let mut batch = WriteBatch::default();
+            batch.delete("b").delete("x").set_revision("n", 2);
+            e.write(batch).unwrap();
+            // Damage is not a commit: losing the next commit keeps it, losing this one takes it too.
+            e.damage(b"c");
+        },
+        |e| {
+            let mut batch = WriteBatch::default();
+            batch.put("d", "1").set_revision("m", 1);
+            e.write(batch).unwrap();
+        },
+        |e| {
+            let mut batch = WriteBatch::default();
+            batch.delete_range(KeyRange::new("a", "c")).put("b", "3");
+            batch.set_revision("n", 4);
+            e.write(batch).unwrap();
+        },
+        |e| {
+            let source = SimEngine::new("source", Arc::new(|_| None), None, false);
+            source.put(b"z", b"1").unwrap();
+            e.restore(source.snapshot().unwrap().as_ref()).unwrap();
+        },
+        |e| {
+            let mut batch = WriteBatch::default();
+            batch.put("c", "2").set_revision("n", 6);
+            e.write(batch).unwrap();
+        },
+    ];
+    for lose in 1..=steps.len() {
+        let engine = engine(Arc::new(|_| None));
+        let mut before = Vec::new();
+        for step in &steps {
+            before.push(engine.frozen());
+            step(&engine);
+        }
+        assert_eq!(engine.crash(lose), lose);
+        assert_eq!(engine.frozen(), before[steps.len() - lose], "losing {lose}");
+    }
+}
+
 #[test]
 fn ambiguous_write_commits_and_reports_failure() {
     let engine = engine(Arc::new(|access| {

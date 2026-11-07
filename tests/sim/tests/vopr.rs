@@ -13,6 +13,10 @@
 //! [`OPEN`]. `BEDROCK_VOPR_FAULTS=storage,rpc` restricts the classes a seed may pick.
 #![cfg(madsim)]
 
+// B-61: allocation is a large share of a run. Memory figures from long runs are therefore mimalloc's, not glibc's.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};

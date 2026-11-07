@@ -506,7 +506,7 @@ fn l2_op(op: &WriteOp) -> bool {
 }
 
 /// A state copy that owns its data, so it can outlive the engine's borrow and be restored later.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Frozen {
     entries: Entries,
     revisions: BTreeMap<String, u64>,
@@ -553,8 +553,8 @@ pub struct SimEngine {
     bug: Option<Bug>,
     /// The first value of each key, for [`Bug::StaleValue`].
     first: Mutex<Entries>,
-    /// States before recent commits, newest last. Each costs a full copy, so only an engine that may lose them keeps them.
-    committed: Option<Mutex<VecDeque<Frozen>>>,
+    /// How to undo each recent commit, newest last. Only an engine that may lose commits keeps them.
+    committed: Option<Mutex<VecDeque<Undo>>>,
     damaged: Mutex<BTreeSet<Vec<u8>>>,
     /// Every call fails from now on.
     wedged: AtomicBool,
@@ -687,7 +687,11 @@ impl SimEngine {
         let mut committed = committed.lock().unwrap();
         let lost = lose.min(committed.len());
         let kept = committed.len() - lost;
-        if let Some(survivor) = committed.drain(kept..).next() {
+        if lost > 0 {
+            let mut survivor = self.frozen();
+            for undo in committed.drain(kept..).rev() {
+                undo.apply(&mut survivor);
+            }
             self.inner
                 .restore(&survivor)
                 .expect("memory restores are infallible");
@@ -697,14 +701,45 @@ impl SimEngine {
         lost
     }
 
-    fn remember(&self) {
+    /// Keeps what undoes `batch`, before it is written.
+    fn remember(&self, batch: &WriteBatch) {
+        self.keep(|| {
+            let read = "memory reads are infallible";
+            let mut keys = Vec::new();
+            for op in &batch.ops {
+                match op {
+                    WriteOp::Put { key, .. } | WriteOp::Delete { key } => {
+                        keys.push((key.clone(), self.inner.get(key).expect(read)));
+                    }
+                    WriteOp::DeleteRange(range) => keys.extend(
+                        self.inner
+                            .scan(range)
+                            .expect(read)
+                            .map(|entry| entry.map(|(key, value)| (key, Some(value))).expect(read)),
+                    ),
+                }
+            }
+            let revisions = batch
+                .revisions
+                .keys()
+                .map(|name| (name.clone(), self.inner.revision(name).expect(read)))
+                .collect();
+            Undo::Batch {
+                keys,
+                revisions,
+                damaged: self.lock_damaged().clone(),
+            }
+        });
+    }
+
+    fn keep(&self, undo: impl FnOnce() -> Undo) {
         if let Some(committed) = &self.committed {
-            let frozen = self.frozen();
+            let undo = undo();
             let mut committed = committed.lock().unwrap();
             if committed.len() == LOSABLE_BATCHES {
                 committed.pop_front();
             }
-            committed.push_back(frozen);
+            committed.push_back(undo);
         }
     }
 
@@ -750,6 +785,47 @@ impl SimEngine {
             entries.push(Err(self.injected(Fault::Io)));
         }
         Box::new(entries.into_iter())
+    }
+}
+
+/// What takes one commit back. A batch keeps only what it overwrote, since copying the whole engine on every commit was
+/// the largest cost in long runs (B-61).
+enum Undo {
+    /// Earlier values of the keys and revisions a batch wrote, `None` where there was none, and the damage before it.
+    Batch {
+        keys: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        revisions: Vec<(String, Option<u64>)>,
+        damaged: BTreeSet<Vec<u8>>,
+    },
+    /// A restore replaces everything, so it keeps everything.
+    Whole(Frozen),
+}
+
+impl Undo {
+    fn apply(self, state: &mut Frozen) {
+        match self {
+            Undo::Whole(earlier) => *state = earlier,
+            Undo::Batch {
+                keys,
+                revisions,
+                damaged,
+            } => {
+                // Every earlier value was read before the batch, so the order they go back in does not matter.
+                for (key, value) in keys {
+                    match value {
+                        Some(value) => state.entries.insert(key, value),
+                        None => state.entries.remove(&key),
+                    };
+                }
+                for (name, revision) in revisions {
+                    match revision {
+                        Some(revision) => state.revisions.insert(name, revision),
+                        None => state.revisions.remove(&name),
+                    };
+                }
+                state.damaged = damaged;
+            }
+        }
     }
 }
 
@@ -810,7 +886,7 @@ impl StorageEngine for SimEngine {
         }
         let batch = self.mutated(batch);
         self.mix_batch(&batch);
-        self.remember();
+        self.remember(&batch);
         {
             // Overwriting a damaged record repairs it.
             let mut damaged = self.lock_damaged();
@@ -846,7 +922,7 @@ impl StorageEngine for SimEngine {
         if let Some(fault) = (self.faults)(Access::Write) {
             return Err(self.injected(fault));
         }
-        self.remember();
+        self.keep(|| Undo::Whole(self.frozen()));
         self.inner.restore(from)?;
         self.lock_damaged().clear();
         Ok(())

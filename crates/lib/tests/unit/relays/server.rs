@@ -74,6 +74,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             baseline: 0,
             confirming: false,
             target: None,
+            woken: Default::default(),
         },
     )]);
     hub.0.subscribers.lock().unwrap().insert(
@@ -180,6 +181,7 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
                 baseline: 0,
                 confirming: false,
                 target: None,
+                woken: Default::default(),
             },
         );
     let pumping = hub.clone();
@@ -505,6 +507,7 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
         baseline: 0,
         confirming: false,
         target: None,
+        woken: Default::default(),
     };
     let set = |f: &dyn Fn(&mut Interest)| {
         f(hub

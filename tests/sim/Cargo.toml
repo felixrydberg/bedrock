@@ -17,6 +17,8 @@ bedrock-cdn = { path = "../../crates/cdn" }
 bedrock-kv = { path = "../../crates/kv" }
 bedrock-quicksilver = { path = "../../crates/quicksilver" }
 bedrock-relay = { path = "../../crates/relay" }
+# The VOPR binary's allocator: about a quarter faster than glibc's, and traces do not depend on it (B-61). Simulation only.
+mimalloc = { version = "0.1.52", default-features = false }
 
 # `tests/transport.rs`, `subscriptions.rs` and `writes.rs` run in both builds.
 [build-dependencies]
