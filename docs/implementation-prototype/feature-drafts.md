@@ -192,6 +192,8 @@ Rules this implies:
 | **N — Shared platform infrastructure (future)** |||||
 | B-56 | Shared API rate-limit infrastructure | Shared infrastructure | shared contracts in `lib`; API integration | To be agreed; does not gate initial KV |
 | B-57 | Gateway binary and shared cluster client | Shared infrastructure | `gateway`, `lib` client, `lib/relays` | B-19, B-22, B-55 |
+| B-61 | Simulation speed: more simulated seconds per real second | Shared infrastructure | `tests/sim`, `scripts/vopr.sh` | B-23 |
+| B-62 | Partial quarantine: rebuild only the damaged range | Shared core | `lib/health` + `lib/reconciliation` + `lib/relays` | B-14, B-21, B-22, B-23 |
 
 ### Parallel work inside the shared core
 
@@ -727,8 +729,6 @@ inspecting engine state rather than through a served read.
 - Prove `MinRevisionReads` through served reads, including absence and listing as #25 requires.
 - Run real `bedrock-kv` readers under faults: reader loss, pressure and idle eviction, reopen, and publication lag.
 - Add real reads to the simulation. Damage is found today by those and by the scrubber (`health::scrub`, #25 / B-23).
-- Partial quarantine: once an adapter can prove damage is limited to a hash range, use the range the scrubber's walk reports
-  instead of quarantining the whole engine.
 
 **Additional context**
 The simulation sends the same load for every seed, and the seed decides only how it arrives: timing, bursts at the same
@@ -1744,6 +1744,137 @@ cannot reach another cell, and public requests have no entry point.
   and recovering afterwards, replayable per seed. Metric labels stay low-cardinality.
 
 ---
+
+#### B-61 — Simulation speed: more simulated seconds per real second
+
+```
+Title:  Feature 🚀: Run more simulated seconds per real second
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+A seed runs on one thread, so a long soak is limited by how fast that thread goes: a simulated day takes 30 to 105 minutes
+depending on the seed, and a simulated month would take about 14 to 52 hours. The more simulated time we get per real second,
+the more seeds and longer runs fit in a night.
+
+**Describe the solution you'd like**
+Work down this list, measuring each change with `scripts/vopr.sh profile` and a soak's `.metrics` file. Percentages come from a
+profile of a simulated hour of seed 90003, the heaviest load shape we have. Gains are estimates until measured.
+
+| Change | Why | Expected gain | Effort |
+| --- | --- | --- | --- |
+| Give WSL all 16 hardware threads (`processors` in `.wslconfig`) | Sweeps and soaks run one seed per CPU, and WSL has 8 of 16 threads | More seeds at once, less than double; a single seed gets no faster | A config change |
+| Undo log in `SimEngine::remember` | Rollback copies the whole engine on every commit, when only changed keys matter | Up to about 21% on seeds with lost-write faults | About 30 lines |
+| `mimalloc` in the test binary | About 37% of the time is in shared libraries, likely `malloc`, `free` and `memcpy` | Maybe 10–15% | A few lines |
+| LTO and one codegen unit for simulation builds | The release profile uses neither | Maybe 5–15%, for slower builds | A few lines |
+| Count stale timers, then reduce them or patch `naive_timer` | `Timer::expire` is about 25%, and timers cannot be cancelled, so dropped timeouts stay in the heap | Unknown until counted | A small fork at most |
+| Break down `Hub::pump` and the rest of the per-commit cost | `Hub::pump` is about 17%, and most of the run is unexplained | Unknown | A profiling pass |
+
+Each change must leave every seed's trace unchanged, except where it is meant to change behaviour. A trace that moves after an
+allocator or compiler change means something depends on memory addresses, which is a determinism bug.
+
+**Describe alternatives you've considered**
+- Threads inside a seed: rejected. madsim gets determinism from one thread choosing the next task.
+- Stripping madsim: rejected. Unused code costs nothing at runtime, so only the hot paths above matter.
+- Our own simulator: rejected. madsim is about 30% of the run, so it could not win much, and a bug in it could quietly weaken
+  every seed.
+- Native Linux: a few percent for one seed, by estimate. Its use is a dedicated machine for `scripts/vopr.sh watch`.
+- Moving the repo into WSL's Linux filesystem helps builds, not a running simulation.
+
+**Additional context**
+Seeds differ widely: a simulated hour takes about 71 real seconds on seed 90002 and about 260 on seed 90003, which made about
+24 times as many commits as seed 90004 in the same simulated time. Evenly spread single writes appear to commit one by one,
+while hot keys and bursts batch. Results from one seed may not carry over, so check more than one load shape.
+
+#### B-62 — Partial quarantine: rebuild only the damaged range
+
+```
+Title:  Feature 🚀: Rebuild only the damaged range of a quarantined engine
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+One bad record quarantines a whole engine instance, and rebuilding it re-bootstraps every scope of that dataset. Ranges only
+split, so that cost grows with a node's range count: `quicksilver-3` held 45 `keys` ranges at the end of a simulated day. While
+it rebuilds, the node serves nothing from that dataset and takes no new ranges for it, even though almost all of its data is
+good. `kv.md` §15.7 prefers the smallest practical recovery, and a failed L2 range is one of the levels it lists.
+
+**Describe the solution you'd like**
+Verify first, then narrow:
+1. Damage quarantines the whole instance, as it does today, so nothing is served while the extent is unknown.
+2. A verification pass checks the whole engine with its own verifier where it has one, then reads every record by range. It is
+   a local read, far cheaper than bootstrapping over the network.
+3. The adapter reports the span of storage it must discard. On RocksDB that is the damaged table file's key span, not the hash
+   range the failure hit. If it can name no span, the whole instance rebuilds.
+4. Every L2 range overlapping that span stays quarantined and the rest serve again.
+5. The adapter physically discards the span, and each of those ranges re-bootstraps through its own scope, then validates as a
+   bootstrap does today.
+
+The client already recovers one scope alone (`Intake::fail`), and the scrubber's walk already names the part of the engine it
+hit. New work:
+- Per-range health. `StorageHealth` tracks quarantine per range, and `Monitored` refuses calls by range. Whole-instance stays
+  the default state. `Member` names the damaged ranges, and `select`, `confirms` and `handoff` filter by range. The owner stays
+  `ready` in the directory, as a rebuilding owner does today, so this needs no directory write and no relay majority. This
+  changes the protocol, so `handoff.tla` and `membership.tla` come first, with `Sicken` per point.
+- The quarantine marker names its ranges, so a restart comes back with the same ranges refused. A marker that cannot be read as
+  ranges means the whole instance.
+- `StorageEngine` gains a way to report and discard a span, and an optional whole-engine verifier. `Reinitialise` gets a range
+  form that uses them and removes only those ranges' records and revisions.
+
+Falls back to the whole instance when:
+- a failure names no key or file, such as a manifest error;
+- the adapter cannot discard the span;
+- a failure is outside the L2 ranges, such as a revision or a namespace-prefixed record;
+- the verification pass fails or is interrupted;
+- more ranges are damaged than it is worth rebuilding one at a time.
+
+**RocksDB**
+Measured with throwaway probes against RocksDB 11.8 on 2026-11-06:
+- `delete_range` does not remove damage. After deleting the range around a bad block, scans are clean, but the next compaction
+  reads the block, sets a background error and stops all writes. Reopening does not help, because the next compaction fails the
+  same way. Only the block's file leaving the engine fixes it. Whole-instance `restore` therefore replaces both column families.
+- `delete_file_in_range` over the damaged file's span works: with 10 table files, one was dropped, the other 9 stayed, and after
+  refilling the span a full compaction and later writes succeeded. The corruption error names the file, and `live_files` gives
+  its key span. Keys are hash-first, so a file maps to a contiguous part of the hash space.
+  RocksDB's header says this leaves level 0 files, so damage in one means a whole-instance rebuild. Compacting it first cannot help, since compaction reads the bad block.
+- A scan cannot prove an engine clean: the same probe shows a clean scan over a block that still stops the engine. The proof
+  needs `VerifyChecksum`, which reads table files directly. It is in RocksDB's C API but not in the `rocksdb` crate, whose raw
+  handle is also private, so it needs an upstream change or a patched crate.
+
+**Open decisions**
+- Whether `VerifyChecksum` reads past the block cache, and what it reports with several bad files. It may stop at the first, so
+  the pass would repeat after each discard.
+- What SurrealKV needs when its adapter lands. Its `skv scrub` sweeps SSTable data blocks, but its README names no library API
+  for that and it skips the log and value log.
+
+**Acceptance**
+- A record damaged in one range rebuilds that range only, and every other range keeps serving throughout.
+- A range under rebuild serves nothing, and a restart during its rebuild does not serve it.
+- Each fallback above rebuilds the whole instance.
+- On a real RocksDB engine, a damaged table file discarded this way leaves compaction and writes working.
+- Deletes stay deleted and no older value replaces a newer one across a range rebuild.
+- `SimEngine` learns damage wider than one record, such as neighbouring keys and metadata. Damage is exactly one record today,
+  so the simulation would otherwise only ever take the narrow path and overstate the gain.
+- Compare rebuild time and time spent unhealthy before and after, using a soak of a seed with the corruption class.
+
+**Describe alternatives you've considered**
+- Trust the failing key's range without a verification pass: rejected. A bad RocksDB block can hold many keys, so neighbouring
+  ranges may be damaged too.
+- Demote the owner to `populating` instead of per-range health: rejected on 2026-11-06. It would reuse `select`, `confirms` and
+  the handoff, but a plain demotion breaks `NoEarlyDrop` and `ReadyHasData` in TLC. It passes a small model (two nodes, one start,
+  `MaxRev = 4`) only with three new rules: another healthy `ready` owner must remain, no promotion while sick, and the node wipes
+  only on proof the demotion is current. It would still need a member signal, a relay majority and a fallback for the last
+  holder, and it would count against the moving-range limit.
+- Repair engine blocks or pages: rejected by `kv.md` §15.7, since replication must not depend on engine internals.
+- Keep rebuilding whole instances and make them faster: helps, but the cost still grows with range count.
+
+**Additional context**
+This shortens rebuilds, not detection. Damage is found by the scrubber's walk, which starts over on every restart, so a durable
+walk position is separate work (`health::scrub`).
+
+Measured on seed 90003 over two simulated hours, with the seed's heavy fault load: 207 quarantines, and quicksilver nodes
+unhealthy for 28–49% of samples. One quicksilver rebuild took about 80 seconds. Seed 90004 reached 60–79%. The simulation's
+damage is one record, so these show the cost of whole-instance rebuilds, not what a real disk would produce.
 
 ## 4. Open decisions
 

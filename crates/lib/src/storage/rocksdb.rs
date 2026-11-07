@@ -3,14 +3,20 @@
 //! Data lives in the `data` column family, every key stored behind a `0x00` byte so the key space ends at `[0x01]`
 //! and unbounded range deletes become one RocksDB range tombstone. Applied revisions live in `revisions`, keyed by
 //! name with a big-endian `u64` value. Every batch is synced before `write` returns.
+//!
+//! [`StorageEngine::restore`] moves to a new generation of both column families, because a damaged table file can only leave
+//! with its column family: range deletes hide its records, and the next compaction reads the bad block and stops all writes.
+//! Dropping the old `data` column family is the commit, so the lowest generation with both column families is current.
 
+use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 
 use ::rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompressionType,
-    Direction, ErrorKind, IteratorMode, Options, ReadOptions, SnapshotWithThreadMode, WriteOptions,
-    properties,
+    BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
+    DBWithThreadMode, Direction, ErrorKind, IteratorMode, MultiThreaded, Options, ReadOptions,
+    SnapshotWithThreadMode, WriteOptions, properties,
 };
 use serde::Deserialize;
 
@@ -24,8 +30,6 @@ const DATA: &str = "data";
 const REVISIONS: &str = "revisions";
 /// The first byte after every stored data key.
 const KEY_END: [u8; 1] = [0x01];
-/// No UTF-8 revision name contains `0xFF`, so this ends the revision space.
-const REVISION_END: [u8; 1] = [0xFF];
 
 /// Memory and compaction budgets for one instance. Unset fields keep RocksDB's defaults.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -39,9 +43,13 @@ pub struct RocksDbOptions {
     pub max_background_jobs: Option<i32>,
 }
 
+type Db = DBWithThreadMode<MultiThreaded>;
+
 pub struct RocksDbAdapter {
     instance: String,
-    db: DB,
+    db: Db,
+    cf_options: Options,
+    generation: RwLock<u64>,
 }
 
 impl RocksDbAdapter {
@@ -69,31 +77,83 @@ impl RocksDbAdapter {
         let mut cf_options = Options::default();
         cf_options.set_compression_type(DBCompressionType::Lz4);
         cf_options.set_block_based_table_factory(&table);
-        let cfs =
-            [DATA, REVISIONS].map(|name| ColumnFamilyDescriptor::new(name, cf_options.clone()));
+        // Listing fails only for an instance that does not exist yet, or one that opening reports properly.
+        let existing: BTreeSet<String> = Db::list_cf(&db_options, path)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let generation = current(&existing);
+        let current = [name(DATA, generation), name(REVISIONS, generation)];
+        let cfs = existing
+            .iter()
+            .filter(|cf| *cf != "default")
+            .chain(&current)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|cf| ColumnFamilyDescriptor::new(cf, cf_options.clone()));
 
         let db =
-            DB::open_cf_descriptors(&db_options, path, cfs).map_err(|e| error(&instance, e))?;
-        Ok(RocksDbAdapter { instance, db })
+            Db::open_cf_descriptors(&db_options, path, cfs).map_err(|e| error(&instance, e))?;
+        // What a restore left behind, before compaction can read a damaged file in it.
+        for cf in existing
+            .iter()
+            .filter(|cf| *cf != "default" && !current.contains(cf))
+        {
+            db.drop_cf(cf).map_err(|e| error(&instance, e))?;
+        }
+        Ok(RocksDbAdapter {
+            instance,
+            db,
+            cf_options,
+            generation: RwLock::new(generation),
+        })
     }
 
-    fn data(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(DATA)
-            .expect("opened with the data column family")
+    fn handle(&self, cf: &str) -> Arc<BoundColumnFamily<'_>> {
+        self.db.cf_handle(cf).expect("opened or created above")
     }
 
-    fn revisions(&self) -> &ColumnFamily {
-        self.db
-            .cf_handle(REVISIONS)
-            .expect("opened with the revisions column family")
+    fn data(&self) -> Arc<BoundColumnFamily<'_>> {
+        self.handle(&name(DATA, *self.generation.read().unwrap()))
+    }
+
+    fn revisions(&self) -> Arc<BoundColumnFamily<'_>> {
+        self.handle(&name(REVISIONS, *self.generation.read().unwrap()))
     }
 
     fn view(&self) -> View<'_> {
+        let generation = self.generation.read().unwrap();
         View {
             engine: self,
+            data: self.handle(&name(DATA, *generation)),
+            revisions: self.handle(&name(REVISIONS, *generation)),
             snapshot: None,
         }
+    }
+
+    /// Creates generation `next` holding `from`'s contents. An empty `from` writes nothing, so an engine whose writes
+    /// stopped can still be emptied.
+    fn fill(&self, next: u64, from: &dyn Snapshot) -> StorageResult<()> {
+        let (data, revisions) = (name(DATA, next), name(REVISIONS, next));
+        for cf in [&data, &revisions] {
+            self.db
+                .create_cf(cf, &self.cf_options)
+                .map_err(|e| error(&self.instance, e))?;
+        }
+        let (data, revisions) = (self.handle(&data), self.handle(&revisions));
+        // ponytail: the whole image goes into one batch, so it must fit in memory; ingest SST files when it doesn't.
+        let mut rocks = ::rocksdb::WriteBatch::default();
+        for entry in from.scan(&KeyRange::all())? {
+            let (key, value) = entry?;
+            rocks.put_cf(&data, data_key(&key), value);
+        }
+        for (name, revision) in from.revisions()? {
+            rocks.put_cf(&revisions, name, revision.to_be_bytes());
+        }
+        if rocks.is_empty() {
+            return Ok(());
+        }
+        self.commit(rocks)
     }
 
     fn commit(&self, batch: ::rocksdb::WriteBatch) -> StorageResult<()> {
@@ -108,7 +168,7 @@ impl RocksDbAdapter {
     fn property(&self, name: &CStr) -> StorageResult<u64> {
         let value = self
             .db
-            .property_int_value_cf(self.data(), name)
+            .property_int_value_cf(&self.data(), name)
             .map_err(|e| error(&self.instance, e))?;
         Ok(value.unwrap_or(0))
     }
@@ -117,7 +177,10 @@ impl RocksDbAdapter {
 /// Reads at the latest state, or through `snapshot`.
 struct View<'a> {
     engine: &'a RocksDbAdapter,
-    snapshot: Option<SnapshotWithThreadMode<'a, DB>>,
+    /// Held so a restore during this view leaves it reading what it started on.
+    data: Arc<BoundColumnFamily<'a>>,
+    revisions: Arc<BoundColumnFamily<'a>>,
+    snapshot: Option<SnapshotWithThreadMode<'a, Db>>,
 }
 
 impl<'a> View<'a> {
@@ -140,7 +203,7 @@ impl<'a> View<'a> {
         let start = data_key(&range.start);
         let engine = self.engine;
         let iter = engine.db.iterator_cf_opt(
-            engine.data(),
+            &self.data,
             options,
             IteratorMode::From(&start, Direction::Forward),
         );
@@ -169,7 +232,7 @@ impl Snapshot for View<'_> {
         let engine = self.engine;
         engine
             .db
-            .get_cf_opt(engine.data(), data_key(key), &self.options())
+            .get_cf_opt(&self.data, data_key(key), &self.options())
             .map_err(|e| error(&engine.instance, e))
     }
 
@@ -181,7 +244,7 @@ impl Snapshot for View<'_> {
         let engine = self.engine;
         let value = engine
             .db
-            .get_cf_opt(engine.revisions(), name, &self.options())
+            .get_cf_opt(&self.revisions, name, &self.options())
             .map_err(|e| error(&engine.instance, e))?;
         value
             .map(|value| self.decode_revision(name, &value))
@@ -192,7 +255,7 @@ impl Snapshot for View<'_> {
         let engine = self.engine;
         engine
             .db
-            .iterator_cf_opt(engine.revisions(), self.options(), IteratorMode::Start)
+            .iterator_cf_opt(&self.revisions, self.options(), IteratorMode::Start)
             .map(|item| {
                 let (name, value) = item.map_err(|e| error(&engine.instance, e))?;
                 let name = String::from_utf8(name.into_vec()).map_err(|e| {
@@ -225,18 +288,18 @@ impl StorageEngine for RocksDbAdapter {
         let mut rocks = ::rocksdb::WriteBatch::default();
         for op in batch.ops {
             match op {
-                WriteOp::Put { key, value } => rocks.put_cf(data, data_key(&key), value),
-                WriteOp::Delete { key } => rocks.delete_cf(data, data_key(&key)),
+                WriteOp::Put { key, value } => rocks.put_cf(&data, data_key(&key), value),
+                WriteOp::Delete { key } => rocks.delete_cf(&data, data_key(&key)),
                 WriteOp::DeleteRange(range) => {
                     if range.bounds().is_some() {
                         let end = range.end.as_deref().map_or(KEY_END.to_vec(), data_key);
-                        rocks.delete_range_cf(data, data_key(&range.start), end);
+                        rocks.delete_range_cf(&data, data_key(&range.start), end);
                     }
                 }
             }
         }
         for (name, revision) in batch.revisions {
-            rocks.put_cf(revisions, name, revision.to_be_bytes());
+            rocks.put_cf(&revisions, name, revision.to_be_bytes());
         }
         self.commit(rocks)
     }
@@ -246,26 +309,33 @@ impl StorageEngine for RocksDbAdapter {
     }
 
     fn snapshot(&self) -> StorageResult<Box<dyn Snapshot + '_>> {
+        // The column families first: a sequence number means nothing to ones created after it.
+        let view = self.view();
         Ok(Box::new(View {
-            engine: self,
             snapshot: Some(self.db.snapshot()),
+            ..view
         }))
     }
 
     fn restore(&self, from: &dyn Snapshot) -> StorageResult<()> {
-        // ponytail: the whole image goes into one batch, so it must fit in memory; ingest SST files when it doesn't.
-        let (data, revisions) = (self.data(), self.revisions());
-        let mut rocks = ::rocksdb::WriteBatch::default();
-        rocks.delete_range_cf(data, &[0x00][..], &KEY_END[..]);
-        rocks.delete_range_cf(revisions, &[][..], &REVISION_END[..]);
-        for entry in from.scan(&KeyRange::all())? {
-            let (key, value) = entry?;
-            rocks.put_cf(data, data_key(&key), value);
+        let mut generation = self.generation.write().unwrap();
+        let (old, next) = (*generation, *generation + 1);
+        let committed = self.fill(next, from).and_then(|()| {
+            self.db
+                .drop_cf(&name(DATA, old))
+                .map_err(|e| error(&self.instance, e))
+        });
+        if let Err(failed) = committed {
+            // Opening drops these too, so only the first error matters.
+            let _ = self.db.drop_cf(&name(DATA, next));
+            let _ = self.db.drop_cf(&name(REVISIONS, next));
+            return Err(failed);
         }
-        for (name, revision) in from.revisions()? {
-            rocks.put_cf(revisions, name, revision.to_be_bytes());
+        *generation = next;
+        if let Err(error) = self.db.drop_cf(&name(REVISIONS, old)) {
+            tracing::warn!(%error, "old revisions stay until the next open");
         }
-        self.commit(rocks)
+        Ok(())
     }
 
     fn stats(&self) -> StorageResult<StorageStats> {
@@ -302,7 +372,7 @@ impl StorageEngine for RocksDbAdapter {
         }
         let end = range.end.as_deref().map_or(KEY_END.to_vec(), data_key);
         self.db
-            .compact_range_cf(self.data(), Some(data_key(&range.start)), Some(end));
+            .compact_range_cf(&self.data(), Some(data_key(&range.start)), Some(end));
         self.health()
     }
 
@@ -324,6 +394,28 @@ impl StorageEngine for RocksDbAdapter {
             _ => Ok(()),
         }
     }
+}
+
+/// The column family `base` of `generation`. Generation 0 keeps the original names.
+fn name(base: &str, generation: u64) -> String {
+    match generation {
+        0 => base.to_owned(),
+        n => format!("{base}.{n}"),
+    }
+}
+
+/// The lowest generation with both column families, or 0 for a new instance.
+fn current(existing: &BTreeSet<String>) -> u64 {
+    existing
+        .iter()
+        .filter_map(|cf| match cf.split_once('.') {
+            Some((DATA, n)) => n.parse().ok(),
+            None if cf == DATA => Some(0),
+            _ => None,
+        })
+        .filter(|generation| existing.contains(&name(REVISIONS, *generation)))
+        .min()
+        .unwrap_or(0)
 }
 
 fn data_key(key: &[u8]) -> Vec<u8> {

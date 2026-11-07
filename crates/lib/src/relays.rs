@@ -29,6 +29,8 @@ use replay::Replay;
 
 pub const PROGRESS: Duration = Duration::from_secs(10);
 pub const IDLE: Duration = Duration::from_secs(30);
+/// How long a recovery waits for a slot before its subscriber has to retry.
+const RECOVERY_WAIT: Duration = Duration::from_secs(5);
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 1024;
 type Key = (String, String);
@@ -1236,10 +1238,7 @@ impl Hub {
                     }
                     Err(error) if error.code() == tonic::Code::OutOfRange => {
                         if let Some(writer) = &self.0.writer {
-                            recovery_permit =
-                                Some(self.0.recoveries.clone().try_acquire_owned().map_err(
-                                    |_| Status::resource_exhausted("recovery capacity exhausted"),
-                                )?);
+                            recovery_permit = Some(self.recovery_permit().await?);
                             let (view, pin) = writer
                                 .begin_recovery(&key.0.0, &key.0.1)
                                 .await
@@ -1394,6 +1393,17 @@ impl Hub {
         }
     }
 
+    /// A slot among this relay's concurrent recoveries. Waiting keeps them moving: a refusal costs the subscriber its next
+    /// retry, however soon a slot frees.
+    async fn recovery_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        let refused = || Status::resource_exhausted("relay recovery capacity exhausted");
+        let permit = self.0.recoveries.clone().acquire_owned();
+        tokio::time::timeout(RECOVERY_WAIT, permit)
+            .await
+            .map_err(|_| refused())?
+            .map_err(|_| refused())
+    }
+
     async fn proxy(
         &self,
         id: u64,
@@ -1402,12 +1412,12 @@ impl Hub {
         visited: &[String],
         force: bool,
     ) -> Result<(), Status> {
-        let _permit = self
-            .0
-            .recoveries
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("relay recovery capacity exhausted"))?;
+        // Only the relay a recovery entered takes a slot: relays forwarding to each other would otherwise wait on each other's.
+        let _permit = if visited.is_empty() {
+            Some(self.recovery_permit().await?)
+        } else {
+            None
+        };
         if visited.contains(&self.0.id) || visited.len() >= 8 {
             return Err(Status::failed_precondition("recovery forwarding loop"));
         }

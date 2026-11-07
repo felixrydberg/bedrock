@@ -56,12 +56,7 @@ use tokio::time::{Instant, sleep};
 /// Seeds that still fail: the bugs left to fix. The check fails until this is empty. A failing seed goes here first, with what
 /// it found and where the fix belongs, then moves to [`REGRESSIONS`] with its fix. A failure that turns out to be a harness
 /// mistake is fixed in the harness, and its seed leaves the list.
-const OPEN: &[(u64, &str)] = &[
-    // RedundancyRestored: cdn-4 is still Populating when the liveness bound ends, with 4 of its 16 `workers` ranges recovered.
-    // Found only with BEDROCK_VOPR_SECONDS=86400, so here at the default length it passes. Not fully traced: relays.rs refuses
-    // a recovery when its permits are taken, and relays/client.rs then treats that relay as failed.
-    (90003, ALL),
-];
+const OPEN: &[(u64, &str)] = &[];
 
 /// Seeds that found a product bug, now fixed, under the bug and the test that holds the fix without the seed. Harness changes
 /// move what a seed does, so that test is the lasting proof. "Traced" seeds were followed to the bug; "grouped" ones stopped
@@ -141,6 +136,10 @@ const REGRESSIONS: &[(u64, &str)] = &[
     // transport.rs: a cancelled wait on an idle stream kept the breaker's probe, so the healthy API stayed out of routing and
     // relays could not recover their views. Traced. `a_cancelled_call_gives_back_its_probe`.
     (10825, ALL),
+    // relays.rs: a recovery took a slot on every relay it passed through, so sibling relays waited on each other's slots and a
+    // long run could not recover its ranges in time. Traced, at BEDROCK_VOPR_SECONDS=86400; passes at 43200 with the fix, and
+    // the full day has not been rerun. `only_the_relay_a_recovery_entered_needs_a_slot`.
+    (90003, ALL),
 ];
 
 /// Seeds that never failed: a quick sample of every fault class.

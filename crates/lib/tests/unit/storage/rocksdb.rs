@@ -32,7 +32,7 @@ storage_contract!(Rocks::default());
 #[allow(clippy::disallowed_methods)] // test fault injection rewrites the instance's files
 fn corrupt_sst(engine: RocksDbAdapter, key: &[u8]) -> RocksDbAdapter {
     assert!(engine.get(key).unwrap().is_some());
-    engine.db.flush_cf(engine.data()).unwrap();
+    engine.db.flush_cf(&engine.data()).unwrap();
     let path = engine.db.path().to_path_buf();
     drop(engine);
     let mut corrupted = 0;
@@ -105,7 +105,7 @@ fn compact_reclaims_a_deleted_range() {
             .unwrap();
     }
     engine.put(b"s/kept", b"v").unwrap();
-    engine.db.flush_cf(engine.data()).unwrap();
+    engine.db.flush_cf(&engine.data()).unwrap();
     let full = engine.disk_usage().unwrap();
     engine.delete_range(KeyRange::prefix(*b"r/")).unwrap();
     engine.compact(&KeyRange::prefix(*b"r/")).unwrap();
@@ -188,4 +188,152 @@ fn acknowledged_writes_survive_kill() {
     }
     let next = engine.get(format!("ns/{}", revision + 1).as_bytes());
     assert_eq!(next, Ok(None), "data committed without its revision");
+}
+
+fn reopened(engine: RocksDbAdapter) -> RocksDbAdapter {
+    let path = engine.db.path().to_path_buf();
+    drop(engine);
+    RocksDbAdapter::open(&path, "test", &RocksDbOptions::default()).unwrap()
+}
+
+fn empty() -> crate::storage::memory::MemoryEngine {
+    crate::storage::memory::MemoryEngine::new("empty")
+}
+
+const FIRST: &[u8] = b"k00000000";
+const LAST: &[u8] = b"k00039999";
+
+/// An engine with one table file large enough to have several blocks, with a block in the middle damaged.
+#[allow(clippy::disallowed_methods)] // test fault injection rewrites the instance's files
+fn damaged(harness: &mut Rocks) -> RocksDbAdapter {
+    let engine = harness.open();
+    for chunk in 0..40 {
+        let mut batch = WriteBatch::default();
+        for i in chunk * 1_000..(chunk + 1) * 1_000 {
+            batch.put(format!("k{i:08}").into_bytes(), [b'v'; 200].to_vec());
+        }
+        engine.write(batch).unwrap();
+    }
+    engine.db.flush_cf(&engine.data()).unwrap();
+    let path = engine.db.path().to_path_buf();
+    drop(engine);
+    let file = std::fs::read_dir(&path)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|file| file.extension().is_some_and(|ext| ext == "sst"))
+        .unwrap();
+    let mut bytes = std::fs::read(&file).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle..middle + 64]
+        .iter_mut()
+        .for_each(|b| *b ^= 0xFF);
+    std::fs::write(&file, bytes).unwrap();
+    RocksDbAdapter::open(&path, "test", &RocksDbOptions::default()).unwrap()
+}
+
+/// Writes across the whole key space and compacts it, which rewrites any table file left there.
+fn compact_over(engine: &RocksDbAdapter) -> StorageResult<()> {
+    engine.put(FIRST, b"newer")?;
+    engine.put(LAST, b"newer")?;
+    engine.db.flush_cf(&engine.data()).unwrap();
+    engine.compact(&KeyRange::new(*b"a", *b"z"))
+}
+
+/// A range delete would leave the damaged file, and scans would pass until compaction read it and stopped all writes.
+#[test]
+fn a_restore_removes_a_damaged_file() {
+    let mut harness = Rocks::default();
+    let engine = damaged(&mut harness);
+
+    engine.restore(&*empty().snapshot().unwrap()).unwrap();
+
+    compact_over(&engine).unwrap();
+    engine.put(b"later", b"1").unwrap();
+    assert_eq!(engine.get(FIRST), Ok(Some(b"newer".to_vec())));
+}
+
+/// RocksDB refuses every write after a failed compaction until it reopens, so emptying must not need one.
+#[test]
+fn a_restore_empties_an_engine_whose_writes_stopped() {
+    let mut harness = Rocks::default();
+    let engine = damaged(&mut harness);
+    assert!(matches!(
+        compact_over(&engine),
+        Err(StorageError::Unavailable(_))
+    ));
+    assert!(engine.put(b"later", b"1").is_err());
+
+    engine.restore(&*empty().snapshot().unwrap()).unwrap();
+    let engine = reopened(engine);
+
+    compact_over(&engine).unwrap();
+    engine.health().unwrap();
+    assert_eq!(engine.get(b"k00020000"), Ok(None));
+}
+
+#[test]
+fn a_restore_lasts_through_a_reopen() {
+    let mut harness = Rocks::default();
+    let source = harness.open();
+    source.put(b"new", b"1").unwrap();
+    let engine = harness.open();
+    engine.put(b"old", b"1").unwrap();
+
+    for _ in 0..2 {
+        engine.restore(&*source.snapshot().unwrap()).unwrap();
+    }
+    let engine = reopened(engine);
+
+    assert_eq!(engine.get(b"old"), Ok(None));
+    assert_eq!(engine.get(b"new"), Ok(Some(b"1".to_vec())));
+}
+
+/// A crash before the old `data` is dropped has not committed, even with the new generation complete.
+#[test]
+fn a_restore_stopped_before_its_commit_changes_nothing() {
+    let mut harness = Rocks::default();
+    let engine = harness.open();
+    engine.put(b"old", b"1").unwrap();
+    for cf in [name(DATA, 1), name(REVISIONS, 1)] {
+        engine.db.create_cf(cf, &Options::default()).unwrap();
+    }
+
+    let engine = reopened(engine);
+
+    assert_eq!(engine.get(b"old"), Ok(Some(b"1".to_vec())));
+    assert!(engine.db.cf_handle(&name(DATA, 1)).is_none());
+}
+
+/// A crash after dropping the old `data` has committed, even with the old revisions still there.
+#[test]
+fn a_restore_stopped_after_its_commit_finishes_on_open() {
+    let mut harness = Rocks::default();
+    let engine = harness.open();
+    let mut batch = WriteBatch::default();
+    batch.put(*b"old", *b"1").set_revision("ns", 3);
+    engine.write(batch).unwrap();
+    for cf in [name(DATA, 1), name(REVISIONS, 1)] {
+        engine.db.create_cf(cf, &Options::default()).unwrap();
+    }
+    engine.db.drop_cf(DATA).unwrap();
+    *engine.generation.write().unwrap() = 1;
+
+    let engine = reopened(engine);
+
+    assert_eq!(engine.get(b"old"), Ok(None));
+    assert_eq!(engine.revision("ns"), Ok(None));
+    assert!(engine.db.cf_handle(REVISIONS).is_none());
+}
+
+#[test]
+fn a_snapshot_keeps_reading_through_a_restore() {
+    let mut harness = Rocks::default();
+    let engine = harness.open();
+    engine.put(b"old", b"1").unwrap();
+    let snapshot = engine.snapshot().unwrap();
+
+    engine.restore(&*empty().snapshot().unwrap()).unwrap();
+
+    assert_eq!(snapshot.get(b"old"), Ok(Some(b"1".to_vec())));
+    assert_eq!(engine.get(b"old"), Ok(None));
 }
