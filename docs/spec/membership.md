@@ -119,11 +119,12 @@ The directory adds `Points`, the possible range starts, and `Write(r, p, o)`, wh
 `p` (a new start splits the covering range). `Write` allows any plan within the assigner's rules, so the model
 checks those rules rather than `assign`'s balance:
 
-- `Covered`: start 0 always exists, so the implicit range ends cover the hash space.
-- `NewOwnersPublished`: only published, non-draining members whose published storage is healthy become new
-  owners. `Sicken` toggles a node's storage health (`sick`); `Set` publishes it with the status (`pubSick`).
-- `NoEarlyDrop`: a range with a holder (`ready` or `leaving`) still in membership keeps a holder. A `leaving` owner
-  goes only when every other owner of the entry is ready.
+- `DirectoryCoverage`: start 0 always exists, so the implicit range ends cover the hash space.
+- `NewOwnersPublished`: only published, non-draining members become new owners.
+- `NoUnhealthyRouting`: no member whose published storage is unhealthy becomes a new owner. `Sicken` toggles a
+  node's storage health (`sick`); `Set` publishes it with the status (`pubSick`).
+- `NoDropBeforeReady`: a range with a holder (`ready` or `leaving`) still in membership keeps a holder. A `leaving`
+  owner goes only when every other owner of the entry is ready.
 
 Owners are never demoted from `ready` to `populating`.
 
@@ -150,7 +151,12 @@ uncapped configs keep both unlimited at shallower depth.
 - `ReadyHasData`: every `ready` or `leaving` owner holds the data, so no range is dropped before its new owners
   are ready, even after a faulty revoke.
 - `ServesHeld`: a node that serves a point from its own view (`ready` or `leaving` there) holds its data.
-- `NewOwnersPublished`, `NoEarlyDrop` and `Freeze` as above, against the abstract membership.
+- `OwnedOrLeaving`: once a node has processed a revoke its relay pushed, it no longer holds that point's data. A
+  confirmed revoke deletes it, and a refused one makes the relay push again.
+- `KeepsHealthyHolder`: a directory write never lets go of a range's last healthy holder, even when an unhealthy
+  owner is listed as ready.
+- `DirectoryCoverage`, `NewOwnersPublished`, `NoDropBeforeReady` and `Freeze` as above, against the abstract
+  membership.
 
 Neither model covers dropping a `leaving` range early under disk pressure (deferred to B-14).
 
@@ -231,14 +237,14 @@ revokes enabled and no caps:
 With a refused revoke making the relay push again (2026-11-03), TLC 1.8.0 checked `handoff.cfg` with 4 workers:
 124,714,070 generated and 11,769,576 distinct states, depth 49, no violation (6 min 32 s).
 
-With `Strict` and the `Sicken` action, which lets a member turn unhealthy, TLC checked on 2026-11-05 (4 workers):
+With the `Sicken` action, which lets a member turn unhealthy, TLC checked on 2026-11-05 (4 workers):
 `handoff.cfg`: 396,310,318 generated and 34,143,510 distinct states, depth 51, no violation (23 min 44 s). With
-`MaxRev = 4`: 143,956,394 generated and 12,408,194 distinct states, no violation (8 min 13 s). `Strict = FALSE`, the
-deliberate bug where any ready owner counts, violates `KeepsHealthyHolder`.
+`MaxRev = 4`: 143,956,394 generated and 12,408,194 distinct states, no violation (8 min 13 s). `Bug = "any-ready"`,
+the deliberate bug where any ready owner counts, violates `KeepsHealthyHolder`.
 
 `publisher.tla` covers what these models cannot: `membership.tla` writes atomically, but a real directory write is
-planned from a view and lands later, and any relay may plan. With `Conditional = TRUE` (`publisher.cfg`) TLC passes 436
-states; `Conditional = FALSE`, the deliberate bug, violates `NoLostUpdate` and `NoRegression`. Run it from `docs/spec`
+planned from a view and lands later, and any relay may plan. `publisher.cfg` passes 436 states; `Bug = "unconditional"`, a writer
+accepting writes planned from any revision, violates `NoLostUpdate` and `NoRegression`. Run it from `docs/spec`
 with `-config publisher.cfg`.
 
 With two points ranges split. Faulty revokes act per point, so the one-point runs cover them; leaving them out keeps

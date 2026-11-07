@@ -81,6 +81,44 @@ Raft truncation requires a recoverable checkpoint covering every namespace in
 the truncated prefix, with Raft index, term and membership. Closed namespaces
 must remain recoverable, and stale publishers must remain fenced.
 
+## Model checks (#25 / B-23 Layer 1)
+
+`scripts/tlc.sh` runs TLC on each model's config, then checks every deliberate bug. Each model has a `Bug`
+constant, `"none"` in its config. Every other value is a bug that must break the invariant the script names beside
+it, checked with that invariant alone so no other one fires first. `scripts/tlc.sh bugs` runs only the bugs, in
+under a minute, and `scripts/tlc.sh relays` runs one model. It needs Java 11 or later and the
+[TLA+ tools jar](https://github.com/tlaplus/tlaplus/releases), by default at `.codex-tmp/tla2tools.jar`.
+Every invariant and property has a bug except `TypeOK`, which only catches mistakes in a model.
+
+On 2026-11-07, TLC 1.8.0 passed every config and caught all 32 bugs:
+
+| Model | Generated states | Distinct states | Time |
+|---|---:|---:|---:|
+| `relays` | 26,865,595 | 2,705,822 | 10 s |
+| `materialized` | 2,207 | 888 | 1 s |
+| `publisher` | 2,965 | 436 | 1 s |
+| `membership` | 17,684,369 | 1,437,600 | 37 s |
+| `handoff` | 396,310,318 | 34,143,510 | 8 min |
+
+The models and the simulation (`tests/sim`) use the same names for the shared invariants:
+
+| Invariant | Models | Simulation |
+|---|---|---|
+| `NoLostAck`, `RetryProtection` | `materialized` | yes |
+| `GapFreeApply` | `relays` | yes |
+| `NoResurrection`, `NoStaleOverwrite` | within `relays` `GapFreeApply` and `materialized` `AtomicDurable` | yes |
+| `DirectoryCoverage`, `NoDropBeforeReady` | `membership`, `handoff` | yes |
+| `NoUnhealthyRouting` | `membership` | yes |
+| `OwnedOrLeaving` | `handoff` | yes |
+| `MinRevisionReads` | none: no model has a read path | yes |
+| `Converged`, `RedundancyRestored` | none: liveness, and the models have no fairness | yes |
+
+The models track payload as the set of revisions applied, so a resurrected or stale value shows as a wrong set,
+which `GapFreeApply` catches. The other invariants are each model's own. On 2026-11-07, `Covered` became
+`DirectoryCoverage`, `NoEarlyDrop` became `NoDropBeforeReady` and `FilteredCoverage` became `GapFreeApply`; older
+check records in the model reports use the old names. `membership`'s `NoUnhealthyRouting` was split out of `NewOwnersPublished`,
+and `handoff` gained `OwnedOrLeaving`.
+
 ## Validation boundaries
 
 The [model report](materialized.md) records checks actually run for this protocol.

@@ -5,7 +5,8 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \* #22 / B-21: one stream per dataset and range carries every namespace of the dataset, each
 \* with its own revisions. The relay pushes whether the subscriber owns the range; dropping it
 \* is the revoke, and the subscriber deletes the range.
-CONSTANTS MaxRevision, QueueLimit, Namespaces
+\* Bug names a deliberate bug for the check that must catch it (scripts/tlc.sh); "none" is the protocol.
+CONSTANTS MaxRevision, QueueLimit, Namespaces, Bug
 VARIABLES head, applied, queued, connected, cached, boundary, pinned, staging, retained, projected,
           pending, ready, assigned, frames, following, reported, lost
 vars == <<head, applied, queued, connected, cached, boundary, pinned, staging, retained, projected,
@@ -38,14 +39,14 @@ Commit(n) == /\ head[n] < MaxRevision /\ head' = [head EXCEPT ![n] = @ + 1]
 Send(n) == /\ connected /\ following /\ ~staging /\ Sent(n) < head[n]
            /\ Len(queued) < QueueLimit
            /\ Sent(n) + 1 \in cached[n] \cup retained[n]
-           /\ queued' = Append(queued, [ns |-> n, r |-> Sent(n) + 1])
+           /\ queued' = Append(queued, [ns |-> n, r |-> Sent(n) + IF Bug = "skip" THEN 2 ELSE 1])
            /\ UNCHANGED <<head, applied, connected, cached, boundary, pinned, staging, retained, projected,
                           pending, ready, assigned, frames, following, reported, lost>>
 \* A receiver whose storage was lost drains coverage until a fresh baseline installs.
 ApplyCoverage == LET q == Head(queued) IN
                  /\ ~lost /\ Len(queued) > 0 /\ q.r = applied[q.ns] + 1
                  /\ applied' = [applied EXCEPT ![q.ns] = q.r] /\ queued' = Tail(queued)
-                 /\ projected' = IF Selected(q.r) THEN [projected EXCEPT ![q.ns] = @ \cup {q.r}]
+                 /\ projected' = IF Selected(q.r) /\ Bug # "payload" THEN [projected EXCEPT ![q.ns] = @ \cup {q.r}]
                                  ELSE projected
                  /\ UNCHANGED <<head, connected, cached, boundary, pinned, staging, retained, pending, ready,
                                 assigned, frames, following, reported, lost>>
@@ -59,13 +60,13 @@ Reconnect == /\ ~connected /\ connected' = TRUE /\ frames' = <<assigned>>
              /\ UNCHANGED <<head, applied, queued, cached, boundary, pinned, staging, retained, projected,
                             pending, ready, assigned, following, reported, lost>>
 \* The leases expire without a disconnect; an unfinished transfer aborts.
-ExpireLease == /\ pinned /\ pinned' = FALSE /\ staging' = FALSE
+ExpireLease == /\ pinned /\ pinned' = FALSE /\ staging' = (Bug = "lease" /\ staging)
                /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, retained, projected, pending,
                               ready, assigned, frames, following, reported, lost>>
 Evict(n) == /\ \E r \in cached[n] : cached' = [cached EXCEPT ![n] = @ \ {r}]
             /\ UNCHANGED <<head, applied, queued, connected, boundary, pinned, staging, retained, projected,
                            pending, ready, assigned, frames, following, reported, lost>>
-GC(n) == /\ \E r \in retained[n] : /\ (~pinned \/ r <= boundary[n])
+GC(n) == /\ \E r \in retained[n] : /\ (~pinned \/ r <= boundary[n] \/ Bug = "gc")
                                     /\ retained' = [retained EXCEPT ![n] = @ \ {r}]
          /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, projected,
                         pending, ready, assigned, frames, following, reported, lost>>
@@ -88,11 +89,11 @@ Confirm == /\ connected /\ pinned /\ pending /\ ~staging /\ ~lost /\ Caught
 \* Local storage is recreated empty for a rebuild. The receiver keeps its cursors but abandons any transfer
 \* and must install and confirm a fresh validated baseline before it is ready again.
 LoseLocal == /\ lost' = TRUE /\ projected' = [n \in Namespaces |-> {}] /\ queued' = <<>>
-             /\ staging' = FALSE /\ pending' = TRUE /\ ready' = FALSE
+             /\ staging' = FALSE /\ pending' = (Bug # "lost" \/ pending) /\ ready' = FALSE
              /\ UNCHANGED <<head, applied, connected, cached, boundary, pinned, retained,
                             assigned, frames, following, reported>>
 \* The receiver's local readiness check.
-BecomeReady == /\ connected /\ following /\ ~staging /\ ~pending /\ Caught /\ ~ready /\ ready' = TRUE
+BecomeReady == /\ connected /\ following /\ ~staging /\ (~pending \/ Bug = "unconfirmed") /\ Caught /\ ~ready /\ ready' = TRUE
                /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, retained,
                               projected, pending, assigned, frames, following, reported, lost>>
 \* The relay pushes the range (the directory made the subscriber an owner) or drops it (the
@@ -102,7 +103,7 @@ Assign == /\ connected /\ ~assigned /\ Len(frames) < QueueLimit
           /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, retained,
                          projected, pending, ready, following, lost>>
 Revoke == /\ connected /\ assigned /\ Len(frames) < QueueLimit
-          /\ assigned' = FALSE /\ frames' = Append(frames, FALSE) /\ reported' = FALSE
+          /\ assigned' = FALSE /\ frames' = Append(frames, FALSE) /\ reported' = (Bug = "report" /\ reported)
           /\ UNCHANGED <<head, applied, queued, connected, cached, boundary, pinned, staging, retained,
                          projected, pending, ready, following, lost>>
 \* The subscriber processes pushes in order. A revoke (confirmed against its own directory
@@ -136,7 +137,8 @@ OrderedCoverage == \A i \in 1..Len(queued) :
                                   + Cardinality({j \in 1..i : queued[j].ns = queued[i].ns})
 ProtectedBootstrap == staging => pinned
 ProtectedTail == pinned => \A n \in Namespaces : (boundary[n]+1..head[n]) \subseteq retained[n]
-FilteredCoverage == ~lost => \A n \in Namespaces : projected[n] = {r \in 1..applied[n] : Selected(r)}
+\* Applied payload matches covered progress exactly: nothing missing, stale or resurrected.
+GapFreeApply == ~lost => \A n \in Namespaces : projected[n] = {r \in 1..applied[n] : Selected(r)}
 ReadyAfterConfirmation == ready => (connected /\ following /\ ~staging /\ ~pending /\ Caught)
 \* A reported subscriber still follows the range it was assigned: it has not deleted it.
 ReportedHolds == reported => (assigned /\ following)

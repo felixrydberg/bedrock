@@ -5,8 +5,9 @@ EXTENDS Naturals, FiniteSets
 \* plan at any time, which also covers two relays that each believe they are the publisher while
 \* sibling state is still syncing. A write carries the revision it was planned from.
 \* `stage` stands for directory progress: a write moves one step on from what its planner saw.
-\* Conditional = FALSE is the deliberate bug: writes land regardless of the revision.
-CONSTANTS Relays, MaxRevision, Conditional
+\* Bug names a deliberate bug for the check that must catch it (scripts/tlc.sh); "none" is the protocol.
+\* "unconditional" lands writes regardless of the revision; "ahead" lets a view claim an uncommitted revision.
+CONSTANTS Relays, MaxRevision, Bug
 VARIABLES rev, stage, view, inflight
 vars == <<rev, stage, view, inflight>>
 
@@ -15,7 +16,7 @@ Init == /\ rev = 0 /\ stage = 0
         /\ inflight = {}
 
 \* The relay's subscription applies the namespace; views can lag it by any amount.
-Refresh(r) == /\ view' = [view EXCEPT ![r] = [rev |-> rev, stage |-> stage]]
+Refresh(r) == /\ view' = [view EXCEPT ![r] = [rev |-> rev + IF Bug = "ahead" THEN 1 ELSE 0, stage |-> stage]]
               /\ UNCHANGED <<rev, stage, inflight>>
 \* The relay plans from its view and sends the write.
 Plan(r) == /\ rev < MaxRevision
@@ -23,7 +24,7 @@ Plan(r) == /\ rev < MaxRevision
            /\ UNCHANGED <<rev, stage, view>>
 \* The writer accepts a write only at the revision it was planned from.
 Land(w) == /\ inflight' = inflight \ {w}
-           /\ IF ~Conditional \/ w.base = rev
+           /\ IF Bug = "unconditional" \/ w.base = rev
                  THEN /\ rev < MaxRevision /\ rev' = rev + 1 /\ stage' = w.stage
                  ELSE UNCHANGED <<rev, stage>>
            /\ UNCHANGED view

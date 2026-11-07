@@ -1,7 +1,8 @@
 ---------------------------- MODULE materialized ----------------------------
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
-CONSTANTS MaxSeq, MaxTime, EventWindow, RetryWindow, MaxEpoch, WithPosition
+\* Bug names a deliberate bug for the check that must catch it (scripts/tlc.sh); "none" is the protocol.
+CONSTANTS MaxSeq, MaxTime, EventWindow, RetryWindow, MaxEpoch, WithPosition, Bug
 VARIABLES history, buffered, durable, now, epoch, bufferEpoch, pending,
           acknowledged, cleanupRequested
 vars == <<history, buffered, durable, now, epoch, bufferEpoch, pending,
@@ -28,8 +29,9 @@ Stage == /\ buffered = durable /\ pending = 0
                 row == [at |-> now, expiry |-> now + RetryWindow,
                         value |-> State(s)]
             IN /\ history' = Append(history, row)
-               /\ buffered' = [revision |-> s, at |-> now, value |-> State(s),
-                    events |-> [i \in DOMAIN durable.events \cup {s} |->
+               /\ buffered' = [revision |-> s, at |-> now,
+                    value |-> IF Bug = "torn" THEN State(s - 1) ELSE State(s),
+                    events |-> [i \in DOMAIN durable.events \cup (IF Bug = "event" THEN {} ELSE {s}) |->
                                   IF i = s THEN row ELSE durable.events[i]],
                     retry |-> [sequence |-> s, expiry |-> row.expiry],
                     position |-> Position(s)]
@@ -39,10 +41,10 @@ Stage == /\ buffered = durable /\ pending = 0
 
 \* Only completion of remote durable flush makes this batch recoverable.
 Flush == /\ buffered # durable /\ bufferEpoch = epoch
-         /\ durable' = buffered
+         /\ durable' = IF Bug = "partial" THEN [buffered EXCEPT !.value = durable.value] ELSE buffered
          /\ UNCHANGED <<history, buffered, now, epoch, bufferEpoch, pending,
                          acknowledged, cleanupRequested>>
-Ack == /\ pending > 0 /\ pending <= durable.revision
+Ack == /\ pending > 0 /\ pending <= IF Bug = "ack" THEN buffered.revision ELSE durable.revision
        /\ acknowledged' = acknowledged \cup {pending} /\ pending' = 0
        /\ cleanupRequested' = TRUE
        /\ UNCHANGED <<history, buffered, durable, now, epoch, bufferEpoch>>
@@ -56,7 +58,7 @@ Retry == /\ pending = 0 /\ LiveRetry
 \* The epoch guard on Flush abstracts fenced single-publisher engine handles.
 Crash == /\ epoch < MaxEpoch /\ epoch' = epoch + 1
          /\ buffered' = durable /\ bufferEpoch' = epoch + 1 /\ pending' = 0
-         /\ history' = SubSeq(history, 1, durable.revision)
+         /\ history' = IF Bug = "crash" THEN history ELSE SubSeq(history, 1, durable.revision)
          /\ UNCHANGED <<durable, now, acknowledged, cleanupRequested>>
 Tick == /\ now < MaxTime /\ now' = now + 1
         /\ UNCHANGED <<history, buffered, durable, epoch, bufferEpoch, pending,
@@ -67,9 +69,9 @@ Tick == /\ now < MaxTime /\ now' = now + 1
 StageCleanup == /\ cleanupRequested /\ pending = 0 /\ buffered = durable
                 /\ buffered' = [durable EXCEPT
                      !.events = [s \in {i \in DOMAIN durable.events :
-                                         durable.events[i].at + EventWindow > now}
+                                         durable.events[i].at + EventWindow > now /\ Bug # "cleanup"}
                                   |-> durable.events[s]],
-                     !.retry = IF LiveRetry THEN durable.retry ELSE EmptyRetry]
+                     !.retry = IF LiveRetry /\ Bug # "retry" THEN durable.retry ELSE EmptyRetry]
                 /\ bufferEpoch' = epoch /\ cleanupRequested' = FALSE
                 /\ UNCHANGED <<history, durable, now, epoch, pending, acknowledged>>
 CleanupFailure == /\ cleanupRequested /\ cleanupRequested' = FALSE

@@ -1269,7 +1269,7 @@ async fn connected(
                         send(&requests, pb::RelayRequest {
                             kind: Some(pb::relay_request::Kind::Progress(true)),
                         }).await?;
-                        for scope in std::mem::take(&mut intake.retries) {
+                        for scope in intake.due(consumers) {
                             send(&requests, consumers.get(&scope).unwrap().request()).await?;
                         }
                     },
@@ -1667,6 +1667,17 @@ impl Intake {
     fn forget(&mut self, consumers: &BTreeMap<Scope, Consumer>) {
         self.failed.retain(|scope| consumers.contains_key(scope));
         self.retries.retain(|scope| consumers.contains_key(scope));
+    }
+
+    /// Takes the retries to send now. A quarantined engine refuses every install until its rebuild starts, and starting
+    /// it requests again, so those wait: each request would hold one of the relay's few recovery slots for nothing,
+    /// starving other recoveries, including this node's rebuild of another dataset.
+    fn due(&mut self, consumers: &BTreeMap<Scope, Consumer>) -> BTreeSet<Scope> {
+        let (due, held) = std::mem::take(&mut self.retries)
+            .into_iter()
+            .partition(|scope| consumers[scope].target.engine.health().is_ok());
+        self.retries = held;
+        due
     }
 
     fn fail(&mut self, scope: &Scope, consumer: &mut Consumer, error: Status) -> Effect {

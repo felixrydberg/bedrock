@@ -17,7 +17,7 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -606,7 +606,10 @@ struct Run {
     history: Mutex<History>,
     samples: Mutex<Vec<Sample>>,
     failure: Mutex<Option<Violation>>,
-    trace: Mutex<Vec<(u128, String)>>,
+    /// Every recorded event, hashed as it happens: a long run would otherwise hold them all.
+    trace: Fingerprint,
+    /// The last events besides acknowledgements, for a failure's report.
+    recent: Mutex<VecDeque<(u128, String)>>,
     started: Instant,
     /// Processes that exited with an error, waiting for the supervisor.
     exited: Mutex<BTreeSet<String>>,
@@ -623,8 +626,14 @@ type Acknowledged = (Stream, String, Key, Option<Value>);
 
 impl Run {
     fn record(&self, event: String) {
-        let at = self.started.elapsed().as_nanos();
-        self.trace.lock().unwrap().push((at, event));
+        self.trace.mix(&event);
+        if !event.starts_with("ack ") {
+            let mut recent = self.recent.lock().unwrap();
+            if recent.len() == 25 {
+                recent.pop_front();
+            }
+            recent.push_back((self.started.elapsed().as_nanos(), event));
+        }
     }
 
     /// Keeps the first violation, which ends the run.
@@ -1499,12 +1508,7 @@ async fn report(run: &Run, processes: &[Process]) {
             eprintln!("{service} members: {members:?}");
         }
     }
-    let trace = run.trace.lock().unwrap();
-    let events: Vec<_> = trace
-        .iter()
-        .filter(|(_, event)| !event.starts_with("ack "))
-        .collect();
-    for (at, event) in events.iter().rev().take(25).rev() {
+    for (at, event) in run.recent.lock().unwrap().iter() {
         eprintln!("{:>10.3}s {event}", *at as f64 / 1e9);
     }
     let history = run.history.lock().unwrap();
@@ -1582,7 +1586,7 @@ fn held_hashes(run: &Run, process: &Process, dataset: &str) -> Vec<u64> {
 /// The whole run so far: what the harness did, and every decision and write underneath it.
 fn trace(run: &Run) -> u64 {
     let mut hasher = DefaultHasher::new();
-    run.trace.lock().unwrap().hash(&mut hasher);
+    run.trace.value().hash(&mut hasher);
     run.chaos.fingerprint.value().hash(&mut hasher);
     hasher.finish()
 }
@@ -1645,7 +1649,8 @@ async fn scenario(options: Options) -> Result<Outcome, Violation> {
         history: Mutex::default(),
         samples: Mutex::default(),
         failure: Mutex::default(),
-        trace: Mutex::default(),
+        trace: Fingerprint::new(),
+        recent: Mutex::default(),
         started: bedrock_lib::monotonic_now(),
         exited: Mutex::default(),
         busy: Mutex::default(),

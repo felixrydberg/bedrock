@@ -1,3 +1,4 @@
 target
 .codex-tmp/
 deploy/local-data
+docs/spec/*_TTrace_*

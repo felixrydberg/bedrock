@@ -833,6 +833,43 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
 }
 
 #[test]
+fn a_quarantined_scope_asks_for_no_recovery_until_its_rebuild() {
+    let health = crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+    let engine = health.wrap_replication("auth", "engine", Arc::new(MemoryEngine::new("auth")));
+    let mut consumer = Consumer::new(Target {
+        engine,
+        ..target(Arc::new(MemoryEngine::new("unused")))
+    })
+    .unwrap();
+    let scope = consumer.scope();
+    let mut intake = Intake::default();
+    intake.fail(&scope, &mut consumer, Status::unavailable("busy"));
+    let mut consumers = BTreeMap::from([(scope.clone(), consumer)]);
+    assert_eq!(
+        intake.due(&consumers),
+        BTreeSet::from([scope.clone()]),
+        "a healthy engine retries at once"
+    );
+
+    let damage = crate::storage::StorageError::Corruption(crate::storage::ErrorContext {
+        engine: "memory",
+        instance: "auth".into(),
+        file: None,
+        partition: None,
+        detail: "damaged".into(),
+    });
+    health.report("auth", "engine", &damage);
+    let failed = consumers.get_mut(&scope).unwrap();
+    intake.fail(&scope, failed, Status::internal("quarantined"));
+    assert!(intake.due(&consumers).is_empty());
+    assert!(intake.due(&consumers).is_empty(), "it keeps waiting");
+
+    // Starting the rebuild requests again by itself; a request that then fails retries as usual.
+    assert!(health.rebuilding("auth", "engine"));
+    assert_eq!(intake.due(&consumers), BTreeSet::from([scope]));
+}
+
+#[test]
 fn local_storage_error_is_scoped_but_malformed_drain_coverage_is_still_fatal() {
     let engine = Arc::new(MemoryEngine::new("auth"));
     let whole = (0, 0);
