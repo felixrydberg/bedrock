@@ -45,6 +45,10 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
 - **Relays.** A relay follows a dataset whole (`[0, 2⁶⁴)`) from its upstream as soon as one subscriber follows it
   by range, and never also by namespace. It starts each subscriber's range in every namespace of the dataset. A range
   follow's `from_namespaces` entry of 0 asks for a fresh baseline; a namespace without an entry starts at 1.
+- **Follow ids.** A relay numbers each `Follow` it sends upstream, and the upstream stamps that number on the
+  follow's deliveries and bootstraps. Deliveries already sent for a follow the relay ended still arrive after its
+  next follow began, so the relay drops frames of follows it ended rather than taking them as a coverage gap
+  (follows.tla).
 - **Readiness.** The relay reports a subscriber ready for a range only after it processed every pushed set and
   then acknowledged through the head, so an acknowledgement from before a pending revoke never counts.
 - **Relay side.** On every reconciliation pass each cell relay pushes its own leaf members their ranges per dataset

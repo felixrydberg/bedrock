@@ -15,7 +15,6 @@ use crate::placement::{hash_of, in_span, valid_span};
 use crate::replication::log::Watched;
 use crate::replication::pb;
 use crate::storage::{KeyRange, StorageEngine, WriteBatch, l2_key, l2_parts, l2_span};
-#[cfg(madsim)]
 use crate::storage::{Snapshot, StorageResult};
 use crate::transport::{Class, Peers};
 
@@ -96,8 +95,7 @@ fn marker_range(rest: &str) -> Option<Range> {
 }
 
 /// One consumer's validated position in `snapshot`: what the snapshot holds for this scope is the stream's state at that
-/// revision. `None` until it has validated progress. For the simulation's checkers (#25 / B-23).
-#[cfg(madsim)]
+/// revision. `None` until it has validated progress. For the checkers of #25 / B-23, simulated and real.
 pub fn applied_at(
     snapshot: &dyn Snapshot,
     dataset: &str,
@@ -115,7 +113,6 @@ pub fn applied_at(
 }
 
 /// `(namespace, range, revision)` of every range consumer of `dataset` with validated progress in `snapshot`.
-#[cfg(madsim)]
 pub fn applied_ranges(
     snapshot: &dyn Snapshot,
     dataset: &str,
@@ -287,7 +284,14 @@ impl Session {
                     {
                         return Err(Status::invalid_argument("invalid relay range selection"));
                     }
-                    let resumed = Consumer::resumed(&target, range)?;
+                    // Damage found in a later range quarantines the engine after the read above passed.
+                    let resumed = match Consumer::resumed(&target, range) {
+                        Err(error) if local(&error) => {
+                            tracing::warn!(%dataset, %error, "held range unreadable; waiting for the relays");
+                            continue;
+                        }
+                        resumed => resumed?,
+                    };
                     if groups.insert((dataset, range), target.engine).is_some() {
                         return Err(Status::invalid_argument("duplicate relay range"));
                     }
@@ -724,6 +728,7 @@ impl Consumer {
             from: self.applied.saturating_add(1),
             span: span(self.target.span),
             from_namespaces: BTreeMap::new(),
+            ..Default::default()
         }
     }
 
@@ -1233,6 +1238,7 @@ async fn connected(
             from: 0,
             span: span(Some(*range)),
             from_namespaces,
+            ..Default::default()
         };
         send(
             &requests,
@@ -1502,6 +1508,7 @@ async fn settle(
                     from: 0,
                     span: span(Some(range)),
                     from_namespaces: BTreeMap::new(),
+                    ..Default::default()
                 };
                 send(
                     requests,
@@ -1636,6 +1643,7 @@ fn narrow(
             from: 0,
             span: span(Some(kept)),
             from_namespaces,
+            ..Default::default()
         }));
     }
     Ok(requests)

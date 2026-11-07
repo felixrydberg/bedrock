@@ -277,6 +277,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bedrock-crash"
+version = "0.1.0"
+dependencies = [
+ "bedrock-lib",
+ "bedrock-sim",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "madsim-tokio",
+ "rand 0.8.8",
+]
+
+[[package]]
 name = "bedrock-kv"
 version = "0.1.0"
 dependencies = [

@@ -234,11 +234,31 @@ impl Writer {
                     "Raft-backed namespace requires the Raft writer",
                 ));
             }
+            // A reopen after `discard` keeps the log, which holds what was durable. It gains what became durable since,
+            // such as a batch whose flush landed but reported failure, and may lack nothing.
+            let head = self.log.head(dataset, namespace).get();
+            if progress.sequence < head {
+                return Err(StorageError::Corruption(ErrorContext {
+                    engine: "writer",
+                    instance: format!("{dataset}/{namespace}"),
+                    file: None,
+                    partition: None,
+                    detail: format!(
+                        "reopened store is at {} behind durable head {head}",
+                        progress.sequence
+                    ),
+                }));
+            }
             let entries = source.events().await?;
-            self.log
-                .reset(dataset, namespace, progress.pruned_through)
-                .map_err(|detail| unavailable(&detail))?;
-            for entry in entries {
+            if head == 0 {
+                self.log
+                    .reset(dataset, namespace, progress.pruned_through)
+                    .map_err(|detail| unavailable(&detail))?;
+            }
+            for entry in entries
+                .into_iter()
+                .filter(|entry| entry.event.sequence > head)
+            {
                 self.log
                     .append(entry.event)
                     .map_err(|detail| unavailable(&detail))?;
@@ -260,16 +280,39 @@ impl Writer {
         Ok(source)
     }
 
+    /// SlateDB closes a database for good when one of its background tasks fails, which a single failed S3 request can
+    /// cause. So a failed handle is dropped, and the next use reopens the namespace from the store, as a restart would,
+    /// which fences the old handle. Closing it instead could flush the failed batch. A fenced one stays fenced: another
+    /// writer owns the namespace.
+    fn discard(state: &mut State, error: &StorageError) {
+        if matches!(error, StorageError::Fenced(_)) {
+            state.fenced = true;
+        } else {
+            state.source = None;
+        }
+    }
+
+    /// A coherent view, discarding the handle if it fails.
+    async fn read_view(
+        &self,
+        state: &mut State,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<View> {
+        let view = self.source(state, dataset, namespace).await?.view().await;
+        if let Err(error) = &view {
+            Self::discard(state, error);
+        }
+        view
+    }
+
     /// Owns a complete coherent view before releasing the namespace gate.
     pub async fn bootstrap(&self, dataset: &str, namespace: &str) -> StorageResult<View> {
         validate_scope(dataset, namespace)?;
         let ns = self.namespace(dataset, namespace);
         let mut state = ns.state.lock().await;
         self.settle(&mut state, dataset, namespace).await?;
-        self.source(&mut state, dataset, namespace)
-            .await?
-            .view()
-            .await
+        self.read_view(&mut state, dataset, namespace).await
     }
 
     /// Settles a failed flush before a read that needs a coherent view. Waiting for a later commit could wait forever: a
@@ -302,11 +345,7 @@ impl Writer {
         if state.recovery.len() >= 4 {
             return Err(unavailable("namespace recovery capacity exhausted"));
         }
-        let view = self
-            .source(&mut state, dataset, namespace)
-            .await?
-            .view()
-            .await?;
+        let view = self.read_view(&mut state, dataset, namespace).await?;
         let now = crate::monotonic_now();
         let lease = Arc::new(RecoveryLease {
             dataset: dataset.into(),
@@ -377,9 +416,16 @@ impl Writer {
             .map(|lease| lease.boundary)
             .min()
             .unwrap_or(u64::MAX);
-        let removed = source
+        let removed = match source
             .cleanup_through(now, &self.persistence.retention, through)
-            .await?;
+            .await
+        {
+            Ok(removed) => removed,
+            Err(error) => {
+                Self::discard(&mut state, &error);
+                return Err(error);
+            }
+        };
         assert!(
             removed <= through,
             "cleanup removed through {removed}, past recovery boundary {through}"
@@ -587,11 +633,10 @@ impl Writer {
                 Ok(())
             }
             Err(error) => {
-                if matches!(error, StorageError::Fenced(_)) {
-                    state.fenced = true;
-                } else {
+                if !matches!(error, StorageError::Fenced(_)) {
                     state.unresolved = Some(entries);
                 }
+                Self::discard(state, &error);
                 Err(commit_error(error))
             }
         }

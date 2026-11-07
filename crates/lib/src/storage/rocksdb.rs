@@ -5,12 +5,13 @@
 //! name with a big-endian `u64` value. Every batch is synced before `write` returns.
 //!
 //! [`StorageEngine::restore`] moves to a new generation of both column families, because a damaged table file can only leave
-//! with its column family: range deletes hide its records, and the next compaction reads the bad block and stops all writes.
+//! with its column family: range deletes hide its records, and every later compaction would read the bad block and fail.
 //! Dropping the old `data` column family is the commit, so the lowest generation with both column families is current.
 
 use std::collections::BTreeSet;
 use std::ffi::CStr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use ::rocksdb::{
@@ -50,6 +51,8 @@ pub struct RocksDbAdapter {
     db: Db,
     cf_options: Options,
     generation: RwLock<u64>,
+    /// Background errors counted before the last restore, which removed whatever caused them.
+    restored_errors: AtomicU64,
 }
 
 impl RocksDbAdapter {
@@ -63,6 +66,9 @@ impl RocksDbAdapter {
         let mut db_options = Options::default();
         db_options.create_if_missing(true);
         db_options.create_missing_column_families(true);
+        // With paranoid checks, a damaged block read by compaction stops every write until a reopen, so the restore that
+        // removes the block could never refill the instance. Without them the error still counts in `health`.
+        db_options.set_paranoid_checks(false);
         if let Some(mb) = options.write_buffer_mb {
             db_options.set_db_write_buffer_size(mb_to_bytes(mb));
         }
@@ -106,7 +112,16 @@ impl RocksDbAdapter {
             db,
             cf_options,
             generation: RwLock::new(generation),
+            restored_errors: AtomicU64::new(0),
         })
+    }
+
+    fn background_errors(&self) -> StorageResult<u64> {
+        let errors = self
+            .db
+            .property_int_value(&**properties::BACKGROUND_ERRORS)
+            .map_err(|e| error(&self.instance, e))?;
+        Ok(errors.unwrap_or(0))
     }
 
     fn handle(&self, cf: &str) -> Arc<BoundColumnFamily<'_>> {
@@ -322,6 +337,8 @@ impl StorageEngine for RocksDbAdapter {
 
     fn restore(&self, from: &dyn Snapshot) -> StorageResult<()> {
         let mut generation = self.generation.write().unwrap();
+        // Read first: an error during the restore may come from the new generation.
+        let errors = self.background_errors()?;
         let (old, next) = (*generation, *generation + 1);
         let committed = self.fill(next, from).and_then(|()| {
             self.db
@@ -335,6 +352,7 @@ impl StorageEngine for RocksDbAdapter {
             return Err(failed);
         }
         *generation = next;
+        self.restored_errors.store(errors, Ordering::Relaxed);
         if let Err(error) = self.db.drop_cf(&name(REVISIONS, old)) {
             tracing::warn!(%error, "old revisions stay until the next open");
         }
@@ -380,22 +398,19 @@ impl StorageEngine for RocksDbAdapter {
     }
 
     fn health(&self) -> StorageResult<()> {
-        // ponytail: the counter never resets, so an error RocksDB recovered from keeps the instance unhealthy until
-        // restart; read the background error status instead if that quarantines too much.
-        let errors = self
-            .db
-            .property_int_value(&**properties::BACKGROUND_ERRORS)
-            .map_err(|e| error(&self.instance, e))?;
-        match errors {
-            Some(n) if n > 0 => Err(StorageError::Unavailable(ErrorContext {
-                engine: ENGINE,
-                instance: self.instance.clone(),
-                file: Some(self.db.path().display().to_string()),
-                partition: None,
-                detail: format!("{n} background errors; RocksDB may have stopped writes"),
-            })),
-            _ => Ok(()),
+        // RocksDB's counter never falls, so only errors since the last restore count. ponytail: one transient flush error
+        // keeps the instance unhealthy until its rebuild; read the background error status if that rebuilds too much.
+        let n = self.background_errors()? - self.restored_errors.load(Ordering::Relaxed);
+        if n == 0 {
+            return Ok(());
         }
+        Err(StorageError::Unavailable(ErrorContext {
+            engine: ENGINE,
+            instance: self.instance.clone(),
+            file: Some(self.db.path().display().to_string()),
+            partition: None,
+            detail: format!("{n} background errors since the last restore"),
+        }))
     }
 }
 

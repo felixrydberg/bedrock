@@ -71,6 +71,9 @@ message Follow {
   uint64 from = 3;
   Span span = 4;
   map<string, uint64> from_namespaces = 5;
+  // The relay's number for this follow, which its deliveries and bootstraps carry back: frames of a follow it ended
+  // can arrive after its next one began (docs/spec/follows.tla).
+  uint64 follow = 6;
 }
 message Unfollow { string dataset = 1; string namespace = 2; Span span = 3; }
 message Recover {
@@ -98,6 +101,7 @@ message Delivery {
   uint64 through = 4;
   repeated bytes events = 5;
   Span span = 6;
+  uint64 follow = 7;
 }
 message ReplayRange {
   string dataset = 1;
@@ -120,6 +124,7 @@ message Bootstrap {
   repeated StateEntry entries = 7;
   bytes checksum = 8;
   Span span = 9;
+  uint64 follow = 10;
 }
 message RelayError {
   string dataset = 1;

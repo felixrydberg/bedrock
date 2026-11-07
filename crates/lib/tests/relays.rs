@@ -258,6 +258,7 @@ fn follow(namespace: &str, from: u64) -> pb::RelayRequest {
         from,
         span: None,
         from_namespaces: Default::default(),
+        ..Default::default()
     }))
 }
 
@@ -356,6 +357,7 @@ async fn invalid_tier_and_customer_kv_subscriptions_are_rejected() {
         from: 1,
         span: None,
         from_namespaces: Default::default(),
+        ..Default::default()
     };
     for kind in [
         pb::relay_request::Kind::Follow(customer.clone()),
@@ -1018,6 +1020,7 @@ async fn siblings_stay_warm_until_the_last_subscriber_leaves_and_a_moved_one_is_
         from: 2,
         span: None,
         from_namespaces: Default::default(),
+        ..Default::default()
     })))
     .await
     .unwrap();

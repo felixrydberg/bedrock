@@ -150,6 +150,8 @@ struct Interest {
     from: u64,
     acked: u64,
     generation: u64,
+    /// The subscriber's number for the follow, stamped on its deliveries and bootstraps (follows.tla).
+    follow: u64,
     baseline: u64,
     /// A bootstrap was sent and its recovered confirmation not yet.
     confirming: bool,
@@ -622,18 +624,19 @@ impl Hub {
         id: u64,
         key: &StreamKey,
         generation: u64,
-        kind: pb::relay_frame::Kind,
+        mut kind: pb::relay_frame::Kind,
     ) -> bool {
-        let Some(changes) = self
-            .0
-            .subscribers
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|s| s.changed.clone())
-        else {
+        let Some((changes, follow)) = self.0.subscribers.lock().unwrap().get(&id).map(|s| {
+            let follow = s.follows.get(key).map_or(0, |interest| interest.follow);
+            (s.changed.clone(), follow)
+        }) else {
             return false;
         };
+        match &mut kind {
+            pb::relay_frame::Kind::Delivery(d) => d.follow = follow,
+            pb::relay_frame::Kind::Bootstrap(b) => b.follow = follow,
+            _ => {}
+        }
         let mut frame = pb::RelayFrame { kind: Some(kind) };
         let queued = tokio::time::timeout(IDLE, async move {
             loop {
@@ -1001,7 +1004,7 @@ impl Hub {
         }
         match key.1.filter(|_| follow.namespace.is_empty()) {
             Some(range) => self.follow_range(id, follow, range, visited),
-            None => self.follow_stream(id, key, follow.from, visited, force),
+            None => self.follow_stream(id, key, follow.from, follow.follow, visited, force),
         }
     }
 
@@ -1028,11 +1031,19 @@ impl Hub {
             // 0 asks for a fresh baseline; a namespace the subscriber has not seen starts at 1.
             let from = follow.from_namespaces.get(&namespace).copied().unwrap_or(1);
             let key = ((dataset.clone(), namespace), Some(range));
-            self.follow_stream(id, key, from, visited.clone(), from == 0);
+            self.follow_stream(id, key, from, follow.follow, visited.clone(), from == 0);
         }
     }
 
-    fn follow_stream(&self, id: u64, key: StreamKey, from: u64, visited: Vec<String>, force: bool) {
+    fn follow_stream(
+        &self,
+        id: u64,
+        key: StreamKey,
+        from: u64,
+        follow: u64,
+        visited: Vec<String>,
+        force: bool,
+    ) {
         // Seed the validated cache's lower bound before upstream traffic can arrive.
         self.source_head(&key.0);
         let generation = self.0.ids.fetch_add(1, Ordering::Relaxed);
@@ -1047,6 +1058,7 @@ impl Hub {
                     from: from.max(1),
                     acked: from.max(1) - 1,
                     generation,
+                    follow,
                     baseline: from.max(1) - 1,
                     confirming: false,
                     target: None,
@@ -1250,6 +1262,7 @@ impl Hub {
                                     through,
                                     events: selected,
                                     span: span(key.1),
+                                    ..Default::default()
                                 }),
                             )
                             .await
@@ -1282,6 +1295,7 @@ impl Hub {
                                 entries: Vec::new(),
                                 checksum: Vec::new(),
                                 span: span(key.1),
+                                ..Default::default()
                             };
                             if !self
                                 .send_scoped(
@@ -1476,6 +1490,7 @@ impl Hub {
                     from,
                     span: span(key.1),
                     from_namespaces: Default::default(),
+                    ..Default::default()
                 };
                 let requested_from = request.from;
                 tx.send(pb::RelayRequest {
@@ -1764,6 +1779,10 @@ impl Hub {
         // Next expected revision per namespace, from namespace follows and whole-dataset follows alike.
         let mut sent = BTreeMap::<Key, u64>::new();
         let mut sent_datasets = BTreeSet::<String>::new();
+        // The number of the follow each namespace is in. Frames of a follow this session ended can arrive after the next
+        // one began, and are dropped (follows.tla).
+        let mut follows = BTreeMap::<Key, u64>::new();
+        let mut numbered = 0;
         let mut progress = tokio::time::interval(PROGRESS);
         let mut received = crate::monotonic_now();
         // Re-armed when it fires rather than per message, which would leave a timer behind for each one (B-61).
@@ -1787,6 +1806,7 @@ impl Hub {
                     span: None,
                 }));
                 sent.remove(&key);
+                follows.remove(&key);
             }
             for dataset in sent_datasets
                 .difference(&datasets)
@@ -1799,6 +1819,7 @@ impl Hub {
                     span: span(Some(WHOLE)),
                 }));
                 sent.retain(|key, _| key.0 != dataset);
+                follows.retain(|key, _| key.0 != dataset);
                 sent_datasets.remove(&dataset);
             }
             for (key, from) in namespaces
@@ -1807,18 +1828,22 @@ impl Hub {
             {
                 if !sent.contains_key(key) {
                     let from = self.resume_from(key, *from);
+                    numbered += 1;
                     requests.push(pb::relay_request::Kind::Follow(pb::Follow {
                         dataset: key.0.clone(),
                         namespace: key.1.clone(),
                         from,
                         span: None,
                         from_namespaces: Default::default(),
+                        follow: numbered,
                     }));
                     sent.insert(key.clone(), from);
+                    follows.insert(key.clone(), numbered);
                 }
             }
             for dataset in &datasets {
                 if sent_datasets.insert(dataset.clone()) {
+                    numbered += 1;
                     let mut from_namespaces = BTreeMap::new();
                     for namespace in self.namespaces(dataset) {
                         let key = (dataset.clone(), namespace);
@@ -1827,6 +1852,7 @@ impl Hub {
                         });
                         let from = self.resume_from(&key, from);
                         sent.insert(key.clone(), from);
+                        follows.insert(key.clone(), numbered);
                         from_namespaces.insert(key.1, from);
                     }
                     requests.push(pb::relay_request::Kind::Follow(pb::Follow {
@@ -1835,6 +1861,7 @@ impl Hub {
                         from: 0,
                         span: span(Some(WHOLE)),
                         from_namespaces,
+                        follow: numbered,
                     }));
                 }
             }
@@ -1871,8 +1898,10 @@ impl Hub {
                 }
                 Some(pb::relay_frame::Kind::Delivery(d)) => {
                     let key = (d.dataset.clone(), d.namespace.clone());
-                    let expected = sent.get(&key).copied().unwrap_or(d.from);
-                    if d.from != expected {
+                    if follows.get(&key) != Some(&d.follow) {
+                        continue;
+                    }
+                    if sent.get(&key) != Some(&d.from) {
                         return Err(Status::data_loss("upstream coverage gap"));
                     }
                     let mut next = d.from;
@@ -1909,6 +1938,9 @@ impl Hub {
                 }
                 Some(pb::relay_frame::Kind::Bootstrap(b)) if b.end => {
                     let key = (b.dataset.clone(), b.namespace.clone());
+                    if follows.get(&key) != Some(&b.follow) {
+                        continue;
+                    }
                     self.observe_head(&key, b.boundary);
                     self.changed();
                     sent.insert(key, b.boundary.saturating_add(1));

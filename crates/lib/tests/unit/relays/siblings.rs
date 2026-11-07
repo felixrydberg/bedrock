@@ -32,6 +32,7 @@ fn subscribe(
             from: *from,
             acked: from - 1,
             generation: id,
+            follow: 0,
             baseline: from - 1,
             confirming: false,
             target: None,

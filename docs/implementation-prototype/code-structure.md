@@ -86,6 +86,24 @@ madsim's clogs, kills and pauses. `crates/lib/src/sim.rs`, compiled only under `
 in-crate tests cannot depend on another crate without a second copy of its traits. Tests outside the crate enable it with
 the `test-support` feature.
 
+`tests/crash` (`bedrock-crash`, #25 / B-23 Layer 3) runs the same cluster as the five release binaries on loopback, with
+RocksDB, the SlateDB namespace engine and SeaweedFS as S3 in Docker. `scripts/crash.sh run` does one run of
+`BEDROCK_CRASH_SECONDS` of faults, then waits for convergence and checks every node's disk; `scripts/crash.sh sweep 10`
+does ten. The faults, picked by `BEDROCK_CRASH_SEED` and limited by `BEDROCK_CRASH_FAULTS`:
+
+- `kill`: SIGKILL a process, then restart it.
+- `disk`: while a storage node is down, cut its WAL tail, flip a byte in an SST file, or wipe a dataset.
+- `network`: every process dials the others through a TCP proxy per node, which refuses, stalls, stalls replies or slows
+  that node's inbound traffic. A partition is therefore one-way.
+- `s3`: the API's S3 proxy refuses, slows, stalls replies, or forwards a request and cuts the reply.
+
+It reuses `tests/sim/src/history.rs`. A running node holds its RocksDB lock, so its copies are read after a kill, which
+makes each kill a crash-consistency check too. At the end, each storage node is killed again until its copies reach the
+head, and copies of one node's disk, damaged on purpose, must break `GapFreeApply`, `NoStaleOverwrite`, `NoResurrection`
+and `NoLostAck`. Unlike the simulation a run is not deterministic: the kernel decides the interleaving, so a failing seed
+may not repeat; its configs, data, logs and `faults.log` stay in `/tmp/bedrock-crash-<seed>`. SIGKILL keeps the page
+cache, so power loss is not covered. Stale writers are not covered yet.
+
 Assertions check only this process's own memory, and stay on in release: a release build aborts on panic and on integer
 overflow, so containers must restart on exit. Data from disk or the network is never asserted on, because one bad event
 reaches every relay; it fails with an explicit error.

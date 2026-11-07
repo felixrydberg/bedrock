@@ -309,6 +309,13 @@ impl StorageHealth {
     }
 }
 
+/// Records a quarantine in `engine` itself, so wrapping it quarantines it until a rebuild.
+pub fn quarantine(engine: &dyn StorageEngine) -> StorageResult<()> {
+    let mut mark = WriteBatch::default();
+    mark.set_revision(QUARANTINED, 1);
+    engine.write(mark)
+}
+
 /// A wrapped engine: reports every outcome and refuses calls while its source is quarantined.
 struct Monitored {
     health: Arc<StorageHealth>,
@@ -341,12 +348,10 @@ impl Monitored {
     }
 
     fn failed(&self, error: &StorageError) {
-        if self.health.failed(&self.source, error) {
-            let mut mark = WriteBatch::default();
-            mark.set_revision(QUARANTINED, 1);
-            if let Err(error) = self.inner.write(mark) {
-                tracing::warn!(%error, "could not record the quarantine; a restart will forget it");
-            }
+        if self.health.failed(&self.source, error)
+            && let Err(error) = quarantine(self.inner.as_ref())
+        {
+            tracing::warn!(%error, "could not record the quarantine; a restart will forget it");
         }
     }
 

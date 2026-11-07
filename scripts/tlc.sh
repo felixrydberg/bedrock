@@ -50,6 +50,8 @@ handoff absent NewOwnersPublished
 handoff early-drop NoDropBeforeReady
 handoff any-ready KeepsHealthyHolder
 handoff minority-write Freeze
+follows untagged NoFalseGap
+follows ahead HeldBeforeNext
 '
 
 tlc() {
@@ -87,7 +89,7 @@ bug() {
     fi
 }
 
-models="relays materialized publisher membership handoff"
+models="relays follows materialized publisher membership handoff"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

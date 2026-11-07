@@ -272,8 +272,13 @@ async fn flush_failures_before_and_after_durability_preserve_the_original_batch(
                 .await,
             Ok(1)
         );
-        // Retrying an uncertain flush reuses exactly the buffered event and fixed expiry.
-        assert_eq!(*factory.controls.writes.lock().unwrap(), writes);
+        // Retrying an uncertain flush reuses exactly the buffered event and fixed expiry, on a reopened handle when the
+        // first never became durable.
+        let retried = factory.controls.writes.lock().unwrap().clone();
+        assert!(
+            retried.iter().all(|batch| *batch == writes[0]),
+            "{retried:?}"
+        );
         let before = writer.bootstrap("kv", "a").await.unwrap();
         assert_eq!(before.values[b"x".as_slice()], b"original");
         assert_eq!(

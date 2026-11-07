@@ -252,22 +252,26 @@ fn a_restore_removes_a_damaged_file() {
     assert_eq!(engine.get(FIRST), Ok(Some(b"newer".to_vec())));
 }
 
-/// RocksDB refuses every write after a failed compaction until it reopens, so emptying must not need one.
+/// Found by the crash tests (#25 / B-23 Layer 3): a compaction that read the damaged block stopped every write, and its
+/// error kept `health` failing, so the rebuild could neither refill the instance nor pass validation until a restart.
 #[test]
-fn a_restore_empties_an_engine_whose_writes_stopped() {
+fn a_rebuild_after_a_failed_compaction_needs_no_reopen() {
     let mut harness = Rocks::default();
     let engine = damaged(&mut harness);
     assert!(matches!(
         compact_over(&engine),
         Err(StorageError::Unavailable(_))
     ));
-    assert!(engine.put(b"later", b"1").is_err());
+    assert!(engine.health().is_err());
 
-    engine.restore(&*empty().snapshot().unwrap()).unwrap();
-    let engine = reopened(engine);
+    let source = harness.open();
+    source.put(b"fresh", b"1").unwrap();
+    engine.restore(&*source.snapshot().unwrap()).unwrap();
+    engine.put(b"later", b"1").unwrap();
 
     compact_over(&engine).unwrap();
     engine.health().unwrap();
+    assert_eq!(engine.get(b"fresh"), Ok(Some(b"1".to_vec())));
     assert_eq!(engine.get(b"k00020000"), Ok(None));
 }
 

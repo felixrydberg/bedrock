@@ -473,6 +473,48 @@ fn flaky_store(failing: &Arc<AtomicBool>) -> Arc<SimFactory> {
     })))
 }
 
+/// Found by the crash tests (#25 / B-23 Layer 3): SlateDB closes a database for good when one S3 request fails, and the
+/// writer kept the closed handle, so the namespace refused every write until a restart.
+#[tokio::test]
+async fn a_handle_closed_by_a_failed_flush_is_reopened() {
+    let failing = Arc::new(AtomicBool::new(false));
+    let broken = Arc::new(AtomicBool::new(false));
+    let store = {
+        let (failing, broken) = (failing.clone(), broken.clone());
+        Arc::new(SimFactory::new(Arc::new(move |access| {
+            let down = failing.load(Ordering::SeqCst);
+            match access {
+                StoreAccess::Open | StoreAccess::Flush if down => {
+                    broken.store(access == StoreAccess::Flush, Ordering::SeqCst);
+                    Some(StoreFault::Unavailable)
+                }
+                StoreAccess::Open => {
+                    broken.store(false, Ordering::SeqCst);
+                    None
+                }
+                _ => broken
+                    .load(Ordering::SeqCst)
+                    .then_some(StoreFault::Unavailable),
+            }
+        })))
+    };
+    let writer = Writer::open(
+        early,
+        config(store, Retention::default(), PersistenceMetrics::default()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(writer.commit(write(Some("first"), Some("a"))).await, Ok(1));
+    failing.store(true, Ordering::SeqCst);
+    assert!(writer.commit(write(Some("lost"), Some("b"))).await.is_err());
+    failing.store(false, Ordering::SeqCst);
+    assert_eq!(writer.commit(write(Some("lost"), Some("b"))).await, Ok(2));
+    assert_eq!(writer.commit(write(Some("third"), None)).await, Ok(3));
+    let view = writer.bootstrap("kv", "one").await.unwrap();
+    assert_eq!(view.sequence, 3);
+    assert_eq!(writer.log().head("kv", "one").get(), 3);
+}
+
 /// Found by the simulation (#25 / B-23): a membership publisher waits for a bootstrap before it writes, so waiting for a
 /// later commit to settle a failed flush deadlocked them.
 #[tokio::test]

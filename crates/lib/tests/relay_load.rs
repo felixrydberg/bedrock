@@ -134,6 +134,7 @@ async fn subscribe(
             from: 1,
             span: Some(span(subscriber)),
             from_namespaces: Default::default(),
+            ..Default::default()
         })),
     })
     .await

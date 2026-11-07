@@ -138,6 +138,7 @@ fn delivery(from: u64, through: u64, events: Vec<pb::Event>) -> pb::Delivery {
             .map(|event| event.encode_to_vec().into())
             .collect(),
         span: None,
+        ..Default::default()
     }
 }
 
@@ -166,6 +167,7 @@ fn bootstrap(boundary: u64, entries: Vec<(&[u8], &[u8])>) -> pb::Bootstrap {
         entries,
         checksum: digest.finalize().to_vec(),
         span: None,
+        ..Default::default()
     }
 }
 
@@ -1277,6 +1279,50 @@ async fn a_damaged_engine_does_not_stop_the_session_starting() {
     let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
     let relays = vec!["10.0.0.1:7000".to_string()];
     Session::join(peers, relays, vec![view], member, ranged).unwrap();
+}
+
+/// Found by the crash tests (#25 / B-23 Layer 3): damage in a later range quarantined the engine, and the earlier range's
+/// second read then failed and ended the session, so the process exited once before running quarantined.
+#[tokio::test]
+async fn damage_in_a_later_range_does_not_stop_the_session_starting() {
+    let sim = Arc::new(crate::storage::sim::SimEngine::new(
+        "quicksilver",
+        Arc::new(|_| None),
+        None,
+        false,
+    ));
+    let middle = u64::MAX / 2;
+    let late = l2_key(middle + 1, "infrastructure", b"k");
+    let mut batch = WriteBatch::default();
+    batch
+        .put(l2_key(1, "infrastructure", b"k"), "v")
+        .put(late.clone(), "v")
+        .set_revision(
+            marker_prefix("quicksilver", (0, middle)) + "infrastructure",
+            1,
+        )
+        .set_revision(
+            marker_prefix("quicksilver", (middle, 0)) + "infrastructure",
+            1,
+        );
+    sim.write(batch).unwrap();
+    sim.damage(&late);
+    let health = crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+    let engine = health.wrap_replication("quicksilver", "engine", sim);
+    let member = pb::Member {
+        node_id: "q1".into(),
+        service: "quicksilver".into(),
+        cell: "c1".into(),
+        status: pb::member::Status::Ready as i32,
+        datasets: vec!["quicksilver".into()],
+        ..Default::default()
+    };
+    let ranged = BTreeMap::from([("quicksilver".to_string(), engine)]);
+    let (_, view) = crate::membership::View::new("quicksilver", "c1");
+    let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
+    let relays = vec!["10.0.0.1:7000".to_string()];
+    Session::join(peers, relays, vec![view], member, ranged).unwrap();
+    assert!(health.unhealthy().contains("quicksilver"));
 }
 
 /// `narrow`'s other arguments, for a member holding `whole` of `auth`, with `engine` as its storage.

@@ -71,6 +71,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             from: 1,
             acked: 0,
             generation: id,
+            follow: id + 100,
             baseline: 0,
             confirming: false,
             target: None,
@@ -140,6 +141,7 @@ async fn byte_budget_disconnects_before_accepting_an_oversized_frame() {
             through: 1,
             events: vec![Bytes::from(vec![0; MAX_BYTES])],
             span: None,
+            ..Default::default()
         })
     ));
     assert!(closed.get());
@@ -178,6 +180,7 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
                 from: 1,
                 acked: 0,
                 generation: 2,
+                follow: 0,
                 baseline: 0,
                 confirming: false,
                 target: None,
@@ -250,6 +253,37 @@ async fn replaced_generation_cannot_enqueue_into_the_new_subscription() {
     );
 }
 
+/// Found by the crash tests (#25 / B-23 Layer 3): a relay took deliveries still in flight for a follow it had ended as a
+/// coverage gap in its next one, so each stream switch cost a reconnect. Frames now carry the follow's number.
+#[tokio::test]
+async fn deliveries_and_bootstraps_carry_the_subscribers_follow_number() {
+    let hub = hub();
+    let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    let key = (("auth".into(), "keys".into()), None);
+    let delivery = pb::relay_frame::Kind::Delivery(pb::Delivery {
+        from: 1,
+        through: 1,
+        ..Default::default()
+    });
+    let bootstrap = pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+        begin: true,
+        ..Default::default()
+    });
+    for kind in [delivery, bootstrap] {
+        assert!(hub.send_scoped(1, &key, 1, kind).await);
+        let frame = tokio_stream::StreamExt::next(&mut frames)
+            .await
+            .unwrap()
+            .unwrap();
+        let follow = match frame.kind.unwrap() {
+            pb::relay_frame::Kind::Delivery(d) => d.follow,
+            pb::relay_frame::Kind::Bootstrap(b) => b.follow,
+            other => panic!("unexpected frame {other:?}"),
+        };
+        assert_eq!(follow, 101);
+    }
+}
+
 #[tokio::test]
 async fn queued_record_bound_applies_across_namespaces_not_only_frames() {
     let hub = hub();
@@ -262,6 +296,7 @@ async fn queued_record_bound_applies_across_namespaces_not_only_frames() {
             through: 600,
             events: vec![Bytes::new(); 600],
             span: None,
+            ..Default::default()
         })
     };
     assert!(hub.send(1, delivery("one")));
@@ -504,6 +539,7 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
         from: acked + 1,
         acked,
         generation: 9,
+        follow: 0,
         baseline: 0,
         confirming: false,
         target: None,
