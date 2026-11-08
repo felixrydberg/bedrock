@@ -1500,9 +1500,9 @@ impl Hub {
                 })
                 .await
                 .unwrap();
-                let (from, force) = self
-                    .recovery_start(id, key, generation, force)
-                    .ok_or_else(|| Status::cancelled("subscription closed"))?;
+                let Some((from, force)) = self.recovery_start(id, key, generation, force) else {
+                    return Ok(());
+                };
                 let request = pb::Follow {
                     dataset: key.0.0.clone(),
                     namespace: key.0.1.clone(),

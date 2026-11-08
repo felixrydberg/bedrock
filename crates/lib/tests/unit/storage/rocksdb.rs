@@ -28,6 +28,34 @@ impl Harness for Rocks {
 
 storage_contract!(Rocks::default());
 
+#[test]
+#[allow(clippy::disallowed_methods)] // real threads exercise RocksDB's native write/restore race
+fn writes_remain_atomic_while_restore_changes_generations() {
+    let mut harness = Rocks::default();
+    let engine = harness.open();
+    let start = std::sync::Barrier::new(2);
+    for revision in 1..=4 {
+        std::thread::scope(|scope| {
+            let mut batch = WriteBatch::default();
+            for key in 0u32..262_144 {
+                batch.put(key.to_be_bytes(), [42; 64]);
+            }
+            batch.set_revision("ns", revision);
+            let writer = scope.spawn(|| {
+                start.wait();
+                engine.write(batch)
+            });
+            start.wait();
+            // Let the write start assembling its batch before restore changes generations.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            engine.restore(&*empty().snapshot().unwrap()).unwrap();
+            writer.join().unwrap().unwrap();
+        });
+        let has_data = engine.get(&0u32.to_be_bytes()).unwrap().is_some();
+        assert_eq!(has_data, engine.revision("ns").unwrap().is_some());
+    }
+}
+
 /// Flushes `key` into an SST file, then flips bytes in the file's first data block while the DB is closed.
 #[allow(clippy::disallowed_methods)] // test fault injection rewrites the instance's files
 fn corrupt_sst(engine: RocksDbAdapter, key: &[u8]) -> RocksDbAdapter {
@@ -290,6 +318,39 @@ fn a_restore_lasts_through_a_reopen() {
 
     assert_eq!(engine.get(b"old"), Ok(None));
     assert_eq!(engine.get(b"new"), Ok(Some(b"1".to_vec())));
+}
+
+#[test]
+fn a_restore_retries_with_leftover_column_families() {
+    let mut harness = Rocks::default();
+    let source = empty();
+    let mut batch = WriteBatch::default();
+    batch.put(*b"new", *b"1").set_revision("ns", 4);
+    source.write(batch).unwrap();
+
+    for leftovers in [&[DATA, REVISIONS][..], &[DATA], &[REVISIONS]] {
+        let engine = harness.open();
+        engine.put(b"old", b"1").unwrap();
+        // A failed restore can leave either or both families when its cleanup also fails.
+        for base in leftovers {
+            let cf = name(base, 1);
+            engine.db.create_cf(&cf, &Options::default()).unwrap();
+            let cf = engine.handle(&cf);
+            if *base == DATA {
+                engine.db.put_cf(&cf, data_key(b"stale"), b"2").unwrap();
+            } else {
+                engine.db.put_cf(&cf, "stale", 99u64.to_be_bytes()).unwrap();
+            }
+        }
+
+        engine.restore(&*source.snapshot().unwrap()).unwrap();
+
+        assert_eq!(engine.get(b"new"), Ok(Some(b"1".to_vec())));
+        assert_eq!(engine.get(b"old"), Ok(None));
+        assert_eq!(engine.get(b"stale"), Ok(None));
+        assert_eq!(engine.revision("ns"), Ok(Some(4)));
+        assert_eq!(engine.revision("stale"), Ok(None));
+    }
 }
 
 /// A crash before the old `data` is dropped has not committed, even with the new generation complete.

@@ -109,7 +109,7 @@ trend() {
 }
 
 sweep() {
-    local count="$1" first="${2:-1}" test logs metrics sampler started seconds failures
+    local count="$1" first="${2:-1}" test logs metrics sampler started seconds failures status=0
     test="$(binary)"
     logs="$(mktemp -d)"
     mkdir -p "$VOPR_REPORTS"
@@ -121,7 +121,7 @@ sweep() {
     sampler=$!
     export -f run_seed
     seq "$first" "$((first + count - 1))" | xargs -P "$(nproc)" -I{} bash -c \
-        'run_seed "$1" "$2" > "$3/$2.log" || touch "$3/$2.failed"' _ "$test" {} "$logs" || true
+        'run_seed "$1" "$2" > "$3/$2.log" || touch "$3/$2.failed"' _ "$test" {} "$logs" || status=$?
     kill "$sampler" 2>/dev/null || true
     seconds="$((SECONDS - started))"
     failures="$(find "$logs" -name '*.failed' | wc -l)"
@@ -142,7 +142,8 @@ sweep() {
         echo "  Log: $logs/$seed.log"
         report "$test" "$seed" "$logs/$seed.log"
     done
-    [ "$failures" -eq 0 ]
+    [ "$failures" -eq 0 ] || status=1
+    return "$status"
 }
 
 replay() {

@@ -13,6 +13,7 @@ import ctypes
 import mmap
 import os
 import re
+import signal
 import struct
 import subprocess
 import sys
@@ -42,7 +43,10 @@ def open_rings(pid):
         attr = ctypes.create_string_buffer(attribute())
         fd = libc.syscall(PERF_EVENT_OPEN, attr, pid, cpu, -1, 0)
         if fd < 0:
-            sys.exit(f"perf_event_open failed: {os.strerror(ctypes.get_errno())}")
+            error = ctypes.get_errno()
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            sys.exit(f"perf_event_open failed: {os.strerror(error)}")
         rings.append(mmap.mmap(fd, size))
     return rings
 
@@ -125,7 +129,10 @@ def main():
     if pid == 0:
         os.close(go_write)
         os.read(go_read, 1)
-        os.execv(program, sys.argv[2:])
+        try:
+            os.execv(program, sys.argv[2:])
+        except OSError:
+            os._exit(127)
     rings = open_rings(pid)
     os.write(go_write, b"x")
     stacks = collections.Counter()
@@ -148,4 +155,5 @@ def main():
     sys.exit(os.waitstatus_to_exitcode(status))
 
 
-main()
+if __name__ == "__main__":
+    main()

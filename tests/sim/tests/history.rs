@@ -308,6 +308,25 @@ fn no_drop_before_ready_fires_when_only_populating_owners_remain() {
 }
 
 #[test]
+fn no_drop_before_ready_checks_every_part_of_a_split() {
+    let before = vec![((0, 0), owners(&[("a", Ready)]))];
+    let healthy = members(&["a", "b"]);
+    for split in [1, HALF, u64::MAX] {
+        let mut after = vec![
+            ((0, split), owners(&[("a", Ready)])),
+            ((split, 0), owners(&[("b", Populating)])),
+        ];
+        assert_eq!(
+            invariant(check_handoff(&before, &after, &healthy)),
+            "NoDropBeforeReady"
+        );
+
+        after[1].1.push(("a".into(), Leaving));
+        check_handoff(&before, &after, &healthy).unwrap();
+    }
+}
+
+#[test]
 fn owned_or_leaving_passes_for_any_listed_state() {
     let placement = placement(&[("a", Leaving)], &[("a", Populating)]);
     check_held(&placement, "a", [1, HALF + 1]).unwrap();
@@ -338,4 +357,20 @@ fn no_unhealthy_routing_fires_when_an_unhealthy_member_gains_a_range() {
         invariant(check_routing(&before, &after, &unhealthy)),
         "NoUnhealthyRouting"
     );
+}
+
+#[test]
+fn no_unhealthy_routing_checks_every_part_of_a_merge() {
+    let unhealthy = members(&["a"]);
+    for split in [1, HALF, u64::MAX] {
+        let before = vec![
+            ((0, split), owners(&[("a", Ready)])),
+            ((split, 0), owners(&[("b", Ready)])),
+        ];
+        let after = vec![((0, 0), owners(&[("a", Populating), ("b", Ready)]))];
+        assert_eq!(
+            invariant(check_routing(&before, &after, &unhealthy)),
+            "NoUnhealthyRouting"
+        );
+    }
 }

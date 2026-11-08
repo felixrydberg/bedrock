@@ -341,7 +341,6 @@ pub fn check_coverage(placement: &Placement) -> Result<(), Violation> {
     Ok(())
 }
 
-/// The owners of the range containing `hash`.
 /// The owners of the range holding `hash`, found by binary search: `placement` is sorted by start, as the harnesses build
 /// it from the directory. A scan made every directory write cost the square of the range count (#66 / B-61).
 fn owners_at(placement: &Placement, hash: u64) -> impl Iterator<Item = &(String, OwnerState)> {
@@ -368,7 +367,15 @@ pub fn check_handoff(
         if !owners.iter().any(ready) {
             continue;
         }
-        let serving = owners_at(after, range.0).any(|(_, state)| *state != OwnerState::Populating);
+        let serving = owners_at(after, range.0).any(|(_, state)| *state != OwnerState::Populating)
+            && after[after.partition_point(|(later, _)| later.0 < range.0)..]
+                .iter()
+                .take_while(|(later, _)| range.1 == 0 || later.0 < range.1)
+                .all(|(_, owners)| {
+                    owners
+                        .iter()
+                        .any(|(_, state)| *state != OwnerState::Populating)
+                });
         if !serving {
             return violation(
                 "NoDropBeforeReady",
@@ -404,7 +411,11 @@ pub fn check_routing(
 ) -> Result<(), Violation> {
     for (range, owners) in after {
         for (owner, _) in owners {
-            let held = owners_at(before, range.0).any(|(earlier, _)| earlier == owner);
+            let held = owners_at(before, range.0).any(|(earlier, _)| earlier == owner)
+                && before[before.partition_point(|(earlier, _)| earlier.0 < range.0)..]
+                    .iter()
+                    .take_while(|(earlier, _)| range.1 == 0 || earlier.0 < range.1)
+                    .all(|(_, owners)| owners.iter().any(|(earlier, _)| earlier == owner));
             if unhealthy.contains(owner) && !held {
                 return violation(
                     "NoUnhealthyRouting",

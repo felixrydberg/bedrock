@@ -1,6 +1,40 @@
 use super::*;
 use crate::health::{CONSECUTIVE_FAILURES, State};
 
+#[cfg(madsim)]
+#[tokio::test]
+async fn raw_dial_obeys_both_rpc_failure_outcomes() {
+    use crate::sim::{Hooks, RpcFuture};
+    use crate::storage::memory::MemoryEngine;
+    use crate::storage::sim::MemoryFactory;
+
+    let addr = "127.0.0.1:7000";
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let peers = Peers::new(&Admin::new());
+    for lost in [false, true] {
+        crate::sim::install(Hooks {
+            engine: Box::new(|_, name| Arc::new(MemoryEngine::new(name))),
+            namespaces: Box::new(|| Arc::new(MemoryFactory::default())),
+            rpc: Box::new(move |_| -> RpcFuture {
+                Box::pin(async move {
+                    let status = Status::unavailable("injected dial fault");
+                    if lost { Ok(Some(status)) } else { Err(status) }
+                })
+            }),
+        });
+        let error = peers.dial(addr).await.err().expect("dial must fail unsent");
+        assert!(error.to_string().contains("injected dial fault"), "{error}");
+    }
+    crate::sim::install(Hooks {
+        engine: Box::new(|_, name| Arc::new(MemoryEngine::new(name))),
+        namespaces: Box::new(|| Arc::new(MemoryFactory::default())),
+        rpc: Box::new(|_| Box::pin(async { Ok(None) })),
+    });
+    let (dialed, accepted) = tokio::join!(peers.dial(addr), listener.accept());
+    assert!(dialed.is_ok());
+    assert!(accepted.is_ok());
+}
+
 #[tokio::test]
 async fn peer_failures_feed_the_breaker() {
     let peers = Peers::new(&Admin::new());

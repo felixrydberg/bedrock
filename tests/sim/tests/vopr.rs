@@ -1818,7 +1818,7 @@ fn run_seed(seed: u64, faults: &str) -> Outcome {
 
 /// madsim's maps and task IDs keep state across a process, so a seed run after others can take a different path. Separate
 /// processes make these runs the ones a sweep and `scripts/vopr.sh replay` see.
-#[allow(clippy::disallowed_methods)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // This launcher isolates seeds before simulation starts.
 fn run_each_in_its_own_process() {
     let test = std::env::current_exe().unwrap();
     let cores = std::thread::available_parallelism().map_or(1, usize::from);

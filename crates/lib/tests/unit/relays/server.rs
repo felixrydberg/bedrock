@@ -107,6 +107,28 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
 }
 
 #[tokio::test]
+async fn a_closed_recovery_does_not_trip_its_sources() {
+    let peers = Arc::new(Peers::new(&Admin::new()));
+    let sources = vec!["first:7000".to_owned(), "second:7000".to_owned()];
+    let hub = Hub::relay(
+        "cell".into(),
+        1,
+        peers.clone(),
+        sources.clone(),
+        Vec::new(),
+        None,
+    );
+    let (frames, _) = subscriber(&hub, 1, 1);
+    drop(frames);
+    let stream = (("auth".into(), "keys".into()), None);
+
+    hub.proxy(1, &stream, 1, &[], false).await.unwrap();
+    for source in &sources {
+        assert_eq!(peers.health().state(source), crate::health::State::Closed);
+    }
+}
+
+#[tokio::test]
 async fn full_queue_disconnects_only_stalled_subscriber_and_releases_interest() {
     let hub = hub();
     let (_slow, closed) = subscriber(&hub, 1, 2);

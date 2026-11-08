@@ -1495,6 +1495,8 @@ async fn settle(
         crate::membership::read(membership.target.engine.as_ref(), &membership.target.prefix)?;
     for dataset in due {
         let frame = pushed.pending.remove(&dataset).unwrap();
+        // A replacement set supersedes its old merges even if local storage cannot read the new plan.
+        pushed.merges.remove(&dataset);
         let mut refused = Vec::new();
         let mut reasons = Vec::new();
         if let Some(engine) = pushed.ranged.get(&dataset).cloned() {
@@ -1504,9 +1506,28 @@ async fn settle(
                 .filter(|(d, _)| *d == dataset)
                 .map(|(_, range)| *range)
                 .collect();
-            // A range unreadable when the session started has no group, and only this can still drop it. A failure here
-            // reconnects for a new push; a rebuild empties storage that stays unreadable.
-            let stored: Vec<Range> = self::held(engine.as_ref(), &dataset)?.into_iter().collect();
+            // A range unreadable when the session started has no group, and only this can still drop it.
+            let stored: Vec<Range> = match self::held(engine.as_ref(), &dataset) {
+                Err(error) if local(&error) => {
+                    tracing::warn!(%dataset, %error, "stored ranges unreadable; refusing this set");
+                    // Stored drops are unknown; refuse the whole space, including an empty pushed set.
+                    let ack = pb::RangesAck {
+                        dataset,
+                        revision: frame.revision,
+                        refused: vec![pb::Span { start: 0, end: 0 }],
+                        reason: error.to_string(),
+                    };
+                    send(
+                        requests,
+                        pb::RelayRequest {
+                            kind: Some(pb::relay_request::Kind::Ranges(ack)),
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+                stored => stored?.into_iter().collect(),
+            };
             let plan = ranges::plan(&held, &stored, &frame.spans)?;
             // Held ranges a refused cut leaves whole: a merge or new range over them waits for the next push.
             let mut blocked = Vec::new();
@@ -1528,9 +1549,21 @@ async fn settle(
                         continue;
                     }
                 };
-                for kind in narrow(
+                let narrowed = narrow(
                     &dataset, &engine, confirmed, consumers, pushed, progress, changes,
-                )? {
+                )?;
+                if narrowed.is_empty() {
+                    let dropped = if change.dropped.is_empty() {
+                        std::slice::from_ref(&change.held)
+                    } else {
+                        &change.dropped
+                    };
+                    refused.extend(dropped.iter().filter_map(|d| span(Some(*d))));
+                    reasons.push("stored range progress unreadable".into());
+                    blocked.push(change.held);
+                    continue;
+                }
+                for kind in narrowed {
                     send(requests, pb::RelayRequest { kind: Some(kind) }).await?;
                 }
             }
@@ -1744,8 +1777,9 @@ fn absorb(
 }
 
 /// Carries a held range's coverage to the parts a split kept and deletes the dropped parts in one atomic batch, then
-/// attempts to compact them. Returns the requests that move the relay's streams to the kept parts. Write and consumer
-/// initialization errors propagate; compaction errors are logged and do not fail the operation.
+/// attempts to compact them. Returns the requests that move the relay's streams to the kept parts. Unreadable local
+/// stored progress leaves the change unconfirmed and returns no requests. Other read, write and consumer initialization
+/// errors propagate; compaction errors are logged and do not fail the operation.
 fn narrow(
     dataset: &str,
     engine: &Arc<dyn StorageEngine>,
@@ -1776,12 +1810,25 @@ fn narrow(
     }
     // Left behind, stored progress would resume over deleted or replaced data. It may have no consumer yet, and an earlier
     // attempt that committed but reported failure can have left it on parts of the range, which no group follows.
-    let stored = held(engine.as_ref(), dataset)?;
+    let stored = match held(engine.as_ref(), dataset) {
+        Err(error) if local(&error) => {
+            tracing::warn!(%dataset, %error, "stored ranges unreadable; refusing this change");
+            return Ok(Vec::new());
+        }
+        stored => stored?,
+    };
     let followed = |range: &Range| pushed.groups.contains_key(&(dataset.to_owned(), *range));
     for range in stored.into_iter().filter(|range| {
         *range == change.held || (ranges::overlaps(*range, change.held) && !followed(range))
     }) {
-        for consumer in Consumer::resumed(&group, range)? {
+        let resumed = match Consumer::resumed(&group, range) {
+            Err(error) if local(&error) => {
+                tracing::warn!(%dataset, %error, "stored range progress unreadable; refusing this change");
+                return Ok(Vec::new());
+            }
+            resumed => resumed?,
+        };
+        for consumer in resumed {
             consumer.retire(&mut batch);
             for &kept in &change.kept {
                 consumer.mark(&mut batch, kept);
