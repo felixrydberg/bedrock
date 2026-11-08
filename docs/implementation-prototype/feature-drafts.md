@@ -7,7 +7,7 @@ which module it lives in, which doc section it comes from, what it depends on, a
 
 Sources: `docs/implementation-prototype/kv.md`, `cdn.md`, `code-structure.md`, `notes.md`.
 
-> Status: B-01 to B-29 (including B-12b, B-18b, B-22b and B-23a, but not B-09b or B-21b), plus B-39 and B-61, are created as GitHub issues (linked below; the issue is the source of truth). Later drafts are still drafts.
+> Status: B-01 to B-29 (including B-12b, B-18b, B-22b and B-23a, but not B-09b), plus B-39 and B-61, are created as GitHub issues (linked below; the issue is the source of truth). Later drafts are still drafts.
 
 > Architecture update, 2026-10-29: decision 11 replaces customer-KV origin cells with per-namespace S3 databases,
 > an API writer and read-only KV caches. This document records the new decision; the older customer-KV origin text in
@@ -144,7 +144,7 @@ Rules this implies:
 | **G — Shared core: reconciliation, recovery, hardening** |||||
 | [B-20](https://github.com/felixrydberg/bedrock/issues/21) | Reconciliation framework | Shared core | `lib/reconciliation` | B-16 |
 | [B-21](https://github.com/felixrydberg/bedrock/issues/22) | Relay-driven L2 range handoff: assign, bootstrap, ready, revoke | Shared core | `lib/relays` + `lib/buckets` + `lib/reconciliation` | B-19, B-20 |
-| B-21b | Drain nodes, cells and namespaces for every dataset | Shared core | `lib/reconciliation` + `lib/placement` | B-15, B-20, B-21 |
+| [B-21b](https://github.com/felixrydberg/bedrock/issues/68) | Drain nodes, cells and namespaces for every dataset | Shared core | `lib/reconciliation` + `lib/placement` | B-15, B-20, B-21 |
 | [B-22](https://github.com/felixrydberg/bedrock/issues/23) | Tiered read fallback and cache rebuild | Shared core | `lib/health` + `lib/reconciliation` | B-14, B-19, B-11 |
 | [B-22b](https://github.com/felixrydberg/bedrock/issues/24) | Read protection: coalescing and per-cell limits | Shared core | `lib/health` + callers | B-22 |
 | [B-23](https://github.com/felixrydberg/bedrock/issues/25) | Hardening gate: TLA+ model, deterministic simulation, real-binary crash tests | Shared core | `lib` (test support), `docs/spec/` | B-23a, created B-01 … B-22b; excludes later B-09b/B-21b |
@@ -570,55 +570,7 @@ Membership-only cases that need no data (failover, restart, cut-off, drain and f
 
 #### B-21b — Drain nodes, cells and namespaces
 
-```
-Title:  Feature 🚀: Generic drain for nodes, cells and single namespaces, with a per-dataset drain hook
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Retiring a node or a cell means stopping new assignments, releasing local work and moving only state that requires another
-holder. Customer KV readers own no persistent namespace state: finish reads, close handles and drop cached bytes.
-Quicksilver is retained in every cell, while CDN artifacts have their own holders. One drain coordinates these different hooks.
-
-**Describe the solution you'd like**
-- **One operation:** `drain(scope, datasets, namespace?)`, through an operator API and CLI.
-  - `scope` is a node or a cell. `datasets` is all of them (the default) or a list. `namespace` narrows the drain to one namespace.
-  - The drain is a record in Quicksilver (`topology/drains/{id}`: scope, datasets, namespace, state, rate), changed by
-    ordinary ordered writes. Deleting the record cancels the drain; it does not introduce a membership/placement epoch.
-- **Placement:** relay range assignment (B-15, decision 13) gives draining members nothing new, and customer-KV cache
-  affinity skips them. Their existing L2 ranges hand off through B-21; customer-KV cache traffic reroutes without moving an
-  authoritative dataset.
-- **Execution** runs in each binary's B-20 reconciliation: the desired state excludes the draining target, and the dataset's
-  drain hook says what that means for each unit it holds. Moves are rate-limited and limited in concurrency per drain.
-- **Per-dataset drain hook:** for a scope and optional namespace, return the moves needed, "nothing to move", or `Unsupported`
-  (an explicit error, never a silent no-op):
-
-  | Dataset | Drain a node | Drain a cell | Drain one namespace from a cell |
-  |---|---|---|---|
-  | `quicksilver` (`full_replica`) | Ranges move to other nodes in the cell (B-21) | Nothing to move: every cell holds it | `Unsupported`: it must be in every cell |
-  | `kv` | Stop new reads, finish in-flight reads, close readers and release caches | Apply the same reader/cache drain on its nodes; S3 data stays in place | Close that namespace's readers and release its local cache |
-  | `auth` | Nothing to move: every cell-tier Gateway holds the whole namespace | Nothing to move: each cell subscribes on its own | `Unsupported` |
-  | `cdn` | Artifact holders move within the cell (B-21, B-43) | Nothing to move: each cell keeps its own holders; the cells taking its traffic can prewarm (B-45) | `Unsupported` until the CDN defines one |
-
-- **Progress and completion:** each dataset reports the units left on the target. The drain is complete when every selected
-  dataset reports zero; then the node can be stopped, or the cell removed from the region's cell list. Taking client traffic away
-  from a drained cell belongs to the front door, outside this issue.
-- **Metrics** (labelled by dataset and scope kind only): units left, moves started, completed and failed. Per-drain detail goes
-  through introspection.
-
-**Additional context**
-- **Implementation:** Shared core. The engine, the drain record and placement eligibility live in `lib`; each dataset's hook lives
-  with its dataset: KV in B-28, Quicksilver in B-24, Auth in B-42, CDN in B-43.
-- **Module:** `lib/reconciliation`, `lib/placement`.
-- **Doc reference:** `kv.md` §9 Cells and Customer KV: Origin Cells and Tiered Caching, §15.5; `cdn.md` §3; `feature-drafts.md` §4 decision 11.
-- **Depends on:** B-15, B-20, B-21.
-- **Acceptance criteria:**
-  - Draining a node under load leaves it holding nothing for any dataset, with no read going backwards.
-  - Draining a cell releases its customer-KV readers/caches and reports "nothing to move" across cells for Quicksilver,
-    Auth and the CDN; the cell gets no new assignments while it drains. No customer-KV S3 data is copied or deleted.
-  - Draining one KV namespace affects only its local handles/caches; unsupported dataset operations return `Unsupported`.
-  - An interrupted drain resumes after a restart. Cancelling a drain makes the target eligible again and leaves no partial copies.
-  - Moves never exceed the drain's rate and concurrency limits.
+Created: [#68](https://github.com/felixrydberg/bedrock/issues/68) — Feature 🚀: Generic drain for nodes, cells and single namespaces, with a per-dataset drain hook
 
 ---
 

@@ -8,6 +8,7 @@ use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, Replic
 use bedrock_lib::health::storage::StorageHealth;
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
+use bedrock_lib::reconciliation::drain::{self, Hook};
 
 pub const DATASETS: &[Dataset] = &[
     // Routing and deployment metadata, complete in every datacenter (`kv.md` §4).
@@ -37,6 +38,12 @@ const fn dataset(
             },
         },
     }
+}
+
+/// The drain hooks of `quicksilver` and `auth` (#68 / B-21b): both sit in L2 hash ranges, so a node drain is the ranges
+/// it is listed in, a cell drain has nothing to move, and one namespace is `Unsupported`.
+pub fn drain_hooks(view: &std::sync::Arc<membership::View>) -> Vec<std::sync::Arc<dyn Hook>> {
+    drain::ranged("quicksilver", view)
 }
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.

@@ -26,6 +26,7 @@ use tonic::Status;
 
 use crate::node::{MembershipSettings, ServiceConfig};
 use crate::placement::{self, Directory, Owner, State};
+use crate::reconciliation::drain::{self, Drain};
 use crate::relays::client::{Selection, Session, Target};
 pub use crate::relays::siblings::Members;
 use crate::relays::siblings::{self, Siblings};
@@ -44,6 +45,13 @@ const RECONCILE: Duration = Duration::from_secs(1);
 /// Services whose L2 is placed in hash ranges, and the datasets each places; every dataset has its own ranges (§4
 /// decisions 13 and 14). Customer KV ranks its readers instead (#18 / B-15).
 const RANGED: [(&str, &[&str]); 2] = [("quicksilver", &["quicksilver", "auth"]), ("cdn", &["cdn"])];
+/// The datasets a service places in hash ranges; empty for a service that places none.
+pub fn ranged_datasets(service: &str) -> &'static [&'static str] {
+    RANGED
+        .iter()
+        .find(|(s, _)| *s == service)
+        .map_or(&[], |(_, datasets)| datasets)
+}
 /// Directory keys are `range/{dataset}/{start:016x}`; node IDs cannot contain `/`.
 const RANGE: &str = "range/";
 /// Dataset → its placement directory.
@@ -430,6 +438,7 @@ pub fn place(
     actual: &Members,
     directories: &Directories,
     ready: &siblings::Ready,
+    drains: &[Drain],
 ) -> Vec<Change> {
     let Some((_, datasets)) = RANGED.iter().find(|(s, _)| *s == service) else {
         return Vec::new();
@@ -464,7 +473,10 @@ pub fn place(
             .collect();
         let mut entries = placement::handoff(directory, &healthy, &ready);
         if entries.is_empty() {
-            entries = placement::assign(directory, &members, &unhealthy, REPLICAS, MAX_MOVING);
+            // A drain's members are `draining`, and its rate bounds the handoffs (#68 / B-21b).
+            let drained = drain::apply(&members, drains, dataset);
+            let moving = drain::moving(drains, MAX_MOVING);
+            entries = placement::assign(directory, &drained, &unhealthy, REPLICAS, moving);
         }
         // Merges wait for a pass with nothing else to write, so they never share a plan with a split.
         let merges = if entries.is_empty() {
@@ -675,7 +687,7 @@ impl Cell {
                 let mut ready = self.hub.ready();
                 ready.extend(self.siblings.ready());
                 for (service, directories) in &directories {
-                    changes.extend(place(service, &actual, directories, &ready));
+                    changes.extend(place(service, &actual, directories, &ready, &[]));
                 }
             }
             let written = commit(changes, based, |change, base| async move {

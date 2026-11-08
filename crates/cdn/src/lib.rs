@@ -9,6 +9,7 @@ use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, Replic
 use bedrock_lib::health::storage::StorageHealth;
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
+use bedrock_lib::reconciliation::drain::{self, Hook};
 
 pub const DATASETS: &[Dataset] = &[Dataset {
     name: "cdn",
@@ -28,6 +29,12 @@ pub const DATASETS: &[Dataset] = &[Dataset {
         },
     },
 }];
+
+/// The `cdn` drain hook (#68 / B-21b): a node drain moves the ranges it holds artifacts for within the cell, a cell drain
+/// has nothing to move because each cell keeps its own holders, and one namespace is `Unsupported` until the CDN defines it.
+pub fn drain_hooks(view: &std::sync::Arc<membership::View>) -> Vec<std::sync::Arc<dyn Hook>> {
+    drain::ranged("cdn", view)
+}
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
 /// If the enabled CDN engine cannot open or is unhealthy at startup, its ranges are not followed and the node stays

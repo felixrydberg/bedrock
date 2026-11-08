@@ -2,6 +2,26 @@
 
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, ConfigError, ServiceConfig};
+use bedrock_lib::reconciliation::drain::{self, Hook, Outcome, Scope};
+
+/// Customer KV's drain (#68 / B-21b): stop new reads, finish the ones in flight, close readers and release caches. S3
+/// data stays in place, so it never has anything to move, and every scope and namespace is supported.
+// ponytail: readers arrive with B-39, so none is open to release yet; count them here once they exist.
+pub struct Readers;
+
+impl Hook for Readers {
+    fn dataset(&self) -> &str {
+        "kv"
+    }
+
+    fn drain(&self, _scope: &Scope, _namespace: Option<&str>) -> Result<Outcome, drain::Error> {
+        Ok(Outcome::NothingToMove)
+    }
+}
+
+pub fn drain_hooks() -> Vec<std::sync::Arc<dyn Hook>> {
+    vec![std::sync::Arc::new(Readers)]
+}
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
 /// Returns configuration, admin startup, or relay session initialization errors.

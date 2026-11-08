@@ -33,3 +33,14 @@ fn hosts_no_datasets() {
         assert!(check_hosts_nothing_pushed(&with_dataset).is_err());
     }
 }
+
+#[test]
+fn a_kv_drain_has_nothing_to_move_for_any_scope_and_namespace() {
+    use bedrock_lib::reconciliation::drain::Outcome;
+    for scope in [Scope::Node("kv-1".into()), Scope::Cell("eu-1a".into())] {
+        for namespace in [None, Some("customer")] {
+            assert_eq!(Readers.drain(&scope, namespace), Ok(Outcome::NothingToMove));
+        }
+    }
+    assert_eq!(drain_hooks().len(), 1);
+}

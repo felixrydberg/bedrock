@@ -15,3 +15,24 @@ fn opens_only_quicksilver_datasets() {
         assert!(Registry::open(DATASETS, &[other.into()], |_| unreachable!()).is_err());
     }
 }
+
+#[test]
+fn quicksilver_and_auth_drain_through_their_ranges() {
+    use bedrock_lib::reconciliation::drain::{Error, Outcome, Scope};
+    let (view, _) = membership::View::new("quicksilver", "eu-1a");
+    let hooks = drain_hooks(&std::sync::Arc::new(view));
+    let datasets: Vec<_> = hooks.iter().map(|h| h.dataset()).collect();
+    assert_eq!(datasets, ["quicksilver", "auth"]);
+    for hook in &hooks {
+        let node = Scope::Node("qs-1".into());
+        assert_eq!(hook.drain(&node, None), Ok(Outcome::NothingToMove));
+        assert_eq!(
+            hook.drain(&Scope::Cell("eu-1a".into()), None),
+            Ok(Outcome::NothingToMove)
+        );
+        assert!(matches!(
+            hook.drain(&node, Some("infrastructure")),
+            Err(Error::Unsupported { .. })
+        ));
+    }
+}

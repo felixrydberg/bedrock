@@ -207,8 +207,8 @@ fn draining_unhealthy_and_l1_members_get_nothing_new() {
         directory.extend(changes);
         settle(&mut directory, &members);
     }
-    // They keep what they held: moving it away is draining (B-21b), not assignment.
-    assert!(loads(&directory)["n00001"] > 0);
+    // What they held hands off (#68 / B-21b).
+    assert_eq!(loads(&directory).get("n00001").copied().unwrap_or(0), 0);
 }
 
 #[test]
@@ -575,4 +575,57 @@ fn neighbours_with_the_same_ready_owners_merge() {
     ]);
     assert_eq!(merges(&directory), [10, 20]);
     assert!(merges(&BTreeMap::new()).is_empty());
+}
+
+#[test]
+fn a_drained_node_hands_its_ranges_off_within_the_rate_and_cancelling_stops_it() {
+    use crate::reconciliation::drain::{self, Drain, Scope, State as Drained};
+    let members = cell(12, 4);
+    let mut directory = Directory::new();
+    converge(&mut directory, &members, &BTreeSet::new());
+    let held = |directory: &Directory| {
+        directory
+            .values()
+            .flatten()
+            .filter(|o| o.node == "n00001")
+            .count()
+    };
+    assert!(held(&directory) > 0);
+    let record = Drain {
+        scope: Scope::Node("n00001".into()),
+        datasets: Vec::new(),
+        namespace: None,
+        state: Drained::Draining,
+        rate: 2,
+    };
+    for _ in 0..200 {
+        let drained = drain::apply(&members, std::slice::from_ref(&record), "quicksilver");
+        let changes = assign(&directory, &drained, &BTreeSet::new(), R, 2);
+        directory.extend(changes);
+        assert!(moving(&directory) <= 2, "moves exceeded the drain rate");
+        settle(&mut directory, &members);
+        if held(&directory) == 0 {
+            break;
+        }
+    }
+    assert_eq!(held(&directory), 0, "the node still holds ranges");
+    for owners in directory.values() {
+        assert_eq!(owners.len(), R, "a drain cost a range its redundancy");
+    }
+    // Cancelled: the record is gone and the node takes ranges again.
+    converge(&mut directory, &members, &BTreeSet::new());
+    assert!(loads(&directory)["n00001"] > 0);
+}
+
+#[test]
+fn a_drain_with_no_member_to_take_the_range_keeps_the_owner() {
+    let mut members = cell(3, 3);
+    let mut directory = Directory::new();
+    converge(&mut directory, &members, &BTreeSet::new());
+    members.get_mut("n00001").unwrap().status = pb::member::Status::Draining as i32;
+    let changes = assign(&directory, &members, &BTreeSet::new(), R, usize::MAX);
+    assert!(
+        changes.is_empty(),
+        "the only copy of a range left: {changes:?}"
+    );
 }

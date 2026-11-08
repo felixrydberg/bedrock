@@ -84,7 +84,8 @@ pub type Directory = BTreeMap<u64, Vec<Owner>>;
 /// The entries to write so every range has `replicas` owners, in distinct failure domains when possible, and members
 /// hold their capacity-weighted share. At most `max_moving` ranges are in handoff at once, counting those already moving.
 /// Ranges of members missing from `members` (removed after the grace period) are reassigned; draining, unhealthy and
-/// non-`l2` members get nothing new. Decreasing `replicas` removes excess owners through bounded leaving handoffs.
+/// non-`l2` members get nothing new, and the ranges a draining member holds hand off like any `leaving` owner's
+/// (#68 / B-21b). Decreasing `replicas` removes excess owners through bounded leaving handoffs.
 pub fn assign(
     directory: &Directory,
     members: &BTreeMap<String, pb::Member>,
@@ -253,6 +254,20 @@ impl<'a> Plan<'a> {
                 continue;
             }
             let held: Vec<_> = owners.iter().filter(|o| o.holds()).collect();
+            // A drain (#68 / B-21b) hands each range of a draining owner to an eligible member. With none to take it
+            // the owner stays, so a drain never costs a range its redundancy.
+            let draining = held
+                .iter()
+                .find(|o| self.members[&o.node].status == pb::member::Status::Draining as i32)
+                .map(|o| o.node.clone());
+            if let Some(old) = draining {
+                if let Some(new) = self.pick(start, 1).first().copied() {
+                    self.mark_leaving(start, &old);
+                    self.add(start, new);
+                    self.moving += 1;
+                }
+                continue;
+            }
             if held.len() > replicas {
                 let old = held[0].node.clone();
                 self.mark_leaving(start, &old);

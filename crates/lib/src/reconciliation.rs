@@ -10,8 +10,10 @@
 //! repair will (B-34: desired = retained artifacts in my ranges, actual = local inventory, repair = fetch). L2 range
 //! handoff (#22 / B-21) does not use it: its steps are directory writes that only the cell relays' majority publisher
 //! may make, so they run in that publisher's pass (`membership::Cell`), which already freezes without a majority.
-//! [`rebuild`] (#23 / B-22) plans "rebuild" for each quarantined storage source.
+//! [`rebuild`] (#23 / B-22) plans "rebuild" for each quarantined storage source. [`drain`] (#68 / B-21b) is the drain
+//! record, the per-dataset drain hook and the placement it drives.
 
+pub mod drain;
 pub mod rebuild;
 
 use std::collections::{BTreeMap, BTreeSet};
