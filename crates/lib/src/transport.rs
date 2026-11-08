@@ -112,7 +112,9 @@ impl Peers {
     /// A raw connection to `addr` for non-gRPC protocols (the B-12 membership writes), over TLS when configured.
     pub async fn dial(&self, addr: &str) -> std::io::Result<Box<dyn Io>> {
         #[cfg(madsim)]
-        crate::sim::rpc(addr).await.map_err(std::io::Error::other)?;
+        if let Some(status) = crate::sim::rpc(addr).await.map_err(std::io::Error::other)? {
+            return Err(std::io::Error::other(status));
+        }
         match &self.tls {
             Some(tls) => tls.dial(addr).await,
             None => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),

@@ -359,7 +359,15 @@ pub fn check_handoff(
         if !owners.iter().any(ready) {
             continue;
         }
-        let serving = owners_at(after, range.0).any(|(_, state)| *state != OwnerState::Populating);
+        let serving = owners_at(after, range.0).any(|(_, state)| *state != OwnerState::Populating)
+            && after
+                .iter()
+                .filter(|(later, _)| within(*range, later.0))
+                .all(|(_, owners)| {
+                    owners
+                        .iter()
+                        .any(|(_, state)| *state != OwnerState::Populating)
+                });
         if !serving {
             return violation(
                 "NoDropBeforeReady",
@@ -395,7 +403,11 @@ pub fn check_routing(
 ) -> Result<(), Violation> {
     for (range, owners) in after {
         for (owner, _) in owners {
-            let held = owners_at(before, range.0).any(|(earlier, _)| earlier == owner);
+            let held = owners_at(before, range.0).any(|(earlier, _)| earlier == owner)
+                && before
+                    .iter()
+                    .filter(|(earlier, _)| within(*range, earlier.0))
+                    .all(|(_, owners)| owners.iter().any(|(earlier, _)| earlier == owner));
             if unhealthy.contains(owner) && !held {
                 return violation(
                     "NoUnhealthyRouting",

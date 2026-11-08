@@ -28,6 +28,34 @@ impl Harness for Rocks {
 
 storage_contract!(Rocks::default());
 
+#[test]
+#[allow(clippy::disallowed_methods)] // real threads exercise RocksDB's native write/restore race
+fn writes_remain_atomic_while_restore_changes_generations() {
+    let mut harness = Rocks::default();
+    let engine = harness.open();
+    let start = std::sync::Barrier::new(2);
+    for revision in 1..=4 {
+        std::thread::scope(|scope| {
+            let mut batch = WriteBatch::default();
+            for key in 0u32..262_144 {
+                batch.put(key.to_be_bytes(), [42; 64]);
+            }
+            batch.set_revision("ns", revision);
+            let writer = scope.spawn(|| {
+                start.wait();
+                engine.write(batch)
+            });
+            start.wait();
+            // Let the write start assembling its batch before restore changes generations.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            engine.restore(&*empty().snapshot().unwrap()).unwrap();
+            writer.join().unwrap().unwrap();
+        });
+        let has_data = engine.get(&0u32.to_be_bytes()).unwrap().is_some();
+        assert_eq!(has_data, engine.revision("ns").unwrap().is_some());
+    }
+}
+
 /// Flushes `key` into an SST file, then flips bytes in the file's first data block while the DB is closed.
 #[allow(clippy::disallowed_methods)] // test fault injection rewrites the instance's files
 fn corrupt_sst(engine: RocksDbAdapter, key: &[u8]) -> RocksDbAdapter {

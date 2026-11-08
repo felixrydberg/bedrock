@@ -1765,9 +1765,9 @@ profile of a simulated hour of seed 90003, the heaviest load shape we have. Gain
 | --- | --- | --- | --- |
 | Give WSL all 16 hardware threads (`processors` in `.wslconfig`) | Sweeps and soaks run one seed per CPU, and WSL has 8 of 16 threads | More seeds at once, less than double; a single seed gets no faster | A config change |
 | Undo log in `SimEngine::remember` | Rollback copies the whole engine on every commit, when only changed keys matter | Up to about 21% on seeds with lost-write faults | About 30 lines |
-| `mimalloc` in the test binary | About 37% of the time is in shared libraries, likely `malloc`, `free` and `memcpy` | Maybe 10–15% | A few lines |
-| LTO and one codegen unit for simulation builds | The release profile uses neither | Maybe 5–15%, for slower builds | A few lines |
-| Count stale timers, then reduce them or patch `naive_timer` | `Timer::expire` is about 25%, and timers cannot be cancelled, so dropped timeouts stay in the heap | Unknown until counted | A small fork at most |
+| `mimalloc` in the test binary — done | The VOPR binary uses `mimalloc`; allocation was a large share of the profile | About a quarter faster than glibc's allocator | Implemented |
+| LTO and one codegen unit for simulation builds — done | The `sim` profile enables fat LTO and one codegen unit; soak and watch use it | About 16% faster seed runs, for slower builds | Implemented |
+| Patch `naive_timer` usage to set one timer per deadline and waker — done | The vendored madsim `Sleep` avoids adding another timer on every poll | Not measured separately | Implemented; remove the patch when upstream includes it |
 | Break down `Hub::pump` and the rest of the per-commit cost | `Hub::pump` is about 17%, and most of the run is unexplained | Unknown | A profiling pass |
 
 Each change must leave every seed's trace unchanged, except where it is meant to change behaviour. A trace that moves after an

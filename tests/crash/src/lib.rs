@@ -135,9 +135,18 @@ impl Options {
             faults: {
                 let named = var("FAULTS").unwrap_or_else(|| "all".into());
                 let named: Vec<&str> = named.split(',').collect();
+                for name in &named {
+                    assert!(
+                        matches!(*name, "all" | "none")
+                            || FAULTS.iter().any(|(known, _)| known == name),
+                        "unknown fault class {name}"
+                    );
+                }
                 FAULTS
                     .iter()
-                    .filter(|(name, _)| named.contains(name) || named.contains(&"all"))
+                    .filter(|(name, _)| {
+                        !named.contains(&"none") && (named.contains(name) || named.contains(&"all"))
+                    })
                     .map(|(_, fault)| *fault)
                     .collect()
             },
@@ -885,7 +894,9 @@ async fn driver(run: Arc<Run>, id: u64, deadline: Instant) {
                     }
                     (Some(2), Some(dataset)) => {
                         run.record(format!("wipe {} {dataset}", node.name));
-                        fs::remove_dir_all(node.data.join(dataset)).unwrap();
+                        if let Err(error) = fs::remove_dir_all(node.data.join(dataset)) {
+                            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+                        }
                     }
                     _ => {}
                 }

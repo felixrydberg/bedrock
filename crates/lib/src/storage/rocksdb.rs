@@ -132,10 +132,6 @@ impl RocksDbAdapter {
         self.handle(&name(DATA, *self.generation.read().unwrap()))
     }
 
-    fn revisions(&self) -> Arc<BoundColumnFamily<'_>> {
-        self.handle(&name(REVISIONS, *self.generation.read().unwrap()))
-    }
-
     fn view(&self) -> View<'_> {
         let generation = self.generation.read().unwrap();
         View {
@@ -299,7 +295,11 @@ impl StorageEngine for RocksDbAdapter {
     }
 
     fn write(&self, batch: WriteBatch) -> StorageResult<()> {
-        let (data, revisions) = (self.data(), self.revisions());
+        let generation = self.generation.read().unwrap();
+        let (data, revisions) = (
+            self.handle(&name(DATA, *generation)),
+            self.handle(&name(REVISIONS, *generation)),
+        );
         let mut rocks = ::rocksdb::WriteBatch::default();
         for op in batch.ops {
             match op {
@@ -319,7 +319,9 @@ impl StorageEngine for RocksDbAdapter {
                 None => rocks.delete_cf(&revisions, name),
             }
         }
-        self.commit(rocks)
+        let result = self.commit(rocks);
+        drop(generation);
+        result
     }
 
     fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
