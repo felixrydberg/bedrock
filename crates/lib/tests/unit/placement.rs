@@ -549,3 +549,30 @@ fn handoff_keeps_leaving_owner_until_all_replacements_are_ready() {
     assert!(!serves(&directory, "old", 10));
     assert!(serves(&directory, "new-2", 10));
 }
+
+/// #66 / B-61: neighbours with the same ready owners merge, whatever order they are listed in, and a chain merges into its
+/// first range; a range mid-handoff, or with different owners, stays apart.
+#[test]
+fn neighbours_with_the_same_ready_owners_merge() {
+    let owners = |nodes: &[&str], state: State| -> Vec<Owner> {
+        nodes
+            .iter()
+            .map(|node| Owner {
+                node: (*node).into(),
+                state,
+            })
+            .collect()
+    };
+    let directory: Directory = BTreeMap::from([
+        (0, owners(&["a", "b"], State::Ready)),
+        (10, owners(&["b", "a"], State::Ready)),
+        (20, owners(&["a", "b"], State::Ready)),
+        (30, owners(&["a", "c"], State::Ready)),
+        (40, owners(&["a", "c"], State::Populating)),
+        (50, owners(&["a", "c"], State::Ready)),
+        (60, Vec::new()),
+        (70, Vec::new()),
+    ]);
+    assert_eq!(merges(&directory), [10, 20]);
+    assert!(merges(&BTreeMap::new()).is_empty());
+}

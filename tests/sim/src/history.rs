@@ -184,14 +184,20 @@ impl History {
         Ok(())
     }
 
-    /// `stream`'s keys and values after `revision`.
-    pub fn state_at(&self, stream: &Stream, revision: u64) -> BTreeMap<Key, Value> {
+    /// The values of the keys of `stream` that `selected` accepts, after `revision`.
+    pub fn state_at(
+        &self,
+        stream: &Stream,
+        revision: u64,
+        selected: impl Fn(&[u8]) -> bool,
+    ) -> BTreeMap<Key, Value> {
         let keys = self.versions.get(stream).into_iter().flatten();
-        keys.filter_map(|(key, versions)| {
-            let (_, value) = versions.range(..=revision).next_back()?;
-            Some((key.clone(), value.clone()?))
-        })
-        .collect()
+        keys.filter(|(key, _)| selected(key))
+            .filter_map(|(key, versions)| {
+                let (_, value) = versions.range(..=revision).next_back()?;
+                Some((key.clone(), value.clone()?))
+            })
+            .collect()
     }
 
     fn versions(&self, stream: &Stream, key: &[u8]) -> Option<&BTreeMap<u64, Option<Value>>> {
@@ -214,8 +220,7 @@ impl History {
                 format!("{stream:?} is applied at {revision}, past the writer's head {head}"),
             );
         }
-        let mut expected = self.state_at(stream, revision);
-        expected.retain(|key, _| selected(key));
+        let expected = self.state_at(stream, revision, selected);
         let keys: BTreeSet<&Key> = expected.keys().chain(held.keys()).collect();
         for key in keys {
             self.check_key(stream, revision, key, expected.get(key), held.get(key))?;
@@ -337,10 +342,14 @@ pub fn check_coverage(placement: &Placement) -> Result<(), Violation> {
 }
 
 /// The owners of the range containing `hash`.
+/// The owners of the range holding `hash`, found by binary search: `placement` is sorted by start, as the harnesses build
+/// it from the directory. A scan made every directory write cost the square of the range count (#66 / B-61).
 fn owners_at(placement: &Placement, hash: u64) -> impl Iterator<Item = &(String, OwnerState)> {
-    placement
-        .iter()
-        .filter(move |(range, _)| within(*range, hash))
+    let after = placement.partition_point(|(range, _)| range.0 <= hash);
+    placement[..after]
+        .last()
+        .filter(|(range, _)| within(*range, hash))
+        .into_iter()
         .flat_map(|(_, owners)| owners)
 }
 

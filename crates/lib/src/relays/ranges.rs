@@ -2,8 +2,10 @@
 //! holds, and whether its own directory view confirms a revoke.
 //!
 //! A relay pushes the member's whole range set per dataset. A held range the set still contains is unchanged. One it
-//! contains only parts of was split: the member keeps those parts with their coverage and drops the rest. One the set
-//! no longer touches is revoked. A pushed range inside no held range is new. Every drop needs confirmation.
+//! contains only parts of was split or re-cut: the member keeps those parts with their coverage and drops the rest. One
+//! the set no longer touches is revoked. A pushed range inside no held range is new. Every drop needs confirmation.
+//! Ranges also merge (#66 / B-61, `docs/spec/merge.tla`): a pushed range made of several kept parts joins their consumers
+//! once each namespace's are at the same revision, and one with gaps bootstraps whole over them.
 
 use std::collections::BTreeSet;
 
@@ -57,16 +59,33 @@ pub struct Change {
     pub dropped: Vec<Range>,
 }
 
+/// Held ranges a pushed range is exactly made of, to join once their consumers agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merge {
+    pub into: Range,
+    pub parts: Vec<Range>,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
     pub changed: Vec<Change>,
     pub added: Vec<Range>,
+    pub merged: Vec<Merge>,
+    /// Pushed ranges holding held ones that do not fill them: a merged range given to a member that kept only some of its
+    /// parts. The parts' consumers retire and the range bootstraps whole, as a new one does; nothing is dropped, since the
+    /// member is a populating owner and its bootstrap replaces the span.
+    pub absorbed: Vec<Merge>,
 }
 
 /// What the pushed `spans` mean for the `held` ranges and the durably `stored` ones. A stored range outside every held one
-/// has data but no consumer. If the set still has it whole it is new; otherwise the parts still pushed are kept, and the rest
-/// drop. Malformed or overlapping spans and a pushed range that straddles a held or stored one return a data-loss status:
-/// assignment only ever splits ranges.
+/// has data but no consumer. Merges move range boundaries (#66 / B-61), so a pushed set may cut any held range anywhere:
+///
+/// 1. Each held or stored range keeps its parts inside pushed ranges, each with its coverage, and drops the rest. A stored
+///    range the set still has whole is new, since nothing follows it.
+/// 2. A pushed range made of more than one whole kept part merges them; one with parts and gaps absorbs its parts and
+///    bootstraps whole; one with no parts is new.
+///
+/// Malformed or overlapping spans return a data-loss status.
 pub fn plan(held: &[Range], stored: &[Range], spans: &[pb::Span]) -> Result<Plan, Status> {
     if spans.iter().any(|s| !valid_span(s)) {
         return Err(Status::data_loss("invalid pushed range"));
@@ -76,54 +95,76 @@ pub fn plan(held: &[Range], stored: &[Range], spans: &[pb::Span]) -> Result<Plan
     if pushed.windows(2).any(|w| overlaps(w[0], w[1])) {
         return Err(Status::data_loss("overlapping pushed ranges"));
     }
+    let size = |range: &Range| end(*range) - u128::from(range.0);
     let mut plan = Plan::default();
-    let parts = |h: Range| -> Vec<Range> {
-        let parts = pushed.iter().copied().filter(|p| within(*p, h));
-        parts.collect()
-    };
     let stored: Vec<Range> = stored
         .iter()
         .copied()
         .filter(|s| !held.iter().any(|h| within(*s, *h)))
         .collect();
-    for &p in &pushed {
-        let overlapping = held.iter().chain(&stored).find(|h| overlaps(p, **h));
-        if overlapping.is_some_and(|h| !within(p, *h)) {
-            return Err(Status::data_loss("pushed range straddles a held range"));
+    // Kept parts, and whether something follows them: a stored range kept whole has no consumer.
+    let mut pieces: Vec<(Range, bool)> = Vec::new();
+    for (&h, followed) in held
+        .iter()
+        .map(|h| (h, true))
+        .chain(stored.iter().map(|s| (s, false)))
+    {
+        let kept: Vec<Range> = pushed
+            .iter()
+            .filter(|p| overlaps(h, **p))
+            .map(|p| intersection(h, *p))
+            .collect();
+        if kept == [h] {
+            pieces.push((h, followed));
+            continue;
         }
-        let split = stored.iter().any(|s| within(p, *s) && parts(*s) != [*s]);
-        if !split && !held.iter().any(|h| overlaps(p, *h)) {
+        let dropped = minus(h, &kept);
+        assert_eq!(
+            kept.iter().chain(&dropped).map(size).sum::<u128>(),
+            size(&h),
+            "kept and dropped parts must exactly fill the held range"
+        );
+        pieces.extend(kept.iter().map(|k| (*k, true)));
+        plan.changed.push(Change {
+            held: h,
+            dropped,
+            kept,
+        });
+    }
+    for &p in &pushed {
+        let inside: Vec<(Range, bool)> = pieces
+            .iter()
+            .copied()
+            .filter(|(r, _)| within(*r, p))
+            .collect();
+        let mut parts: Vec<Range> = inside.iter().map(|(r, _)| *r).collect();
+        parts.sort_unstable();
+        // A held part may also be a kept part of a stored range around it.
+        parts.dedup();
+        if parts.is_empty() || inside == [(p, false)] {
+            plan.added.push(p);
+            continue;
+        }
+        if parts == [p] {
+            continue;
+        }
+        let whole = parts.iter().map(size).sum::<u128>() == size(&p);
+        let merge = Merge { into: p, parts };
+        if whole && inside.iter().all(|(_, followed)| *followed) {
+            plan.merged.push(merge);
+        } else {
+            plan.absorbed.push(merge);
             plan.added.push(p);
         }
     }
-    for &h in held {
-        let kept: Vec<Range> = pushed.iter().copied().filter(|p| within(*p, h)).collect();
-        if kept != [h] {
-            let dropped = minus(h, &kept);
-            let size = |range: &Range| end(*range) - u128::from(range.0);
-            assert_eq!(
-                kept.iter().chain(&dropped).map(size).sum::<u128>(),
-                size(&h),
-                "kept and dropped parts must exactly fill the held range"
-            );
-            plan.changed.push(Change {
-                held: h,
-                dropped,
-                kept,
-            });
-        }
-    }
-    for &h in &stored {
-        let kept = parts(h);
-        if kept != [h] {
-            plan.changed.push(Change {
-                held: h,
-                dropped: minus(h, &kept),
-                kept,
-            });
-        }
-    }
     Ok(plan)
+}
+
+/// The part of `a` inside `b`; they must overlap.
+fn intersection(a: Range, b: Range) -> Range {
+    let start = a.0.max(b.0);
+    let stop = if end(a) <= end(b) { a.1 } else { b.1 };
+    (start, stop)
 }
 
 /// Whether `node`'s own directory view confirms dropping `range`: every directory range overlapping it no longer lists

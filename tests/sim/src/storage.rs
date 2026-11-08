@@ -535,6 +535,10 @@ impl Snapshot for Frozen {
     fn revisions(&self) -> StorageResult<BTreeMap<String, u64>> {
         Ok(self.revisions.clone())
     }
+
+    fn revisions_in(&self, ranges: &[super::Names]) -> StorageResult<BTreeMap<String, u64>> {
+        Ok(super::names_in(&self.revisions, ranges))
+    }
 }
 
 impl Frozen {
@@ -859,6 +863,11 @@ impl Snapshot for SimSnapshot<'_> {
     fn revisions(&self) -> StorageResult<BTreeMap<String, u64>> {
         self.owner.check_read()?;
         self.inner.revisions()
+    }
+
+    fn revisions_in(&self, ranges: &[super::Names]) -> StorageResult<BTreeMap<String, u64>> {
+        self.owner.check_read()?;
+        self.inner.revisions_in(ranges)
     }
 }
 

@@ -72,6 +72,12 @@ all membership changes until it returns.
   epoch.
 - **Freeze.** Without a majority nothing is written, so placement freezes with membership and nodes keep serving
   what they hold.
+- **Merges.** Assignment only splits ranges, so with churn their count would grow without bound, and with it every write's
+  fan-out to range streams (#66 / B-61). On a pass with nothing else to write, the publisher deletes the entry of each
+  range whose owners are the same nodes as the range before it, all `ready` (`placement::merges`). No hash changes
+  owners, so a merge needs no handoff. A member holding the parts joins their consumers once each namespace's are at the
+  same revision; a member holding only some parts bootstraps the merged range whole over them
+  ([relays.md](relays.md#range-streams)). Merges move range boundaries, so a later split can cut a held range anywhere.
 
 ## Range handoff
 
@@ -116,8 +122,10 @@ Invariants and properties:
 - `Freeze`: with no majority anywhere, the published view and directory do not change.
 
 The directory adds `Points`, the possible range starts, and `Write(r, p, o)`, which writes owners `o` at start
-`p` (a new start splits the covering range). `Write` allows any plan within the assigner's rules, so the model
-checks those rules rather than `assign`'s balance:
+`p` (a new start splits the covering range). `Merge(r, p)` deletes start `p` when its entry equals the range before
+it's (#66 / B-61). `Write` allows any plan within the assigner's rules, so the model checks those rules rather than
+`assign`'s balance. The deliberate bug `merge-unequal` merges ranges with different owners and breaks
+`NoDropBeforeReady`:
 
 - `DirectoryCoverage`: start 0 always exists, so the implicit range ends cover the hash space.
 - `NewOwnersPublished`: only published, non-draining members become new owners.

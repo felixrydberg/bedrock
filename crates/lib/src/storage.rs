@@ -259,6 +259,45 @@ pub trait Snapshot: Send + Sync {
     fn scan(&self, range: &KeyRange) -> StorageResult<Scan<'_>>;
     fn revision(&self, name: &str) -> StorageResult<Option<u64>>;
     fn revisions(&self) -> StorageResult<BTreeMap<String, u64>>;
+
+    /// The revisions named within any of `ranges`, each a half-open `[from, to)` of names, in one read. Revision names
+    /// grow with range history, so adapters override this to read only those names (#66 / B-61).
+    fn revisions_in(&self, ranges: &[Names]) -> StorageResult<BTreeMap<String, u64>> {
+        Ok(names_in(&self.revisions()?, ranges))
+    }
+}
+
+/// A half-open range `[from, to)` of revision names.
+pub type Names = (String, String);
+
+/// Every name starting with `prefix`, which must end in an ASCII character other than DEL, as the callers' `:` does.
+pub fn prefixed(prefix: &str) -> Names {
+    let mut to = prefix.to_owned();
+    let last = to.pop().filter(|c| c.is_ascii() && *c != '\x7f');
+    let last = last.expect("a prefix ends in an ASCII character other than DEL");
+    to.push(char::from(last as u8 + 1));
+    (prefix.to_owned(), to)
+}
+
+/// Exactly `name`: nothing sorts between it and itself followed by NUL.
+pub fn named(name: &str) -> Names {
+    (name.to_owned(), format!("{name}\0"))
+}
+
+/// The entries of `revisions` named within any of `ranges`.
+pub fn names_in(revisions: &BTreeMap<String, u64>, ranges: &[Names]) -> BTreeMap<String, u64> {
+    let mut found = BTreeMap::new();
+    for (from, to) in ranges.iter().filter(|(from, to)| from < to) {
+        found.extend(
+            revisions
+                .range::<str, _>((
+                    std::ops::Bound::Included(from.as_str()),
+                    std::ops::Bound::Excluded(to.as_str()),
+                ))
+                .map(|(name, revision)| (name.clone(), *revision)),
+        );
+    }
+    found
 }
 
 /// One local storage instance. Adapters pass the contract suite in `tests/support/storage_contract.rs`.

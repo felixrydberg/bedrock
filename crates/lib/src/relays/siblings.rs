@@ -206,6 +206,10 @@ impl pb::siblings_server::Siblings for Server {
             let mut sent = Members::new();
             let mut sent_ready = Ready::new();
             let mut sent_interests = Interests::new();
+            // Rebuilt only when the hub-wide version moves, as every follow and unfollow does: building it walks every
+            // stream, and this runs each second (#66 / B-61). A cursor in it matters only when an interest is first sent.
+            let mut interests = Interests::new();
+            let mut interests_at = None;
             let mut synced = false;
             loop {
                 let at = version.get();
@@ -215,7 +219,11 @@ impl pb::siblings_server::Siblings for Server {
                     Members::new()
                 };
                 let ready = hub.ready();
-                let interests = hub.interests();
+                let planned = hub.0.changed.get();
+                if interests_at != Some(planned) {
+                    interests = hub.interests();
+                    interests_at = Some(planned);
+                }
                 let mut changed_ready: Vec<pb::Ready> = ready
                     .iter()
                     .filter(|(key, spans)| sent_ready.get(*key) != Some(*spans))
@@ -265,7 +273,7 @@ impl pb::siblings_server::Siblings for Server {
                     }
                     sent = current;
                     sent_ready = ready;
-                    sent_interests = interests;
+                    sent_interests = interests.clone();
                     synced = true;
                 }
                 tokio::select! {

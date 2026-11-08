@@ -15,7 +15,7 @@ use crate::placement::{hash_of, in_span, valid_span};
 use crate::replication::log::Watched;
 use crate::replication::pb;
 use crate::storage::{KeyRange, StorageEngine, WriteBatch, l2_key, l2_parts, l2_span};
-use crate::storage::{Snapshot, StorageResult};
+use crate::storage::{Snapshot, StorageResult, named, prefixed};
 use crate::transport::{Class, Peers};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -53,6 +53,8 @@ struct Pushed {
     pending: BTreeMap<String, pb::Ranges>,
     /// Ranges unfollowed on this connection; frames the relay sent before the unfollow are dropped.
     retired: BTreeSet<(String, Range)>,
+    /// Per dataset, held ranges the latest applied set merged, joined once their consumers agree (#66 / B-61).
+    merges: BTreeMap<String, Vec<ranges::Merge>>,
 }
 
 fn span(range: Option<(u64, u64)>) -> Option<pb::Span> {
@@ -75,7 +77,7 @@ fn held(engine: &dyn StorageEngine, dataset: &str) -> Result<BTreeSet<Range>, St
     let revisions = engine
         .snapshot()
         .map_err(storage)?
-        .revisions()
+        .revisions_in(&[prefixed(&prefix)])
         .map_err(storage)?;
     revisions
         .iter()
@@ -104,7 +106,11 @@ pub fn applied_at(
     span: Option<Range>,
 ) -> StorageResult<Option<u64>> {
     let names = Names::of(dataset, namespace, prefix, span);
-    let revisions = snapshot.revisions()?;
+    let revisions = snapshot.revisions_in(&[
+        named(&names.active),
+        named(&names.pending),
+        named(&names.revision),
+    ])?;
     let validated =
         revisions.get(&names.active) == Some(&1) && revisions.get(&names.pending) != Some(&1);
     Ok(validated
@@ -119,7 +125,7 @@ pub fn applied_ranges(
 ) -> StorageResult<Vec<(String, Range, u64)>> {
     let prefix = format!("relay:range:{dataset}:");
     let mut applied = Vec::new();
-    for (name, value) in snapshot.revisions()? {
+    for (name, value) in snapshot.revisions_in(&[prefixed(&prefix)])? {
         let Some(rest) = name.strip_prefix(&prefix).filter(|_| value == 1) else {
             continue;
         };
@@ -322,6 +328,7 @@ impl Session {
             }),
             pending: BTreeMap::new(),
             retired: BTreeSet::new(),
+            merges: BTreeMap::new(),
         };
         // Without its own view a member could never confirm a revoke or acknowledge a pushed set.
         if !pushed.ranged.is_empty()
@@ -545,7 +552,7 @@ impl Consumer {
             .engine
             .snapshot()
             .map_err(storage)?
-            .revisions()
+            .revisions_in(&[prefixed(&prefix)])
             .map_err(storage)?;
         revisions
             .iter()
@@ -590,7 +597,9 @@ impl Consumer {
             target.span,
         );
         let snapshot = target.engine.snapshot().map_err(storage)?;
-        let revisions = snapshot.revisions().map_err(storage)?;
+        let revisions = snapshot
+            .revisions_in(&[prefixed(&active_prefix)])
+            .map_err(storage)?;
         let matches = revisions.get(&active) == Some(&1);
         let previous = revisions
             .iter()
@@ -792,8 +801,8 @@ impl Consumer {
         }
     }
 
-    /// Hands this range consumer's coverage to `range`, a part of its range a split kept: every revision applied for
-    /// the whole range is applied for the part. Unvalidated progress is not handed on; the part bootstraps.
+    /// Hands this range consumer's coverage to `range`: a part of its range a split kept, or a merged range whose every part
+    /// is at this revision. Unvalidated progress is not handed on; the range bootstraps.
     fn carry(&self, batch: &mut WriteBatch, range: Range) {
         self.mark(batch, range);
         let s = &self.target.selection;
@@ -827,12 +836,23 @@ impl Consumer {
             self.recover || boundary >= self.applied,
             "applied revision moved backwards"
         );
+        // Only the names this commit retires, and the markers of ranges starting inside its own that it may overtake:
+        // not every name the engine holds, which grow with range history (#66 / B-61).
+        let mut names = vec![prefixed(&self.active_prefix)];
+        if let Some((start, end)) = self.target.span {
+            let markers = format!("relay:range:{}:", self.target.selection.dataset);
+            let to = match end {
+                0 => prefixed(&markers).1,
+                end => format!("{markers}{end:016x}"),
+            };
+            names.push((format!("{markers}{start:016x}"), to));
+        }
         let revisions = self
             .target
             .engine
             .snapshot()
             .map_err(storage)?
-            .revisions()
+            .revisions_in(&names)
             .map_err(storage)?;
         for name in revisions
             .keys()
@@ -1115,6 +1135,7 @@ async fn run(
             // A new session starts with the relay's current set.
             pushed.pending.clear();
             pushed.retired.clear();
+            pushed.merges.clear();
             let error = connection(
                 &peers,
                 upstream,
@@ -1130,6 +1151,7 @@ async fn run(
             if drained() {
                 return;
             }
+            tracing::warn!(%upstream, %error, "relay session ended");
             changed(&progress, &changes, |state| {
                 state.connected = false;
                 state.error = Some(error.clone());
@@ -1322,6 +1344,10 @@ async fn connected(
             Some(pb::relay_frame::Kind::Ranges(ranges)) => {
                 pushed.pending.insert(ranges.dataset.clone(), ranges);
                 settle(&requests, consumers, pushed, progress, changes).await?;
+                // A merge's parts may already agree, and a quiet stream would bring no frame to try it after.
+                for kind in join(consumers, pushed, progress, changes)? {
+                    send(&requests, pb::RelayRequest { kind: Some(kind) }).await?;
+                }
                 intake.forget(consumers);
                 continue;
             }
@@ -1429,6 +1455,13 @@ async fn connected(
             settle(&requests, consumers, pushed, progress, changes).await?;
             intake.forget(consumers);
         }
+        // This frame may have brought a merge's consumers level.
+        if !pushed.merges.is_empty() {
+            for kind in join(consumers, pushed, progress, changes)? {
+                send(&requests, pb::RelayRequest { kind: Some(kind) }).await?;
+            }
+            intake.forget(consumers);
+        }
     }
 }
 
@@ -1475,6 +1508,8 @@ async fn settle(
             // reconnects for a new push; a rebuild empties storage that stays unreadable.
             let stored: Vec<Range> = self::held(engine.as_ref(), &dataset)?.into_iter().collect();
             let plan = ranges::plan(&held, &stored, &frame.spans)?;
+            // Held ranges a refused cut leaves whole: a merge or new range over them waits for the next push.
+            let mut blocked = Vec::new();
             for change in &plan.changed {
                 let unhealthy = members
                     .values()
@@ -1489,6 +1524,7 @@ async fn settle(
                         tracing::warn!(%dataset, held = ?change.held, %reason, "refused a revoke the directory view does not confirm");
                         refused.extend(change.dropped.iter().filter_map(|d| span(Some(*d))));
                         reasons.push(reason);
+                        blocked.push(change.held);
                         continue;
                     }
                 };
@@ -1498,7 +1534,18 @@ async fn settle(
                     send(requests, pb::RelayRequest { kind: Some(kind) }).await?;
                 }
             }
-            for range in plan.added {
+            let clear = |range: &Range| !blocked.iter().any(|b| ranges::overlaps(*b, *range));
+            // The latest set decides: a merge it no longer has is dropped before it starts.
+            let merges = plan.merged.iter().filter(|m| clear(&m.into)).cloned();
+            pushed.merges.insert(dataset.clone(), merges.collect());
+            for absorbed in plan.absorbed.iter().filter(|a| clear(&a.into)) {
+                for kind in absorb(
+                    &dataset, &engine, absorbed, consumers, pushed, progress, changes,
+                )? {
+                    send(requests, pb::RelayRequest { kind: Some(kind) }).await?;
+                }
+            }
+            for range in plan.added.into_iter().filter(clear) {
                 pushed
                     .groups
                     .insert((dataset.clone(), range), engine.clone());
@@ -1534,6 +1581,166 @@ async fn settle(
         .await?;
     }
     Ok(())
+}
+
+/// Joins the consumers of each pending merge whose parts agree: every namespace of the dataset has a validated consumer
+/// for every part, all at one revision. One atomic batch retires them and gives the merged range that coverage
+/// (`docs/spec/merge.tla`); merging at a lower revision would roll a part back, at a higher one skip some of its events.
+/// Returns the requests that move the relay's streams to the merged ranges. Write and consumer errors propagate.
+fn join(
+    consumers: &mut BTreeMap<Scope, Consumer>,
+    pushed: &mut Pushed,
+    progress: &Mutex<Progress>,
+    changes: &Watched<u64>,
+) -> Result<Vec<pb::relay_request::Kind>, Status> {
+    let mut requests = Vec::new();
+    for (dataset, merges) in pushed.merges.clone() {
+        let Some(engine) = pushed.ranged.get(&dataset).cloned() else {
+            continue;
+        };
+        for merge in merges {
+            let mut scopes = Vec::new();
+            let mut level = true;
+            for namespace in crate::placement::namespaces(&dataset) {
+                let parts: Vec<Scope> = merge
+                    .parts
+                    .iter()
+                    .map(|part| (dataset.clone(), (*namespace).to_owned(), Some(*part)))
+                    .collect();
+                let applied: Option<BTreeSet<u64>> = parts
+                    .iter()
+                    .map(|scope| {
+                        consumers
+                            .get(scope)
+                            .filter(|c| c.validated())
+                            .map(|c| c.applied)
+                    })
+                    .collect();
+                level &= applied.is_some_and(|applied| applied.len() == 1);
+                scopes.extend(parts);
+            }
+            if !level {
+                continue;
+            }
+            let mut batch = WriteBatch::default();
+            for scope in &scopes {
+                consumers[scope].retire(&mut batch);
+            }
+            for scope in scopes
+                .iter()
+                .filter(|scope| scope.2 == Some(merge.parts[0]))
+            {
+                consumers[scope].carry(&mut batch, merge.into);
+            }
+            if let Err(error) = engine.write(batch) {
+                // The batch may have committed, so these cursors may no longer be stored.
+                for scope in &scopes {
+                    consumers.get_mut(scope).unwrap().distrust();
+                }
+                return Err(storage(error));
+            }
+            for scope in &scopes {
+                consumers.remove(scope);
+            }
+            changed(progress, changes, |state| {
+                for scope in &scopes {
+                    state.scopes.remove(scope);
+                    state.rebuilt.remove(scope);
+                }
+            });
+            let group = Target {
+                selection: Selection {
+                    dataset: dataset.clone(),
+                    namespace: String::new(),
+                },
+                engine: engine.clone(),
+                prefix: Vec::new(),
+                span: None,
+            };
+            let mut from_namespaces = BTreeMap::new();
+            for namespace in crate::placement::namespaces(&dataset) {
+                let consumer = Consumer::in_range(&group, namespace, merge.into)?;
+                from_namespaces.insert((*namespace).to_owned(), consumer.resume());
+                let scope = consumer.scope();
+                changed(progress, changes, |state| {
+                    state.scopes.insert(
+                        scope.clone(),
+                        (consumer.applied, None, consumer.validated()),
+                    );
+                });
+                consumers.insert(scope, consumer);
+            }
+            for part in &merge.parts {
+                pushed.groups.remove(&(dataset.clone(), *part));
+                pushed.retired.insert((dataset.clone(), *part));
+                requests.push(pb::relay_request::Kind::Unfollow(pb::Unfollow {
+                    dataset: dataset.clone(),
+                    namespace: String::new(),
+                    span: span(Some(*part)),
+                }));
+            }
+            pushed
+                .groups
+                .insert((dataset.clone(), merge.into), engine.clone());
+            requests.push(pb::relay_request::Kind::Follow(pb::Follow {
+                dataset: dataset.clone(),
+                namespace: String::new(),
+                from: 0,
+                span: span(Some(merge.into)),
+                from_namespaces,
+                ..Default::default()
+            }));
+            if let Some(pending) = pushed.merges.get_mut(&dataset) {
+                pending.retain(|m| *m != merge);
+            }
+        }
+    }
+    pushed.merges.retain(|_, merges| !merges.is_empty());
+    Ok(requests)
+}
+
+/// Retires the consumers of held ranges inside `absorbed.into`, which the caller then follows as a new range: it
+/// bootstraps over their data, which is never dropped. Returns the requests that end the parts' streams. Write errors
+/// propagate.
+fn absorb(
+    dataset: &str,
+    engine: &Arc<dyn StorageEngine>,
+    absorbed: &ranges::Merge,
+    consumers: &mut BTreeMap<Scope, Consumer>,
+    pushed: &mut Pushed,
+    progress: &Mutex<Progress>,
+    changes: &Watched<u64>,
+) -> Result<Vec<pb::relay_request::Kind>, Status> {
+    let scopes: Vec<Scope> = consumers
+        .keys()
+        .filter(|(d, _, range)| d == dataset && range.is_some_and(|r| absorbed.parts.contains(&r)))
+        .cloned()
+        .collect();
+    let mut batch = WriteBatch::default();
+    for scope in &scopes {
+        consumers[scope].retire(&mut batch);
+    }
+    engine.write(batch).map_err(storage)?;
+    for scope in &scopes {
+        consumers.remove(scope);
+    }
+    changed(progress, changes, |state| {
+        for scope in &scopes {
+            state.scopes.remove(scope);
+            state.rebuilt.remove(scope);
+        }
+    });
+    let mut requests = Vec::new();
+    for part in &absorbed.parts {
+        pushed.groups.remove(&(dataset.to_owned(), *part));
+        pushed.retired.insert((dataset.to_owned(), *part));
+        requests.push(pb::relay_request::Kind::Unfollow(pb::Unfollow {
+            dataset: dataset.to_owned(),
+            namespace: String::new(),
+            span: span(Some(*part)),
+        }));
+    }
+    Ok(requests)
 }
 
 /// Carries a held range's coverage to the parts a split kept and deletes the dropped parts in one atomic batch, then
@@ -1609,6 +1816,8 @@ fn narrow(
     changed(progress, changes, |state| {
         for scope in &scopes {
             state.scopes.remove(scope);
+            // Ranges only split, so a dropped scope never comes back under its old range (#66 / B-61).
+            state.rebuilt.remove(scope);
         }
     });
     let mut requests = vec![pb::relay_request::Kind::Unfollow(pb::Unfollow {

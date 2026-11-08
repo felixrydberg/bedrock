@@ -151,7 +151,8 @@ async fn stalled_subscriber_shows_rising_lag_and_queue_depth() {
     for sequence in 11..=30 {
         hub.publish(event("users", sequence));
     }
-    hub.changed();
+    // As a delivery from upstream would, which is what wakes the namespace's streams.
+    hub.arrived(&("auth".into(), "users".into()));
     let after = subscriber_state(&hub, 30).await;
     assert_eq!(before["follows"][0]["lag"], 10);
     assert_eq!(after["follows"][0]["lag"], 30);

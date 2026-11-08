@@ -26,6 +26,7 @@ macro_rules! storage_contract {
             put_overwrite_delete,
             batch_applies_in_order,
             revisions_are_per_name_and_outside_key_space,
+            revisions_in_reads_only_the_named_ranges,
             a_deleted_revision_reads_as_never_set,
             scans_in_key_order,
             snapshot_is_consistent,
@@ -175,6 +176,39 @@ pub fn revisions_are_per_name_and_outside_key_space(h: &mut impl Harness) {
         engine.snapshot().unwrap().revisions(),
         Ok(BTreeMap::from([("a".into(), 2), ("b".into(), 5)]))
     );
+}
+
+/// #66 / B-61: a read of name ranges returns exactly what filtering every revision would, and nothing outside them.
+pub fn revisions_in_reads_only_the_named_ranges(h: &mut impl Harness) {
+    use crate::storage::{named, prefixed};
+    let engine = h.open();
+    let mut batch = WriteBatch::default();
+    batch
+        .set_revision("relay:a", 1)
+        .set_revision("relay:a:x", 2)
+        .set_revision("relay:b", 3)
+        .set_revision("relay:b2", 4)
+        .set_revision("relay:c:0010", 5)
+        .set_revision("relay:c:0020", 6)
+        .set_revision("other", 7);
+    engine.write(batch).unwrap();
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(
+        snapshot.revisions_in(&[
+            prefixed("relay:a:"),
+            named("relay:b"),
+            ("relay:c:0010".into(), "relay:c:0020".into()),
+            named("missing"),
+        ]),
+        Ok(BTreeMap::from([
+            ("relay:a:x".into(), 2),
+            ("relay:b".into(), 3),
+            ("relay:c:0010".into(), 5),
+        ]))
+    );
+    assert_eq!(snapshot.revisions_in(&[]), Ok(BTreeMap::new()));
+    let backwards = ("relay:c".to_owned(), "relay:a".to_owned());
+    assert_eq!(snapshot.revisions_in(&[backwards]), Ok(BTreeMap::new()));
 }
 
 pub fn a_deleted_revision_reads_as_never_set(h: &mut impl Harness) {

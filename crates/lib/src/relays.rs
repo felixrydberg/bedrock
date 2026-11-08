@@ -104,6 +104,8 @@ struct Inner {
     replay: Option<Arc<Replay>>,
     subscribers: Mutex<BTreeMap<u64, Subscriber>>,
     heads: Mutex<BTreeMap<Key, Arc<Watched<Option<u64>>>>>,
+    /// Counts what arrives from upstream per namespace, so only that namespace's streams wake for it (#66 / B-61).
+    arrivals: Mutex<BTreeMap<Key, Arc<Watched<u64>>>>,
     recent: Mutex<Recent>,
     changed: Arc<Watched<u64>>,
     ids: AtomicU64,
@@ -246,6 +248,7 @@ impl Hub {
             replay,
             subscribers: Mutex::default(),
             heads: Mutex::default(),
+            arrivals: Mutex::default(),
             recent: Mutex::default(),
             changed: Arc::new(Watched::new(0)),
             ids: AtomicU64::new(1),
@@ -511,6 +514,19 @@ impl Hub {
             });
         }
         head.get()
+    }
+    fn arrival(&self, key: &Key) -> Arc<Watched<u64>> {
+        self.0
+            .arrivals
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .clone()
+    }
+    /// Wakes the streams of `key`: something arrived from upstream, possibly below the head they last saw.
+    fn arrived(&self, key: &Key) {
+        self.arrival(key).update(|v| *v = v.wrapping_add(1));
     }
     fn observe_head(&self, key: &Key, sequence: u64) {
         self.head(key)
@@ -1114,8 +1130,12 @@ impl Hub {
         let mut recovery_permit = None;
         // One timer for the whole stream: a new sleep on every pass leaves one behind per event, for its full length (B-61).
         let mut recheck = std::pin::pin!(tokio::time::sleep(PROGRESS));
+        // Only what concerns this stream wakes it: its own interest (`changes`), its namespace's head or arrivals, and the
+        // recheck. The hub-wide signal moves on every follow, unfollow and stream end, and waking every stream for each
+        // costs the square of the stream count, which grows as ranges split (#66 / B-61).
+        let arrival = self.arrival(&key.0);
         loop {
-            let version = self.0.changed.get();
+            let arrived = arrival.get();
             let local_version = changes.get();
             let Some((from, acked)) = self.current(id, &key, generation) else {
                 return Ok(());
@@ -1415,14 +1435,13 @@ impl Hub {
             if let Some(writer) = &self.0.writer {
                 let head = writer.log().head(&key.0.0, &key.0.1);
                 tokio::select! {biased;
-                    _=self.0.changed.wait_until(|v|*v!=version)=>{},
                     _=changes.wait_until(|v|*v!=local_version)=>{},
                     _=head.wait_until(|v|Some(*v)!=h)=>{},
                     _=recheck.as_mut()=>recheck.as_mut().reset(crate::monotonic_now()+PROGRESS),
                 }
             } else {
                 tokio::select! {biased;
-                    _=self.0.changed.wait_until(|v|*v!=version)=>{},
+                    _=arrival.wait_until(|v|*v!=arrived)=>{},
                     _=changes.wait_until(|v|*v!=local_version)=>{},
                     _=recheck.as_mut()=>recheck.as_mut().reset(crate::monotonic_now()+PROGRESS),
                 }
@@ -1680,8 +1699,7 @@ impl Hub {
 
     /// What to follow upstream: [`Hub::own`] plus the interests siblings share, which behave like one more subscriber
     /// (#41 / B-12b). Such a stream starts after this relay's history, or at the sibling's cursor if that is later.
-    // ponytail: rebuilds the union on every upstream wake, like `own`; cache it per sibling update if region relays
-    // with thousands of interests show this in profiles.
+    // ponytail: rebuilds the union, like `own`, though the upstream loop calls it only when the hub-wide version moved.
     pub fn desired(&self) -> Wanted {
         let (mut namespaces, mut datasets) = self.own();
         let (followed, _) = self.derived(&namespaces, &datasets);
@@ -1787,88 +1805,94 @@ impl Hub {
         let mut received = crate::monotonic_now();
         // Re-armed when it fires rather than per message, which would leave a timer behind for each one (B-61).
         let mut idle = std::pin::pin!(tokio::time::sleep_until(received + IDLE));
+        // The hub-wide version the follows were last planned at. Everything `desired` reads moves it, so a frame that
+        // left it alone needs no new plan: planning walks every subscriber's follows (#66 / B-61).
+        let mut planned = None;
         loop {
             let version = self.0.changed.get();
-            let (namespaces, datasets) = self.desired();
-            let mut requests = Vec::new();
-            for key in sent
-                .keys()
-                .filter(|key| {
-                    !sent_datasets.contains(&key.0)
-                        && (datasets.contains(&key.0) || !namespaces.contains_key(*key))
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                requests.push(pb::relay_request::Kind::Unfollow(pb::Unfollow {
-                    dataset: key.0.clone(),
-                    namespace: key.1.clone(),
-                    span: None,
-                }));
-                sent.remove(&key);
-                follows.remove(&key);
-            }
-            for dataset in sent_datasets
-                .difference(&datasets)
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                requests.push(pb::relay_request::Kind::Unfollow(pb::Unfollow {
-                    dataset: dataset.clone(),
-                    namespace: String::new(),
-                    span: span(Some(WHOLE)),
-                }));
-                sent.retain(|key, _| key.0 != dataset);
-                follows.retain(|key, _| key.0 != dataset);
-                sent_datasets.remove(&dataset);
-            }
-            for (key, from) in namespaces
-                .iter()
-                .filter(|(key, _)| !datasets.contains(&key.0))
-            {
-                if !sent.contains_key(key) {
-                    let from = self.resume_from(key, *from);
-                    numbered += 1;
-                    requests.push(pb::relay_request::Kind::Follow(pb::Follow {
+            if planned != Some(version) {
+                planned = Some(version);
+                let (namespaces, datasets) = self.desired();
+                let mut requests = Vec::new();
+                for key in sent
+                    .keys()
+                    .filter(|key| {
+                        !sent_datasets.contains(&key.0)
+                            && (datasets.contains(&key.0) || !namespaces.contains_key(*key))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    requests.push(pb::relay_request::Kind::Unfollow(pb::Unfollow {
                         dataset: key.0.clone(),
                         namespace: key.1.clone(),
-                        from,
                         span: None,
-                        from_namespaces: Default::default(),
-                        follow: numbered,
                     }));
-                    sent.insert(key.clone(), from);
-                    follows.insert(key.clone(), numbered);
+                    sent.remove(&key);
+                    follows.remove(&key);
                 }
-            }
-            for dataset in &datasets {
-                if sent_datasets.insert(dataset.clone()) {
-                    numbered += 1;
-                    let mut from_namespaces = BTreeMap::new();
-                    for namespace in self.namespaces(dataset) {
-                        let key = (dataset.clone(), namespace);
-                        let from = namespaces.get(&key).copied().unwrap_or_else(|| {
-                            self.source_head(&key).unwrap_or(0).saturating_add(1)
-                        });
-                        let from = self.resume_from(&key, from);
-                        sent.insert(key.clone(), from);
-                        follows.insert(key.clone(), numbered);
-                        from_namespaces.insert(key.1, from);
-                    }
-                    requests.push(pb::relay_request::Kind::Follow(pb::Follow {
+                for dataset in sent_datasets
+                    .difference(&datasets)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    requests.push(pb::relay_request::Kind::Unfollow(pb::Unfollow {
                         dataset: dataset.clone(),
                         namespace: String::new(),
-                        from: 0,
                         span: span(Some(WHOLE)),
-                        from_namespaces,
-                        follow: numbered,
                     }));
+                    sent.retain(|key, _| key.0 != dataset);
+                    follows.retain(|key, _| key.0 != dataset);
+                    sent_datasets.remove(&dataset);
                 }
-            }
-            for kind in requests {
-                tx.send(pb::RelayRequest { kind: Some(kind) })
-                    .await
-                    .map_err(|_| Status::unavailable("upstream request queue closed"))?;
+                for (key, from) in namespaces
+                    .iter()
+                    .filter(|(key, _)| !datasets.contains(&key.0))
+                {
+                    if !sent.contains_key(key) {
+                        let from = self.resume_from(key, *from);
+                        numbered += 1;
+                        requests.push(pb::relay_request::Kind::Follow(pb::Follow {
+                            dataset: key.0.clone(),
+                            namespace: key.1.clone(),
+                            from,
+                            span: None,
+                            from_namespaces: Default::default(),
+                            follow: numbered,
+                        }));
+                        sent.insert(key.clone(), from);
+                        follows.insert(key.clone(), numbered);
+                    }
+                }
+                for dataset in &datasets {
+                    if sent_datasets.insert(dataset.clone()) {
+                        numbered += 1;
+                        let mut from_namespaces = BTreeMap::new();
+                        for namespace in self.namespaces(dataset) {
+                            let key = (dataset.clone(), namespace);
+                            let from = namespaces.get(&key).copied().unwrap_or_else(|| {
+                                self.source_head(&key).unwrap_or(0).saturating_add(1)
+                            });
+                            let from = self.resume_from(&key, from);
+                            sent.insert(key.clone(), from);
+                            follows.insert(key.clone(), numbered);
+                            from_namespaces.insert(key.1, from);
+                        }
+                        requests.push(pb::relay_request::Kind::Follow(pb::Follow {
+                            dataset: dataset.clone(),
+                            namespace: String::new(),
+                            from: 0,
+                            span: span(Some(WHOLE)),
+                            from_namespaces,
+                            follow: numbered,
+                        }));
+                    }
+                }
+                for kind in requests {
+                    tx.send(pb::RelayRequest { kind: Some(kind) })
+                        .await
+                        .map_err(|_| Status::unavailable("upstream request queue closed"))?;
+                }
             }
             let message = tokio::select! {biased;
                 _=self.0.changed.wait_until(|v|*v!=version)=>continue,
@@ -1894,7 +1918,7 @@ impl Hub {
                     let key = (range.dataset, range.namespace);
                     self.0.stats.upstream_head(&key, range.head);
                     self.observe_head(&key, range.head);
-                    self.changed();
+                    self.arrived(&key);
                 }
                 Some(pb::relay_frame::Kind::Delivery(d)) => {
                     let key = (d.dataset.clone(), d.namespace.clone());
@@ -1923,8 +1947,8 @@ impl Hub {
                     if next != d.through.saturating_add(1) {
                         return Err(Status::data_loss("upstream incomplete coverage"));
                     }
+                    self.arrived(&key);
                     sent.insert(key, d.through.saturating_add(1));
-                    self.changed();
                     tx.send(pb::RelayRequest {
                         kind: Some(pb::relay_request::Kind::Ack(pb::Ack {
                             dataset: d.dataset,
@@ -1942,7 +1966,7 @@ impl Hub {
                         continue;
                     }
                     self.observe_head(&key, b.boundary);
-                    self.changed();
+                    self.arrived(&key);
                     sent.insert(key, b.boundary.saturating_add(1));
                     tx.send(pb::RelayRequest {
                         kind: Some(pb::relay_request::Kind::Ack(pb::Ack {

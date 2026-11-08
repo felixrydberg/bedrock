@@ -47,12 +47,17 @@ struct Service {
 
 type Lag = Family<Dataset, Histogram, fn() -> Histogram>;
 
+/// How long a member's disconnect count is kept after its latest disconnect.
+const DISCONNECTS_KEPT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// What the hot path records; everything else is read from the hub when asked.
 pub(super) struct Stats {
     // ponytail: never pruned, bounded by the namespaces this relay has carried, like the hub's head map.
     namespaces: Mutex<BTreeMap<Key, Namespace>>,
     upstream: Mutex<Option<String>>,
-    disconnects: Mutex<BTreeMap<MemberKey, u64>>,
+    /// Full-queue disconnects per member over the last [`DISCONNECTS_KEPT`], with the latest one's time. Older entries
+    /// go, so members that left long ago are not kept forever (#66 / B-61).
+    disconnects: Mutex<BTreeMap<MemberKey, (u64, tokio::time::Instant)>>,
     events_in: Family<Dataset, Counter>,
     bytes_in: Family<Dataset, Counter>,
     events_out: Family<Dataset, Counter>,
@@ -210,12 +215,14 @@ impl Stats {
     }
 
     pub(super) fn disconnected(&self, member: &pb::Member) {
-        *self
-            .disconnects
-            .lock()
-            .unwrap()
+        let now = crate::monotonic_now();
+        let mut disconnects = self.disconnects.lock().unwrap();
+        disconnects.retain(|_, (_, at)| now.duration_since(*at) < DISCONNECTS_KEPT);
+        let (count, at) = disconnects
             .entry(crate::membership::key(member))
-            .or_default() += 1;
+            .or_insert((0, now));
+        *count += 1;
+        *at = now;
     }
 }
 
@@ -923,7 +930,7 @@ fn subscribers(hub: &Hub, query: &Query) -> Value {
             "follows": follows,
             "queued_events": sub.events,
             "queued_bytes": sub.bytes,
-            "disconnects": member.map_or(0, |m| disconnects.get(&crate::membership::key(m)).copied().unwrap_or(0)),
+            "disconnects": member.map_or(0, |m| disconnects.get(&crate::membership::key(m)).map_or(0, |(count, _)| *count)),
         });
         Some((sub.id, value))
     });
