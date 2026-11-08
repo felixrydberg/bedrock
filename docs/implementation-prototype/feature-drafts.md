@@ -194,6 +194,7 @@ Rules this implies:
 | B-57 | Gateway binary and shared cluster client | Shared infrastructure | `gateway`, `lib` client, `lib/relays` | B-19, B-22, B-55 |
 | [B-61](https://github.com/felixrydberg/bedrock/issues/66) | Simulation speed: more simulated seconds per real second | Shared infrastructure | `tests/sim`, `scripts/vopr.sh` | B-23 |
 | B-62 | Partial quarantine: rebuild only the damaged range | Shared core | `lib/health` + `lib/reconciliation` + `lib/relays` | B-14, B-21, B-22, B-23 |
+| B-63 | Operational scenarios: scale out, drain, cancel and rolling restart under load | Shared core | `tests/sim`, `tests/crash` | B-23, B-21b |
 
 ### Parallel work inside the shared core
 
@@ -1790,6 +1791,44 @@ walk position is separate work (`health::scrub`).
 Measured on seed 90003 over two simulated hours, with the seed's heavy fault load: 207 quarantines, and quicksilver nodes
 unhealthy for 28–49% of samples. One quicksilver rebuild took about 80 seconds. Seed 90004 reached 60–79%. The simulation's
 damage is one record, so these show the cost of whole-instance rebuilds, not what a real disk would produce.
+
+#### B-63 — Operational scenarios: scale out, drain, cancel and rolling restart under load
+
+```
+Title:  Feature 🚀: End-to-end operational scenarios: scale out, drain, cancel and rolling restart under load
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+Simulation covers membership events on the shared core (join, relay failover, restart within grace, a cut-off node, a killed
+node, and a graceful `draining` leave, checked against the writer), and the crash harness covers kills and disk faults on a
+fixed cluster. Nothing exercises operating a live cluster: adding nodes, draining a node or cell, cancelling, and restarting
+nodes in turn, with real binaries and writes running.
+
+**Describe the solution you'd like**
+- **Simulation (madsim)**, extending `tests/sim/tests/membership.rs`, seeded, each seed replaying to the same trace:
+  - Held node drain (B-21b): a node stays `draining`, its ranges hand off within the drain rate, every `ready` owner holds the
+    committed data of its ranges, and nothing is revoked before the new owners are `ready`.
+  - Cancel: deleting the drain record mid-handoff makes the node eligible again and leaves no partial copies.
+  - Cell drain: nothing moves across cells for quicksilver, auth and cdn, and the cell gets no new assignments.
+  - Scale out, then scale in: joins and rebalancing, then drains below the replica count, which must keep redundancy.
+  - Rolling restart of every node, one at a time, with no write lost and no read going backwards.
+- **Real binaries** (`tests/crash`, `scripts/crash.sh`): a dynamic cluster where the harness starts a new node, drains one
+  through the operator path and removes it, and does a rolling restart. The existing invariants and disk checks apply.
+- Failing seeds go to OPEN, then REGRESSIONS, with a focused test.
+
+**Additional context**
+- **Implementation:** Test support only; no product code.
+- **Module:** `tests/sim`, `tests/crash`.
+- **Depends on:** B-23, B-21b. The drain-record cases also need B-24 (#55) to read `topology/drains`. The operator path needs an
+  operator API that does not exist yet; until then the real-binary drain announces `draining` from the node. Consider splitting
+  the real-binary half into its own issue once an operator API exists.
+- **Acceptance criteria:**
+  - Every scenario above passes for the required seeds and replays to the same trace.
+  - A drain leaves the target holding nothing for any dataset, with no read going backwards.
+  - Cancelling a drain leaves no partial copies and makes the target eligible again.
+  - A drain never takes a range below its replica count.
+  - The real-binary run completes a scale-out, a drain and a rolling restart with every invariant intact.
 
 ## 4. Open decisions
 
