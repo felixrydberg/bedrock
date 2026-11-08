@@ -147,6 +147,9 @@ impl RocksDbAdapter {
     fn fill(&self, next: u64, from: &dyn Snapshot) -> StorageResult<()> {
         let (data, revisions) = (name(DATA, next), name(REVISIONS, next));
         for cf in [&data, &revisions] {
+            if self.db.cf_handle(cf).is_some() {
+                self.db.drop_cf(cf).map_err(|e| error(&self.instance, e))?;
+            }
             self.db
                 .create_cf(cf, &self.cf_options)
                 .map_err(|e| error(&self.instance, e))?;

@@ -320,6 +320,39 @@ fn a_restore_lasts_through_a_reopen() {
     assert_eq!(engine.get(b"new"), Ok(Some(b"1".to_vec())));
 }
 
+#[test]
+fn a_restore_retries_with_leftover_column_families() {
+    let mut harness = Rocks::default();
+    let source = empty();
+    let mut batch = WriteBatch::default();
+    batch.put(*b"new", *b"1").set_revision("ns", 4);
+    source.write(batch).unwrap();
+
+    for leftovers in [&[DATA, REVISIONS][..], &[DATA], &[REVISIONS]] {
+        let engine = harness.open();
+        engine.put(b"old", b"1").unwrap();
+        // A failed restore can leave either or both families when its cleanup also fails.
+        for base in leftovers {
+            let cf = name(base, 1);
+            engine.db.create_cf(&cf, &Options::default()).unwrap();
+            let cf = engine.handle(&cf);
+            if *base == DATA {
+                engine.db.put_cf(&cf, data_key(b"stale"), b"2").unwrap();
+            } else {
+                engine.db.put_cf(&cf, "stale", 99u64.to_be_bytes()).unwrap();
+            }
+        }
+
+        engine.restore(&*source.snapshot().unwrap()).unwrap();
+
+        assert_eq!(engine.get(b"new"), Ok(Some(b"1".to_vec())));
+        assert_eq!(engine.get(b"old"), Ok(None));
+        assert_eq!(engine.get(b"stale"), Ok(None));
+        assert_eq!(engine.revision("ns"), Ok(Some(4)));
+        assert_eq!(engine.revision("stale"), Ok(None));
+    }
+}
+
 /// A crash before the old `data` is dropped has not committed, even with the new generation complete.
 #[test]
 fn a_restore_stopped_before_its_commit_changes_nothing() {

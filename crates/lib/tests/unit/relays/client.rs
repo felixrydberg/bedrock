@@ -968,6 +968,141 @@ fn pushed_ranges(revision: u64, spans: &[(u64, u64)]) -> pb::Ranges {
 }
 
 #[tokio::test]
+async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets() {
+    use crate::storage::sim::{Access, Fault, SimEngine};
+    use pb::relay_request::Kind;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let whole = (0, 0);
+    let marker = marker_prefix("auth", whole) + "users";
+    // Quarantine and both narrowing reads are isolated; malformed persisted state remains fatal.
+    for (fail_at, marker, expected_error, spans) in [
+        (None, marker.clone(), None, Vec::new()),
+        (Some(1), marker.clone(), None, Vec::new()),
+        (Some(2), marker.clone(), None, Vec::new()),
+        (Some(1), marker, None, vec![(0, 1 << 63), (1 << 63, 0)]),
+        (
+            Some(usize::MAX),
+            "relay:range:auth:broken".into(),
+            Some(tonic::Code::DataLoss),
+            Vec::new(),
+        ),
+        (
+            Some(usize::MAX),
+            marker_prefix("auth", whole) + "bad\0name",
+            Some(tonic::Code::InvalidArgument),
+            Vec::new(),
+        ),
+    ] {
+        let reads = Arc::new(AtomicUsize::new(usize::MAX / 2));
+        let observed = reads.clone();
+        let data = Arc::new(SimEngine::new(
+            "auth",
+            Arc::new(move |access| {
+                (access == Access::Read && Some(observed.fetch_add(1, Ordering::SeqCst)) == fail_at)
+                    .then_some(Fault::Unavailable)
+            }),
+            None,
+            false,
+        ));
+        data.put(&stored_at(b"k"), b"value").unwrap();
+        let mut batch = WriteBatch::default();
+        batch.set_revision(marker, 1);
+        data.write(batch).unwrap();
+        let health =
+            crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+        let engine = health.wrap_replication("auth", "engine", data.clone());
+        let me: Scope = ("membership".into(), "quicksilver.c1".into(), None);
+        let membership = view(7, &[]);
+        let moved = pb::Range {
+            owners: vec![pb::range::Owner {
+                node_id: "other".into(),
+                state: pb::range::owner::State::Ready as i32,
+            }],
+        };
+        membership
+            .target
+            .engine
+            .put(
+                b"quicksilver.c1\0range/auth/0000000000000000",
+                &moved.encode_to_vec(),
+            )
+            .unwrap();
+        let mut consumers = BTreeMap::from([(me.clone(), membership)]);
+        let mut pushed = revoke_state(&engine, whole);
+        pushed.me = Some(("n1".into(), me));
+        pushed.ranged.insert(
+            "quicksilver".into(),
+            Arc::new(MemoryEngine::new("quicksilver")),
+        );
+        pushed.pending.insert(
+            "auth".into(),
+            pb::Ranges {
+                dataset: "auth".into(),
+                ..pushed_ranges(7, &spans)
+            },
+        );
+        pushed
+            .pending
+            .insert("quicksilver".into(), pushed_ranges(7, &[whole]));
+        if fail_at.is_none() {
+            health.report(
+                "auth",
+                "engine",
+                &crate::storage::StorageError::Corruption(crate::storage::ErrorContext {
+                    engine: "memory",
+                    instance: "auth".into(),
+                    file: None,
+                    partition: None,
+                    detail: "damaged".into(),
+                }),
+            );
+        }
+        reads.store(0, Ordering::SeqCst);
+        let (tx, mut rx) = mpsc::channel(8);
+        let result = settle(
+            &tx,
+            &mut consumers,
+            &mut pushed,
+            &Mutex::new(Progress::default()),
+            &Watched::new(0),
+        )
+        .await;
+        if let Some(code) = expected_error {
+            assert_eq!(result.unwrap_err().code(), code);
+            assert!(rx.try_recv().is_err());
+            continue;
+        }
+        result.unwrap();
+
+        match rx.try_recv().unwrap().kind.unwrap() {
+            Kind::Ranges(ack) => {
+                assert_eq!(ack.dataset, "auth");
+                assert_eq!(ack.refused, [pb::Span { start: 0, end: 0 }]);
+                assert!(!ack.reason.is_empty());
+            }
+            other => panic!("expected a refusing acknowledgement, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            Some(Kind::Follow(follow)) if follow.dataset == "quicksilver"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            Some(Kind::Ranges(ack)) if ack.dataset == "quicksilver" && ack.refused.is_empty()
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(pushed.groups.contains_key(&("auth".into(), whole)));
+        assert!(!pushed.retired.contains(&("auth".into(), whole)));
+        assert_eq!(data.get(&stored_at(b"k")).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(
+            held(data.as_ref(), "auth").unwrap(),
+            BTreeSet::from([whole])
+        );
+    }
+}
+
+#[tokio::test]
 async fn pushed_revokes_wait_for_the_view_are_refused_unless_it_confirms_then_drop_and_keep_coverage()
  {
     use pb::range::owner::State::{Leaving, Ready};

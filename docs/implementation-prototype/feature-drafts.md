@@ -1764,7 +1764,7 @@ profile of a simulated hour of seed 90003, the heaviest load shape we have. Gain
 | Change | Why | Expected gain | Effort |
 | --- | --- | --- | --- |
 | Give WSL all 16 hardware threads (`processors` in `.wslconfig`) | Sweeps and soaks run one seed per CPU, and WSL has 8 of 16 threads | More seeds at once, less than double; a single seed gets no faster | A config change |
-| Undo log in `SimEngine::remember` | Rollback copies the whole engine on every commit, when only changed keys matter | Up to about 21% on seeds with lost-write faults | About 30 lines |
+| Undo log in `SimEngine::remember` — done | `Undo::Batch` tracks overwritten keys and revisions instead of copying the whole engine on every commit | Estimated up to about 21% on seeds with lost-write faults | Implemented |
 | `mimalloc` in the test binary — done | The VOPR binary uses `mimalloc`; allocation was a large share of the profile | About a quarter faster than glibc's allocator | Implemented |
 | LTO and one codegen unit for simulation builds — done | The `sim` profile enables fat LTO and one codegen unit; soak and watch use it | About 16% faster seed runs, for slower builds | Implemented |
 | Patch `naive_timer` usage to set one timer per deadline and waker — done | The vendored madsim `Sleep` avoids adding another timer on every poll | Not measured separately | Implemented; remove the patch when upstream includes it |
