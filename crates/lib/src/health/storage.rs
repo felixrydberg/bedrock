@@ -11,6 +11,10 @@
 //! - **Recovery** is [`crate::reconciliation::rebuild`] (#23 / B-22). A `Rebuilding` source still refuses every
 //!   [`StorageHealth::wrap`]ped call, so nothing is served from it, while its [`StorageHealth::wrap_replication`] handle
 //!   restores it. Only a validated rebuild makes it [`StorageHealth::recovered`].
+//! - **Detection.** Reads find damage, and [`super::scrub`] reads what nothing else does.
+//! - **Restarts.** Quarantine is recorded in the engine itself, so a process that stops before its rebuild finishes starts
+//!   quarantined rather than serving damage nothing would notice. The rebuild's `restore` removes the record with
+//!   everything else. Recording is best effort, since the failing disk may refuse it.
 //!
 //! Processes are per service, so a broken CDN cache disk never marks the same machine's KV node unhealthy.
 
@@ -29,6 +33,9 @@ use crate::storage::{
     StorageStats, WriteBatch,
 };
 use crate::transport::admin::Admin;
+
+/// The revision that records a quarantine in the quarantined engine.
+const QUARANTINED: &str = "health:quarantined";
 
 /// `kv.md` §16: `Unhealthy` data cannot be trusted; `Rebuilding` is being restored and validated. Neither is served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, EncodeLabelValue)]
@@ -127,13 +134,26 @@ impl StorageHealth {
         engine: Arc<dyn StorageEngine>,
         rebuilds: bool,
     ) -> Arc<dyn StorageEngine> {
-        Arc::new(Monitored {
+        let monitored = Monitored {
             health: self.clone(),
             source: self.source(dataset, layer),
             layer,
             rebuilds,
             inner: engine,
-        })
+        };
+        match monitored.inner.revision(QUARANTINED) {
+            Ok(Some(1)) => {
+                let mut report = monitored.source.report.lock().unwrap();
+                if report.state == State::Healthy {
+                    tracing::error!(%dataset, "local storage was quarantined before this restart");
+                    self.set(&monitored.source, &mut report, State::Unhealthy);
+                }
+            }
+            Ok(_) => {}
+            // This read counts like any other: it may be the one that finds the damage.
+            Err(error) => monitored.failed(&error),
+        }
+        Arc::new(monitored)
     }
 
     /// Reports a failure of storage that is not a wrapped engine, such as the CDN's `CacheStorage` (B-30).
@@ -226,7 +246,8 @@ impl StorageHealth {
         }
     }
 
-    fn failed(&self, source: &Source, error: &StorageError) {
+    /// Returns whether this failure quarantined the source.
+    fn failed(&self, source: &Source, error: &StorageError) -> bool {
         let (kind, quarantine) = match error {
             StorageError::Corruption(_) => ("corruption", true),
             StorageError::IoError(_) => ("io", false),
@@ -234,7 +255,7 @@ impl StorageHealth {
             StorageError::Fenced(_)
             | StorageError::Unsupported(_)
             | StorageError::Overloaded(_) => {
-                return;
+                return false;
             }
         };
         let quarantine = quarantine
@@ -248,13 +269,25 @@ impl StorageHealth {
         let mut report = source.report.lock().unwrap();
         report.errors += 1;
         report.last = Some(error.clone());
-        if quarantine && report.state != State::Unhealthy {
+        let newly = quarantine && report.state != State::Unhealthy;
+        if newly {
             tracing::error!(dataset = %source.dataset, %error, "local storage quarantined");
             self.set(source, &mut report, State::Unhealthy);
         }
+        newly
     }
 
     fn set(&self, source: &Source, report: &mut Report, to: State) {
+        assert!(
+            matches!(
+                (report.state, to),
+                (State::Healthy, State::Unhealthy)
+                    | (State::Unhealthy, State::Rebuilding)
+                    | (State::Rebuilding, State::Healthy | State::Unhealthy)
+            ),
+            "storage health cannot go from {:?} to {to:?}",
+            report.state
+        );
         self.gauge(&source.dataset, report.state).dec();
         self.gauge(&source.dataset, to).inc();
         report.state = to;
@@ -274,6 +307,13 @@ impl StorageHealth {
             })
             .clone()
     }
+}
+
+/// Records a quarantine in `engine` itself, so wrapping it quarantines it until a rebuild.
+pub fn quarantine(engine: &dyn StorageEngine) -> StorageResult<()> {
+    let mut mark = WriteBatch::default();
+    mark.set_revision(QUARANTINED, 1);
+    engine.write(mark)
 }
 
 /// A wrapped engine: reports every outcome and refuses calls while its source is quarantined.
@@ -302,16 +342,24 @@ impl Monitored {
         let result = result();
         match &result {
             Ok(_) => self.health.succeeded(&self.source),
-            Err(error) => self.health.failed(&self.source, error),
+            Err(error) => self.failed(error),
         }
         result
+    }
+
+    fn failed(&self, error: &StorageError) {
+        if self.health.failed(&self.source, error)
+            && let Err(error) = quarantine(self.inner.as_ref())
+        {
+            tracing::warn!(%error, "could not record the quarantine; a restart will forget it");
+        }
     }
 
     /// Reports errors met while iterating; entries already returned stay returned.
     fn reporting<'a>(&'a self, scan: Scan<'a>) -> Scan<'a> {
         Box::new(scan.inspect(move |entry| {
             if let Err(error) = entry {
-                self.health.failed(&self.source, error);
+                self.failed(error);
             }
         }))
     }

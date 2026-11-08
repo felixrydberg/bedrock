@@ -94,6 +94,10 @@ pub fn assign(
     let mut plan = Plan::new(directory, members, unhealthy, replicas);
     plan.repair(replicas, max_moving);
     plan.rebalance(max_moving);
+    for owners in plan.ranges.values() {
+        let nodes: BTreeSet<&str> = owners.iter().map(|owner| owner.node.as_str()).collect();
+        assert_eq!(nodes.len(), owners.len(), "a node owns a range twice");
+    }
     plan.ranges
         .into_iter()
         .filter(|(start, owners)| directory.get(start) != Some(owners))
@@ -409,6 +413,10 @@ impl<'a> Plan<'a> {
             return start;
         }
         let at = start + (size - piece) as u64;
+        assert!(
+            piece > 0 && at > start,
+            "a split must fall inside the range"
+        );
         let owners = self.ranges[&start].clone();
         for owner in owners.iter().filter(|o| o.holds()) {
             let node = self.members.get_key_value(&owner.node).unwrap().0.as_str();
@@ -470,7 +478,8 @@ fn ratio(load: u128, target: f64) -> u64 {
 
 /// The entries to write as handoffs complete (#22 / B-21, `docs/spec/handoff.tla`, `Write`): a `populating` owner whose
 /// relay reports it ready for the entry (`ready` holds `(node, start)`) becomes `ready`. Once no owner of an entry is
-/// populating and a `ready` one is still a member, its `leaving` owners go, so no range loses its last holder.
+/// populating and a `ready` one is still in `members`, its `leaving` owners go, so no range loses its last holder. Callers
+/// leave out members whose copy cannot be trusted.
 pub fn handoff(
     directory: &Directory,
     members: &BTreeMap<String, pb::Member>,

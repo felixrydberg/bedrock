@@ -1,11 +1,11 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::tests::Factory;
 use crate::replication::log::Log;
 use crate::storage::StorageError;
-use crate::storage::namespace::memory::MemoryFactory;
+use crate::storage::sim::{MemoryFactory, SimFactory, StoreAccess, StoreFault};
 
 fn early() -> u64 {
     1_000
@@ -26,6 +26,7 @@ fn write(value: Option<&str>, retry: Option<&str>) -> Write {
             Operation::Set(value.as_bytes().to_vec())
         }),
         idempotency_key: retry.map(str::to_owned),
+        expected: None,
     }
 }
 
@@ -461,4 +462,138 @@ async fn idle_stream_expiry_is_immediate_and_live_retry_triggers_physical_cleanu
     let view = writer.bootstrap("kv", "one").await.unwrap();
     assert_eq!(view.values[b"key".as_slice()], b"value");
     assert_eq!(view.retries["retry"].expires_at, 1_500);
+}
+
+/// A store whose flushes fail while `failing` is set.
+fn flaky_store(failing: &Arc<AtomicBool>) -> Arc<SimFactory> {
+    let failing = failing.clone();
+    Arc::new(SimFactory::new(Arc::new(move |access| {
+        (access == StoreAccess::Flush && failing.load(Ordering::SeqCst))
+            .then_some(StoreFault::Unavailable)
+    })))
+}
+
+/// Found by the crash tests (#25 / B-23 Layer 3): SlateDB closes a database for good when one S3 request fails, and the
+/// writer kept the closed handle, so the namespace refused every write until a restart.
+#[tokio::test]
+async fn a_handle_closed_by_a_failed_flush_is_reopened() {
+    let failing = Arc::new(AtomicBool::new(false));
+    let broken = Arc::new(AtomicBool::new(false));
+    let store = {
+        let (failing, broken) = (failing.clone(), broken.clone());
+        Arc::new(SimFactory::new(Arc::new(move |access| {
+            let down = failing.load(Ordering::SeqCst);
+            match access {
+                StoreAccess::Open | StoreAccess::Flush if down => {
+                    broken.store(access == StoreAccess::Flush, Ordering::SeqCst);
+                    Some(StoreFault::Unavailable)
+                }
+                StoreAccess::Open => {
+                    broken.store(false, Ordering::SeqCst);
+                    None
+                }
+                _ => broken
+                    .load(Ordering::SeqCst)
+                    .then_some(StoreFault::Unavailable),
+            }
+        })))
+    };
+    let writer = Writer::open(
+        early,
+        config(store, Retention::default(), PersistenceMetrics::default()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(writer.commit(write(Some("first"), Some("a"))).await, Ok(1));
+    failing.store(true, Ordering::SeqCst);
+    assert!(writer.commit(write(Some("lost"), Some("b"))).await.is_err());
+    failing.store(false, Ordering::SeqCst);
+    assert_eq!(writer.commit(write(Some("lost"), Some("b"))).await, Ok(2));
+    assert_eq!(writer.commit(write(Some("third"), None)).await, Ok(3));
+    let view = writer.bootstrap("kv", "one").await.unwrap();
+    assert_eq!(view.sequence, 3);
+    assert_eq!(writer.log().head("kv", "one").get(), 3);
+}
+
+/// Found by the simulation (#25 / B-23): a membership publisher waits for a bootstrap before it writes, so waiting for a
+/// later commit to settle a failed flush deadlocked them.
+#[tokio::test]
+async fn bootstrap_settles_a_failed_flush_without_a_later_commit() {
+    let failing = Arc::new(AtomicBool::new(true));
+    let writer = Writer::open(
+        early,
+        config(
+            flaky_store(&failing),
+            Retention::default(),
+            PersistenceMetrics::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(writer.commit(write(Some("v"), Some("r"))).await.is_err());
+    assert!(writer.bootstrap("kv", "one").await.is_err());
+    failing.store(false, Ordering::SeqCst);
+    let view = writer.bootstrap("kv", "one").await.unwrap();
+    assert_eq!(view.sequence, 1);
+    assert_eq!(view.values[b"key".as_slice()], b"v");
+    // The retry finds what the settled flush committed.
+    assert_eq!(writer.commit(write(Some("v"), Some("r"))).await.unwrap(), 1);
+}
+
+/// A subscriber must not apply an event that a crash could still erase.
+#[tokio::test]
+async fn recovery_never_serves_past_the_durable_head() {
+    let failing = Arc::new(AtomicBool::new(false));
+    let writer = Writer::open(
+        early,
+        config(
+            flaky_store(&failing),
+            Retention::default(),
+            PersistenceMetrics::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        writer.commit(write(Some("durable"), None)).await.unwrap(),
+        1
+    );
+    let (view, lease) = writer.begin_recovery("kv", "one").await.unwrap();
+    assert_eq!(view.sequence, 1);
+    failing.store(true, Ordering::SeqCst);
+    assert!(writer.commit(write(Some("buffered"), None)).await.is_err());
+    let events = writer
+        .recovery_events("kv", "one", 2, &lease)
+        .await
+        .unwrap();
+    assert!(events.is_empty());
+}
+
+/// Found by the simulation (#25 / B-23): a publisher's delayed write landed after newer ones and undid them.
+#[tokio::test]
+async fn a_write_planned_from_an_old_revision_is_refused() {
+    let writer = Writer::open(
+        early,
+        config(
+            Arc::new(MemoryFactory::default()),
+            Retention::default(),
+            PersistenceMetrics::default(),
+        ),
+    )
+    .await
+    .unwrap();
+    let planned = |value, expected| Write {
+        expected: Some(expected),
+        ..write(Some(value), None)
+    };
+    assert_eq!(writer.commit(planned("first", 0)).await, Ok(1));
+    assert_eq!(writer.commit(planned("second", 1)).await, Ok(2));
+    assert_eq!(
+        writer.commit(planned("late", 1)).await,
+        Err(CommitError::Conflict)
+    );
+    let view = writer.bootstrap("kv", "one").await.unwrap();
+    assert_eq!(view.sequence, 2);
+    assert_eq!(view.values[b"key".as_slice()], b"second");
+    assert_eq!(writer.commit(planned("third", 2)).await, Ok(3));
 }

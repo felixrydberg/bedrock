@@ -40,7 +40,13 @@ x509-parser = "0.18"
 protoc-bin-vendored = "3"
 tonic-build = { package = "madsim-tonic-build", version = "0.6" }
 
+[features]
+# Compiles simulated storage for tests outside this crate; production builds leave it out.
+test-support = []
+
 [dev-dependencies]
+# Integration tests link the library without `cfg(test)`.
+bedrock-lib = { path = ".", features = ["test-support"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 figment = { workspace = true, features = ["test"] }
 tempfile.workspace = true

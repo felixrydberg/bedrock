@@ -120,6 +120,7 @@ impl TimeHandle {
         Sleep {
             handle: self.clone(),
             deadline: deadline.max(min_deadline),
+            armed: None,
         }
     }
 

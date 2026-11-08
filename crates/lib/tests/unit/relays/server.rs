@@ -51,12 +51,12 @@ async fn reconnect_resumes_after_only_the_contiguous_cached_prefix() {
     assert_eq!(hub.resume_from(&key, 1), 4);
     hub.encoded(replay_event(4));
     assert_eq!(hub.resume_from(&key, 1), 7);
-    assert_eq!(hub.resume_from(&key, 8), 8);
     assert_eq!(hub.source_head(&key), Some(6));
     hub.observe_head(&key, 2);
     assert_eq!(hub.source_head(&key), Some(6));
     hub.observe_head(&key, 7);
     assert_eq!(hub.source_head(&key), Some(7));
+    assert_eq!(hub.resume_from(&key, 8), 8);
 }
 
 fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>>) {
@@ -71,9 +71,11 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             from: 1,
             acked: 0,
             generation: id,
+            follow: id + 100,
             baseline: 0,
             confirming: false,
             target: None,
+            woken: Default::default(),
         },
     )]);
     hub.0.subscribers.lock().unwrap().insert(
@@ -102,6 +104,28 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
         },
         closed,
     )
+}
+
+#[tokio::test]
+async fn a_closed_recovery_does_not_trip_its_sources() {
+    let peers = Arc::new(Peers::new(&Admin::new()));
+    let sources = vec!["first:7000".to_owned(), "second:7000".to_owned()];
+    let hub = Hub::relay(
+        "cell".into(),
+        1,
+        peers.clone(),
+        sources.clone(),
+        Vec::new(),
+        None,
+    );
+    let (frames, _) = subscriber(&hub, 1, 1);
+    drop(frames);
+    let stream = (("auth".into(), "keys".into()), None);
+
+    hub.proxy(1, &stream, 1, &[], false).await.unwrap();
+    for source in &sources {
+        assert_eq!(peers.health().state(source), crate::health::State::Closed);
+    }
 }
 
 #[tokio::test]
@@ -139,6 +163,7 @@ async fn byte_budget_disconnects_before_accepting_an_oversized_frame() {
             through: 1,
             events: vec![Bytes::from(vec![0; MAX_BYTES])],
             span: None,
+            ..Default::default()
         })
     ));
     assert!(closed.get());
@@ -177,9 +202,11 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
                 from: 1,
                 acked: 0,
                 generation: 2,
+                follow: 0,
                 baseline: 0,
                 confirming: false,
                 target: None,
+                woken: Default::default(),
             },
         );
     let pumping = hub.clone();
@@ -248,6 +275,37 @@ async fn replaced_generation_cannot_enqueue_into_the_new_subscription() {
     );
 }
 
+/// Found by the crash tests (#25 / B-23 Layer 3): a relay took deliveries still in flight for a follow it had ended as a
+/// coverage gap in its next one, so each stream switch cost a reconnect. Frames now carry the follow's number.
+#[tokio::test]
+async fn deliveries_and_bootstraps_carry_the_subscribers_follow_number() {
+    let hub = hub();
+    let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    let key = (("auth".into(), "keys".into()), None);
+    let delivery = pb::relay_frame::Kind::Delivery(pb::Delivery {
+        from: 1,
+        through: 1,
+        ..Default::default()
+    });
+    let bootstrap = pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+        begin: true,
+        ..Default::default()
+    });
+    for kind in [delivery, bootstrap] {
+        assert!(hub.send_scoped(1, &key, 1, kind).await);
+        let frame = tokio_stream::StreamExt::next(&mut frames)
+            .await
+            .unwrap()
+            .unwrap();
+        let follow = match frame.kind.unwrap() {
+            pb::relay_frame::Kind::Delivery(d) => d.follow,
+            pb::relay_frame::Kind::Bootstrap(b) => b.follow,
+            other => panic!("unexpected frame {other:?}"),
+        };
+        assert_eq!(follow, 101);
+    }
+}
+
 #[tokio::test]
 async fn queued_record_bound_applies_across_namespaces_not_only_frames() {
     let hub = hub();
@@ -260,6 +318,7 @@ async fn queued_record_bound_applies_across_namespaces_not_only_frames() {
             through: 600,
             events: vec![Bytes::new(); 600],
             span: None,
+            ..Default::default()
         })
     };
     assert!(hub.send(1, delivery("one")));
@@ -311,7 +370,7 @@ async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
     let writer = Writer::open(
         || 1_700_000_000_000,
         Persistence {
-            factory: Arc::new(crate::storage::namespace::memory::MemoryFactory::default()),
+            factory: Arc::new(crate::storage::sim::MemoryFactory::default()),
             retention: Retention::default(),
             metrics: PersistenceMetrics::default(),
         },
@@ -326,6 +385,7 @@ async fn bootstrap_waits_for_a_slow_reader_instead_of_disconnecting() {
                 key: key.to_be_bytes().to_vec(),
                 operation: crate::replication::Operation::Set(vec![42]),
                 idempotency_key: None,
+                expected: None,
             })
             .await
             .unwrap();
@@ -501,9 +561,11 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
         from: acked + 1,
         acked,
         generation: 9,
+        follow: 0,
         baseline: 0,
         confirming: false,
         target: None,
+        woken: Default::default(),
     };
     let set = |f: &dyn Fn(&mut Interest)| {
         f(hub
@@ -687,4 +749,23 @@ async fn a_refused_push_is_pushed_again_on_the_next_pass() {
     hub.push_ranges(&me, ranges(9));
     let again = tokio::time::timeout(std::time::Duration::from_secs(1), next());
     assert_eq!(again.await.expect("the refused set is pushed again"), 9);
+}
+
+/// Found by the simulation (#25 / B-23): a stream started at a sibling's cursor skipped two revisions, and the relay kept
+/// reporting its old head, so a subscriber arriving behind the cursor looked caught up and never fetched them.
+#[test]
+fn a_stream_started_past_this_relays_history_moves_its_head_to_the_cursor() {
+    let hub = hub();
+    let key = ("cdn".to_owned(), "workers".to_owned());
+    hub.observe_head(&key, 124);
+    assert_eq!(hub.resume_from(&key, 127), 127);
+    assert_eq!(hub.source_head(&key), Some(126));
+
+    let fresh = ("cdn".to_owned(), "pages".to_owned());
+    assert_eq!(hub.resume_from(&fresh, 1), 1);
+    assert_eq!(
+        hub.source_head(&fresh),
+        None,
+        "a first follow proves nothing"
+    );
 }

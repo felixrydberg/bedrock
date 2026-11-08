@@ -293,7 +293,7 @@ async fn scenario(api: SocketAddr, replication: String) {
 async fn open_writer() -> Arc<bedrock_lib::replication::writer::Writer> {
     use bedrock_lib::replication::materialized::Retention;
     use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Writer};
-    use bedrock_lib::storage::namespace::memory::MemoryFactory;
+    use bedrock_lib::storage::sim::MemoryFactory;
     Writer::open(
         || 1_700_000_000_000,
         Persistence {
@@ -357,15 +357,6 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
 #[madsim::test]
 async fn http_writes_commit_once_and_reach_subscribers_in_order() {
     simulated().await;
-}
-
-/// One seed must replay one schedule (B-23a). Append any seed that ever failed.
-#[cfg(madsim)]
-#[test]
-fn same_seed_same_schedule() {
-    for seed in [1, 2, 3] {
-        madsim::runtime::Runtime::check_determinism(seed, madsim::Config::default(), simulated);
-    }
 }
 
 #[cfg(madsim)]

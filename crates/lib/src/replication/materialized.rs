@@ -1,7 +1,7 @@
 //! Atomic event/state persistence (#11 / B-11). Standalone acknowledgement follows
 //! remote durability; future Raft supplies committed batches through the same path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use prost::Message;
@@ -60,6 +60,51 @@ pub struct RetryRecord {
     pub expires_at: u64,
 }
 
+/// Live retry records. They are kept for a whole retention period, so nothing per-commit may walk them: this indexes them
+/// by expiry, and ending them costs only what expires.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Retries {
+    records: BTreeMap<String, RetryRecord>,
+    expiries: BTreeSet<(u64, String)>,
+}
+
+impl Retries {
+    pub fn get(&self, key: &str) -> Option<&RetryRecord> {
+        self.records.get(key)
+    }
+
+    pub fn insert(&mut self, key: String, record: RetryRecord) {
+        self.expiries.insert((record.expires_at, key.clone()));
+        if let Some(old) = self.records.insert(key.clone(), record.clone())
+            && old.expires_at != record.expires_at
+        {
+            self.expiries.remove(&(old.expires_at, key));
+        }
+    }
+
+    /// Removes every record expired by `now` and returns their keys.
+    pub fn expire(&mut self, now: u64) -> Vec<String> {
+        let mut expired = Vec::new();
+        while self.expiries.first().is_some_and(|(at, _)| *at <= now) {
+            if let Some((_, key)) = self.expiries.pop_first() {
+                self.records.remove(&key);
+                expired.push(key);
+            }
+        }
+        expired
+    }
+}
+
+impl From<BTreeMap<String, RetryRecord>> for Retries {
+    fn from(records: BTreeMap<String, RetryRecord>) -> Self {
+        let mut retries = Retries::default();
+        for (key, record) in records {
+            retries.insert(key, record);
+        }
+        retries
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Progress {
     pub sequence: u64,
@@ -67,6 +112,38 @@ pub struct Progress {
     pub retries: BTreeMap<String, RetryRecord>,
     pub pruned_through: u64,
     pub raft: Option<RaftPosition>,
+}
+
+/// What [`Materialized::persist`] made durable. It leaves out the retries, because copying them costs a commit as much as
+/// they number: the caller knows which ones it just added.
+#[derive(Clone, Copy, Debug)]
+pub struct Persisted {
+    pub sequence: u64,
+    pub committed_at: u64,
+    pub pruned_through: u64,
+    pub raft: Option<RaftPosition>,
+}
+
+/// The namespace's progress as this handle last wrote or read it. Taken out while a change is under way and put back only
+/// after the write succeeded, so an error leaves nothing to trust and the next call reads the store.
+struct Tracked {
+    sequence: u64,
+    committed_at: u64,
+    retries: Retries,
+    pruned_through: u64,
+    raft: Option<RaftPosition>,
+}
+
+impl From<View> for Tracked {
+    fn from(view: View) -> Self {
+        Tracked {
+            sequence: view.sequence,
+            committed_at: view.committed_at,
+            retries: view.retries.into(),
+            pruned_through: view.pruned_through,
+            raft: view.raft,
+        }
+    }
 }
 
 /// Covered committed Raft log position, independent of namespace/engine sequences.
@@ -173,7 +250,7 @@ pub struct Materialized {
     db: Arc<dyn NamespaceDatabase>,
     dataset: String,
     namespace: String,
-    lock: Mutex<()>,
+    tracked: Mutex<Option<Tracked>>,
 }
 
 fn context(instance: &str, detail: impl Into<String>) -> ErrorContext {
@@ -221,13 +298,24 @@ impl Materialized {
             db: factory.open(dataset, namespace).await?,
             dataset: dataset.into(),
             namespace: namespace.into(),
-            lock: Mutex::new(()),
+            tracked: Mutex::new(None),
         };
-        if let Err(error) = materialized.read_progress().await {
-            let _ = materialized.db.close().await;
-            return Err(error);
+        match materialized.read_progress().await {
+            Ok(view) => *materialized.tracked.lock().await = Some(view.into()),
+            Err(error) => {
+                let _ = materialized.db.close().await;
+                return Err(error);
+            }
         }
         Ok(materialized)
+    }
+
+    /// The tracked progress, read from the store if a failure dropped it.
+    async fn take_tracked(&self, tracked: &mut Option<Tracked>) -> StorageResult<Tracked> {
+        match tracked.take() {
+            Some(tracked) => Ok(tracked),
+            None => Ok(self.read_progress().await?.into()),
+        }
     }
 
     fn corrupt(&self, detail: impl Into<String>) -> StorageError {
@@ -351,25 +439,27 @@ impl Materialized {
     }
 
     pub async fn view(&self) -> StorageResult<View> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.tracked.lock().await;
         self.read_view().await
     }
 
     pub async fn progress(&self) -> StorageResult<Progress> {
-        let _guard = self.lock.lock().await;
-        let view = self.read_progress().await?;
-        Ok(Progress {
+        let mut slot = self.tracked.lock().await;
+        let view = self.take_tracked(&mut slot).await?;
+        let progress = Progress {
             sequence: view.sequence,
             committed_at: view.committed_at,
-            retries: view.retries,
+            retries: view.retries.records.clone(),
             pruned_through: view.pruned_through,
             raft: view.raft,
-        })
+        };
+        *slot = Some(view);
+        Ok(progress)
     }
 
     pub async fn apply(&self, entries: &[Committed]) -> StorageResult<()> {
-        let _guard = self.lock.lock().await;
-        self.apply_locked(entries, None).await
+        let mut slot = self.tracked.lock().await;
+        self.apply_locked(&mut slot, entries, None).await
     }
 
     /// The common standalone/future-Raft persistence operation. All events, values,
@@ -379,26 +469,28 @@ impl Materialized {
         &self,
         entries: &[Committed],
         raft: Option<RaftPosition>,
-    ) -> StorageResult<Progress> {
-        let _guard = self.lock.lock().await;
-        self.apply_locked(entries, raft).await?;
+    ) -> StorageResult<Persisted> {
+        let mut slot = self.tracked.lock().await;
+        self.apply_locked(&mut slot, entries, raft).await?;
         self.db.flush().await?;
-        let view = self.read_progress().await?;
-        Ok(Progress {
+        let view = self.take_tracked(&mut slot).await?;
+        let persisted = Persisted {
             sequence: view.sequence,
             committed_at: view.committed_at,
-            retries: view.retries,
             pruned_through: view.pruned_through,
             raft: view.raft,
-        })
+        };
+        *slot = Some(view);
+        Ok(persisted)
     }
 
     async fn apply_locked(
         &self,
+        slot: &mut Option<Tracked>,
         entries: &[Committed],
         raft: Option<RaftPosition>,
     ) -> StorageResult<()> {
-        let mut view = self.read_progress().await?;
+        let mut view = self.take_tracked(slot).await?;
         if view.sequence == 0 && entries.is_empty() && raft.is_some() {
             return Err(StorageError::Unsupported(context(
                 "namespace",
@@ -422,7 +514,7 @@ impl Materialized {
         {
             return Err(self.corrupt("Raft-backed state requires a committed Raft position"));
         }
-        let original_retries = view.retries.clone();
+        let mut retries: BTreeMap<String, Option<RetryRecord>> = BTreeMap::new();
         let original_sequence = view.sequence;
         let mut changes: Changes = Vec::new();
         for entry in entries {
@@ -479,40 +571,32 @@ impl Materialized {
             ));
             view.sequence = event.sequence;
             view.committed_at = event.committed_at;
-            view.retries
-                .retain(|_, retry| retry.expires_at > event.committed_at);
+            for expired in view.retries.expire(event.committed_at) {
+                retries.insert(expired, None);
+            }
             if let Some(retry_key) = &entry.retry_key {
-                view.retries.insert(
-                    retry_key.clone(),
-                    RetryRecord {
-                        sequence: event.sequence,
-                        expires_at: entry.retry_expires_at,
-                    },
-                );
+                let retry = RetryRecord {
+                    sequence: event.sequence,
+                    expires_at: entry.retry_expires_at,
+                };
+                view.retries.insert(retry_key.clone(), retry.clone());
+                retries.insert(retry_key.clone(), Some(retry));
             }
         }
         if view.sequence == original_sequence && (raft.is_none() || view.raft == raft) {
+            *slot = Some(view);
             return Ok(());
         }
         view.raft = raft.or(view.raft);
-        for retry_key in original_retries.keys() {
-            if !view.retries.contains_key(retry_key) {
-                changes.push((key(b'r', retry_key.as_bytes()), None));
-            }
-        }
-        for (retry_key, retry) in &view.retries {
-            if original_retries.get(retry_key) != Some(retry) {
-                changes.push((
-                    key(b'r', retry_key.as_bytes()),
-                    Some(
-                        StoredRetry {
-                            sequence: retry.sequence,
-                            expires_at: retry.expires_at,
-                        }
-                        .encode_to_vec(),
-                    ),
-                ));
-            }
+        for (retry_key, retry) in retries {
+            let stored = retry.map(|retry| {
+                StoredRetry {
+                    sequence: retry.sequence,
+                    expires_at: retry.expires_at,
+                }
+                .encode_to_vec()
+            });
+            changes.push((key(b'r', retry_key.as_bytes()), stored));
         }
         changes.push((
             META_KEY.to_vec(),
@@ -530,7 +614,9 @@ impl Materialized {
                 .encode_to_vec(),
             ),
         ));
-        self.db.write(changes).await
+        self.db.write(changes).await?;
+        *slot = Some(view);
+        Ok(())
     }
 
     fn decode_event(&self, encoded: &[u8], value: &[u8]) -> StorageResult<Committed> {
@@ -586,23 +672,23 @@ impl Materialized {
     }
 
     pub async fn events(&self) -> StorageResult<Vec<Committed>> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.tracked.lock().await;
         self.events_locked(&self.read_progress().await?).await
     }
 
     /// Reads at most `limit` retained events from `from` by sequence key, never the whole history.
     pub async fn events_from(&self, from: u64, limit: u64) -> StorageResult<Vec<Committed>> {
-        let _guard = self.lock.lock().await;
-        let view = self.read_progress().await?;
-        if from <= view.pruned_through {
+        let mut slot = self.tracked.lock().await;
+        let view = self.take_tracked(&mut slot).await?;
+        let (sequence, pruned_through) = (view.sequence, view.pruned_through);
+        *slot = Some(view);
+        if from <= pruned_through {
             return Err(StorageError::Unavailable(context(
                 &format!("{}/{}", self.dataset, self.namespace),
                 "requested events were pruned",
             )));
         }
-        let through = view
-            .sequence
-            .min(from.saturating_add(limit).saturating_sub(1));
+        let through = sequence.min(from.saturating_add(limit).saturating_sub(1));
         let mut events = Vec::new();
         for sequence in from..=through {
             let encoded = key(b'e', &sequence.to_be_bytes());
@@ -630,8 +716,8 @@ impl Materialized {
         through: u64,
     ) -> StorageResult<u64> {
         retention.validate()?;
-        let _guard = self.lock.lock().await;
-        let mut view = self.read_progress().await?;
+        let mut slot = self.tracked.lock().await;
+        let mut view = self.take_tracked(&mut slot).await?;
         let mut changes = Vec::new();
         // Read only the expired prefix, not the whole retained history on every write.
         // Bound one pass; further namespace activity can continue physical reclamation.
@@ -657,13 +743,13 @@ impl Materialized {
             view.pruned_through = entry.event.sequence;
             changes.push((encoded, None));
         }
-        for (retry_key, retry) in &view.retries {
-            if retry.expires_at <= now {
-                changes.push((key(b'r', retry_key.as_bytes()), None));
-            }
+        for retry_key in view.retries.expire(now) {
+            changes.push((key(b'r', retry_key.as_bytes()), None));
         }
         if changes.is_empty() {
-            return Ok(view.pruned_through);
+            let pruned_through = view.pruned_through;
+            *slot = Some(view);
+            return Ok(pruned_through);
         }
         changes.push((
             META_KEY.to_vec(),
@@ -682,19 +768,23 @@ impl Materialized {
             ),
         ));
         self.db.write(changes).await?;
+        let pruned_through = view.pruned_through;
+        *slot = Some(view);
         self.db.flush().await?;
-        Ok(view.pruned_through)
+        Ok(pruned_through)
     }
 
     pub async fn publish(&self) -> StorageResult<u64> {
-        let _guard = self.lock.lock().await;
-        let sequence = self.read_progress().await?.sequence;
+        let mut slot = self.tracked.lock().await;
+        let view = self.take_tracked(&mut slot).await?;
+        let sequence = view.sequence;
+        *slot = Some(view);
         self.db.flush().await?;
         Ok(sequence)
     }
 
     pub async fn close(&self) -> StorageResult<()> {
-        let _guard = self.lock.lock().await;
+        let _guard = self.tracked.lock().await;
         self.db.close().await
     }
 }

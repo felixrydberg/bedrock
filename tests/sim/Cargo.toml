@@ -6,14 +6,19 @@ rust-version.workspace = true
 publish = false
 description = "Deterministic simulation tests for the shared core (B-23a); most only compile under `--cfg madsim`."
 
+[target.'cfg(madsim)'.dependencies]
+bedrock-lib.workspace = true
+madsim.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+
 [target.'cfg(madsim)'.dev-dependencies]
 bedrock-cdn = { path = "../../crates/cdn" }
 bedrock-kv = { path = "../../crates/kv" }
 bedrock-quicksilver = { path = "../../crates/quicksilver" }
 bedrock-relay = { path = "../../crates/relay" }
-aws-sdk-s3.workspace = true
-axum = { version = "0.8", default-features = false, features = ["http1"] }
-madsim.workspace = true
+# The VOPR binary's allocator: about a quarter faster than glibc's, and traces do not depend on it (B-61). Simulation only.
+mimalloc = { version = "0.1.52", default-features = false }
 
 # `tests/transport.rs`, `subscriptions.rs` and `writes.rs` run in both builds.
 [build-dependencies]
@@ -22,7 +27,7 @@ tonic-build = { package = "madsim-tonic-build", version = "0.6" }
 
 [dev-dependencies]
 bedrock-api = { path = "../../crates/api" }
-bedrock-lib.workspace = true
+bedrock-lib = { workspace = true, features = ["test-support"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["service", "tokio"] }

@@ -29,6 +29,8 @@ use replay::Replay;
 
 pub const PROGRESS: Duration = Duration::from_secs(10);
 pub const IDLE: Duration = Duration::from_secs(30);
+/// How long a recovery waits for a slot before its subscriber has to retry.
+const RECOVERY_WAIT: Duration = Duration::from_secs(5);
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 1024;
 type Key = (String, String);
@@ -148,11 +150,16 @@ struct Interest {
     from: u64,
     acked: u64,
     generation: u64,
+    /// The subscriber's number for the follow, stamped on its deliveries and bootstraps (follows.tla).
+    follow: u64,
     baseline: u64,
     /// A bootstrap was sent and its recovered confirmation not yet.
     confirming: bool,
     /// The head this stream must be acknowledged through to count as ready, fixed when it first could.
     target: Option<u64>,
+    /// Wakes this stream's pump: its acknowledgements and its end. A subscriber-wide signal would wake every stream the
+    /// subscriber follows on each acknowledgement, a cost that grows with the square of its ranges (B-61).
+    woken: Arc<Watched<u64>>,
 }
 
 /// Accounts serialized queue bytes when tonic drains a subscriber's bounded queue.
@@ -170,14 +177,19 @@ impl Drop for Frames {
         }
     }
 }
+/// Gives back `amount` of a queue budget. Taking more than was added would wrap and hold backpressure on forever.
+fn release(counter: &AtomicUsize, amount: usize) {
+    let before = counter.fetch_sub(amount, Ordering::Relaxed);
+    assert!(before >= amount, "queue accounting underflowed");
+}
+
 impl Stream for Frames {
     type Item = Result<pb::RelayFrame, Status>;
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let item = Pin::new(&mut self.rx).poll_next(cx);
         if let Poll::Ready(Some(Ok(ref frame))) = item {
-            self.bytes.fetch_sub(frame.encoded_len(), Ordering::Relaxed);
-            self.events
-                .fetch_sub(queued_events(frame), Ordering::Relaxed);
+            release(&self.bytes, frame.encoded_len());
+            release(&self.events, queued_events(frame));
             self.changed.update(|v| *v = v.wrapping_add(1));
         }
         item
@@ -277,13 +289,13 @@ impl Hub {
     async fn persist_replay(&self, mut pending: mpsc::Receiver<ReplayItem>) {
         let mut rebuild_after = crate::monotonic_now();
         while let Some((event, mut now, size)) = pending.recv().await {
-            self.0.replay_bytes.fetch_sub(size, Ordering::Relaxed);
+            release(&self.0.replay_bytes, size);
             let mut events = vec![event];
             while events.len() < 256 {
                 let Ok((event, at, size)) = pending.try_recv() else {
                     break;
                 };
-                self.0.replay_bytes.fetch_sub(size, Ordering::Relaxed);
+                release(&self.0.replay_bytes, size);
                 now = now.max(at);
                 events.push(event);
             }
@@ -504,7 +516,9 @@ impl Hub {
         self.head(key)
             .update(|head| *head = Some(head.unwrap_or(0).max(sequence)));
     }
-    /// Live subscriptions start after the contiguous prefix the relay can already serve.
+    /// Live subscriptions start after the contiguous prefix the relay can already serve. A cursor proves what precedes it
+    /// exists, so the head moves up to it: a stream started past this relay's history, as one for a sibling's subscribers
+    /// is, delivers nothing from before the cursor, and a subscriber behind it must see it is behind to fetch the rest.
     fn resume_from(&self, key: &Key, from: u64) -> u64 {
         let mut ranges = self
             .0
@@ -543,6 +557,9 @@ impl Hub {
                 next = last.saturating_add(1);
             }
         }
+        if next > 1 {
+            self.observe_head(key, next - 1);
+        }
         next
     }
     fn remove(&self, id: u64) {
@@ -550,6 +567,9 @@ impl Hub {
         if let Some(sub) = removed {
             sub.closed.update(|v| *v = true);
             sub.changed.update(|v| *v = v.wrapping_add(1));
+            for interest in sub.follows.values() {
+                interest.woken.update(|v| *v = v.wrapping_add(1));
+            }
             if let Some(mut member) = sub.member {
                 self.0.stats.disconnected(&member);
                 if member.status == pb::member::Status::Draining as i32 {
@@ -604,18 +624,19 @@ impl Hub {
         id: u64,
         key: &StreamKey,
         generation: u64,
-        kind: pb::relay_frame::Kind,
+        mut kind: pb::relay_frame::Kind,
     ) -> bool {
-        let Some(changes) = self
-            .0
-            .subscribers
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|s| s.changed.clone())
-        else {
+        let Some((changes, follow)) = self.0.subscribers.lock().unwrap().get(&id).map(|s| {
+            let follow = s.follows.get(key).map_or(0, |interest| interest.follow);
+            (s.changed.clone(), follow)
+        }) else {
             return false;
         };
+        match &mut kind {
+            pb::relay_frame::Kind::Delivery(d) => d.follow = follow,
+            pb::relay_frame::Kind::Bootstrap(b) => b.follow = follow,
+            _ => {}
+        }
         let mut frame = pb::RelayFrame { kind: Some(kind) };
         let queued = tokio::time::timeout(IDLE, async move {
             loop {
@@ -702,8 +723,8 @@ impl Hub {
                 Ok(true)
             }
             Err(error) => {
-                sub.bytes.fetch_sub(len, Ordering::Relaxed);
-                sub.events.fetch_sub(events, Ordering::Relaxed);
+                release(&sub.bytes, len);
+                release(&sub.events, events);
                 drop(subscribers);
                 match error {
                     mpsc::error::TrySendError::Full(Ok(frame)) => Err(Box::new(frame)),
@@ -726,6 +747,27 @@ impl Hub {
             .filter(|f| f.generation == generation)
             .map(|f| (f.from, f.acked))
     }
+    /// Where a recovery asks its next source to start, and whether that is a full recovery. A bootstrap sent but not yet
+    /// confirmed makes it one: only a full recovery ends in the confirmation the subscriber is waiting for.
+    fn recovery_start(
+        &self,
+        id: u64,
+        key: &StreamKey,
+        generation: u64,
+        force: bool,
+    ) -> Option<(u64, bool)> {
+        let subscribers = self.0.subscribers.lock().unwrap();
+        let interest = subscribers
+            .get(&id)?
+            .follows
+            .get(key)
+            .filter(|interest| interest.generation == generation)?;
+        Some(if force || interest.confirming {
+            (0, true)
+        } else {
+            (interest.from, false)
+        })
+    }
     fn advance(&self, id: u64, key: &StreamKey, generation: u64, through: u64) {
         if let Some(interest) = self
             .0
@@ -736,7 +778,9 @@ impl Hub {
             .and_then(|sub| sub.follows.get_mut(key))
             .filter(|f| f.generation == generation)
         {
-            interest.from = through.saturating_add(1);
+            let next = through.saturating_add(1);
+            assert!(next >= interest.from, "a subscription moved backwards");
+            interest.from = next;
         }
     }
     fn baseline(&self, id: u64, key: &StreamKey, generation: u64, boundary: u64) {
@@ -779,12 +823,12 @@ impl Hub {
     fn acknowledge(&self, id: u64, ack: pb::Ack) {
         if let Some(sub) = self.0.subscribers.lock().unwrap().get_mut(&id) {
             let key = ((ack.dataset, ack.namespace), range(ack.span.as_ref()));
-            if let Some(interest) = sub.follows.get_mut(&key)
-                && ack.applied < interest.from
-            {
-                interest.acked = interest.acked.max(ack.applied);
+            if let Some(interest) = sub.follows.get_mut(&key) {
+                if ack.applied < interest.from {
+                    interest.acked = interest.acked.max(ack.applied);
+                }
+                interest.woken.update(|v| *v = v.wrapping_add(1));
             }
-            sub.changed.update(|v| *v = v.wrapping_add(1));
         }
     }
     /// An empty namespace with a range unfollows that range in every namespace of the dataset.
@@ -794,13 +838,21 @@ impl Hub {
             match range.filter(|_| unfollow.namespace.is_empty()) {
                 Some(range) => {
                     sub.ranges.remove(&(unfollow.dataset.clone(), range));
-                    sub.follows.retain(|((dataset, _), r), _| {
-                        *dataset != unfollow.dataset || *r != Some(range)
+                    sub.follows.retain(|((dataset, _), r), interest| {
+                        let kept = *dataset != unfollow.dataset || *r != Some(range);
+                        if !kept {
+                            interest.woken.update(|v| *v = v.wrapping_add(1));
+                        }
+                        kept
                     });
                 }
                 None => {
-                    sub.follows
-                        .remove(&((unfollow.dataset, unfollow.namespace), range));
+                    if let Some(interest) = sub
+                        .follows
+                        .remove(&((unfollow.dataset, unfollow.namespace), range))
+                    {
+                        interest.woken.update(|v| *v = v.wrapping_add(1));
+                    }
                 }
             }
             sub.changed.update(|v| *v = v.wrapping_add(1));
@@ -876,7 +928,7 @@ impl Hub {
                     .try_send((event.clone(), now, size))
                     .is_err()
             {
-                self.0.replay_bytes.fetch_sub(size, Ordering::Relaxed);
+                release(&self.0.replay_bytes, size);
             }
         }
         let committed_at = event.committed_at;
@@ -952,7 +1004,7 @@ impl Hub {
         }
         match key.1.filter(|_| follow.namespace.is_empty()) {
             Some(range) => self.follow_range(id, follow, range, visited),
-            None => self.follow_stream(id, key, follow.from, visited, force),
+            None => self.follow_stream(id, key, follow.from, follow.follow, visited, force),
         }
     }
 
@@ -979,11 +1031,19 @@ impl Hub {
             // 0 asks for a fresh baseline; a namespace the subscriber has not seen starts at 1.
             let from = follow.from_namespaces.get(&namespace).copied().unwrap_or(1);
             let key = ((dataset.clone(), namespace), Some(range));
-            self.follow_stream(id, key, from, visited.clone(), from == 0);
+            self.follow_stream(id, key, from, follow.follow, visited.clone(), from == 0);
         }
     }
 
-    fn follow_stream(&self, id: u64, key: StreamKey, from: u64, visited: Vec<String>, force: bool) {
+    fn follow_stream(
+        &self,
+        id: u64,
+        key: StreamKey,
+        from: u64,
+        follow: u64,
+        visited: Vec<String>,
+        force: bool,
+    ) {
         // Seed the validated cache's lower bound before upstream traffic can arrive.
         self.source_head(&key.0);
         let generation = self.0.ids.fetch_add(1, Ordering::Relaxed);
@@ -992,17 +1052,22 @@ impl Hub {
             let Some(sub) = subscribers.get_mut(&id) else {
                 return;
             };
-            sub.follows.insert(
+            let replaced = sub.follows.insert(
                 key.clone(),
                 Interest {
                     from: from.max(1),
                     acked: from.max(1) - 1,
                     generation,
+                    follow,
                     baseline: from.max(1) - 1,
                     confirming: false,
                     target: None,
+                    woken: Arc::default(),
                 },
             );
+            if let Some(replaced) = replaced {
+                replaced.woken.update(|v| *v = v.wrapping_add(1));
+            }
             sub.changed.update(|v| *v = v.wrapping_add(1));
         }
         self.changed();
@@ -1032,11 +1097,14 @@ impl Hub {
         force: bool,
     ) -> Result<(), Status> {
         let opened = crate::monotonic_now();
-        let Some((changes, mut moved)) = self.0.subscribers.lock().unwrap().get(&id).map(|s| {
-            // A stream followed long after the session opened is new work, not failover.
-            let moved = s.moved.filter(|at| opened.duration_since(*at) < IDLE);
-            (s.changed.clone(), moved)
-        }) else {
+        let Some((changes, mut moved)) =
+            self.0.subscribers.lock().unwrap().get(&id).and_then(|s| {
+                // A stream followed long after the session opened is new work, not failover.
+                let moved = s.moved.filter(|at| opened.duration_since(*at) < IDLE);
+                let interest = s.follows.get(&key).filter(|i| i.generation == generation)?;
+                Some((interest.woken.clone(), moved))
+            })
+        else {
             return Ok(());
         };
         let mut announced = false;
@@ -1044,6 +1112,8 @@ impl Hub {
         let mut lease: Option<Arc<RecoveryLease>> = None;
         let mut renewed_through = 0;
         let mut recovery_permit = None;
+        // One timer for the whole stream: a new sleep on every pass leaves one behind per event, for its full length (B-61).
+        let mut recheck = std::pin::pin!(tokio::time::sleep(PROGRESS));
         loop {
             let version = self.0.changed.get();
             let local_version = changes.get();
@@ -1192,6 +1262,7 @@ impl Hub {
                                     through,
                                     events: selected,
                                     span: span(key.1),
+                                    ..Default::default()
                                 }),
                             )
                             .await
@@ -1203,10 +1274,7 @@ impl Hub {
                     }
                     Err(error) if error.code() == tonic::Code::OutOfRange => {
                         if let Some(writer) = &self.0.writer {
-                            recovery_permit =
-                                Some(self.0.recoveries.clone().try_acquire_owned().map_err(
-                                    |_| Status::resource_exhausted("recovery capacity exhausted"),
-                                )?);
+                            recovery_permit = Some(self.recovery_permit().await?);
                             let (view, pin) = writer
                                 .begin_recovery(&key.0.0, &key.0.1)
                                 .await
@@ -1227,6 +1295,7 @@ impl Hub {
                                 entries: Vec::new(),
                                 checksum: Vec::new(),
                                 span: span(key.1),
+                                ..Default::default()
                             };
                             if !self
                                 .send_scoped(
@@ -1349,16 +1418,27 @@ impl Hub {
                     _=self.0.changed.wait_until(|v|*v!=version)=>{},
                     _=changes.wait_until(|v|*v!=local_version)=>{},
                     _=head.wait_until(|v|Some(*v)!=h)=>{},
-                    _=tokio::time::sleep(PROGRESS)=>{},
+                    _=recheck.as_mut()=>recheck.as_mut().reset(crate::monotonic_now()+PROGRESS),
                 }
             } else {
                 tokio::select! {biased;
                     _=self.0.changed.wait_until(|v|*v!=version)=>{},
                     _=changes.wait_until(|v|*v!=local_version)=>{},
-                    _=tokio::time::sleep(PROGRESS)=>{},
+                    _=recheck.as_mut()=>recheck.as_mut().reset(crate::monotonic_now()+PROGRESS),
                 }
             }
         }
+    }
+
+    /// A slot among this relay's concurrent recoveries. Waiting keeps them moving: a refusal costs the subscriber its next
+    /// retry, however soon a slot frees.
+    async fn recovery_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        let refused = || Status::resource_exhausted("relay recovery capacity exhausted");
+        let permit = self.0.recoveries.clone().acquire_owned();
+        tokio::time::timeout(RECOVERY_WAIT, permit)
+            .await
+            .map_err(|_| refused())?
+            .map_err(|_| refused())
     }
 
     async fn proxy(
@@ -1369,12 +1449,12 @@ impl Hub {
         visited: &[String],
         force: bool,
     ) -> Result<(), Status> {
-        let _permit = self
-            .0
-            .recoveries
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("relay recovery capacity exhausted"))?;
+        // Only the relay a recovery entered takes a slot: relays forwarding to each other would otherwise wait on each other's.
+        let _permit = if visited.is_empty() {
+            Some(self.recovery_permit().await?)
+        } else {
+            None
+        };
         if visited.contains(&self.0.id) || visited.len() >= 8 {
             return Err(Status::failed_precondition("recovery forwarding loop"));
         }
@@ -1401,18 +1481,16 @@ impl Hub {
                 })
                 .await
                 .unwrap();
+                let Some((from, force)) = self.recovery_start(id, key, generation, force) else {
+                    return Ok(());
+                };
                 let request = pb::Follow {
                     dataset: key.0.0.clone(),
                     namespace: key.0.1.clone(),
-                    from: if force {
-                        0
-                    } else {
-                        self.current(id, key, generation)
-                            .ok_or_else(|| Status::cancelled("subscription closed"))?
-                            .0
-                    },
+                    from,
                     span: span(key.1),
                     from_namespaces: Default::default(),
+                    ..Default::default()
                 };
                 let requested_from = request.from;
                 tx.send(pb::RelayRequest {
@@ -1701,8 +1779,14 @@ impl Hub {
         // Next expected revision per namespace, from namespace follows and whole-dataset follows alike.
         let mut sent = BTreeMap::<Key, u64>::new();
         let mut sent_datasets = BTreeSet::<String>::new();
+        // The number of the follow each namespace is in. Frames of a follow this session ended can arrive after the next
+        // one began, and are dropped (follows.tla).
+        let mut follows = BTreeMap::<Key, u64>::new();
+        let mut numbered = 0;
         let mut progress = tokio::time::interval(PROGRESS);
         let mut received = crate::monotonic_now();
+        // Re-armed when it fires rather than per message, which would leave a timer behind for each one (B-61).
+        let mut idle = std::pin::pin!(tokio::time::sleep_until(received + IDLE));
         loop {
             let version = self.0.changed.get();
             let (namespaces, datasets) = self.desired();
@@ -1722,6 +1806,7 @@ impl Hub {
                     span: None,
                 }));
                 sent.remove(&key);
+                follows.remove(&key);
             }
             for dataset in sent_datasets
                 .difference(&datasets)
@@ -1734,6 +1819,7 @@ impl Hub {
                     span: span(Some(WHOLE)),
                 }));
                 sent.retain(|key, _| key.0 != dataset);
+                follows.retain(|key, _| key.0 != dataset);
                 sent_datasets.remove(&dataset);
             }
             for (key, from) in namespaces
@@ -1742,18 +1828,22 @@ impl Hub {
             {
                 if !sent.contains_key(key) {
                     let from = self.resume_from(key, *from);
+                    numbered += 1;
                     requests.push(pb::relay_request::Kind::Follow(pb::Follow {
                         dataset: key.0.clone(),
                         namespace: key.1.clone(),
                         from,
                         span: None,
                         from_namespaces: Default::default(),
+                        follow: numbered,
                     }));
                     sent.insert(key.clone(), from);
+                    follows.insert(key.clone(), numbered);
                 }
             }
             for dataset in &datasets {
                 if sent_datasets.insert(dataset.clone()) {
+                    numbered += 1;
                     let mut from_namespaces = BTreeMap::new();
                     for namespace in self.namespaces(dataset) {
                         let key = (dataset.clone(), namespace);
@@ -1762,6 +1852,7 @@ impl Hub {
                         });
                         let from = self.resume_from(&key, from);
                         sent.insert(key.clone(), from);
+                        follows.insert(key.clone(), numbered);
                         from_namespaces.insert(key.1, from);
                     }
                     requests.push(pb::relay_request::Kind::Follow(pb::Follow {
@@ -1770,6 +1861,7 @@ impl Hub {
                         from: 0,
                         span: span(Some(WHOLE)),
                         from_namespaces,
+                        follow: numbered,
                     }));
                 }
             }
@@ -1780,7 +1872,13 @@ impl Hub {
             }
             let message = tokio::select! {biased;
                 _=self.0.changed.wait_until(|v|*v!=version)=>continue,
-                _=tokio::time::sleep_until(received+IDLE)=>return Err(Status::deadline_exceeded("upstream idle")),
+                _=idle.as_mut()=>{
+                    if received+IDLE>crate::monotonic_now() {
+                        idle.as_mut().reset(received+IDLE);
+                        continue;
+                    }
+                    return Err(Status::deadline_exceeded("upstream idle"));
+                },
                 _=progress.tick()=>{
                     tx.send(pb::RelayRequest{kind:Some(pb::relay_request::Kind::Progress(true))}).await.map_err(|_|Status::unavailable("upstream requests closed"))?;
                     continue;
@@ -1800,8 +1898,10 @@ impl Hub {
                 }
                 Some(pb::relay_frame::Kind::Delivery(d)) => {
                     let key = (d.dataset.clone(), d.namespace.clone());
-                    let expected = sent.get(&key).copied().unwrap_or(d.from);
-                    if d.from != expected {
+                    if follows.get(&key) != Some(&d.follow) {
+                        continue;
+                    }
+                    if sent.get(&key) != Some(&d.from) {
                         return Err(Status::data_loss("upstream coverage gap"));
                     }
                     let mut next = d.from;
@@ -1838,6 +1938,9 @@ impl Hub {
                 }
                 Some(pb::relay_frame::Kind::Bootstrap(b)) if b.end => {
                     let key = (b.dataset.clone(), b.namespace.clone());
+                    if follows.get(&key) != Some(&b.follow) {
+                        continue;
+                    }
                     self.observe_head(&key, b.boundary);
                     self.changed();
                     sent.insert(key, b.boundary.saturating_add(1));
@@ -1973,10 +2076,12 @@ impl pb::relay_server::Relay for Hub {
             let mut tick = tokio::time::interval(PROGRESS);
             tick.tick().await;
             let mut received = crate::monotonic_now();
+            // Re-armed when it fires rather than per message, which would leave a timer behind for each one (B-61).
+            let mut idle = std::pin::pin!(tokio::time::sleep_until(received + IDLE));
             loop {
                 tokio::select! {biased;
                     _=closed.wait_until(|v|*v)=>break,
-                    _=tokio::time::sleep_until(received+IDLE)=>break,
+                    _=idle.as_mut()=>if received+IDLE>crate::monotonic_now() {idle.as_mut().reset(received+IDLE)} else {break},
                     // A full queue skips the tick; stalled readers are disconnected by scoped sends after IDLE.
                     _=tick.tick()=>if matches!(hub.enqueue(id,pb::RelayFrame{kind:Some(pb::relay_frame::Kind::Tick(true))},None),Ok(false)){break},
                     request=requests.message()=>match request {

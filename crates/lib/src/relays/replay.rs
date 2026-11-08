@@ -397,7 +397,25 @@ impl State {
         *latest = (*latest).max(at);
     }
 
+    /// Eviction walks `age` and `eviction` to find `records`, so all three must hold the same ids.
+    fn assert_indexed(&self) {
+        assert_eq!(
+            self.records.len(),
+            self.age.len(),
+            "replay age index drifted"
+        );
+        assert_eq!(
+            self.records.len(),
+            self.eviction.len(),
+            "replay eviction index drifted"
+        );
+    }
+
     fn insert(&mut self, config: &ReplayConfig, id: Identity, record: Record) {
+        assert!(
+            !self.records.contains_key(&id),
+            "replay record inserted twice"
+        );
         self.age.insert((record.arrived_at, id.clone()));
         self.eviction.insert((
             config.priorities.get(&id.0).copied().unwrap_or(0),
@@ -406,6 +424,7 @@ impl State {
         ));
         self.bytes += record.bytes;
         self.records.insert(id, record);
+        self.assert_indexed();
     }
 
     fn remove(&mut self, config: &ReplayConfig, id: &Identity) {
@@ -418,6 +437,7 @@ impl State {
             ));
             self.bytes -= record.bytes;
         }
+        self.assert_indexed();
     }
 }
 

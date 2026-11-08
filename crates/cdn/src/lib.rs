@@ -31,7 +31,7 @@ pub const DATASETS: &[Dataset] = &[Dataset {
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
 /// If the enabled CDN engine cannot open or is unhealthy at startup, its ranges are not followed and the node stays
-/// unready until restart. Configuration, admin startup, registry and relay session initialization errors are returned.
+/// unready until restart; one that damage stopped opening starts empty and quarantined instead, and rebuilds. Configuration, admin startup, registry and relay session initialization errors are returned.
 pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-cdn");
@@ -56,7 +56,8 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     for instance in datasets.iter() {
         let name = instance.dataset.name;
         match &instance.engine {
-            Ok(engine) if engine.health().is_ok() => {
+            // A quarantined dataset still joins: its rebuild refills it through this session.
+            Ok(engine) if engine.health().is_ok() || storage.unhealthy().contains(name) => {
                 ranged.insert(name.to_owned(), replication[name].clone());
             }
             _ => tracing::warn!(
@@ -89,6 +90,15 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         &replication,
         bedrock_lib::placement::hash_of("rebuild", &config.node.node_id, b""),
     );
+    let scrubbing = bedrock_lib::health::scrub::start(
+        datasets
+            .iter()
+            .filter_map(|instance| {
+                let engine = instance.engine.as_ref().ok()?.clone();
+                Some((instance.dataset.name.to_owned(), engine))
+            })
+            .collect(),
+    );
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
@@ -107,6 +117,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     }
     admin.set_ready(false);
     rebuilding.abort();
+    scrubbing.abort();
     session.drain().await;
     tracing::info!("shutting down");
     Ok(())

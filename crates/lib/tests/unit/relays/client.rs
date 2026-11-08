@@ -1,4 +1,5 @@
 use super::*;
+use crate::placement::{Owner, State};
 use crate::storage::memory::MemoryEngine;
 
 #[tokio::test]
@@ -85,7 +86,7 @@ fn target(engine: Arc<MemoryEngine>) -> Target {
 }
 
 /// The consumer of namespace `users` in a range of `auth`.
-fn ranged(engine: Arc<MemoryEngine>, range: (u64, u64)) -> Consumer {
+fn ranged(engine: Arc<dyn StorageEngine>, range: (u64, u64)) -> Consumer {
     let group = Target {
         selection: Selection {
             dataset: "auth".into(),
@@ -137,6 +138,7 @@ fn delivery(from: u64, through: u64, events: Vec<pb::Event>) -> pb::Delivery {
             .map(|event| event.encode_to_vec().into())
             .collect(),
         span: None,
+        ..Default::default()
     }
 }
 
@@ -165,6 +167,7 @@ fn bootstrap(boundary: u64, entries: Vec<(&[u8], &[u8])>) -> pb::Bootstrap {
         entries,
         checksum: digest.finalize().to_vec(),
         span: None,
+        ..Default::default()
     }
 }
 
@@ -518,14 +521,20 @@ fn splitting_unconfirmed_coverage_requires_the_kept_range_to_recover() {
     };
     let progress = Mutex::new(Progress::default());
     let changes = Watched::new(0);
+    let change = ranges::Change {
+        held: whole,
+        kept: vec![kept],
+        dropped: vec![(0, kept.0), (kept.1, 0)],
+    };
+    let owners = vec![Owner {
+        node: "other".into(),
+        state: State::Ready,
+    }];
+    let directory = BTreeMap::from([(0, owners)]);
     let requests = narrow(
         "auth",
         &engine,
-        &ranges::Change {
-            held: whole,
-            kept: vec![kept],
-            dropped: vec![(0, kept.0), (kept.1, 0)],
-        },
+        ranges::confirm(Some(&directory), "me", &change, &BTreeSet::new()).unwrap(),
         &mut consumers,
         &mut pushed,
         &progress,
@@ -548,7 +557,11 @@ fn splitting_unconfirmed_coverage_requires_the_kept_range_to_recover() {
     assert!(!replacement.validated());
     assert_eq!(replacement.resume(), 0);
     assert_eq!(data.get(&stored_at(b"k")).unwrap(), Some(b"value".to_vec()));
-    assert!(held(data.as_ref(), "auth").unwrap().is_empty());
+    // Found by the simulation (#25 / B-23): the data stays, so a restart has to know the part is held or a revoke misses it.
+    assert_eq!(held(data.as_ref(), "auth").unwrap(), BTreeSet::from([kept]));
+    let resumed = Consumer::resumed(&replacement.target, kept).unwrap();
+    assert!(!resumed[0].validated());
+    assert_eq!(resumed[0].resume(), 0);
 }
 
 fn range(head: u64, recovered: bool) -> pb::ReplayRange {
@@ -622,7 +635,7 @@ async fn installed_bootstrap_and_tail_wait_for_source_confirmation_before_reads_
     assert!(consumer.validated());
     assert_eq!(
         engine.revision(&consumer.pending_confirmation).unwrap(),
-        Some(0)
+        None
     );
     changed(&progress, &changes, |state| {
         state
@@ -822,6 +835,43 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
 }
 
 #[test]
+fn a_quarantined_scope_asks_for_no_recovery_until_its_rebuild() {
+    let health = crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+    let engine = health.wrap_replication("auth", "engine", Arc::new(MemoryEngine::new("auth")));
+    let mut consumer = Consumer::new(Target {
+        engine,
+        ..target(Arc::new(MemoryEngine::new("unused")))
+    })
+    .unwrap();
+    let scope = consumer.scope();
+    let mut intake = Intake::default();
+    intake.fail(&scope, &mut consumer, Status::unavailable("busy"));
+    let mut consumers = BTreeMap::from([(scope.clone(), consumer)]);
+    assert_eq!(
+        intake.due(&consumers),
+        BTreeSet::from([scope.clone()]),
+        "a healthy engine retries at once"
+    );
+
+    let damage = crate::storage::StorageError::Corruption(crate::storage::ErrorContext {
+        engine: "memory",
+        instance: "auth".into(),
+        file: None,
+        partition: None,
+        detail: "damaged".into(),
+    });
+    health.report("auth", "engine", &damage);
+    let failed = consumers.get_mut(&scope).unwrap();
+    intake.fail(&scope, failed, Status::internal("quarantined"));
+    assert!(intake.due(&consumers).is_empty());
+    assert!(intake.due(&consumers).is_empty(), "it keeps waiting");
+
+    // Starting the rebuild requests again by itself; a request that then fails retries as usual.
+    assert!(health.rebuilding("auth", "engine"));
+    assert_eq!(intake.due(&consumers), BTreeSet::from([scope]));
+}
+
+#[test]
 fn local_storage_error_is_scoped_but_malformed_drain_coverage_is_still_fatal() {
     let engine = Arc::new(MemoryEngine::new("auth"));
     let whole = (0, 0);
@@ -914,6 +964,141 @@ fn pushed_ranges(revision: u64, spans: &[(u64, u64)]) -> pb::Ranges {
             .iter()
             .map(|&(start, end)| pb::Span { start, end })
             .collect(),
+    }
+}
+
+#[tokio::test]
+async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets() {
+    use crate::storage::sim::{Access, Fault, SimEngine};
+    use pb::relay_request::Kind;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let whole = (0, 0);
+    let marker = marker_prefix("auth", whole) + "users";
+    // Quarantine and both narrowing reads are isolated; malformed persisted state remains fatal.
+    for (fail_at, marker, expected_error, spans) in [
+        (None, marker.clone(), None, Vec::new()),
+        (Some(1), marker.clone(), None, Vec::new()),
+        (Some(2), marker.clone(), None, Vec::new()),
+        (Some(1), marker, None, vec![(0, 1 << 63), (1 << 63, 0)]),
+        (
+            Some(usize::MAX),
+            "relay:range:auth:broken".into(),
+            Some(tonic::Code::DataLoss),
+            Vec::new(),
+        ),
+        (
+            Some(usize::MAX),
+            marker_prefix("auth", whole) + "bad\0name",
+            Some(tonic::Code::InvalidArgument),
+            Vec::new(),
+        ),
+    ] {
+        let reads = Arc::new(AtomicUsize::new(usize::MAX / 2));
+        let observed = reads.clone();
+        let data = Arc::new(SimEngine::new(
+            "auth",
+            Arc::new(move |access| {
+                (access == Access::Read && Some(observed.fetch_add(1, Ordering::SeqCst)) == fail_at)
+                    .then_some(Fault::Unavailable)
+            }),
+            None,
+            false,
+        ));
+        data.put(&stored_at(b"k"), b"value").unwrap();
+        let mut batch = WriteBatch::default();
+        batch.set_revision(marker, 1);
+        data.write(batch).unwrap();
+        let health =
+            crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+        let engine = health.wrap_replication("auth", "engine", data.clone());
+        let me: Scope = ("membership".into(), "quicksilver.c1".into(), None);
+        let membership = view(7, &[]);
+        let moved = pb::Range {
+            owners: vec![pb::range::Owner {
+                node_id: "other".into(),
+                state: pb::range::owner::State::Ready as i32,
+            }],
+        };
+        membership
+            .target
+            .engine
+            .put(
+                b"quicksilver.c1\0range/auth/0000000000000000",
+                &moved.encode_to_vec(),
+            )
+            .unwrap();
+        let mut consumers = BTreeMap::from([(me.clone(), membership)]);
+        let mut pushed = revoke_state(&engine, whole);
+        pushed.me = Some(("n1".into(), me));
+        pushed.ranged.insert(
+            "quicksilver".into(),
+            Arc::new(MemoryEngine::new("quicksilver")),
+        );
+        pushed.pending.insert(
+            "auth".into(),
+            pb::Ranges {
+                dataset: "auth".into(),
+                ..pushed_ranges(7, &spans)
+            },
+        );
+        pushed
+            .pending
+            .insert("quicksilver".into(), pushed_ranges(7, &[whole]));
+        if fail_at.is_none() {
+            health.report(
+                "auth",
+                "engine",
+                &crate::storage::StorageError::Corruption(crate::storage::ErrorContext {
+                    engine: "memory",
+                    instance: "auth".into(),
+                    file: None,
+                    partition: None,
+                    detail: "damaged".into(),
+                }),
+            );
+        }
+        reads.store(0, Ordering::SeqCst);
+        let (tx, mut rx) = mpsc::channel(8);
+        let result = settle(
+            &tx,
+            &mut consumers,
+            &mut pushed,
+            &Mutex::new(Progress::default()),
+            &Watched::new(0),
+        )
+        .await;
+        if let Some(code) = expected_error {
+            assert_eq!(result.unwrap_err().code(), code);
+            assert!(rx.try_recv().is_err());
+            continue;
+        }
+        result.unwrap();
+
+        match rx.try_recv().unwrap().kind.unwrap() {
+            Kind::Ranges(ack) => {
+                assert_eq!(ack.dataset, "auth");
+                assert_eq!(ack.refused, [pb::Span { start: 0, end: 0 }]);
+                assert!(!ack.reason.is_empty());
+            }
+            other => panic!("expected a refusing acknowledgement, got {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            Some(Kind::Follow(follow)) if follow.dataset == "quicksilver"
+        ));
+        assert!(matches!(
+            rx.try_recv().unwrap().kind,
+            Some(Kind::Ranges(ack)) if ack.dataset == "quicksilver" && ack.refused.is_empty()
+        ));
+        assert!(rx.try_recv().is_err());
+        assert!(pushed.groups.contains_key(&("auth".into(), whole)));
+        assert!(!pushed.retired.contains(&("auth".into(), whole)));
+        assert_eq!(data.get(&stored_at(b"k")).unwrap(), Some(b"value".to_vec()));
+        assert_eq!(
+            held(data.as_ref(), "auth").unwrap(),
+            BTreeSet::from([whole])
+        );
     }
 }
 
@@ -1195,5 +1380,354 @@ async fn a_member_announces_only_the_ranged_datasets_it_follows() {
     assert_eq!(
         session.member.as_ref().unwrap().get().datasets,
         ["quicksilver"]
+    );
+}
+
+/// Found by the simulation (#25 / B-23): the session refused to start on a damaged record, so the process exited on every
+/// restart before the rebuild that repairs it could run.
+#[tokio::test]
+async fn a_damaged_engine_does_not_stop_the_session_starting() {
+    let engine = Arc::new(crate::storage::sim::SimEngine::new(
+        "quicksilver",
+        Arc::new(|_| None),
+        None,
+        false,
+    ));
+    let key = l2_key(1, "infrastructure", b"k");
+    let mut batch = WriteBatch::default();
+    batch
+        .put(key.clone(), "v")
+        .set_revision(marker_prefix("quicksilver", (0, 0)) + "infrastructure", 1);
+    engine.write(batch).unwrap();
+    engine.damage(&key);
+    let member = pb::Member {
+        node_id: "q1".into(),
+        service: "quicksilver".into(),
+        cell: "c1".into(),
+        status: pb::member::Status::Ready as i32,
+        datasets: vec!["quicksilver".into()],
+        ..Default::default()
+    };
+    let engine: Arc<dyn StorageEngine> = engine;
+    let ranged = BTreeMap::from([("quicksilver".to_string(), engine)]);
+    let (_, view) = crate::membership::View::new("quicksilver", "c1");
+    let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
+    let relays = vec!["10.0.0.1:7000".to_string()];
+    Session::join(peers, relays, vec![view], member, ranged).unwrap();
+}
+
+/// Found by the crash tests (#25 / B-23 Layer 3): damage in a later range quarantined the engine, and the earlier range's
+/// second read then failed and ended the session, so the process exited once before running quarantined.
+#[tokio::test]
+async fn damage_in_a_later_range_does_not_stop_the_session_starting() {
+    let sim = Arc::new(crate::storage::sim::SimEngine::new(
+        "quicksilver",
+        Arc::new(|_| None),
+        None,
+        false,
+    ));
+    let middle = u64::MAX / 2;
+    let late = l2_key(middle + 1, "infrastructure", b"k");
+    let mut batch = WriteBatch::default();
+    batch
+        .put(l2_key(1, "infrastructure", b"k"), "v")
+        .put(late.clone(), "v")
+        .set_revision(
+            marker_prefix("quicksilver", (0, middle)) + "infrastructure",
+            1,
+        )
+        .set_revision(
+            marker_prefix("quicksilver", (middle, 0)) + "infrastructure",
+            1,
+        );
+    sim.write(batch).unwrap();
+    sim.damage(&late);
+    let health = crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+    let engine = health.wrap_replication("quicksilver", "engine", sim);
+    let member = pb::Member {
+        node_id: "q1".into(),
+        service: "quicksilver".into(),
+        cell: "c1".into(),
+        status: pb::member::Status::Ready as i32,
+        datasets: vec!["quicksilver".into()],
+        ..Default::default()
+    };
+    let ranged = BTreeMap::from([("quicksilver".to_string(), engine)]);
+    let (_, view) = crate::membership::View::new("quicksilver", "c1");
+    let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
+    let relays = vec!["10.0.0.1:7000".to_string()];
+    Session::join(peers, relays, vec![view], member, ranged).unwrap();
+    assert!(health.unhealthy().contains("quicksilver"));
+}
+
+/// `narrow`'s other arguments, for a member holding `whole` of `auth`, with `engine` as its storage.
+fn revoke_state(engine: &Arc<dyn StorageEngine>, whole: Range) -> Pushed {
+    Pushed {
+        groups: Groups::from([(("auth".into(), whole), engine.clone())]),
+        ranged: BTreeMap::from([("auth".into(), engine.clone())]),
+        me: None,
+        pending: BTreeMap::new(),
+        retired: BTreeSet::new(),
+    }
+}
+
+/// A directory in which another node holds everything, so a revoke is allowed.
+fn replaced() -> crate::placement::Directory {
+    let owner = Owner {
+        node: "other".into(),
+        state: State::Ready,
+    };
+    BTreeMap::from([(0, vec![owner])])
+}
+
+/// Found by the simulation (#25 / B-23): a revoke's write can commit and still report failure. The consumer must not keep
+/// trusting a cursor whose data may be gone, or it applies deliveries over the hole and claims full coverage.
+#[test]
+fn a_revoke_with_an_unknown_outcome_stops_trusting_the_consumer() {
+    use crate::storage::sim::{Access, Fault, SimEngine};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let failing = Arc::new(AtomicBool::new(false));
+    let write_fails = failing.clone();
+    let data = Arc::new(SimEngine::new(
+        "auth",
+        Arc::new(move |access| {
+            (access == Access::Write && write_fails.load(Ordering::SeqCst))
+                .then_some(Fault::Ambiguous)
+        }),
+        None,
+        false,
+    ));
+    let whole = (0, 0);
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    consumer.awaiting_confirmation = false;
+    assert!(consumer.validated());
+    let scope = consumer.scope();
+    let mut consumers = BTreeMap::from([(scope.clone(), consumer)]);
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: Vec::new(),
+        dropped: vec![whole],
+    };
+    failing.store(true, Ordering::SeqCst);
+    let revoked = narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut consumers,
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    );
+    assert!(revoked.is_err());
+    assert!(!consumers[&scope].validated());
+}
+
+/// A range can be revoked before its consumer exists, when its progress could not be read at startup. Deleting the data
+/// must retire that stored progress too, or a later push resumes the cursor over nothing.
+#[test]
+fn a_revoke_retires_stored_progress_no_consumer_holds() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let whole = (0, 0);
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    let active = consumer.active.clone();
+    assert_eq!(data.revision(&active).unwrap(), Some(1));
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: Vec::new(),
+        dropped: vec![whole],
+    };
+    narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut BTreeMap::new(),
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    )
+    .unwrap();
+    assert_eq!(data.revision(&active).unwrap(), None);
+    assert!(held(data.as_ref(), "auth").unwrap().is_empty());
+    // B-61: retiring deletes the names, so a node's revisions do not grow with its range history.
+    let left: Vec<_> = data
+        .snapshot()
+        .unwrap()
+        .revisions()
+        .unwrap()
+        .into_keys()
+        .collect();
+    assert!(
+        left.iter().all(|name| !name.starts_with("relay:")),
+        "{left:?}"
+    );
+}
+
+/// Found by the simulation (#25 / B-23): a split whose write committed but reported failure left progress on the parts. A
+/// later revoke of one part deleted its data and retired only the whole range, so a later push resumed the part's cursor
+/// over nothing.
+#[test]
+fn a_revoke_retires_progress_stored_for_part_of_the_range() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let (whole, part) = ((0, 0), only(b"k"));
+    let mut consumer = ranged(data.clone(), part);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            part,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    let active = consumer.active.clone();
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: Vec::new(),
+        dropped: vec![whole],
+    };
+    narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut BTreeMap::new(),
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    )
+    .unwrap();
+    assert_eq!(data.revision(&active).unwrap(), None);
+    assert!(held(data.as_ref(), "auth").unwrap().is_empty());
+}
+
+/// Found by the simulation (#25 / B-23): a read failure while creating a split part's consumer left a group with none. A
+/// further split then retired the stored marker and left the parts it kept unmarked, so a restart or revoke missed them.
+#[test]
+fn a_split_without_a_consumer_still_marks_what_it_keeps() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let (whole, kept) = ((0, 0), only(b"k"));
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: vec![kept],
+        dropped: vec![(0, kept.0), (kept.1, 0)],
+    };
+    narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut BTreeMap::new(),
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    )
+    .unwrap();
+    assert_eq!(held(data.as_ref(), "auth").unwrap(), BTreeSet::from([kept]));
+}
+
+/// Found by the simulation (#25 / B-23): a split that committed but reported failure left a trusted cursor on a part. The
+/// retry dropped nothing, so that cursor stayed active over data newer bootstraps replaced.
+#[test]
+fn a_retried_split_retires_progress_an_earlier_attempt_left_on_a_part() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let whole = (0, 0);
+    let (first, part) = ((0, 1 << 63), (1 << 63, 0));
+    let parts = [(1 << 63, 3 << 62), (3 << 62, 0)];
+    let mut consumer = ranged(data.clone(), whole);
+    consumer
+        .bootstrap(in_range(
+            bootstrap(9, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        ))
+        .unwrap();
+    consumer
+        .range(&in_range(range(9, true), whole, |r, s| r.span = s))
+        .unwrap();
+    assert!(consumer.validated());
+    let mut left = WriteBatch::default();
+    consumer.carry(&mut left, part);
+    data.write(left).unwrap();
+    consumer.distrust();
+
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let mut consumers = BTreeMap::from([(consumer.scope(), consumer)]);
+    let mut pushed = revoke_state(&engine, whole);
+    let change = ranges::Change {
+        held: whole,
+        kept: vec![first, parts[0], parts[1]],
+        dropped: Vec::new(),
+    };
+    narrow(
+        "auth",
+        &engine,
+        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        &mut consumers,
+        &mut pushed,
+        &Mutex::new(Progress::default()),
+        &Watched::new(0),
+    )
+    .unwrap();
+    assert_eq!(
+        held(data.as_ref(), "auth").unwrap(),
+        BTreeSet::from([first, parts[0], parts[1]])
+    );
+}
+
+/// Found by the simulation (#25 / B-23): after a split that committed but reported failure, the whole range's consumer
+/// installed newer data while the cursors left on its parts still claimed the old revision.
+#[test]
+fn a_commit_retires_cursors_an_unknown_split_left_on_parts_of_its_range() {
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let (whole, part) = ((0, 0), (1 << 63, 0));
+    let mut consumer = ranged(data.clone(), whole);
+    let baseline = |boundary| {
+        in_range(
+            bootstrap(boundary, vec![(b"k", b"value")]),
+            whole,
+            |b, s| b.span = s,
+        )
+    };
+    consumer.bootstrap(baseline(9)).unwrap();
+    consumer
+        .range(&in_range(range(9, true), whole, |r, s| r.span = s))
+        .unwrap();
+    let mut left = WriteBatch::default();
+    consumer.carry(&mut left, part);
+    data.write(left).unwrap();
+    consumer.distrust();
+    assert!(held(data.as_ref(), "auth").unwrap().contains(&part));
+
+    consumer.bootstrap(baseline(12)).unwrap();
+    assert_eq!(
+        held(data.as_ref(), "auth").unwrap(),
+        BTreeSet::from([whole])
     );
 }

@@ -191,3 +191,43 @@ fn compaction_reaches_the_wrapped_engine() {
     // The trait's default would succeed without asking the adapter.
     assert_eq!(engine.compact(&KeyRange::all()), Err(io()));
 }
+
+/// Found by the simulation (#25 / B-23): a process that crashed mid-rebuild came back healthy and ready, with the damage
+/// still on disk and nothing left to find it.
+#[test]
+fn a_restart_remembers_quarantine_until_a_rebuild_clears_it() {
+    let raw = Arc::new(MemoryEngine::new("a"));
+    let health = StorageHealth::new(&Admin::new());
+    let engine = health.wrap("a", ENGINE, raw.clone());
+    engine.put(b"k", b"v").unwrap();
+    engine.put(b"other", b"v").unwrap();
+    raw.corrupt(b"k");
+    assert!(matches!(engine.get(b"k"), Err(StorageError::Corruption(_))));
+
+    let restarted = StorageHealth::new(&Admin::new());
+    let engine = restarted.wrap("a", ENGINE, raw.clone());
+    assert_eq!(restarted.unhealthy(), BTreeSet::from(["a".to_string()]));
+    assert!(matches!(
+        engine.get(b"other"),
+        Err(StorageError::Unavailable(_))
+    ));
+
+    // A rebuild replaces everything, the marker included.
+    let empty = MemoryEngine::new("empty");
+    raw.restore(&*empty.snapshot().unwrap()).unwrap();
+    let rebuilt = StorageHealth::new(&Admin::new());
+    let _engine = rebuilt.wrap("a", ENGINE, raw);
+    assert!(rebuilt.unhealthy().is_empty());
+}
+
+/// Reading the record at startup can be what finds the damage, so its failure must count.
+#[test]
+fn a_failure_reading_the_quarantine_record_is_reported() {
+    use crate::storage::sim::{Access, Fault, SimEngine};
+
+    let faults = Arc::new(|access| (access == Access::Read).then_some(Fault::Corruption));
+    let raw = Arc::new(SimEngine::new("a", faults, None, false));
+    let health = StorageHealth::new(&Admin::new());
+    let _engine = health.wrap("a", ENGINE, raw);
+    assert_eq!(health.unhealthy(), BTreeSet::from(["a".to_string()]));
+}

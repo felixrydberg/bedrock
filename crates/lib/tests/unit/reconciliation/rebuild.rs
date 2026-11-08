@@ -152,6 +152,50 @@ async fn storage_failing_again_during_its_rebuild_is_not_recovered() {
     assert!(scripted.serving.get(b"k").is_err());
 }
 
+/// Fails again, then waits forever, as a real resubscribe waits for installs a quarantined source refuses.
+struct Blocked {
+    health: Arc<StorageHealth>,
+}
+
+#[async_trait::async_trait]
+impl Restore for Blocked {
+    async fn restore(&self) -> StorageResult<()> {
+        self.health.report(SOURCE.0, SOURCE.1, &corruption());
+        std::future::pending().await
+    }
+}
+
+/// Found by the simulation (#25 / B-23, seed 43 of `corruption`).
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn storage_failing_again_abandons_a_blocked_rebuild_at_once() {
+    let admin = Admin::new();
+    let health = StorageHealth::new(&admin);
+    health.report(SOURCE.0, SOURCE.1, &corruption());
+    let restore: Arc<dyn Restore> = Arc::new(Blocked {
+        health: health.clone(),
+    });
+    let rebuild = Rebuild::new(
+        health.clone(),
+        BTreeMap::from([((SOURCE.0.to_owned(), SOURCE.1), restore)]),
+    );
+    let config = Config {
+        burst: 10,
+        refill: Duration::from_millis(1),
+        repair_timeout: Duration::from_secs(600),
+        base_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(1),
+        seed: 7,
+    };
+    let mut reconciler =
+        Reconciler::new("rebuild", Arc::new(rebuild), config, &Metrics::new(&admin));
+    let started = crate::monotonic_now();
+    assert_eq!(reconciler.pass().await.unwrap().failed, 1);
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(10), "waited {took:?}");
+    assert_eq!(state(&health), State::Unhealthy);
+}
+
 #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
 #[cfg_attr(madsim, tokio::test)]
 async fn reinitialise_recreates_the_instance_without_old_data_or_revisions() {

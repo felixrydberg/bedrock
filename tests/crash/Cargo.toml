@@ -1,0 +1,20 @@
+[package]
+name = "bedrock-crash"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "Real-binary crash and fault checks for the shared core (#25 / B-23 Layer 3); run with scripts/crash.sh."
+
+# The harness drives real processes, sockets and RocksDB, so simulation builds leave it out.
+[target.'cfg(not(madsim))'.dependencies]
+bedrock-lib.workspace = true
+bedrock-sim = { path = "../sim" }
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+rand = "0.8"
+tokio = { workspace = true, features = ["io-util"] }
+
+[lints]
+workspace = true

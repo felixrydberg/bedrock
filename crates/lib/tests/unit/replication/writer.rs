@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::replication::log::Log;
-use crate::storage::namespace::memory::MemoryFactory;
 use crate::storage::namespace::{Changes, NamespaceDatabase, NamespaceFactory};
+use crate::storage::sim::MemoryFactory;
 use crate::storage::{Entry, ErrorContext, StorageError, StorageResult};
 use async_trait::async_trait;
 
@@ -120,6 +120,7 @@ fn set(namespace: &str, key: &str, value: &str, idempotency_key: Option<&str>) -
         key: key.into(),
         operation: Operation::Set(value.into()),
         idempotency_key: idempotency_key.map(Into::into),
+        expected: None,
     }
 }
 
@@ -271,8 +272,13 @@ async fn flush_failures_before_and_after_durability_preserve_the_original_batch(
                 .await,
             Ok(1)
         );
-        // Retrying an uncertain flush reuses exactly the buffered event and fixed expiry.
-        assert_eq!(*factory.controls.writes.lock().unwrap(), writes);
+        // Retrying an uncertain flush reuses exactly the buffered event and fixed expiry, on a reopened handle when the
+        // first never became durable.
+        let retried = factory.controls.writes.lock().unwrap().clone();
+        assert!(
+            retried.iter().all(|batch| *batch == writes[0]),
+            "{retried:?}"
+        );
         let before = writer.bootstrap("kv", "a").await.unwrap();
         assert_eq!(before.values[b"x".as_slice()], b"original");
         assert_eq!(

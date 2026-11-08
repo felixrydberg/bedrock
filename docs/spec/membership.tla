@@ -7,7 +7,8 @@ EXTENDS Naturals, FiniteSets
 \* one dataset's directory: each dataset has its own, given only to its Carriers.
 \* #13 / B-14: a member's update also carries its storage health; unhealthy members get no new ranges.
 \* #22 / B-21: handoff.tla checks how owners become ready and how ranges are revoked.
-CONSTANTS Relays, Nodes, Grace, Points, Carriers
+\* Bug names a deliberate bug for the check that must catch it (scripts/tlc.sh); "none" is the protocol.
+CONSTANTS Relays, Nodes, Grace, Points, Carriers, Bug
 None == 0
 VARIABLES up, side, conn, drain, leftAt, gone, gap, pub, split, starts, own, sick, pubSick
 vars == <<up, side, conn, drain, leftAt, gone, gap, pub, split, starts, own, sick, pubSick>>
@@ -18,7 +19,7 @@ Entry(h) == own[Cover(h)]
 
 Live(r) == {s \in Relays : up[s] /\ side[s] = side[r]}
 Quorum(r) == up[r] /\ 2 * Cardinality(Live(r)) > Cardinality(Relays)
-Publisher(r) == Quorum(r) /\ \A s \in Live(r) : r <= s
+Publisher(r) == (Quorum(r) \/ (Bug = "minority" /\ up[r])) /\ \A s \in Live(r) : r <= s
 Held(r, n) == conn[n] \in Live(r)
 Status(n) == IF drain[n] THEN "draining" ELSE "ready"
 Min(a, b) == IF a < b THEN a ELSE b
@@ -43,7 +44,7 @@ Connect(n, r) == /\ up[r] /\ conn[n] = None
                  /\ conn' = [conn EXCEPT ![n] = r]
                  /\ leftAt' = [leftAt EXCEPT ![n] = None]
                  /\ gap' = [gap EXCEPT ![n] = 0]
-                 /\ gone' = Clocks(up, side, conn')
+                 /\ gone' = IF Bug = "clock" THEN gone ELSE Clocks(up, side, conn')
                  /\ UNCHANGED <<up, side, drain, pub, split, starts, own, sick, pubSick>>
 \* Node crash, cut-off stream or failover start.
 Disconnect(n) == /\ conn[n] # None /\ conn' = [conn EXCEPT ![n] = None]
@@ -85,7 +86,7 @@ Set(r, n) == /\ Publisher(r) /\ Held(r, n) /\ <<pub[n], pubSick[n]>> # <<Status(
              /\ pubSick' = [pubSick EXCEPT ![n] = sick[n]]
              /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, split, starts, own, sick>>
 Delete(r, n) == /\ Publisher(r) /\ pub[n] # "absent" /\ ~Held(r, n)
-                /\ (leftAt[n] \in Live(r) \/ gone[r][n] >= Grace)
+                /\ (leftAt[n] \in Live(r) \/ gone[r][n] >= Grace \/ (Bug = "early-removal" /\ pub[n] = "draining"))
                 /\ pub' = [pub EXCEPT ![n] = "absent"]
                 /\ pubSick' = [pubSick EXCEPT ![n] = FALSE]
                 /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, split, starts, own, sick>>
@@ -95,17 +96,18 @@ Delete(r, n) == /\ Publisher(r) /\ pub[n] # "absent" /\ ~Held(r, n)
 \* from membership, or when leaving and every other owner of the entry is ready.
 Write(r, p, o) ==
     LET cur == Entry(p) IN
-    /\ Publisher(r) /\ (p \notin starts \/ o # own[p])
+    /\ (Publisher(r) \/ (Bug = "minority-write" /\ up[r])) /\ (p \notin starts \/ o # own[p])
     /\ \A n \in Nodes :
         /\ o[n] = "populating" => \/ cur[n] = "populating"
-                                  \/ cur[n] = "none" /\ pub[n] = "ready" /\ n \in Carriers /\ ~pubSick[n]
+                                  \/ cur[n] = "none" /\ (pub[n] = "ready" \/ (Bug = "draining" /\ pub[n] = "draining"))
+                                     /\ n \in Carriers /\ (~pubSick[n] \/ Bug = "sick")
         /\ o[n] = "ready" => cur[n] \in {"ready", "populating"}
         /\ o[n] = "leaving" => cur[n] \in Holds
         /\ (o[n] = "none" /\ cur[n] # "none") =>
             \/ pub[n] = "absent"
             \/ cur[n] = "leaving" /\ (\A m \in Nodes : o[m] # "populating")
-                                  /\ (\E m \in Nodes : o[m] = "ready")
-    /\ starts' = starts \cup {p}
+                                  /\ (Bug = "early-drop" \/ \E m \in Nodes : o[m] = "ready")
+    /\ starts' = IF Bug = "gap" THEN (starts \cup {p}) \ {0} ELSE starts \cup {p}
     /\ own' = [own EXCEPT ![p] = o]
     /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, pub, split, sick, pubSick>>
 
@@ -124,15 +126,17 @@ TypeOK == /\ conn \in [Nodes -> Relays \cup {None}] /\ leftAt \in [Nodes -> Rela
           /\ own \in [Points -> [Nodes -> {"none", "populating"} \cup Holds]]
           /\ sick \in [Nodes -> BOOLEAN] /\ pubSick \in [Nodes -> BOOLEAN]
 \* Ends are implicit, so the directory covers the hash space after every write.
-Covered == 0 \in starts
-\* Only published, non-draining members carrying the dataset whose published storage is healthy are given
-\* new ranges.
+DirectoryCoverage == 0 \in starts
+\* Only published, non-draining members carrying the dataset are given new ranges.
 NewOwnersPublished == [][\A h \in Points, n \in Nodes :
                             (Entry(h)'[n] = "populating" /\ Entry(h)[n] # "populating")
-                                => pub[n] = "ready" /\ n \in Carriers /\ ~pubSick[n]]_vars
+                                => pub[n] = "ready" /\ n \in Carriers]_vars
+\* No member whose published storage is unhealthy is given a new range.
+NoUnhealthyRouting == [][\A h \in Points, n \in Nodes :
+                            (Entry(h)'[n] = "populating" /\ Entry(h)[n] # "populating") => ~pubSick[n]]_vars
 \* A range that has a holder still in membership keeps a holder: a leaving owner goes only
 \* once a new owner is ready.
-NoEarlyDrop == [][\A h \in Points :
+NoDropBeforeReady == [][\A h \in Points :
                     (\E n \in Nodes : Entry(h)[n] \in Holds /\ pub[n] # "absent")
                         => \E n \in Nodes : Entry(h)'[n] \in Holds]_vars
 \* Majority sides cannot both elect a publisher.

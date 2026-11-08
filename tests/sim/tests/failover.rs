@@ -16,7 +16,7 @@ use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::pb;
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
 use bedrock_lib::storage::memory::MemoryEngine;
-use bedrock_lib::storage::namespace::memory::MemoryFactory;
+use bedrock_lib::storage::sim::MemoryFactory;
 use bedrock_lib::storage::{StorageEngine, l2_key};
 use bedrock_lib::transport::Peers;
 use bedrock_lib::transport::admin::Admin;
@@ -135,6 +135,7 @@ async fn commit(writer: &Arc<Writer>, first: u64, last: u64) {
                 key,
                 operation: Operation::Set(revision.to_be_bytes().to_vec()),
                 idempotency_key: None,
+                expected: None,
             };
             assert_eq!(writer.commit(write).await.unwrap(), revision);
         }

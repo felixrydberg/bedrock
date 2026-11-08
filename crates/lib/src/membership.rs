@@ -12,12 +12,13 @@
 //! nothing left to write.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::header::{AUTHORIZATION, HOST};
+use hyper::header::{AUTHORIZATION, HOST, IF_MATCH};
 use hyper_util::rt::TokioIo;
 use prost::Message;
 use tokio::time::Instant;
@@ -303,6 +304,43 @@ pub enum Change {
     },
 }
 
+impl Change {
+    fn service(&self) -> &str {
+        match self {
+            Change::Set(member) => &member.service,
+            Change::Delete((service, _)) | Change::Range { service, .. } => service,
+        }
+    }
+}
+
+/// Writes a plan in order from the revisions in `based`, each write building on the last, and returns the latest revision
+/// written per service. Only a prefix of a plan may land: a later write alone can leave part of the hash space unowned. A
+/// failed write may never have reached the API, so its base would still pass; it ends its service's plan, and the next pass
+/// replans from the view.
+async fn commit<F: Future<Output = Option<u64>>>(
+    changes: Vec<Change>,
+    mut based: BTreeMap<String, u64>,
+    mut write: impl FnMut(Change, u64) -> F,
+) -> BTreeMap<String, u64> {
+    let mut written = BTreeMap::new();
+    for change in changes {
+        let service = change.service().to_owned();
+        let Some(&base) = based.get(&service) else {
+            continue;
+        };
+        match write(change, base).await {
+            Some(revision) => {
+                based.insert(service.clone(), revision);
+                written.insert(service, revision);
+            }
+            None => {
+                based.remove(&service);
+            }
+        }
+    }
+    written
+}
+
 /// What one cell relay sees: its own leaf members and each sibling's synced list, `None` while unreachable.
 pub struct Observed<'a> {
     pub me: &'a str,
@@ -404,15 +442,20 @@ pub fn place(
                 spans.iter().map(|(start, _)| (node.clone(), *start))
             })
             .collect();
-        let mut entries = placement::handoff(directory, &members, &ready);
+        // Storage trouble in a dataset takes no new ranges of it (B-14). Such members keep what they hold for B-22 to
+        // rebuild; sources skip them meanwhile. Their copy may be damaged, so it also cannot release a healthy one.
+        let unhealthy: BTreeSet<String> = members
+            .iter()
+            .filter(|(_, m)| m.unhealthy.iter().any(|d| d == dataset))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let healthy = members
+            .iter()
+            .filter(|(id, _)| !unhealthy.contains(*id))
+            .map(|(id, member)| (id.clone(), member.clone()))
+            .collect();
+        let mut entries = placement::handoff(directory, &healthy, &ready);
         if entries.is_empty() {
-            // Storage trouble in a dataset takes no new ranges of it (B-14). Such members keep what they hold for B-22
-            // to rebuild; sources skip them meanwhile.
-            let unhealthy = members
-                .iter()
-                .filter(|(_, m)| m.unhealthy.iter().any(|d| d == dataset))
-                .map(|(id, _)| id.clone())
-                .collect();
             entries = placement::assign(directory, &members, &unhealthy, REPLICAS, MAX_MOVING);
         }
         changes.extend(entries.into_iter().map(|(start, owners)| Change::Range {
@@ -557,6 +600,15 @@ impl Cell {
             if !session.ready() {
                 continue;
             }
+            // Revisions first: an apply landing in between then makes a plan look older than it is, which only gets it
+            // refused. Writes carry them, so a delayed write or a second publisher cannot undo newer state.
+            let based: BTreeMap<String, u64> = published
+                .iter()
+                .map(|(service, _)| {
+                    let applied = session.applied(DATASET, &namespace(service, &self.cell));
+                    ((*service).to_owned(), applied.unwrap_or(0))
+                })
+                .collect();
             let mut actual = Members::new();
             let mut directories = Vec::new();
             let read: Result<(), Status> = published.iter().try_for_each(|(service, view)| {
@@ -607,13 +659,9 @@ impl Cell {
                     changes.extend(place(service, &actual, directories, &ready));
                 }
             }
-            let mut written = BTreeMap::new();
-            for change in changes {
-                let service = match &change {
-                    Change::Set(member) => member.service.clone(),
-                    Change::Delete((service, _)) | Change::Range { service, .. } => service.clone(),
-                };
-                match tokio::time::timeout(TIMEOUT, self.write(&change)).await {
+            let written = commit(changes, based, |change, base| async move {
+                tracing::debug!(relay = %self.me, base, ?change, "membership write");
+                match tokio::time::timeout(TIMEOUT, self.write(&change, base)).await {
                     Ok(Ok(revision)) => {
                         if matches!(change, Change::Range { .. }) {
                             *self
@@ -621,16 +669,22 @@ impl Cell {
                                 .directory_writes
                                 .lock()
                                 .unwrap()
-                                .entry(service.clone())
+                                .entry(change.service().to_owned())
                                 .or_default() += 1;
                         }
-                        let latest = written.entry(service).or_insert(revision);
-                        *latest = revision.max(*latest);
+                        Some(revision)
                     }
-                    Ok(Err(error)) => tracing::warn!(?change, %error, "membership write failed"),
-                    Err(_) => tracing::warn!(?change, "membership write timed out"),
+                    Ok(Err(error)) => {
+                        tracing::warn!(?change, %error, "membership write failed");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(?change, "membership write timed out");
+                        None
+                    }
                 }
-            }
+            })
+            .await;
             // The next plan must see these writes, or it would repeat them.
             again = !written.is_empty();
             for (service, revision) in written {
@@ -674,7 +728,8 @@ impl Cell {
     }
 
     /// One write through `bedrock-api`; returns the committed revision.
-    async fn write(&self, change: &Change) -> Result<u64, String> {
+    /// Commits `change`, planned from revision `base` of its namespace.
+    async fn write(&self, change: &Change, base: u64) -> Result<u64, String> {
         let (method, (service, key), body) = match change {
             Change::Set(member) => (hyper::Method::PUT, key(member), member.encode_to_vec()),
             Change::Delete(key) => (hyper::Method::DELETE, key.clone(), Vec::new()),
@@ -703,6 +758,7 @@ impl Cell {
             .method(method)
             .uri(uri)
             .header(HOST, &self.api)
+            .header(IF_MATCH, base)
             .header(AUTHORIZATION, format!("Bearer {}", self.write_token))
             .body(Full::new(Bytes::from(body)))
             .map_err(|e| e.to_string())?;

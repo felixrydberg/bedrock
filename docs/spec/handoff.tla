@@ -8,7 +8,10 @@ EXTENDS Naturals, FiniteSets, Sequences, TLC
 \* and a connect. Points are possible range starts; a range ends where the next start begins.
 \* With Capped, a run has at most MaxCuts disconnects and MaxFlips quorum changes, which lets
 \* TLC reach deeper directory histories; uncapped configs check unlimited ones.
-CONSTANTS Nodes, Points, Carriers, MaxRev, Faulty, Capped, MaxCuts, MaxFlips
+\* pub is "sick" for a published member reporting this dataset unhealthy (#13 / B-14). Its copy may be
+\* damaged, so it never counts as the ready owner that lets another copy go.
+\* Bug names a deliberate bug for the check that must catch it (scripts/tlc.sh); "none" is the protocol.
+CONSTANTS Nodes, Points, Carriers, MaxRev, Faulty, Capped, MaxCuts, MaxFlips, Bug
 VARIABLES pub, conn, quorum, starts, own, rev, told, chan, follow, copy, view, cuts, flips
 \* rev: directory revision. told: what the relays last pushed a node for a point
 \* ("unknown" after its session ends). chan: pushed frames the node has not processed; `ok`
@@ -25,8 +28,10 @@ Entry(h) == own[Cover(h)]
 \* The points of the range starting at p when the starts are S.
 Span(S, p) == {h \in Points : h >= p /\ \A s \in S : s <= h => s <= p}
 \* Node n's view of the current directory.
+Counts(m) == Bug = "any-ready" \/ pub[m] = "ready"
 Current(n) == [h \in Points |-> [mine |-> Entry(h)[n],
-                                 other |-> \E m \in Nodes \ {n} : Entry(h)[m] = "ready"]]
+                                 other |-> \E m \in Nodes \ {n} :
+                                     Entry(h)[m] = "ready" /\ Counts(m)]]
 Count(c) == IF Capped THEN c + 1 ELSE c
 
 Init == /\ pub = [n \in Nodes |-> "absent"] /\ conn = [n \in Nodes |-> FALSE] /\ quorum = TRUE
@@ -52,6 +57,10 @@ Publish(n) == /\ quorum /\ conn[n] /\ pub[n] = "absent" /\ pub' = [pub EXCEPT ![
 \* After the grace period, or at once after a graceful leave.
 Remove(n) == /\ quorum /\ ~conn[n] /\ pub[n] # "absent" /\ pub' = [pub EXCEPT ![n] = "absent"]
              /\ UNCHANGED <<conn, quorum, starts, own, rev, nvars, cuts, flips>>
+\* A member's storage turns unhealthy, or its rebuild finishes.
+Sicken(n) == /\ pub[n] # "absent"
+             /\ pub' = [pub EXCEPT ![n] = IF pub[n] = "ready" THEN "sick" ELSE "ready"]
+             /\ UNCHANGED <<conn, quorum, starts, own, rev, nvars, cuts, flips>>
 Partition == /\ quorum' = ~quorum /\ flips' = Count(flips)
              /\ UNCHANGED <<pub, conn, starts, own, rev, nvars, cuts>>
 
@@ -68,17 +77,17 @@ ReadyFor(n, S) == /\ conn[n]
 Write(p, o) ==
     LET cur == Entry(p)
         S == Span(starts \cup {p}, p) IN
-    /\ quorum /\ (p \notin starts \/ o # own[p])
+    /\ (quorum \/ Bug = "minority-write") /\ (p \notin starts \/ o # own[p])
     /\ \A n \in Nodes :
         /\ o[n] = "populating" => \/ cur[n] = "populating"
-                                  \/ cur[n] = "none" /\ pub[n] = "ready" /\ n \in Carriers
+                                  \/ cur[n] = "none" /\ (pub[n] = "ready" \/ Bug = "absent") /\ n \in Carriers
         /\ o[n] = "ready" => \/ cur[n] = "ready"
-                             \/ cur[n] = "populating" /\ ReadyFor(n, S)
+                             \/ cur[n] = "populating" /\ (ReadyFor(n, S) \/ Bug = "unready")
         /\ o[n] = "leaving" => cur[n] \in Holds
         /\ (o[n] = "none" /\ cur[n] # "none") =>
             \/ pub[n] = "absent"
             \/ cur[n] = "leaving" /\ (\A m \in Nodes : o[m] # "populating")
-                                  /\ (\E m \in Nodes : o[m] = "ready")
+                                  /\ (Bug = "early-drop" \/ \E m \in Nodes : o[m] = "ready" /\ Counts(m))
     /\ starts' = starts \cup {p}
     /\ own' = [own EXCEPT ![p] = o]
     /\ rev' = rev + 1
@@ -97,7 +106,9 @@ BadRevoke(n, h) == /\ Faulty /\ conn[n]
                    /\ UNCHANGED <<pub, conn, quorum, starts, own, rev, told, follow, copy, view, cuts, flips>>
 \* The node's own directory subscription catches up, past every pushed frame's revision.
 Observe(n) == /\ conn[n] /\ view[n] # Current(n)
-              /\ view' = [view EXCEPT ![n] = Current(n)]
+              /\ view' = [view EXCEPT ![n] = [h \in Points |->
+                     IF Bug = "view" /\ Entry(h)[n] = "populating" THEN [Current(n)[h] EXCEPT !.mine = "ready"]
+                     ELSE Current(n)[h]]]
               /\ chan' = [chan EXCEPT ![n] = [h \in Points |->
                      [i \in 1..Len(chan[n][h]) |-> [chan[n][h][i] EXCEPT !.ok = TRUE]]]]
               /\ UNCHANGED <<pub, conn, quorum, starts, own, rev, told, follow, copy, cuts, flips>>
@@ -114,7 +125,7 @@ Receive(n, h) == LET f == Head(chan[n][h]) IN
                                  /\ UNCHANGED <<copy, told>>
                     ELSE IF Confirms(n, h)
                          THEN /\ follow' = [follow EXCEPT ![n][h] = FALSE]
-                              /\ copy' = [copy EXCEPT ![n][h] = FALSE]
+                              /\ copy' = IF Bug = "keep" THEN copy ELSE [copy EXCEPT ![n][h] = FALSE]
                               /\ UNCHANGED told
                          ELSE /\ told' = [told EXCEPT ![n][h] = "unknown"]
                               /\ UNCHANGED <<follow, copy>>
@@ -126,7 +137,7 @@ Copy(n, h) == /\ conn[n] /\ follow[n][h] /\ ~copy[n][h]
 
 Next == \/ Partition
         \/ \E n \in Nodes : Connect(n) \/ Disconnect(n) \/ Publish(n) \/ Remove(n)
-                            \/ Observe(n)
+                            \/ Observe(n) \/ Sicken(n)
         \/ \E p \in Points, o \in [Nodes -> {"none", "populating"} \cup Holds] : Write(p, o)
         \/ \E n \in Nodes, h \in Points : Push(n, h) \/ BadRevoke(n, h) \/ Receive(n, h) \/ Copy(n, h)
 Spec == Init /\ [][Next]_vars
@@ -136,26 +147,34 @@ Bound == /\ rev <= MaxRev /\ cuts <= MaxCuts /\ flips <= MaxFlips
 \* Nodes are interchangeable model values when every node carries the dataset.
 NodePerms == Permutations(Nodes)
 
-TypeOK == /\ pub \in [Nodes -> {"absent", "ready"}] /\ quorum \in BOOLEAN
+TypeOK == /\ pub \in [Nodes -> {"absent", "ready", "sick"}] /\ quorum \in BOOLEAN
           /\ starts \subseteq Points
           /\ own \in [Points -> [Nodes -> {"none", "populating"} \cup Holds]]
           /\ told \in [Nodes -> [Points -> {"on", "off", "unknown"}]]
           /\ follow \in [Nodes -> [Points -> BOOLEAN]] /\ copy \in [Nodes -> [Points -> BOOLEAN]]
 \* Ends are implicit, so the directory covers the hash space after every write.
-Covered == 0 \in starts
+DirectoryCoverage == 0 \in starts
 \* Every ready or leaving owner holds the data: no owner is ready before its copy, and no
 \* node drops data the directory still has it holding, even after a faulty revoke.
 ReadyHasData == \A h \in Points, n \in Nodes : Entry(h)[n] \in Holds => copy[n][h]
 \* A node serves only from its own view (ready or leaving), and then it holds the data.
 ServesHeld == \A h \in Points, n \in Nodes : view[n][h].mine \in Holds => copy[n][h]
+\* A node holds no data its relay revoked once it has processed that revoke: a confirmed revoke deletes, and a
+\* refused one makes the relay push again.
+OwnedOrLeaving == \A h \in Points, n \in Nodes : told[n][h] = "off" /\ chan[n][h] = <<>> => ~copy[n][h]
 \* Only published, non-draining members carrying the dataset are given new ranges.
 NewOwnersPublished == [][\A h \in Points, n \in Nodes :
                             (Entry(h)'[n] = "populating" /\ Entry(h)[n] # "populating")
                                 => pub[n] = "ready" /\ n \in Carriers]_vars
 \* A range that has a holder still in membership keeps a holder.
-NoEarlyDrop == [][\A h \in Points :
+NoDropBeforeReady == [][\A h \in Points :
                     (\E n \in Nodes : Entry(h)[n] \in Holds /\ pub[n] # "absent")
                         => \E n \in Nodes : Entry(h)'[n] \in Holds]_vars
+\* A directory write never lets go of a range's last healthy holder, even when an unhealthy owner
+\* is listed as ready.
+KeepsHealthyHolder == [][(pub' = pub) => \A h \in Points :
+                            (\E n \in Nodes : Entry(h)[n] \in Holds /\ pub[n] = "ready")
+                                => \E n \in Nodes : Entry(h)'[n] \in Holds /\ pub[n] = "ready"]_vars
 \* Without a relay majority nothing becomes ready, moves or is revoked by the directory.
 Freeze == [][~quorum => <<starts, own>>' = <<starts, own>>]_vars
 =============================================================================

@@ -1,5 +1,5 @@
 use super::*;
-use crate::relays::{Interest, Subscriber};
+use crate::relays::{Interest, RECOVERY_WAIT, Subscriber};
 use crate::transport::admin::Admin;
 
 const LONG: Duration = Duration::from_secs(3600);
@@ -32,9 +32,11 @@ fn subscribe(
             from: *from,
             acked: from - 1,
             generation: id,
+            follow: 0,
             baseline: from - 1,
             confirming: false,
             target: None,
+            woken: Default::default(),
         };
         (key, interest)
     });
@@ -304,4 +306,67 @@ fn siblings_must_share_a_selector_a_relay_would_serve() {
     ] {
         assert!(!crate::relays::selectable(&invalid), "{invalid:?}");
     }
+}
+
+/// Found by the simulation (#25 / B-23): a recovery source was lost after a bootstrap reached the subscriber but before its
+/// confirmation. The next source was asked for a plain catch-up, which never confirms, so the subscriber waited forever.
+#[test]
+fn a_bootstrap_still_unconfirmed_makes_the_next_source_a_full_recovery() {
+    let hub = hub();
+    let _own = subscribe(&hub, 1, &[("auth", "keys", None, 13)], &[]);
+    let stream = (key("auth", "keys"), None);
+    assert_eq!(hub.recovery_start(1, &stream, 1, false), Some((13, false)));
+    assert_eq!(hub.recovery_start(1, &stream, 1, true), Some((0, true)));
+
+    let mut subscribers = hub.0.subscribers.lock().unwrap();
+    let interest = subscribers.get_mut(&1).unwrap().follows.get_mut(&stream);
+    interest.unwrap().confirming = true;
+    drop(subscribers);
+    assert_eq!(hub.recovery_start(1, &stream, 1, false), Some((0, true)));
+    assert_eq!(
+        hub.recovery_start(1, &stream, 2, false),
+        None,
+        "a newer follow"
+    );
+}
+
+/// Found by the simulation (#25 / B-23): a refused recovery came back only on the subscriber's 10 second retry, so a node with
+/// many ranges took minutes to recover, however quick each recovery was.
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn a_recovery_waits_for_a_slot_to_free() {
+    let hub = hub();
+    let held = hub.0.recoveries.clone().acquire_many_owned(4).await;
+    let waiting = {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.recovery_permit().await.map(drop) })
+    };
+    tokio::time::sleep(RECOVERY_WAIT / 2).await;
+    assert!(!waiting.is_finished());
+    drop(held);
+    waiting.await.unwrap().unwrap();
+}
+
+/// Found by the simulation (#25 / B-23): a recovery took a slot on every relay it passed through, so sibling relays ran about
+/// as many recoveries as one of them, and waited on each other's slots until they timed out.
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn only_the_relay_a_recovery_entered_needs_a_slot() {
+    let hub = hub();
+    let stream = (key("cdn", "pages"), None);
+    let _held = hub.0.recoveries.clone().acquire_many_owned(4).await;
+    let entered = hub.proxy(1, &stream, 1, &[], false).await.unwrap_err();
+    assert_eq!(entered.code(), tonic::Code::ResourceExhausted);
+    let visited = ["sibling".to_owned()];
+    let forwarded = hub.proxy(1, &stream, 1, &visited, false).await.unwrap_err();
+    assert_eq!(forwarded.code(), tonic::Code::Unavailable);
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn a_recovery_is_refused_when_no_slot_frees_in_time() {
+    let hub = hub();
+    let _held = hub.0.recoveries.clone().acquire_many_owned(4).await;
+    let refused = hub.recovery_permit().await.unwrap_err();
+    assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
 }

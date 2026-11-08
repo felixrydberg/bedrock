@@ -200,20 +200,41 @@ impl Registry {
 
 /// The node's engine for `dataset`: RocksDB in `data_dir/{dataset}`, or in memory in simulation builds, which compile
 /// RocksDB out (B-23a).
+///
+/// Damage that stops RocksDB opening would keep the dataset down until someone deleted it. Its contents cannot be trusted
+/// and a rebuild replaces all of them, so the instance is deleted and starts empty and quarantined, and B-22 rebuilds it.
+#[cfg(not(madsim))]
+#[allow(clippy::disallowed_methods)] // deletes the unopenable instance's directory
 pub fn open_engine(data_dir: &Path, dataset: &Dataset) -> StorageResult<Arc<dyn StorageEngine>> {
+    use crate::storage::rocksdb::RocksDbAdapter;
+    use crate::storage::{ErrorContext, StorageError};
+    let path = data_dir.join(dataset.name);
     // ponytail: RocksDB defaults; map the resolved dataset budget onto `RocksDbOptions` when budgets are enforced.
-    #[cfg(not(madsim))]
-    let engine = crate::storage::rocksdb::RocksDbAdapter::open(
-        &data_dir.join(dataset.name),
-        dataset.name,
-        &Default::default(),
-    )?;
-    #[cfg(madsim)]
-    let engine = {
-        let _ = data_dir;
-        crate::storage::memory::MemoryEngine::new(dataset.name)
-    };
-    Ok(Arc::new(engine))
+    let open = || RocksDbAdapter::open(&path, dataset.name, &Default::default());
+    match open() {
+        Err(StorageError::Corruption(damage)) => {
+            tracing::error!(
+                dataset = dataset.name,
+                ?damage,
+                "storage cannot open; deleting it to rebuild"
+            );
+            std::fs::remove_dir_all(&path).map_err(|e| {
+                StorageError::IoError(ErrorContext {
+                    detail: format!("deleting the damaged instance: {e}"),
+                    ..damage
+                })
+            })?;
+            let engine = open()?;
+            crate::health::storage::quarantine(&engine)?;
+            Ok(Arc::new(engine))
+        }
+        opened => Ok(Arc::new(opened?)),
+    }
+}
+
+#[cfg(madsim)]
+pub fn open_engine(data_dir: &Path, dataset: &Dataset) -> StorageResult<Arc<dyn StorageEngine>> {
+    Ok(crate::sim::engine(data_dir, dataset.name))
 }
 
 #[cfg(test)]

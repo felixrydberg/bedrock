@@ -20,6 +20,8 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 pub struct Sleep {
     pub(super) handle: TimeHandle,
     pub(super) deadline: Instant,
+    /// bedrock: the deadline and waker a timer is already set for.
+    pub(super) armed: Option<(Instant, std::task::Waker)>,
 }
 
 impl Sleep {
@@ -48,8 +50,17 @@ impl Future for Sleep {
         if self.is_elapsed() {
             return Poll::Ready(());
         }
+        // bedrock: one timer per deadline and waker. Upstream adds one on every poll, and timers cannot be cancelled, so a
+        // select that wakes often around a long timeout fills the heap with copies that each wake the task for nothing.
+        let this = self.get_mut();
+        if let Some((deadline, waker)) = &this.armed {
+            if *deadline == this.deadline && waker.will_wake(cx.waker()) {
+                return Poll::Pending;
+            }
+        }
         let waker = cx.waker().clone();
-        self.handle.add_timer_at(self.deadline, || waker.wake());
+        this.armed = Some((this.deadline, waker.clone()));
+        this.handle.add_timer_at(this.deadline, || waker.wake());
         Poll::Pending
     }
 }

@@ -144,6 +144,7 @@ async fn stalled_subscriber_shows_rising_lag_and_queue_depth() {
         from: 1,
         span: None,
         from_namespaces: Default::default(),
+        ..Default::default()
     };
     hub.follow(1, follow, Vec::new(), false).await;
     let before = subscriber_state(&hub, 10).await;

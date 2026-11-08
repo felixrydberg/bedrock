@@ -14,9 +14,9 @@ use prometheus_client::{
 };
 use tokio::sync::oneshot;
 
-use super::log::MemoryLog;
+use super::log::{Log, MemoryLog};
 use super::materialized::{
-    Committed, Materialized, Progress, Retention, RetryRecord, View, validate_scope,
+    Committed, Materialized, Persisted, Retention, Retries, RetryRecord, View, validate_scope,
 };
 use super::{Event, Operation, stream};
 use crate::storage::namespace::NamespaceFactory;
@@ -39,12 +39,16 @@ pub struct Write {
     pub operation: Operation,
     /// Until fixed expiry, a retry returns its original sequence without applying again.
     pub idempotency_key: Option<String>,
+    /// Commit only as the revision after this one: the write was planned from it, and anything newer invalidates the plan.
+    pub expected: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommitError {
     Invalid(String),
     Busy,
+    /// The namespace moved past [`Write::expected`]; nothing was written.
+    Conflict,
     Fenced,
     /// Persistence may have completed; retry with the same idempotency key.
     Unavailable(String),
@@ -55,6 +59,7 @@ impl fmt::Display for CommitError {
         match self {
             Self::Invalid(reason) => write!(f, "invalid write: {reason}"),
             Self::Busy => f.write_str("too many writes waiting in this namespace"),
+            Self::Conflict => f.write_str("the namespace moved past the expected revision"),
             Self::Fenced => f.write_str("another writer owns this namespace"),
             Self::Unavailable(detail) => write!(f, "commit outcome unknown: {detail}"),
         }
@@ -131,7 +136,7 @@ struct State {
     source: Option<Arc<Materialized>>,
     head: u64,
     committed_at: u64,
-    retries: BTreeMap<String, RetryRecord>,
+    retries: Retries,
     unresolved: Option<Vec<Committed>>,
     fenced: bool,
     recovery: Vec<std::sync::Weak<RecoveryLease>>,
@@ -229,18 +234,41 @@ impl Writer {
                     "Raft-backed namespace requires the Raft writer",
                 ));
             }
+            // A reopen after `discard` keeps the log, which holds what was durable. It gains what became durable since,
+            // such as a batch whose flush landed but reported failure, and may lack nothing.
+            let head = self.log.head(dataset, namespace).get();
+            if progress.sequence < head {
+                return Err(StorageError::Corruption(ErrorContext {
+                    engine: "writer",
+                    instance: format!("{dataset}/{namespace}"),
+                    file: None,
+                    partition: None,
+                    detail: format!(
+                        "reopened store is at {} behind durable head {head}",
+                        progress.sequence
+                    ),
+                }));
+            }
             let entries = source.events().await?;
-            self.log
-                .reset(dataset, namespace, progress.pruned_through)
-                .map_err(|detail| unavailable(&detail))?;
-            for entry in entries {
+            if head == 0 {
+                self.log
+                    .reset(dataset, namespace, progress.pruned_through)
+                    .map_err(|detail| unavailable(&detail))?;
+            }
+            for entry in entries
+                .into_iter()
+                .filter(|entry| entry.event.sequence > head)
+            {
                 self.log
                     .append(entry.event)
                     .map_err(|detail| unavailable(&detail))?;
             }
+            if self.log.head(dataset, namespace).get() != progress.sequence {
+                return Err(unavailable("restored events do not reach the durable head"));
+            }
             state.head = progress.sequence;
             state.committed_at = progress.committed_at;
-            state.retries = progress.retries;
+            state.retries = progress.retries.into();
             Ok(())
         }
         .await;
@@ -252,18 +280,54 @@ impl Writer {
         Ok(source)
     }
 
+    /// SlateDB closes a database for good when one of its background tasks fails, which a single failed S3 request can
+    /// cause. So a failed handle is dropped, and the next use reopens the namespace from the store, as a restart would,
+    /// which fences the old handle. Closing it instead could flush the failed batch. A fenced one stays fenced: another
+    /// writer owns the namespace.
+    fn discard(state: &mut State, error: &StorageError) {
+        if matches!(error, StorageError::Fenced(_)) {
+            state.fenced = true;
+        } else {
+            state.source = None;
+        }
+    }
+
+    /// A coherent view, discarding the handle if it fails.
+    async fn read_view(
+        &self,
+        state: &mut State,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<View> {
+        let view = self.source(state, dataset, namespace).await?.view().await;
+        if let Err(error) = &view {
+            Self::discard(state, error);
+        }
+        view
+    }
+
     /// Owns a complete coherent view before releasing the namespace gate.
     pub async fn bootstrap(&self, dataset: &str, namespace: &str) -> StorageResult<View> {
         validate_scope(dataset, namespace)?;
         let ns = self.namespace(dataset, namespace);
         let mut state = ns.state.lock().await;
-        if state.fenced || state.unresolved.is_some() {
-            return Err(unavailable("unresolved persistence outcome"));
+        self.settle(&mut state, dataset, namespace).await?;
+        self.read_view(&mut state, dataset, namespace).await
+    }
+
+    /// Settles a failed flush before a read that needs a coherent view. Waiting for a later commit could wait forever: a
+    /// membership publisher writes only once its own bootstrap succeeded.
+    async fn settle(&self, state: &mut State, dataset: &str, namespace: &str) -> StorageResult<()> {
+        if state.fenced {
+            return Err(unavailable("another writer owns this namespace"));
         }
-        self.source(&mut state, dataset, namespace)
-            .await?
-            .view()
-            .await
+        self.source(state, dataset, namespace).await?;
+        if let Some(entries) = state.unresolved.take() {
+            self.persist(state, entries)
+                .await
+                .map_err(|error| unavailable(&error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub async fn begin_recovery(
@@ -274,20 +338,14 @@ impl Writer {
         validate_scope(dataset, namespace)?;
         let ns = self.namespace(dataset, namespace);
         let mut state = ns.state.lock().await;
-        if state.fenced || state.unresolved.is_some() {
-            return Err(unavailable("unresolved persistence outcome"));
-        }
+        self.settle(&mut state, dataset, namespace).await?;
         state
             .recovery
             .retain(|lease| lease.upgrade().is_some_and(|l| l.valid()));
         if state.recovery.len() >= 4 {
             return Err(unavailable("namespace recovery capacity exhausted"));
         }
-        let view = self
-            .source(&mut state, dataset, namespace)
-            .await?
-            .view()
-            .await?;
+        let view = self.read_view(&mut state, dataset, namespace).await?;
         let now = crate::monotonic_now();
         let lease = Arc::new(RecoveryLease {
             dataset: dataset.into(),
@@ -316,17 +374,20 @@ impl Writer {
                 "recovery lease expired or invalid scope/cursor",
             ));
         }
-        let source = {
+        let (source, durable) = {
             let ns = self.namespace(dataset, namespace);
             let mut state = ns.state.lock().await;
-            self.source(&mut state, dataset, namespace).await?
+            let source = self.source(&mut state, dataset, namespace).await?;
+            (source, state.head)
         };
-        // The namespace gate is released so commits continue during the bounded read.
+        // The namespace gate is released so commits continue during the bounded read. The store can also hold batches
+        // whose flush has not succeeded, and a crash may yet erase those, so nothing past the durable head goes out.
         Ok(source
             .events_from(from, 256)
             .await?
             .into_iter()
             .map(|entry| entry.event)
+            .take_while(|event| event.sequence <= durable)
             .collect())
     }
 
@@ -355,13 +416,24 @@ impl Writer {
             .map(|lease| lease.boundary)
             .min()
             .unwrap_or(u64::MAX);
-        let removed = source
+        let removed = match source
             .cleanup_through(now, &self.persistence.retention, through)
-            .await?;
+            .await
+        {
+            Ok(removed) => removed,
+            Err(error) => {
+                Self::discard(&mut state, &error);
+                return Err(error);
+            }
+        };
+        assert!(
+            removed <= through,
+            "cleanup removed through {removed}, past recovery boundary {through}"
+        );
         self.log
             .prune(dataset, namespace, removed)
             .map_err(|detail| unavailable(&detail))?;
-        state.retries.retain(|_, retry| retry.expires_at > now);
+        state.retries.expire(now);
         Ok(())
     }
 
@@ -451,9 +523,7 @@ impl Writer {
             }
             return;
         };
-        state
-            .retries
-            .retain(|_, retry| retry.expires_at > committed_at);
+        state.retries.expire(committed_at);
         let mut entries = Vec::new();
         let mut in_batch = BTreeMap::new();
         let mut waiting = Vec::new();
@@ -469,6 +539,13 @@ impl Writer {
             }
             if let Some(&sequence) = key.as_ref().and_then(|key| in_batch.get(key)) {
                 waiting.push((done, sequence));
+                continue;
+            }
+            if write
+                .expected
+                .is_some_and(|expected| expected != state.head + entries.len() as u64)
+            {
+                let _ = done.send(Err(CommitError::Conflict));
                 continue;
             }
             let Some(sequence) = state
@@ -525,30 +602,41 @@ impl Writer {
             .as_ref()
             .expect("source opened before persistence");
         match source.persist(&entries, None).await {
-            Ok(Progress {
+            Ok(Persisted {
                 sequence,
                 committed_at,
-                retries,
                 ..
             }) => {
+                assert!(sequence >= state.head, "the namespace head moved backwards");
+                let last = entries.last().map(|entry| entry.event.clone());
                 for entry in entries {
                     if entry.event.sequence > state.head {
+                        if let Some(key) = entry.retry_key {
+                            let retry = RetryRecord {
+                                sequence: entry.event.sequence,
+                                expires_at: entry.retry_expires_at,
+                            };
+                            state.retries.insert(key, retry);
+                        }
                         self.log
                             .append(entry.event)
                             .expect("batch continues durable log");
                     }
                 }
+                if let Some(last) = last {
+                    assert_eq!(sequence, last.sequence, "persisted a different head");
+                    let log = self.log.head(&last.dataset, &last.namespace).get();
+                    assert_eq!(log, sequence, "the log and the durable head disagree");
+                }
                 state.head = sequence;
                 state.committed_at = committed_at;
-                state.retries = retries;
                 Ok(())
             }
             Err(error) => {
-                if matches!(error, StorageError::Fenced(_)) {
-                    state.fenced = true;
-                } else {
+                if !matches!(error, StorageError::Fenced(_)) {
                     state.unresolved = Some(entries);
                 }
+                Self::discard(state, &error);
                 Err(commit_error(error))
             }
         }

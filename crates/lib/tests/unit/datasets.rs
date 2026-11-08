@@ -227,6 +227,29 @@ fn rejects_empty_dataset_list() {
     assert!(Registry::open(&[dataset("kv")], &[], |_| unreachable!()).is_err());
 }
 
+/// Found by the crash tests (#25 / B-23 Layer 3): damage read while opening kept the dataset unfollowed and the node
+/// unready, with no rebuild, until someone deleted the instance.
+#[test]
+#[cfg(not(madsim))]
+#[allow(clippy::disallowed_methods)] // test fault injection rewrites the instance's files
+fn an_instance_that_cannot_open_starts_empty_and_quarantined() {
+    let dir = tempfile::tempdir().unwrap();
+    let cdn = dataset("cdn");
+    open_engine(dir.path(), &cdn)
+        .unwrap()
+        .put(b"k", b"v")
+        .unwrap();
+    // Damaged table files open and fail when read; damaged metadata stops the open.
+    std::fs::write(dir.path().join("cdn/CURRENT"), "damaged").unwrap();
+
+    let engine = open_engine(dir.path(), &cdn).unwrap();
+
+    assert_eq!(engine.get(b"k"), Ok(None));
+    let health = StorageHealth::new(&Admin::new());
+    health.wrap("cdn", "engine", engine);
+    assert!(health.unhealthy().contains("cdn"));
+}
+
 #[test]
 #[cfg(not(madsim))]
 fn engines_persist_in_separate_dataset_directories() {

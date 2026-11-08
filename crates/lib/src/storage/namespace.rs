@@ -8,8 +8,6 @@ use async_trait::async_trait;
 
 use super::{Entry, StorageResult};
 
-pub mod memory;
-
 pub(crate) fn valid_identity(identity: &str) -> bool {
     !identity.is_empty()
         && identity != "."

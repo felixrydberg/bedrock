@@ -5,7 +5,8 @@
 //!
 //! `PUT /v1/{dataset}/{namespace}/{key}` sets the key to the request body and `DELETE` deletes it. The response body is
 //! the committed sequence. An `Idempotency-Key` retry returns the original sequence while it remains
-//! within the configured retry duration (24 hours by default). An expired retry is a new write.
+//! within the configured retry duration (24 hours by default). An expired retry is a new write. An `If-Match` header
+//! holding a revision commits only if that is still the namespace's head, otherwise it answers 412 and writes nothing.
 //! Every write requires `Authorization: Bearer <write_token>`; the configured token grants access to all writes.
 //! With `tls` configured, both listeners use TLS (B-55): relays need a node certificate, while write callers may
 //! present one but still authenticate with the token.
@@ -47,7 +48,7 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
             .map_err(|error| ConfigError(error.to_string()))?,
     ));
     #[cfg(madsim)]
-    let factory = Arc::new(bedrock_lib::storage::namespace::memory::MemoryFactory::default());
+    let factory = bedrock_lib::sim::namespaces();
     let writer = Writer::open(
         now,
         Persistence {
@@ -171,6 +172,14 @@ async fn write(
         Some(Ok(key)) if !key.is_empty() => Some(key.to_owned()),
         Some(_) => return (StatusCode::BAD_REQUEST, "invalid Idempotency-Key".into()),
     };
+    let expected = match headers.get(header::IF_MATCH).map(|revision| {
+        let revision = revision.to_str().ok();
+        revision.and_then(|revision| revision.parse::<u64>().ok())
+    }) {
+        None => None,
+        Some(Some(revision)) => Some(revision),
+        Some(None) => return (StatusCode::BAD_REQUEST, "invalid If-Match".into()),
+    };
     let operation = match method {
         Method::DELETE => Operation::Delete,
         _ => Operation::Set(value.to_vec()),
@@ -181,6 +190,7 @@ async fn write(
         key: key.into_bytes(),
         operation,
         idempotency_key,
+        expected,
     };
     match writer.commit(write).await {
         Ok(sequence) => (StatusCode::OK, sequence.to_string()),
@@ -188,6 +198,7 @@ async fn write(
             let status = match error {
                 CommitError::Invalid(_) => StatusCode::BAD_REQUEST,
                 CommitError::Busy => StatusCode::TOO_MANY_REQUESTS,
+                CommitError::Conflict => StatusCode::PRECONDITION_FAILED,
                 CommitError::Fenced | CommitError::Unavailable(_) => {
                     StatusCode::SERVICE_UNAVAILABLE
                 }

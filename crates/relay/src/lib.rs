@@ -39,9 +39,7 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
     let engine: Result<
         Arc<dyn bedrock_lib::storage::StorageEngine>,
         bedrock_lib::storage::StorageError,
-    > = Ok(Arc::new(bedrock_lib::storage::memory::MemoryEngine::new(
-        "replay",
-    )));
+    > = Ok(bedrock_lib::sim::engine(&config.node.data_dir, "replay"));
     let replay =
         engine.and_then(|engine| bedrock_lib::relays::replay::Replay::open(engine, replay_config));
     let replay = match replay {

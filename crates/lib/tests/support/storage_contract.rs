@@ -26,6 +26,7 @@ macro_rules! storage_contract {
             put_overwrite_delete,
             batch_applies_in_order,
             revisions_are_per_name_and_outside_key_space,
+            a_deleted_revision_reads_as_never_set,
             scans_in_key_order,
             snapshot_is_consistent,
             restore_replaces_everything,
@@ -173,6 +174,25 @@ pub fn revisions_are_per_name_and_outside_key_space(h: &mut impl Harness) {
     assert_eq!(
         engine.snapshot().unwrap().revisions(),
         Ok(BTreeMap::from([("a".into(), 2), ("b".into(), 5)]))
+    );
+}
+
+pub fn a_deleted_revision_reads_as_never_set(h: &mut impl Harness) {
+    let engine = h.open();
+    let mut batch = WriteBatch::default();
+    batch.set_revision("a", 1).set_revision("b", 2);
+    engine.write(batch).unwrap();
+    let mut batch = WriteBatch::default();
+    batch
+        .delete_revision("a")
+        .delete_revision("b")
+        .set_revision("b", 3)
+        .delete_revision("never");
+    engine.write(batch).unwrap();
+    assert_eq!(engine.revision("a"), Ok(None));
+    assert_eq!(
+        engine.snapshot().unwrap().revisions(),
+        Ok(BTreeMap::from([("b".into(), 3)]))
     );
 }
 

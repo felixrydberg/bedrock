@@ -12,7 +12,7 @@ use bedrock_lib::relays::{
 use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::pb::relay_server::RelayServer;
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
-use bedrock_lib::storage::namespace::memory::MemoryFactory;
+use bedrock_lib::storage::sim::MemoryFactory;
 
 use bedrock_lib::replication::Operation;
 use bedrock_lib::storage::StorageEngine;
@@ -47,6 +47,7 @@ async fn append(writer: &Arc<Writer>, sequence: u64) {
                 key: b"k".to_vec(),
                 operation: Operation::Set(sequence.to_be_bytes().to_vec()),
                 idempotency_key: None,
+                expected: None,
             })
             .await
             .unwrap(),

@@ -18,8 +18,8 @@ use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, W
 use bedrock_lib::replication::{Event, Operation};
 use bedrock_lib::storage::StorageEngine;
 use bedrock_lib::storage::memory::MemoryEngine;
-use bedrock_lib::storage::namespace::memory::MemoryFactory;
 use bedrock_lib::storage::rocksdb::{RocksDbAdapter, RocksDbOptions};
+use bedrock_lib::storage::sim::MemoryFactory;
 use bedrock_lib::transport::admin::Admin;
 use bedrock_lib::transport::{Class, Peers};
 use prost::Message;
@@ -134,6 +134,7 @@ async fn subscribe(
             from: 1,
             span: Some(span(subscriber)),
             from_namespaces: Default::default(),
+            ..Default::default()
         })),
     })
     .await
@@ -234,7 +235,7 @@ fn process_memory() -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "opt-in hardware measurement; run explicitly in release mode"]
-async fn thousand_bucket_subscribers_at_ten_thousand_events_per_second() {
+async fn thousand_range_subscribers_at_ten_thousand_events_per_second() {
     eprintln!(
         "relay_load profile: {}",
         if cfg!(debug_assertions) {
@@ -378,6 +379,7 @@ async fn thousand_bucket_subscribers_at_ten_thousand_events_per_second() {
                         key,
                         operation: Operation::Set(vec![42; PAYLOAD]),
                         idempotency_key: None,
+                        expected: None,
                     })
                     .await
             });
