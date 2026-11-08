@@ -67,5 +67,5 @@ Choose the cheapest available model that can reliably complete and verify the ta
 ## Disk hygiene
 
 - When you spawn a worker, worktree or test environment, or create a new `CARGO_TARGET_DIR`, clean up WSL space as part of the task. Delete only build caches and Docker artifacts that no running task uses, and list what you removed in the report.
-- Then compact the VHDX files: the distro's `ext4.vhdx` and Docker Desktop's `docker_data.vhdx`. Quit Docker Desktop, run `wsl --shutdown`, then `Optimize-VHD -Mode Full` from an elevated PowerShell. Deleting alone does not return space to Windows.
+- Defer VHDX compaction to the user, or obtain explicit approval after affected work has stopped. To compact the distro's `ext4.vhdx` and Docker Desktop's `docker_data.vhdx`, quit Docker Desktop, run `wsl --shutdown`, then `Optimize-VHD -Mode Full` from an elevated PowerShell. Deleting alone does not return space to Windows.
 - Compaction needs an elevated shell. If you cannot run that step, say so in the report and leave it to the user.
