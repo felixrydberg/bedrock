@@ -729,6 +729,60 @@ async fn settled(what: &str, reference: &Leaf, members: &[&str]) {
     }
 }
 
+/// A directory merge can become ready before its consumers join. Their stored parts must cover the whole range.
+fn has_progress(revisions: &BTreeMap<String, u64>, namespace: &str, range: (u64, u64)) -> bool {
+    let end = |value: u64| {
+        if value == 0 {
+            1u128 << 64
+        } else {
+            value.into()
+        }
+    };
+    let mut covered = u128::from(range.0);
+    // Revision names sort by their fixed-width range start, including overlapping remnants of a split.
+    for (start, stop) in revisions.iter().filter_map(|(marker, value)| {
+        if *value != 1 {
+            return None;
+        }
+        let rest = marker.strip_prefix("relay:range:cdn:")?;
+        let start = u64::from_str_radix(rest.get(..16)?, 16).ok()?;
+        let stop = u64::from_str_radix(rest.get(17..33)?, 16).ok()?;
+        (rest.get(34..)? == namespace).then_some((start, stop))
+    }) {
+        if u128::from(start) > covered {
+            break;
+        }
+        covered = covered.max(end(stop));
+        if covered >= end(range.1) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn merged_range_progress_requires_gap_free_parts() {
+    const HALF: u64 = 1 << 63;
+    for (parts, range, expected) in [
+        (vec![(0, HALF), (HALF, 0)], (0, 0), true),
+        (vec![(0, HALF)], (0, 0), false),
+        (vec![(0, HALF), (HALF + 1, 0)], (0, 0), false),
+        (vec![(0, HALF + 1), (HALF, 0)], (0, 0), true),
+        (vec![(0, 0)], (1, u64::MAX), true),
+    ] {
+        let revisions = parts
+            .iter()
+            .map(|(start, end)| (format!("relay:range:cdn:{start:016x}-{end:016x}:pages"), 1))
+            .collect();
+        assert_eq!(
+            has_progress(&revisions, "pages", range),
+            expected,
+            "{parts:?}"
+        );
+        assert!(!has_progress(&revisions, "other", range));
+    }
+}
+
 /// Runs throughout: no member's view lists a directory owner it never saw as a member (one revision order), and no
 /// member's own view shows it `ready` for a range it holds no progress for in some namespace the writer has written
 /// (no owner is ready before its copy). Another member's view may lag behind a revoke the owner already applied.
@@ -772,24 +826,8 @@ async fn invariants(leaves: Vec<(&'static str, Arc<Leaf>)>, model: Arc<Model>) {
                         .revisions()
                         .unwrap();
                     for namespace in &written {
-                        let held = revisions.iter().any(|(marker, value)| {
-                            *value == 1
-                                && marker
-                                    .strip_prefix("relay:range:cdn:")
-                                    .and_then(|rest| {
-                                        let start =
-                                            u64::from_str_radix(rest.get(..16)?, 16).ok()?;
-                                        let end =
-                                            u64::from_str_radix(rest.get(17..33)?, 16).ok()?;
-                                        (rest.get(34..)? == namespace).then_some((start, end))
-                                    })
-                                    .is_some_and(|held| {
-                                        within(held, range.0)
-                                            && (held.1 == 0 || (range.1 != 0 && range.1 <= held.1))
-                                    })
-                        });
                         assert!(
-                            held,
+                            has_progress(&revisions, namespace, range),
                             "{} is ready for {range:x?} without progress in {namespace}",
                             owner.node
                         );

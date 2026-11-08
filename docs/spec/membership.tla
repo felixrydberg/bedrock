@@ -111,10 +111,20 @@ Write(r, p, o) ==
     /\ own' = [own EXCEPT ![p] = o]
     /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, pub, split, sick, pubSick>>
 
+\* #66 / B-61: ranges only split, so with churn their count, and every write's fan-out to them, grows without bound. The
+\* assigner deletes start p when its entry is the range before it's, so no point's owners change and the ranges merge.
+Below(p) == CHOOSE q \in Points : q < p /\ \A t \in Points : t < p => t <= q
+Merge(r, p) == /\ (Publisher(r) \/ (Bug = "minority-write" /\ up[r])) /\ p \in starts /\ p # 0
+               /\ (own[p] = Entry(Below(p)) \/ Bug = "merge-unequal")
+               /\ starts' = starts \ {p}
+               /\ own' = [own EXCEPT ![p] = [n \in Nodes |-> "none"]]
+               /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, pub, split, sick, pubSick>>
+
 Next == \/ Tick
         \/ \E n \in Nodes : Disconnect(n) \/ Drain(n) \/ Leave(n) \/ Restart(n) \/ Sicken(n)
         \/ \E n \in Nodes, r \in Relays : Connect(n, r) \/ Set(r, n) \/ Delete(r, n)
         \/ \E r \in Relays : Crash(r) \/ Recover(r) \/ Move(r)
+        \/ \E r \in Relays, p \in Points : Merge(r, p)
         \/ \E r \in Relays, p \in Points, o \in [Nodes -> {"none", "populating"} \cup Holds] :
             Write(r, p, o)
 Spec == Init /\ [][Next]_vars

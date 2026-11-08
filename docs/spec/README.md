@@ -93,15 +93,16 @@ under a minute, and `scripts/tlc.sh relays` runs one model. It needs Java 11 or 
 [TLA+ tools jar](https://github.com/tlaplus/tlaplus/releases), by default at `.codex-tmp/tla2tools.jar`.
 Every invariant and property has a bug except `TypeOK`, which only catches mistakes in a model.
 
-On 2026-11-07, TLC 1.8.0 passed every config and caught all 34 bugs:
+On 2026-11-08, TLC 1.8.0 passed every config and caught all 38 bugs:
 
 | Model | Generated states | Distinct states | Time |
 |---|---:|---:|---:|
 | `relays` | 26,865,595 | 2,705,822 | 10 s |
 | `follows` | 2,399 | 713 | 1 s |
+| `merge` | 262 | 112 | 1 s |
 | `materialized` | 2,207 | 888 | 1 s |
 | `publisher` | 2,965 | 436 | 1 s |
-| `membership` | 17,684,369 | 1,437,600 | 37 s |
+| `membership` | 17,874,929 | 1,437,600 | 37 s |
 | `handoff` | 396,310,318 | 34,143,510 | 8 min |
 
 The models and the simulation (`tests/sim`) use the same names for the shared invariants:
@@ -109,7 +110,7 @@ The models and the simulation (`tests/sim`) use the same names for the shared in
 | Invariant | Models | Simulation |
 |---|---|---|
 | `NoLostAck`, `RetryProtection` | `materialized` | yes |
-| `GapFreeApply` | `relays` | yes |
+| `GapFreeApply` | `relays`, `merge` | yes |
 | `NoResurrection`, `NoStaleOverwrite` | within `relays` `GapFreeApply` and `materialized` `AtomicDurable` | yes |
 | `DirectoryCoverage`, `NoDropBeforeReady` | `membership`, `handoff` | yes |
 | `NoUnhealthyRouting` | `membership` | yes |

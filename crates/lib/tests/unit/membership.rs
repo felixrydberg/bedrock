@@ -330,19 +330,23 @@ fn settle(service: &str, actual: &Members, directories: &mut Directories) -> usi
             return pass;
         }
         for change in changes {
-            let Change::Range {
-                dataset,
-                start,
-                owners,
-                ..
-            } = change
-            else {
-                panic!("placement wrote {change:?}");
-            };
-            directories
-                .entry(dataset)
-                .or_default()
-                .insert(start, owners);
+            match change {
+                Change::Range {
+                    dataset,
+                    start,
+                    owners,
+                    ..
+                } => {
+                    directories
+                        .entry(dataset)
+                        .or_default()
+                        .insert(start, owners);
+                }
+                Change::Merge { dataset, start, .. } => {
+                    directories.entry(dataset).or_default().remove(&start);
+                }
+                change => panic!("placement wrote {change:?}"),
+            }
         }
     }
     panic!("placement did not settle");

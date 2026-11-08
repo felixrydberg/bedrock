@@ -266,10 +266,40 @@ impl Snapshot for View<'_> {
     }
 
     fn revisions(&self) -> StorageResult<std::collections::BTreeMap<String, u64>> {
+        self.revisions_between("", None)
+    }
+
+    fn revisions_in(
+        &self,
+        ranges: &[super::Names],
+    ) -> StorageResult<std::collections::BTreeMap<String, u64>> {
+        let mut found = std::collections::BTreeMap::new();
+        for (from, to) in ranges {
+            found.extend(self.revisions_between(from, Some(to))?);
+        }
+        Ok(found)
+    }
+}
+
+impl View<'_> {
+    /// The revisions named in `[from, to)`, reading only those; no `to` reads to the end.
+    fn revisions_between(
+        &self,
+        from: &str,
+        to: Option<&str>,
+    ) -> StorageResult<std::collections::BTreeMap<String, u64>> {
         let engine = self.engine;
         engine
             .db
-            .iterator_cf_opt(&self.revisions, self.options(), IteratorMode::Start)
+            .iterator_cf_opt(
+                &self.revisions,
+                self.options(),
+                IteratorMode::From(from.as_bytes(), Direction::Forward),
+            )
+            .take_while(|item| match (item, to) {
+                (Ok((name, _)), Some(to)) => **name < *to.as_bytes(),
+                _ => true,
+            })
             .map(|item| {
                 let (name, value) = item.map_err(|e| error(&engine.instance, e))?;
                 let name = String::from_utf8(name.into_vec()).map_err(|e| {

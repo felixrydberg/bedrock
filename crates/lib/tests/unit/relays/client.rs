@@ -518,6 +518,7 @@ fn splitting_unconfirmed_coverage_requires_the_kept_range_to_recover() {
         me: None,
         pending: BTreeMap::new(),
         retired: BTreeSet::new(),
+        merges: BTreeMap::new(),
     };
     let progress = Mutex::new(Progress::default());
     let changes = Watched::new(0);
@@ -976,22 +977,45 @@ async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets()
     let whole = (0, 0);
     let marker = marker_prefix("auth", whole) + "users";
     // Quarantine and both narrowing reads are isolated; malformed persisted state remains fatal.
-    for (fail_at, marker, expected_error, spans) in [
-        (None, marker.clone(), None, Vec::new()),
-        (Some(1), marker.clone(), None, Vec::new()),
-        (Some(2), marker.clone(), None, Vec::new()),
-        (Some(1), marker, None, vec![(0, 1 << 63), (1 << 63, 0)]),
+    for (fail_at, marker, expected_error, spans, range) in [
+        (None, marker.clone(), None, Vec::new(), whole),
+        (Some(1), marker.clone(), None, Vec::new(), whole),
+        (Some(2), marker.clone(), None, Vec::new(), whole),
+        (
+            Some(1),
+            marker,
+            None,
+            vec![(0, 1 << 63), (1 << 63, 0)],
+            whole,
+        ),
+        // A refused cut also blocks a merged range's bootstrap over the unreadable part.
+        (
+            Some(0),
+            marker_prefix("auth", (0, 1 << 62)) + "users",
+            None,
+            vec![(1, 0)],
+            (0, 1 << 62),
+        ),
+        (
+            Some(1),
+            marker_prefix("auth", (0, 1 << 62)) + "users",
+            None,
+            vec![(1, 0)],
+            (0, 1 << 62),
+        ),
         (
             Some(usize::MAX),
             "relay:range:auth:broken".into(),
             Some(tonic::Code::DataLoss),
             Vec::new(),
+            whole,
         ),
         (
             Some(usize::MAX),
             marker_prefix("auth", whole) + "bad\0name",
             Some(tonic::Code::InvalidArgument),
             Vec::new(),
+            whole,
         ),
     ] {
         let reads = Arc::new(AtomicUsize::new(usize::MAX / 2));
@@ -1029,7 +1053,18 @@ async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets()
             )
             .unwrap();
         let mut consumers = BTreeMap::from([(me.clone(), membership)]);
-        let mut pushed = revoke_state(&engine, whole);
+        let mut pushed = revoke_state(&engine, range);
+        if range != whole {
+            let other = (range.1, 1 << 63);
+            pushed.groups.insert(("auth".into(), other), engine.clone());
+            pushed.merges.insert(
+                "auth".into(),
+                vec![ranges::Merge {
+                    into: (range.0, other.1),
+                    parts: vec![range, other],
+                }],
+            );
+        }
         pushed.me = Some(("n1".into(), me));
         pushed.ranged.insert(
             "quicksilver".into(),
@@ -1078,7 +1113,12 @@ async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets()
         match rx.try_recv().unwrap().kind.unwrap() {
             Kind::Ranges(ack) => {
                 assert_eq!(ack.dataset, "auth");
-                assert_eq!(ack.refused, [pb::Span { start: 0, end: 0 }]);
+                let dropped = if range == whole || fail_at == Some(0) {
+                    whole
+                } else {
+                    (0, 1)
+                };
+                assert_eq!(ack.refused, [span(Some(dropped)).unwrap()]);
                 assert!(!ack.reason.is_empty());
             }
             other => panic!("expected a refusing acknowledgement, got {other:?}"),
@@ -1092,12 +1132,13 @@ async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets()
             Some(Kind::Ranges(ack)) if ack.dataset == "quicksilver" && ack.refused.is_empty()
         ));
         assert!(rx.try_recv().is_err());
-        assert!(pushed.groups.contains_key(&("auth".into(), whole)));
-        assert!(!pushed.retired.contains(&("auth".into(), whole)));
+        assert!(pushed.groups.contains_key(&("auth".into(), range)));
+        assert!(!pushed.retired.contains(&("auth".into(), range)));
+        assert!(pushed.merges.get("auth").is_none_or(Vec::is_empty));
         assert_eq!(data.get(&stored_at(b"k")).unwrap(), Some(b"value".to_vec()));
         assert_eq!(
             held(data.as_ref(), "auth").unwrap(),
-            BTreeSet::from([whole])
+            BTreeSet::from([range])
         );
     }
 }
@@ -1155,6 +1196,7 @@ async fn pushed_revokes_wait_for_the_view_are_refused_unless_it_confirms_then_dr
         me: Some(("n1".into(), me.clone())),
         pending: BTreeMap::new(),
         retired: BTreeSet::new(),
+        merges: BTreeMap::new(),
     };
     let progress = Mutex::new(Progress::default());
     let changes = Watched::new(0);
@@ -1468,6 +1510,7 @@ fn revoke_state(engine: &Arc<dyn StorageEngine>, whole: Range) -> Pushed {
         me: None,
         pending: BTreeMap::new(),
         retired: BTreeSet::new(),
+        merges: BTreeMap::new(),
     }
 }
 
@@ -1729,5 +1772,96 @@ fn a_commit_retires_cursors_an_unknown_split_left_on_parts_of_its_range() {
     assert_eq!(
         held(data.as_ref(), "auth").unwrap(),
         BTreeSet::from([whole])
+    );
+}
+
+/// #66 / B-61: a member joins the consumers of merged ranges only once they are at one revision, and then in one batch
+/// that leaves the merged range holding that coverage (`docs/spec/merge.tla`).
+#[test]
+fn merged_ranges_join_only_at_one_revision() {
+    const HALF: u64 = 1 << 63;
+    let data = Arc::new(MemoryEngine::new("auth"));
+    let engine: Arc<dyn StorageEngine> = data.clone();
+    let group = Target {
+        selection: Selection {
+            dataset: "auth".into(),
+            namespace: String::new(),
+        },
+        engine: engine.clone(),
+        prefix: Vec::new(),
+        span: None,
+    };
+    let (low, high, whole) = ((0, HALF), (HALF, 0), (0, 0));
+    let at = |range: Range, applied: u64| {
+        let names = Names::of("auth", "keys", &[], Some(range));
+        let mut batch = WriteBatch::default();
+        batch
+            .set_revision(names.marker.as_ref().unwrap(), 1)
+            .set_revision(&names.active, 1)
+            .set_revision(&names.revision, applied);
+        data.write(batch).unwrap();
+        Consumer::in_range(&group, "keys", range).unwrap()
+    };
+    let mut consumers = BTreeMap::new();
+    for consumer in [at(low, 5), at(high, 4)] {
+        consumers.insert(consumer.scope(), consumer);
+    }
+    let merge = ranges::Merge {
+        into: whole,
+        parts: vec![low, high],
+    };
+    let mut pushed = Pushed {
+        groups: Groups::from([
+            (("auth".into(), low), engine.clone()),
+            (("auth".into(), high), engine.clone()),
+        ]),
+        ranged: BTreeMap::from([("auth".into(), engine.clone())]),
+        me: None,
+        pending: BTreeMap::new(),
+        retired: BTreeSet::new(),
+        merges: BTreeMap::from([("auth".into(), vec![merge])]),
+    };
+    let progress = Mutex::new(Progress::default());
+    let changes = Watched::new(0);
+
+    // One part behind: joining at either revision would roll a part back or skip its events.
+    assert!(
+        join(&mut consumers, &mut pushed, &progress, &changes)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        held(data.as_ref(), "auth").unwrap(),
+        BTreeSet::from([low, high])
+    );
+
+    let caught_up = at(high, 5);
+    consumers.insert(caught_up.scope(), caught_up);
+    match join(&mut consumers, &mut pushed, &progress, &changes)
+        .unwrap()
+        .as_slice()
+    {
+        [
+            pb::relay_request::Kind::Unfollow(a),
+            pb::relay_request::Kind::Unfollow(b),
+            pb::relay_request::Kind::Follow(follow),
+        ] => {
+            assert_eq!((a.span, b.span), (span(Some(low)), span(Some(high))));
+            assert_eq!(follow.span, span(Some(whole)));
+            assert_eq!(follow.from_namespaces, BTreeMap::from([("keys".into(), 6)]));
+        }
+        other => panic!("expected the joining requests, got {other:?}"),
+    }
+    assert_eq!(
+        held(data.as_ref(), "auth").unwrap(),
+        BTreeSet::from([whole])
+    );
+    let joined = &consumers[&("auth".into(), "keys".into(), Some(whole))];
+    assert_eq!((joined.applied, joined.validated()), (5, true));
+    assert_eq!(consumers.len(), 1);
+    assert!(pushed.retired.contains(&("auth".into(), low)) && pushed.merges.is_empty());
+    assert_eq!(
+        pushed.groups.keys().collect::<Vec<_>>(),
+        [&("auth".into(), whole)]
     );
 }

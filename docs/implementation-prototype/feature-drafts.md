@@ -7,7 +7,7 @@ which module it lives in, which doc section it comes from, what it depends on, a
 
 Sources: `docs/implementation-prototype/kv.md`, `cdn.md`, `code-structure.md`, `notes.md`.
 
-> Status: B-01 to B-29 (including B-12b, B-18b, B-22b and B-23a, but not B-09b or B-21b), plus B-39, are created as GitHub issues (linked below; the issue is the source of truth). Later drafts are still drafts.
+> Status: B-01 to B-29 (including B-12b, B-18b, B-22b and B-23a, but not B-09b or B-21b), plus B-39 and B-61, are created as GitHub issues (linked below; the issue is the source of truth). Later drafts are still drafts.
 
 > Architecture update, 2026-10-29: decision 11 replaces customer-KV origin cells with per-namespace S3 databases,
 > an API writer and read-only KV caches. This document records the new decision; the older customer-KV origin text in
@@ -192,7 +192,7 @@ Rules this implies:
 | **N — Shared platform infrastructure (future)** |||||
 | B-56 | Shared API rate-limit infrastructure | Shared infrastructure | shared contracts in `lib`; API integration | To be agreed; does not gate initial KV |
 | B-57 | Gateway binary and shared cluster client | Shared infrastructure | `gateway`, `lib` client, `lib/relays` | B-19, B-22, B-55 |
-| B-61 | Simulation speed: more simulated seconds per real second | Shared infrastructure | `tests/sim`, `scripts/vopr.sh` | B-23 |
+| [B-61](https://github.com/felixrydberg/bedrock/issues/66) | Simulation speed: more simulated seconds per real second | Shared infrastructure | `tests/sim`, `scripts/vopr.sh` | B-23 |
 | B-62 | Partial quarantine: rebuild only the damaged range | Shared core | `lib/health` + `lib/reconciliation` + `lib/relays` | B-14, B-21, B-22, B-23 |
 
 ### Parallel work inside the shared core
@@ -1747,44 +1747,7 @@ cannot reach another cell, and public requests have no entry point.
 
 #### B-61 — Simulation speed: more simulated seconds per real second
 
-```
-Title:  Feature 🚀: Run more simulated seconds per real second
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-A seed runs on one thread, so a long soak is limited by how fast that thread goes: a simulated day takes 30 to 105 minutes
-depending on the seed, and a simulated month would take about 14 to 52 hours. The more simulated time we get per real second,
-the more seeds and longer runs fit in a night.
-
-**Describe the solution you'd like**
-Work down this list, measuring each change with `scripts/vopr.sh profile` and a soak's `.metrics` file. Percentages come from a
-profile of a simulated hour of seed 90003, the heaviest load shape we have. Gains are estimates until measured.
-
-| Change | Why | Expected gain | Effort |
-| --- | --- | --- | --- |
-| Give WSL all 16 hardware threads (`processors` in `.wslconfig`) | Sweeps and soaks run one seed per CPU, and WSL has 8 of 16 threads | More seeds at once, less than double; a single seed gets no faster | A config change |
-| Undo log in `SimEngine::remember` — done | `Undo::Batch` tracks overwritten keys and revisions instead of copying the whole engine on every commit | Estimated up to about 21% on seeds with lost-write faults | Implemented |
-| `mimalloc` in the test binary — done | The VOPR binary uses `mimalloc`; allocation was a large share of the profile | About a quarter faster than glibc's allocator | Implemented |
-| LTO and one codegen unit for simulation builds — done | The `sim` profile enables fat LTO and one codegen unit; soak and watch use it | About 16% faster seed runs, for slower builds | Implemented |
-| Patch `naive_timer` usage to set one timer per deadline and waker — done | The vendored madsim `Sleep` avoids adding another timer on every poll | Not measured separately | Implemented; remove the patch when upstream includes it |
-| Break down `Hub::pump` and the rest of the per-commit cost | `Hub::pump` is about 17%, and most of the run is unexplained | Unknown | A profiling pass |
-
-Each change must leave every seed's trace unchanged, except where it is meant to change behaviour. A trace that moves after an
-allocator or compiler change means something depends on memory addresses, which is a determinism bug.
-
-**Describe alternatives you've considered**
-- Threads inside a seed: rejected. madsim gets determinism from one thread choosing the next task.
-- Stripping madsim: rejected. Unused code costs nothing at runtime, so only the hot paths above matter.
-- Our own simulator: rejected. madsim is about 30% of the run, so it could not win much, and a bug in it could quietly weaken
-  every seed.
-- Native Linux: a few percent for one seed, by estimate. Its use is a dedicated machine for `scripts/vopr.sh watch`.
-- Moving the repo into WSL's Linux filesystem helps builds, not a running simulation.
-
-**Additional context**
-Seeds differ widely: a simulated hour takes about 71 real seconds on seed 90002 and about 260 on seed 90003, which made about
-24 times as many commits as seed 90004 in the same simulated time. Evenly spread single writes appear to commit one by one,
-while hot keys and bursts batch. Results from one seed may not carry over, so check more than one load shape.
+Created: [#66](https://github.com/felixrydberg/bedrock/issues/66) — Feature 🚀: Run more simulated seconds per real second
 
 #### B-62 — Partial quarantine: rebuild only the damaged range
 

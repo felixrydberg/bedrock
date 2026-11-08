@@ -117,6 +117,40 @@ fn stalled(hub: &Hub, id: u64) -> mpsc::Receiver<Result<pb::RelayFrame, tonic::S
     rx
 }
 
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn subscriber_disconnect_count_uses_sliding_hour() {
+    let hub = relay();
+    let _queue = stalled(&hub, 1);
+    let member = pb::Member {
+        node_id: "node".into(),
+        ..Default::default()
+    };
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&1)
+        .unwrap()
+        .member = Some(member.clone());
+    let count = || {
+        subscribers(&hub, &Query::parse(""))["items"][0]["disconnects"]
+            .as_u64()
+            .unwrap()
+    };
+
+    hub.0.stats.disconnected(&member);
+    tokio::time::sleep(Duration::from_secs(1800)).await;
+    hub.0.stats.disconnected(&member);
+    assert_eq!(count(), 2);
+    tokio::time::sleep(Duration::from_secs(1800)).await;
+    assert_eq!(count(), 1);
+    hub.0.stats.disconnected(&member);
+    assert_eq!(count(), 2);
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    assert_eq!(count(), 0);
+}
+
 async fn subscriber_state(hub: &Hub, queued: u64) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -151,7 +185,8 @@ async fn stalled_subscriber_shows_rising_lag_and_queue_depth() {
     for sequence in 11..=30 {
         hub.publish(event("users", sequence));
     }
-    hub.changed();
+    // As a delivery from upstream would, which is what wakes the namespace's streams.
+    hub.arrived(&("auth".into(), "users".into()));
     let after = subscriber_state(&hub, 30).await;
     assert_eq!(before["follows"][0]["lag"], 10);
     assert_eq!(after["follows"][0]["lag"], 30);

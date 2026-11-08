@@ -93,6 +93,10 @@ impl Snapshot for View {
     fn revisions(&self) -> StorageResult<BTreeMap<String, u64>> {
         Ok((*self.revisions).clone())
     }
+
+    fn revisions_in(&self, ranges: &[super::Names]) -> StorageResult<BTreeMap<String, u64>> {
+        Ok(super::names_in(&self.revisions, ranges))
+    }
 }
 
 impl StorageEngine for MemoryEngine {

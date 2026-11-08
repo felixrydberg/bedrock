@@ -431,6 +431,13 @@ impl Snapshot for MonitoredSnapshot<'_> {
     fn revisions(&self) -> StorageResult<BTreeMap<String, u64>> {
         self.owner.call(|| self.inner.revisions())
     }
+
+    fn revisions_in(
+        &self,
+        ranges: &[crate::storage::Names],
+    ) -> StorageResult<BTreeMap<String, u64>> {
+        self.owner.call(|| self.inner.revisions_in(ranges))
+    }
 }
 
 #[cfg(test)]

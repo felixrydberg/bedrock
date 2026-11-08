@@ -65,6 +65,15 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
   span. It acknowledges every set it applied with `RangesAck`, listing the revokes it refused and why; the relay
   then forgets that set and pushes it again on its next publish pass. A range
   held before a restart resumes until the relays push the current set.
+- **Merges.** The publisher also merges neighbouring ranges with the same ready owners (#66 / B-61,
+  [membership.md](membership.md#placement-directory)), so a pushed set can move boundaries anywhere. The member first
+  cuts each held range at the pushed boundaries, carrying coverage to every part still pushed, as for a split. A
+  pushed range made of several such parts then merges them: the member keeps following the parts until, in every
+  namespace, their consumers are at one revision, and then one atomic batch retires them and gives the merged range that
+  coverage, and it follows the merged range from there (`merge.tla`). Joining at a lower revision would roll a part back,
+  at a higher one skip some of its events. A pushed range with parts and gaps retires the parts' consumers and
+  bootstraps whole over them, since the member is a populating owner there. A refused cut holds back any merge or new
+  range over it until the next push.
 
 ## Model
 

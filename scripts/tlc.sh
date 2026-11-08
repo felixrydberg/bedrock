@@ -43,6 +43,7 @@ membership sick NoUnhealthyRouting
 membership early-drop NoDropBeforeReady
 membership early-removal NoEarlyRemoval
 membership minority-write Freeze
+membership merge-unequal NoDropBeforeReady
 handoff unready ReadyHasData
 handoff view ServesHeld
 handoff keep OwnedOrLeaving
@@ -52,6 +53,9 @@ handoff any-ready KeepsHealthyHolder
 handoff minority-write Freeze
 follows untagged NoFalseGap
 follows ahead HeldBeforeNext
+merge lower GapFreeApply
+merge higher GapFreeApply
+merge drift OneCursor
 '
 
 tlc() {
@@ -89,7 +93,7 @@ bug() {
     fi
 }
 
-models="relays follows materialized publisher membership handoff"
+models="relays follows merge materialized publisher membership handoff"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

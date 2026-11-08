@@ -5,7 +5,7 @@
 //! `/introspect/{upstream,namespaces,subscribers,membership,siblings}`, filtered by `dataset`, namespace `prefix` and `service`; the only per-namespace series are the top-[`TOP`] gauges.
 //! End-to-end lag is `now - committed_at` on the hub's runtime clock as each event enters a relay, at every tier.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -47,12 +47,16 @@ struct Service {
 
 type Lag = Family<Dataset, Histogram, fn() -> Histogram>;
 
+/// The window used for each member's disconnect count.
+const DISCONNECTS_KEPT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// What the hot path records; everything else is read from the hub when asked.
 pub(super) struct Stats {
     // ponytail: never pruned, bounded by the namespaces this relay has carried, like the hub's head map.
     namespaces: Mutex<BTreeMap<Key, Namespace>>,
     upstream: Mutex<Option<String>>,
-    disconnects: Mutex<BTreeMap<MemberKey, u64>>,
+    /// Full-queue disconnect times per member, pruned after [`DISCONNECTS_KEPT`] (#66 / B-61).
+    disconnects: Mutex<BTreeMap<MemberKey, VecDeque<Instant>>>,
     events_in: Family<Dataset, Counter>,
     bytes_in: Family<Dataset, Counter>,
     events_out: Family<Dataset, Counter>,
@@ -210,12 +214,21 @@ impl Stats {
     }
 
     pub(super) fn disconnected(&self, member: &pb::Member) {
-        *self
-            .disconnects
-            .lock()
-            .unwrap()
+        let mut disconnects = self.disconnects.lock().unwrap();
+        let now = crate::monotonic_now();
+        disconnects.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|at| now.duration_since(*at) >= DISCONNECTS_KEPT)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+        disconnects
             .entry(crate::membership::key(member))
-            .or_default() += 1;
+            .or_default()
+            .push_back(now);
     }
 }
 
@@ -892,6 +905,7 @@ fn namespaces(hub: &Hub, query: &Query) -> Value {
 /// Per session: identity, follows with range, acknowledged revision and lag, queue depth and the member's disconnects.
 fn subscribers(hub: &Hub, query: &Query) -> Value {
     let disconnects = hub.0.stats.disconnects.lock().unwrap().clone();
+    let now = crate::monotonic_now();
     let filtered = query.dataset.is_some() || !query.prefix.is_empty();
     let items = hub.snapshot().into_iter().filter_map(|sub| {
         if query.service.as_ref().is_some_and(|s| s != sub.service()) {
@@ -923,7 +937,7 @@ fn subscribers(hub: &Hub, query: &Query) -> Value {
             "follows": follows,
             "queued_events": sub.events,
             "queued_bytes": sub.bytes,
-            "disconnects": member.map_or(0, |m| disconnects.get(&crate::membership::key(m)).copied().unwrap_or(0)),
+            "disconnects": member.map_or(0, |m| disconnects.get(&crate::membership::key(m)).map_or(0, |times| times.iter().filter(|at| now.duration_since(**at) < DISCONNECTS_KEPT).count())),
         });
         Some((sub.id, value))
     });

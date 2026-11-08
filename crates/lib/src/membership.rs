@@ -302,13 +302,21 @@ pub enum Change {
         start: u64,
         owners: Vec<Owner>,
     },
+    /// Deletes the range entry at `start`, joining its range to the one before (#66 / B-61, [`placement::merges`]).
+    Merge {
+        service: String,
+        dataset: String,
+        start: u64,
+    },
 }
 
 impl Change {
     fn service(&self) -> &str {
         match self {
             Change::Set(member) => &member.service,
-            Change::Delete((service, _)) | Change::Range { service, .. } => service,
+            Change::Delete((service, _))
+            | Change::Range { service, .. }
+            | Change::Merge { service, .. } => service,
         }
     }
 }
@@ -458,11 +466,22 @@ pub fn place(
         if entries.is_empty() {
             entries = placement::assign(directory, &members, &unhealthy, REPLICAS, MAX_MOVING);
         }
+        // Merges wait for a pass with nothing else to write, so they never share a plan with a split.
+        let merges = if entries.is_empty() {
+            placement::merges(directory)
+        } else {
+            Vec::new()
+        };
         changes.extend(entries.into_iter().map(|(start, owners)| Change::Range {
             service: service.into(),
             dataset: (*dataset).into(),
             start,
             owners,
+        }));
+        changes.extend(merges.into_iter().map(|start| Change::Merge {
+            service: service.into(),
+            dataset: (*dataset).into(),
+            start,
         }));
     }
     changes
@@ -663,7 +682,7 @@ impl Cell {
                 tracing::debug!(relay = %self.me, base, ?change, "membership write");
                 match tokio::time::timeout(TIMEOUT, self.write(&change, base)).await {
                     Ok(Ok(revision)) => {
-                        if matches!(change, Change::Range { .. }) {
+                        if matches!(change, Change::Range { .. } | Change::Merge { .. }) {
                             *self
                                 .publisher
                                 .directory_writes
@@ -742,6 +761,15 @@ impl Cell {
                 hyper::Method::PUT,
                 (service.clone(), format!("{RANGE}{dataset}/{start:016x}")),
                 encode(owners),
+            ),
+            Change::Merge {
+                service,
+                dataset,
+                start,
+            } => (
+                hyper::Method::DELETE,
+                (service.clone(), format!("{RANGE}{dataset}/{start:016x}")),
+                Vec::new(),
             ),
         };
         let uri = format!("/v1/{DATASET}/{}/{key}", namespace(&service, &self.cell));

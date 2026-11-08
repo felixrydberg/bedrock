@@ -4,7 +4,8 @@
 //! - [`assign`] is run by the cell relays' majority membership publisher. From the published placement directory and
 //!   membership it returns the directory entries to write: ranges of removed members get new owners, and members far from
 //!   their capacity-weighted share take ranges from the most loaded, splitting where needed. [`handoff`] then marks
-//!   owners `ready` as their relays report them so and removes `leaving` ones (#22 / B-21).
+//!   owners `ready` as their relays report them so and removes `leaving` ones (#22 / B-21). [`merges`] joins neighbours
+//!   whose owners are the same again (#66 / B-61).
 //! - [`owners`] and [`serves`] read the published directory (#19 / B-16, `docs/spec/membership.md`).
 //! - [`rank`] orders customer-KV readers by rendezvous hash. Customer KV has no ranges.
 //! - [`hash_of`] places a key in the hash space; relay range streams select keys with [`in_span`] (#22 / B-21).
@@ -505,6 +506,27 @@ pub fn handoff(
             (next != *owners).then_some((*start, next))
         })
         .collect()
+}
+
+/// Starts to delete so neighbouring ranges with the same owners, all `ready`, become one (#66 / B-61,
+/// `docs/spec/membership.tla`, `Merge`). Without it ranges only split, so with churn their count, and every write's fan-out
+/// to their streams, grows without bound. No hash changes owners, so a merge needs no handoff; members join their range
+/// consumers once those agree (`docs/spec/merge.tla`).
+pub fn merges(directory: &Directory) -> Vec<u64> {
+    directory
+        .iter()
+        .zip(directory.iter().skip(1))
+        .filter(|((_, before), (_, owners))| {
+            nodes_of(owners).is_some_and(|nodes| Some(nodes) == nodes_of(before))
+        })
+        .map(|(_, (start, _))| *start)
+        .collect()
+}
+
+/// The nodes of an entry whose owners are all `ready`.
+fn nodes_of(owners: &[Owner]) -> Option<BTreeSet<String>> {
+    let ready = !owners.is_empty() && owners.iter().all(|o| o.state == State::Ready);
+    ready.then(|| owners.iter().map(|o| o.node.clone()).collect())
 }
 
 /// The owners of the range holding `hash`; none before the directory's first write.

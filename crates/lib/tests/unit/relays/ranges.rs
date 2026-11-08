@@ -48,14 +48,68 @@ fn a_pushed_set_keeps_splits_drops_and_adds() {
 }
 
 #[test]
-fn malformed_or_straddling_pushed_sets_are_protocol_errors() {
-    for pushed in [vec![(5, 5)], vec![(0, 10), (5, 20)], vec![(50, 150)]] {
+fn malformed_or_overlapping_pushed_sets_are_protocol_errors() {
+    for pushed in [vec![(5, 5)], vec![(0, 10), (5, 20)]] {
         assert_eq!(
             plan(&[(0, 100)], &[], &spans(&pushed)).unwrap_err().code(),
             tonic::Code::DataLoss,
             "{pushed:?}"
         );
     }
+}
+
+/// #66 / B-61: a pushed range made of whole held ranges merges them, dropping nothing. One that also covers ranges the
+/// member does not hold absorbs its parts and bootstraps whole. One covering only part of a held range still straddles.
+#[test]
+fn a_pushed_range_made_of_whole_held_ranges_merges_them() {
+    let held = [(HALF, 0), (100, 200), (0, 100), (300, 400)];
+    let joined = plan(&held, &[], &spans(&[(0, 200), (300, 400), (HALF, 0)])).unwrap();
+    assert_eq!(
+        joined.merged,
+        [Merge {
+            into: (0, 200),
+            parts: vec![(0, 100), (100, 200)],
+        }]
+    );
+    assert!(joined.changed.is_empty() && joined.added.is_empty());
+
+    let held = [(0, 100), (100, 200), (300, 400)];
+    let absorbed = plan(&held, &[], &spans(&[(0, 400)])).unwrap();
+    assert_eq!(
+        absorbed.absorbed,
+        [Merge {
+            into: (0, 400),
+            parts: held.to_vec(),
+        }]
+    );
+    assert_eq!(absorbed.added, [(0, 400)]);
+    assert!(absorbed.changed.is_empty() && absorbed.merged.is_empty());
+
+    // Merges move boundaries: a re-cut keeps each part's coverage in the new ranges, then joins what fills one.
+    let recut = plan(&held, &[], &spans(&[(0, 150), (150, 400)])).unwrap();
+    assert_eq!(
+        recut.changed,
+        [Change {
+            held: (100, 200),
+            kept: vec![(100, 150), (150, 200)],
+            dropped: vec![],
+        }]
+    );
+    assert_eq!(
+        recut.merged,
+        [Merge {
+            into: (0, 150),
+            parts: vec![(0, 100), (100, 150)],
+        }]
+    );
+    assert_eq!(
+        recut.absorbed,
+        [Merge {
+            into: (150, 400),
+            parts: vec![(150, 200), (300, 400)],
+        }]
+    );
+    assert_eq!(recut.added, [(150, 400)]);
 }
 
 #[test]
@@ -169,7 +223,12 @@ fn a_stored_range_without_a_consumer_is_dropped_where_the_set_no_longer_has_it()
     let kept = plan(&[], &[(0, 100)], &[span(0, 100)]).unwrap();
     assert_eq!(kept.added, [(0, 100)]);
     assert!(kept.changed.is_empty());
-    assert!(plan(&[], &[(0, 100)], &[span(50, 150)]).is_err());
+    // #66 / B-61: merges move boundaries, so a pushed range straddling a stored one cuts it and bootstraps whole.
+    let recut = plan(&[], &[(0, 100)], &[span(50, 150)]).unwrap();
+    assert_eq!(recut.changed[0].kept, [(50, 100)]);
+    assert_eq!(recut.changed[0].dropped, [(0, 50)]);
+    assert_eq!(recut.added, [(50, 150)]);
+    assert_eq!(recut.absorbed[0].parts, [(50, 100)]);
 }
 
 /// Found by the simulation (#25 / B-23): a refused drop left the stored whole beside a part already followed, and treating

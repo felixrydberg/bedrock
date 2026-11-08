@@ -967,6 +967,53 @@ async fn sampler(run: Arc<Run>) {
     }
 }
 
+/// Each dataset's current placement, which must cover the hash space.
+fn placements(run: &Run) -> Result<BTreeMap<&'static str, Placement>, Violation> {
+    let mut placements = BTreeMap::new();
+    for dataset in ["quicksilver", "auth", "cdn"] {
+        let directory = run
+            .views
+            .of(dataset)
+            .directory(dataset)
+            .map_err(|error| Violation {
+                invariant: "RedundancyRestored",
+                detail: format!("no {dataset} directory: {error}"),
+            })?;
+        let placed = placement(&directory);
+        check_coverage(&placed)?;
+        placements.insert(dataset, placed);
+    }
+    Ok(placements)
+}
+
+/// Whether the directory lists `node` as `ready` wherever it lists it: `/ready` counts only the ranges a node already
+/// follows, so a range it was just given would not hold it back.
+fn settled(run: &Run, node: &Node) -> bool {
+    node.kind.datasets().iter().all(|dataset| {
+        run.views
+            .of(dataset)
+            .directory(dataset)
+            .is_ok_and(|directory| {
+                directory
+                    .values()
+                    .flatten()
+                    .all(|owner| owner.node != node.name || owner.state == State::Ready)
+            })
+    })
+}
+
+/// Whether `node`'s published member record reports none of its datasets unhealthy.
+fn healthy(run: &Run, node: &Node) -> bool {
+    node.kind.datasets().iter().all(|dataset| {
+        run.views.of(dataset).members().is_ok_and(|members| {
+            members
+                .values()
+                .filter(|member| member.node_id == node.name)
+                .all(|member| !member.unhealthy.iter().any(|d| d == dataset))
+        })
+    })
+}
+
 /// Why the cluster has not converged yet, naming the invariant that breaks if it lasts past the bound.
 async fn unconverged(run: &Run) -> Option<Violation> {
     let waiting = |invariant, detail: String| Some(Violation { invariant, detail });
@@ -1058,20 +1105,7 @@ async fn verify(run: &Run) -> Result<(), Violation> {
             sample.check(&history)?;
         }
     }
-    let mut placements = BTreeMap::new();
-    for dataset in ["quicksilver", "auth", "cdn"] {
-        let directory = run
-            .views
-            .of(dataset)
-            .directory(dataset)
-            .map_err(|error| Violation {
-                invariant: "RedundancyRestored",
-                detail: format!("no {dataset} directory: {error}"),
-            })?;
-        let placed = placement(&directory);
-        check_coverage(&placed)?;
-        placements.insert(dataset, placed);
-    }
+    placements(run)?;
     let storage: Vec<_> = run
         .cluster
         .nodes
@@ -1087,23 +1121,29 @@ async fn verify(run: &Run) -> Result<(), Violation> {
             run.cluster.kill(node);
             let (samples, hashes) = inspect(node);
             run.cluster.start(node);
-            for (dataset, hashes) in hashes {
-                check_held(&placements[dataset], &node.name, hashes)?;
-            }
+            // Ranges keep merging and moving while the cluster settles (#66 / B-61), so ownership is read afresh and has
+            // to come true: a node drops a revoked range only after its view shows the revoke.
+            let placements = placements(run)?;
+            let held = hashes.into_iter().find_map(|(dataset, hashes)| {
+                check_held(&placements[dataset], &node.name, hashes).err()
+            });
             let behind = {
                 let history = run.history.lock().unwrap();
                 for sample in &samples {
                     sample.check(&history)?;
                 }
-                behind(node, &samples, &placements, &history)
+                held.or_else(|| behind(node, &samples, &placements, &history))
             };
             let Some(behind) = behind else {
                 break;
             };
             // A node a rebuild emptied must bootstrap again, which takes longer than a fixed pause: killing it before it
-            // is ready would restart that every time.
+            // is ready would restart that every time. `/ready` leaves out a quarantined dataset, so a rebuild must also
+            // have finished, which the node's member record shows.
             sleep(Duration::from_secs(2)).await;
-            while !ready(node).await && Instant::now() < deadline {
+            while !(ready(node).await && healthy(run, node) && settled(run, node))
+                && Instant::now() < deadline
+            {
                 sleep(Duration::from_millis(500)).await;
             }
             if Instant::now() >= deadline {
