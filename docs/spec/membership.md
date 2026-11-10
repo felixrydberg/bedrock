@@ -320,7 +320,7 @@ counts match the 2026-11-01 run; this TLC build reports the depth as 22.
 The handoff model, run from `docs/spec`:
 
 ```sh
-java -XX:+UseParallelGC -cp ../../scripts/tla2tools.jar tlc2.TLC -workers 6 -checkpoint 5 -metadir ../../.codex-tmp/tlc-handoff -config handoff.cfg handoff.tla
+java -XX:+UseParallelGC -Xmx4g -cp ../../scripts/tla2tools.jar tlc2.TLC -workers 4 -checkpoint 5 -metadir ../../.codex-tmp/tlc-handoff -config handoff.cfg handoff.tla
 ```
 
 The same TLC build on 2026-11-02, with `Nodes = {n1, n2}` under symmetry, both carrying the dataset, faulty

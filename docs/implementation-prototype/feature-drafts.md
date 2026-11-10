@@ -1825,7 +1825,7 @@ nodes in turn, with real binaries and writes running.
   - Held node drain (B-21b): a node stays `draining`, its ranges hand off within the drain rate, every `ready` owner holds the
     committed data of its ranges, and nothing is revoked before the new owners are `ready`.
   - Cancel: deleting the drain record mid-handoff makes the node eligible again and leaves no partial copies.
-  - Cell drain: nothing moves across cells for quicksilver, auth and cdn, and the cell gets no new assignments.
+  - Cell drain: nothing moves across cells for quicksilver and cdn, and the cell gets no new assignments.
   - Scale out, then scale in: joins and rebalancing, then drains below the replica count, which must keep redundancy.
   - Rolling restart of every node, one at a time, with no write lost and no read going backwards.
 - **Real binaries** (`tests/crash`, `scripts/crash.sh`): a dynamic cluster where the harness starts a new node, drains one

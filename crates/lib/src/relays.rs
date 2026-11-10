@@ -1183,6 +1183,7 @@ impl Hub {
         let mut lease: Option<Arc<RecoveryLease>> = None;
         let mut local_recovery = false;
         let mut renewed_through = 0;
+        let mut local_deadline = crate::monotonic_now();
         let mut recovery_permit = None;
         // One timer for the whole stream: a new sleep on every pass leaves one behind per event, for its full length (B-61).
         let mut recheck = std::pin::pin!(tokio::time::sleep(PROGRESS));
@@ -1239,6 +1240,17 @@ impl Hub {
                     return Ok(());
                 }
                 announced = true;
+            }
+            if local_recovery {
+                // Like the writer's lease: acknowledgement progress renews the slot, silence for IDLE gives it up.
+                if acked > renewed_through {
+                    renewed_through = acked;
+                    local_deadline = crate::monotonic_now() + IDLE;
+                } else if crate::monotonic_now() >= local_deadline {
+                    return Err(Status::deadline_exceeded(
+                        "cell recovery acknowledgement stalled",
+                    ));
+                }
             }
             if local_recovery && h.is_some_and(|head| acked >= head) {
                 if !self
@@ -1391,6 +1403,8 @@ impl Hub {
                             self.advance(id, &key, generation, boundary);
                             self.baseline(id, &key, generation, boundary);
                             local_recovery = true;
+                            renewed_through = boundary;
+                            local_deadline = crate::monotonic_now() + IDLE;
                             forced = false;
                             continue;
                         }
@@ -1544,6 +1558,7 @@ impl Hub {
                 tokio::select! {biased;
                     _=changes.wait_until(|v|*v!=local_version)=>{},
                     _=changed.wait_until(|v|Some(*v)!=control_version)=>{},
+                    _=recheck.as_mut(), if local_recovery=>recheck.as_mut().reset(crate::monotonic_now()+PROGRESS),
                 }
             } else if let Some(writer) = &self.0.writer {
                 let head = writer.log().head(&key.0.0, &key.0.1);

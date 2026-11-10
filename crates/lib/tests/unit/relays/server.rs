@@ -315,6 +315,72 @@ async fn cell_membership_uses_local_control_despite_central_history_and_unavaila
     task.abort();
 }
 
+/// A cell at head 5 whose committed view is always coherent; nothing ever changes.
+struct StillCell(Arc<Watched<u64>>);
+
+impl LocalControlSource for StillCell {
+    fn validate_namespace(&self, _: &str, _: &str) -> Result<(), Status> {
+        Ok(())
+    }
+    fn identity(&self) -> pb::ControlAck {
+        Default::default()
+    }
+    fn validate_peer(&self, _: &pb::ControlAck) -> Result<(), Status> {
+        Ok(())
+    }
+    fn changed(&self) -> Arc<Watched<u64>> {
+        self.0.clone()
+    }
+    fn head(&self, _: &str) -> Result<u64, Status> {
+        Ok(5)
+    }
+    fn read(&self, _: &str, _: u64, _: usize) -> Result<Vec<Event>, Status> {
+        Ok(Vec::new())
+    }
+    fn view(&self, namespace: &str) -> Result<crate::replication::materialized::View, Status> {
+        Ok(crate::replication::materialized::View {
+            dataset: "membership".into(),
+            namespace: namespace.into(),
+            sequence: 5,
+            committed_at: 1234,
+            values: Default::default(),
+            retries: Default::default(),
+            pruned_through: 5,
+            raft: None,
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cell_recovery_never_acknowledged_gives_up_its_slot() {
+    let hub = hub()
+        .with_cell("cell".into())
+        .with_control(Arc::new(StillCell(Arc::new(Watched::new(0)))));
+    let (_frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    let key = (("membership".into(), "kv.cell".into()), None);
+    {
+        let mut subscribers = hub.0.subscribers.lock().unwrap();
+        let follows = &mut subscribers.get_mut(&1).unwrap().follows;
+        let interest = follows
+            .remove(&(("auth".into(), "keys".into()), None))
+            .unwrap();
+        follows.insert(key.clone(), interest);
+    }
+    let permits = hub.0.recoveries.available_permits();
+    let pumping = hub.clone();
+    let task = tokio::spawn(async move { pumping.pump(1, key, 1, Vec::new(), true).await });
+    // Bootstrapped through 5, but the subscriber never acknowledges: the slot is held, then released after IDLE.
+    tokio::time::sleep(IDLE / 2).await;
+    assert_eq!(hub.0.recoveries.available_permits(), permits - 1);
+    let error = tokio::time::timeout(IDLE + PROGRESS, task)
+        .await
+        .expect("a silent subscriber cannot hold a recovery slot forever")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    assert_eq!(hub.0.recoveries.available_permits(), permits);
+}
+
 #[tokio::test]
 async fn a_closed_recovery_does_not_trip_its_sources() {
     let peers = Arc::new(Peers::new(&Admin::new()));
