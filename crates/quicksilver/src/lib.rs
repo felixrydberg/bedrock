@@ -1,6 +1,6 @@
 //! `bedrock-quicksilver`: hosts the `quicksilver` dataset (control-plane data in relay-assigned L2 hash ranges).
 
-mod namespaces {}
+pub mod namespaces;
 mod operations {}
 pub mod storage;
 
