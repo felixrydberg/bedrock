@@ -21,12 +21,7 @@ use crate::replication::pb;
 /// The namespaces of a dataset placed in L2 ranges, fixed in code; empty for every other dataset. The writer accepts no
 /// other namespace of a ranged dataset, and a member is ready for a range only once it holds all of them (#22 / B-21).
 pub fn namespaces(dataset: &str) -> &'static [&'static str] {
-    match dataset {
-        "quicksilver" => &["infrastructure"],
-        "auth" => &["keys"],
-        "cdn" => &["pages", "workers"],
-        _ => &[],
-    }
+    crate::datasets::capabilities::namespaces(dataset)
 }
 
 /// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.

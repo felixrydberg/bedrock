@@ -3,6 +3,12 @@
 A member is a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process that is receiving updates: it holds a leaf
 `Relay.Session` to a relay of its own cell. There is no heartbeat or gossip protocol and no epoch.
 
+The cell is an independent cluster for membership, placement and maintenance. External relays and gateways are
+transport paths to the Writer, outside its control quorum. Changing those paths does not change the cell's identity,
+directory or drain intent. An upstream outage may delay product data and prevent a read from meeting its revision
+or freshness requirement, while local control continues with a healthy cell quorum. Product-data handoffs still
+require verified data and readiness; local consensus cannot make an incomplete copy ready.
+
 ## Protocol
 
 - **Handshake.** A leaf `Hello` carries a `Member`: node ID, service, region, DC, cell, roles, datasets,
@@ -22,18 +28,26 @@ A member is a `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process that 
   ticks every 10 seconds and the 30-second stream deadline. A relay shares only its own leaf members, never what it
   learned from a sibling. A sibling counts as live only while its synced stream is up. The stream also carries
   subscriber interests, at every tier ([relays.md](relays.md#sibling-interests)); above the cell tier it carries only
-  those.
+  those. Cell-control peers validate configured region, DC, cell and the complete voter list before accepting either
+  Raft packets or a sibling snapshot. The receiver rejects mismatches before processing state; the sender verifies the
+  returned group identity. Production `CellControl.Step` also requires a verified relay caller in this cell whose
+  certificate host and unique URI node ID match the configured voter named by the Raft packet; a packet's voter ID
+  or host SAN alone is not identity.
+  `failure_domain` describes a replica's rack or power domain and may differ within a group.
 - **Publication.** Dataset `membership`, namespace `{service}.{cell}`, key node ID, value the encoded `Member`.
-  Cell relays subscribe to every service namespace (`quicksilver`, `kv`, `cdn`) through their upstreams like any subscriber. Once that view is
-  current, the relay with the lowest address among itself and its live siblings publishes, but only while they
-  are a strict majority of the configured relays. It writes the diff between the union of live lists and the
-  published view through `bedrock-api` with the relay's `write_token`. It then waits until its subscription
+  Cell relays subscribe locally to every service's membership namespace (`quicksilver`, `kv`, `cdn`). Once that view is
+  current, the embedded Raft leader publishes, but only while its synced sibling observations form a strict majority
+  of the configured relays. It commits the diff between the union of live lists and the published view through the
+  cell's durable relay quorum. The API, S3, Quicksilver and upstream relays are absent from this control path. Every relay
+  reads its own committed control store through a local relay subscription. The publisher waits until that subscription
   applies the returned revisions before planning again.
 - **Grace.** Every relay keeps its own absence clock for each published member that no live list holds, and
   resets it when one does. The publisher deletes after `grace_ms` (default 20 s) of absence, or immediately
   for a live `LEFT` marker. Failover to another cell relay within the grace period therefore writes nothing:
   the entry is unchanged. A restarted node rejoins under the same node ID.
-- **Freeze.** Without a majority, or before the relay's subscription is current, nothing is written. With every
+- **Freeze.** Without a durable Raft majority, no new control writes are acknowledged. Before its current-term committed
+  prefix and local subscription are current, a leader cannot plan. Already committed changes may still apply or reach
+  lagging subscribers after connectivity is lost. With every
   cell relay down, nodes keep their last view. A node cut off from all relays is removed even though its peers
   may still reach it.
 - **Isolation.** Quicksilver, KV and CDN, and different cells, use separate namespaces. Relays ignore entries for another
@@ -60,10 +74,10 @@ all membership changes until it returns.
   plans from applied membership. Each pass runs `placement::assign` (#18 / B-15) per dataset, over the members whose
   `datasets` include it, with 3 replicas and at most 16 ranges moving, and applies the handoff steps below. It then
   waits for its subscription to apply the writes, as for membership. Every write carries the revision its plan was read
-  at (`If-Match`), so a publisher planning from a stale view cannot overwrite newer state, and a failed write abandons
+  at (checked during ordered Raft application), plus its internal leadership term, so a publisher planning from a stale
+  view or superseded leadership cannot overwrite newer state. A failed write abandons
   the rest of its plan: only a prefix of a plan may land, since a later write alone can leave part of the hash space
-  unowned. `bedrock-quicksilver` places `quicksilver` and
-  `auth`; `bedrock-cdn` places `cdn`, whose ref keys sit at their artifact's content hash (B-34, §4 decision 14). A
+  unowned. `bedrock-quicksilver` places `quicksilver`; `bedrock-cdn` places `cdn`, whose ref keys sit at their artifact's content hash (B-34, §4 decision 14). Auth is not hosted or placed until the Gateway work. A
   member announcing a dataset as unhealthy (#13 / B-14) gets no new ranges of it. It keeps what it holds, for B-22
   to rebuild, and source selection skips it for the unhealthy datasets only.
 - **Owner checks.** Nodes read the directory from `membership::View::directory`. `placement::owners` lists the owners
@@ -106,10 +120,83 @@ pushes the full set again and the publisher continues from published state. With
 written, so no range becomes `ready` or is revoked. A member cut off past the grace period is removed from its
 ranges; when it reconnects, the pushed set no longer lists them and it drops them.
 
+## Drain records
+
+#68 / B-21b. An operator drains a node or a cell by writing the entry `drain/{id}` into the cell's membership namespace
+`{service}.{cell}` through authenticated `CellControl.Write` on a cell relay, and cancels it by deleting the entry. It is an
+ordinary ordered write, so it shares the
+namespace's revision order with members and the directory, and it adds no epoch. A cell drain is written to each ranged
+service's namespace in the cell. Both accepting the write and planning from it require the cell's quorum. Operator writes
+use the relay's optional `write_token` and can modify only `drain/{id}` keys in that cell; they cannot write members or range
+assignments. An operator retry identity is `<issued_unix_ms>:<unique>`, valid for 24 hours. Its original result and fixed
+expiry persist atomically, including across leader changes and snapshots; an expired identity is rejected. Cancelling and
+then retrying an earlier drain returns the old receipt without restoring the record. The operator CLI remains deferred.
+
+The publisher treats a drained member like a `draining` one: it gets no new ranges, and each range it holds hands off through
+the existing `leaving` entries and the steps above, bounded by the drain's rate. A record that does not decode is corruption:
+the publisher freezes that service until it is removed. Other services continue using their own validated inputs; the
+unreadable service's absence clocks restart after recovery so an unseen reconnect cannot cause an early removal.
+Operator cancellation remains an ordered quorum write even while publication is frozen. `service_isolation.tla` checks
+service-local freeze, independent publication, conservative clocks and revision CAS; `cell.tla` checks durability.
+`membership.tla` models record presence as `pubDrain` with `Order(n)`, which
+writes or deletes it with a quorum, and completion as `CompleteDrain(n)`, which requires the node to own no ranges. The
+deliberate bug `drain-record` gives a new range to a drained node and breaks `NewOwnersPublished`.
+
+The convergence simulation limits permanent control-store damage to fewer than a voter majority. Losing a majority's
+durable state requires operator disaster recovery, so the separate corrupt-voter test verifies that such a minority
+cannot acknowledge new writes; the convergence campaign does not silently repair or bootstrap those stores.
+
+The current hooks support node and cell scopes without a namespace selector, for the ranged datasets hosted by the service:
+`quicksilver` in `quicksilver`, and `cdn` in `cdn`. Other datasets, `kv`, and namespace drains are rejected before
+the Raft append. A node target must already be a member of that service and cell. The local planner writes `Drained` only
+after every selected dataset hook reports zero units, using the same quorum and namespace CAS as placement. The completed
+record continues to exclude its target from new assignments until it is deleted; a cell-scoped hook reports no cross-cell
+movement and the cell drain is written once per ranged service as above.
+
+## Local control storage and recovery
+
+Each cell embeds `raft-rs` 0.7.0 in its existing relay processes. A separate `control` storage instance uses the shared
+`StorageEngine` contract (RocksDB with synchronous durable batches normally, persistent simulated disks under madsim).
+Disposable product replay storage cannot be used to recover this authority. Raft votes, hard state and log entries persist
+before dependent responses. Committed state, retained events, per-service revisions, retry results and applied Raft position
+persist atomically before publication or operator acknowledgement. The leader assigns each event's `committed_at` once;
+followers, snapshots and deliveries preserve it. Internal Raft terms fence proposals and do not add a membership or placement
+epoch to subscriber views.
+
+Production cell authority requires mutual TLS, including bearer-token operator writes; startup rejects missing TLS.
+`membership.voter_ids` maps every configured voter address, including this relay, to a distinct certificate URI node ID.
+The local entry must match `node_id`. Inbound Raft senders and outbound voter connections must match the configured
+service, cell and node ID as well as the address's host SAN; shared hosts and multiple SANs grant no extra voter identity.
+Simulation retains its explicit plaintext transport exception while validating the same configured identity mapping.
+
+The configured voter addresses, certificate node IDs and group location are persisted along with each relay's identity. Mismatches and corrupt
+records fail closed. At least three distinct voters are required. Voters are fixed for this version: changing `replay_peers`
+independently is not a supported reconfiguration procedure. Initialize an empty cluster deliberately with
+`[membership] bootstrap = true`, then disable that setting. Normal restarts recover retained disks with `bootstrap = false`.
+Do not initialize a replacement disk as a fresh voter in an existing group; recovery/reconfiguration must preserve Raft's
+durability assumptions. Permanent loss of a voting majority requires a separate disaster-recovery procedure and never
+silently resets control state.
+
+Control disks created before certificate identity pinning lack this identity record and are rejected. Do not erase or
+re-bootstrap them in a live group to bypass validation. A pre-production empty group may be deliberately recreated;
+an existing populated group requires an explicit offline migration preserving its complete durable state and voter identities.
+
+Control snapshots contain live state without tombstones, the applied position and valid operator retry results. A lagging
+relay installs a verified snapshot before resuming the ordered log. Subscriber event tails retain up to 256 events and
+512 KiB per service; an older cursor receives a checksummed local full snapshot instead of falling back to the API. Live
+control data is bounded at 16 MiB, operator retry records at 65,536, and Raft transport messages at 64 MiB. Exhaustion is an
+explicit error. Internal CAS planner writes do not consume operator retry capacity. The current local storage layout writes
+a checksummed control record; its write amplification grows with cell state and has not been load-qualified for large cells.
+
+This replaces API-backed membership configuration. The obsolete `membership.api` field is rejected. Existing deployments
+need a deliberate cutover: retain required operator drain intent, initialize the local quorum and restart dependent control
+views. There is no automatic import of old API membership history and no supported mixed-version rolling cutover.
+
 ## Model
 
-`membership.tla` abstracts the mesh and the reconciliation pass as atomic. Relays are numbers and the lowest live
-relay of a majority side publishes. Relay partitions are two transitive sides. `Tick` advances absence clocks:
+`membership.tla` abstracts the mesh and the reconciliation pass as atomic. Relays are numbers; selecting the lowest live
+relay of a majority side represents a single committed publisher in this abstraction, not the implementation's election
+algorithm. Actual leadership belongs to Raft. Relay partitions in this model are two transitive sides. `Tick` advances absence clocks:
 one per relay and node (`gone`), plus the node's real absence (`gap`). Nodes connect, disconnect, drain, leave
 gracefully and restart; relays crash, recover and change sides.
 
@@ -128,7 +215,7 @@ it's (#66 / B-61). `Write` allows any plan within the assigner's rules, so the m
 `NoDropBeforeReady`:
 
 - `DirectoryCoverage`: start 0 always exists, so the implicit range ends cover the hash space.
-- `NewOwnersPublished`: only published, non-draining members become new owners.
+- `NewOwnersPublished`: only published, non-draining members with no drain record become new owners.
 - `NoUnhealthyRouting`: no member whose published storage is unhealthy becomes a new owner. `Sicken` toggles a
   node's storage health (`sick`); `Set` publishes it with the status (`pubSick`).
 - `NoDropBeforeReady`: a range with a holder (`ready` or `leaving`) still in membership keeps a holder. A `leaving`
@@ -170,17 +257,20 @@ Neither model covers dropping a `leaving` range early under disk pressure (defer
 
 `membership.tla` does not model message delays or a sibling whose stream fails silently: a node that moves to a relay whose
 mesh stream to the publisher is dead but not yet detected can be removed and re-added once. Asymmetric
-partitions are not modeled. If relays A and B cannot reach each other but both reach C, both can publish
-and flap the entries they disagree on. The model does not prove liveness, the Rust implementation or the
-complete B-23 gate.
+partitions are not modeled here. Raft supplies log matching and leadership ordering in the implementation; differing
+membership observations during failover still need grace and handoff checks. `cell.tla` separately checks the integration
+boundary: a durable quorum before commitment, no speculative application, atomic applied position and conditional revision
+application. Its four negative controls break `DurableCommit`, `CommittedApply`, `AtomicApply` and `OrderedCAS`. It abstracts
+Raft's election algorithm and does not re-prove the consensus library. Neither model proves liveness, the Rust implementation
+or the complete B-23 gate.
 
 ## Checks
 
 With the [official TLA+ release](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0) jar saved as
-`.codex-tmp/tla2tools.jar`, run from `docs/spec`:
+`scripts/tla2tools.jar` (checked in), run from `docs/spec`:
 
 ```sh
-java -XX:+UseParallelGC -cp ../../.codex-tmp/tla2tools.jar tlc2.TLC -workers 1 -metadir ../../.codex-tmp/tlc-membership -config membership.cfg membership.tla
+java -XX:+UseParallelGC -cp ../../scripts/tla2tools.jar tlc2.TLC -workers 1 -metadir ../../.codex-tmp/tlc-membership -config membership.cfg membership.tla
 ```
 
 TLC 1.8.0 on 2026-10-31 with `Relays = {1, 2, 3}` and `Grace = 2`:
@@ -230,7 +320,7 @@ counts match the 2026-11-01 run; this TLC build reports the depth as 22.
 The handoff model, run from `docs/spec`:
 
 ```sh
-java -XX:+UseParallelGC -cp ../../.codex-tmp/tla2tools.jar tlc2.TLC -workers 6 -checkpoint 5 -metadir ../../.codex-tmp/tlc-handoff -config handoff.cfg handoff.tla
+java -XX:+UseParallelGC -cp ../../scripts/tla2tools.jar tlc2.TLC -workers 6 -checkpoint 5 -metadir ../../.codex-tmp/tlc-handoff -config handoff.cfg handoff.tla
 ```
 
 The same TLC build on 2026-11-02, with `Nodes = {n1, n2}` under symmetry, both carrying the dataset, faulty
@@ -276,8 +366,11 @@ distinct states without finishing, and an exact revision on every frame kept the
 frames recorded only whether the node's view had reached it.
 
 Implementation evidence is separate. Unit tests cover `membership::plan`, the relay member list and
-configuration validation. `tests/sim/tests/membership.rs` runs the real `bedrock-api` and `bedrock-relay` entry
-points for seeds 1, 2 and 42, twice each, comparing traces. It covers join, relay failover, restart within grace,
+configuration validation. `tests/sim/tests/membership.rs` runs the real `bedrock-relay` entry points, using `bedrock-api`
+only for product-data scenarios. Its cell-authority scenario cuts off the API, drains and cancels a node, restarts every
+relay and checks a fresh subscriber, rejects minority writes and wrong peer locations, and permits differing racks. Each
+scenario runs
+for seeds 1, 2 and 42, twice each, comparing traces. It also covers join, relay failover, restart within grace,
 drain, a cut-off node, a killed node, all relays down, and service and cell isolation. Its placement scenario
 starts four CDN members in one cell and one in another. Every node sees three ready owners per range in its own
 cell, and a killed member's ranges move to the others only after the grace period. Unit tests cover

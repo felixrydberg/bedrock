@@ -8,6 +8,14 @@ and never create a live edge. This is the sole subscription transport; the
 superseded B-10 Replication.Subscribe client, service and relay bridge were removed.
 The writer's ordered log and change notifications remain shared primitives.
 
+For product data, the cell treats external relays and gateways as transport paths to the logical Writer. Only
+immediate upstream endpoints are configured at the cell boundary; local cluster decisions do not depend on the
+intermediate topology. Switching paths preserves dataset/namespace revisions and the Writer's original commit
+times, and resumes through the existing replay or validated bootstrap protocol. Tier checks constrain live edges
+to prevent loops; they confer no authority over a cell's membership, placement or drain state. That authority is
+the cell's own durable relay quorum ([membership.md](membership.md)). An external outage can stall product-data
+catch-up, but cannot require a new cell identity, control bootstrap or placement directory.
+
 Each follow selects a namespace or a dataset hash range ([range streams](#range-streams)).
 Delivery covers an inclusive consecutive revision interval per namespace, including
 revisions whose payload lies outside the range. Matching original events and the
@@ -33,10 +41,11 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
   far each namespace it touches is covered, so namespaces without writes add nothing. The subscriber keeps one
   covered revision per namespace and resumes with that table. Each ranged dataset has a fixed namespace set in code
   (`placement::namespaces`): `quicksilver` has `infrastructure`, `auth` has `keys` and `cdn` has `pages` and
-  `workers`. The writer rejects any other namespace of these datasets, so the list is complete. This is the
+  `workers`. Auth is not currently placed by Quicksilver; its namespace remains available to the generic writer and
+  relay contracts for future Gateway work. The writer rejects any other namespace of these datasets. This is the
   model's constant `Namespaces`.
 - **Pushed ranges.** A relay pushes each leaf subscriber its full owned range set per dataset, tagged with the
-  directory revision it was derived from. The subscriber follows the ranges added. A range dropped from the set is
+  directory revision it was derived from. The ranges and revision come from the same atomic applied snapshot. The subscriber follows the ranges added. A range dropped from the set is
   the revoke: the subscriber confirms it against its own directory view, then unfollows and deletes the range, or
   refuses and reports a mismatch. Narrowing a held range after a split keeps its coverage; a new range starts from
   nothing and bootstraps where retained history does not reach.
@@ -155,8 +164,8 @@ recovery request, as long as their cursors fall within the sibling's replay wind
 
 - **Shape.** An interest is the `Follow` the relay would send upstream for its own subscribers alone, and its removal
   the matching `Unfollow`. Whatever hash ranges subscribers follow, a relay follows that dataset whole, so one
-  interest (`[0, 2⁶⁴)`, every fixed namespace) stands for all of them. A cell shares at most six: three datasets and
-  three membership namespaces.
+  interest (`[0, 2⁶⁴)`, every fixed namespace) stands for all of them. A cell authority shares only product-data interests;
+  its three membership namespaces originate in local Raft storage and never become upstream interests.
 - **Own only.** A relay shares what its own sessions need, never what a sibling shared. Upstream it follows the union
   of the two, as one more subscriber, so the tier above sees nothing new. When the last real subscriber leaves, the
   interest leaves with it.
@@ -166,7 +175,9 @@ recovery request, as long as their cursors fall within the sibling's replay wind
 - **Every tier.** Cell siblings share too, rather than deriving interests from the placement directory: DC and region
   need sharing anyway, relays without `[membership]` never read the directory, and it holds no membership namespaces.
   Above the cell tier the stream carries interests only, and the same-cell check on `Siblings.Watch` applies only at
-  the cell tier, because only its relays share one cell.
+  the cell tier, because only its relays share one cell. Cell-control siblings additionally validate region, DC, cell and
+  the complete voter configuration in both directions before accepting any member or readiness snapshot. Raft packets
+  use the same group identity checks. A different `failure_domain` is allowed for replicas in different racks.
 - **Lost sibling.** Interests a sibling shared when its stream dropped stay for the grace period (`membership.grace_ms`,
   otherwise its 20-second default), even if it returns sooner without them, because its subscribers are still moving.
 - **Cap.** A relay follows at most 4,096 sibling interests beyond its own, range follows first, then by selector. The
@@ -329,10 +340,10 @@ every invariant above plus `ReadyNotLost`: 26,865,595 generated states, 2,705,82
 `ReadyNotLost` (840 distinct states).
 
 With the [official TLA+ release](https://github.com/tlaplus/tlaplus/releases/tag/v1.8.0)
-jar saved as `.codex-tmp/tla2tools.jar`, run from `docs/spec`:
+jar saved as `scripts/tla2tools.jar` (checked in), run from `docs/spec`:
 
 ```sh
-java -XX:+UseParallelGC -cp ../../.codex-tmp/tla2tools.jar tlc2.TLC -workers 1 -metadir ../../.codex-tmp/tlc-relays -config relays.cfg relays.tla
+java -XX:+UseParallelGC -cp ../../scripts/tla2tools.jar tlc2.TLC -workers 1 -metadir ../../.codex-tmp/tlc-relays -config relays.cfg relays.tla
 ```
 
 The focused suites cover selector changes, filtered coverage, corruption, restart,

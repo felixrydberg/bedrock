@@ -25,6 +25,121 @@ fn ready(node_id: &str) -> pb::Member {
     entry(node_id, pb::member::Status::Ready)
 }
 
+#[test]
+fn unreadable_service_is_excluded_and_its_absence_clock_restarts() {
+    let old = crate::monotonic_now();
+    let now = old + GRACE + GRACE;
+    let mut bad = ready("bad");
+    bad.service = "quicksilver".into();
+    let mut healthy = ready("new");
+    healthy.service = "cdn".into();
+    let mut missing = ready("missing");
+    missing.service = "cdn".into();
+    let mut local = members(&[bad.clone(), healthy.clone()]);
+    let mut remote = BTreeMap::from([("b".into(), Some(members(&[bad.clone()])))]);
+    let mut absent = BTreeMap::from([(key(&bad), old), (key(&missing), old)]);
+    retain_readable(
+        &BTreeSet::from(["cdn"]),
+        &mut local,
+        &mut remote,
+        &mut absent,
+    );
+    assert!(!local.contains_key(&key(&bad)));
+    assert!(remote["b"].as_ref().unwrap().is_empty());
+    assert!(!absent.contains_key(&key(&bad)));
+    assert_eq!(absent[&key(&missing)], old);
+
+    let relays = relays();
+    let seen = Observed {
+        me: "a",
+        relays: &relays,
+        cell: "eu-1a",
+        local: &local,
+        remote: &remote,
+    };
+    assert_eq!(
+        plan(&seen, &members(&[missing.clone()]), &mut absent, now, GRACE),
+        Some(vec![
+            Change::Set(healthy.clone()),
+            Change::Delete(key(&missing))
+        ])
+    );
+
+    let recovered = members(&[bad.clone(), healthy]);
+    assert_eq!(
+        plan(&seen, &recovered, &mut absent, now, GRACE),
+        Some(Vec::new())
+    );
+    assert_eq!(absent[&key(&bad)], now);
+}
+
+#[test]
+fn obsolete_auth_drain_only_invalidates_its_service_view() {
+    let (quicksilver, _) = Published::new("quicksilver", "eu-1a");
+    let (cdn, _) = Published::new("cdn", "eu-1a");
+    let record = Drain {
+        scope: drain::Scope::Node("qs-1".into()),
+        datasets: vec!["auth".into()],
+        namespace: None,
+        state: drain::State::Draining,
+        rate: 1,
+    };
+    let mut key = quicksilver.prefix.clone();
+    key.extend(Drain::key("old-auth").as_bytes());
+    quicksilver.engine.put(&key, &record.encode()).unwrap();
+    let hooks = |service| drain::ranged_with(service, |_| Ok(Directory::new()));
+    assert!(
+        quicksilver
+            .validated("quicksilver", "eu-1a", &hooks("quicksilver"))
+            .is_err()
+    );
+    assert!(cdn.validated("cdn", "eu-1a", &hooks("cdn")).is_ok());
+    quicksilver.engine.delete(&key).unwrap();
+    assert!(
+        quicksilver
+            .validated("quicksilver", "eu-1a", &hooks("quicksilver"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn snapshot_revision_requires_validated_progress_or_a_fresh_empty_stream() {
+    assert_eq!(validated_revision(None, Some(0), true), Some(0));
+    assert_eq!(validated_revision(None, Some(0), false), None);
+    assert_eq!(validated_revision(None, None, true), None);
+    assert_eq!(validated_revision(Some(2), Some(1), false), None);
+    assert_eq!(validated_revision(Some(1), Some(2), false), Some(1));
+}
+
+#[test]
+fn pushed_ranges_keep_the_revision_of_their_captured_directory() {
+    let owner = Owner {
+        node: "qs-1".into(),
+        state: State::Ready,
+    };
+    let old = DirectoryAt {
+        revision: 7,
+        directories: Directories::from([(
+            "quicksilver".into(),
+            Directory::from([(0, vec![owner])]),
+        )]),
+    };
+    let newer = DirectoryAt {
+        revision: 8,
+        directories: Directories::new(),
+    };
+    assert_eq!(
+        old.ranges("quicksilver", "qs-1"),
+        pb::Ranges {
+            dataset: "quicksilver".into(),
+            revision: 7,
+            spans: vec![pb::Span { start: 0, end: 0 }]
+        }
+    );
+    assert_eq!(newer.ranges("quicksilver", "qs-1").revision, 8);
+    assert!(newer.ranges("quicksilver", "qs-1").spans.is_empty());
+}
+
 /// Relay `me`'s plan, given its own members and its siblings' lists (`None`: unreachable).
 fn run(
     me: &str,
@@ -50,7 +165,7 @@ fn run(
 }
 
 #[tokio::test]
-async fn only_the_lowest_relay_of_a_majority_publishes() {
+async fn planning_requires_a_majority_and_the_caller_supplies_raft_leadership() {
     let now = crate::monotonic_now();
     let mut absent = BTreeMap::new();
     let node = [ready("kv-1")];
@@ -66,7 +181,7 @@ async fn only_the_lowest_relay_of_a_majority_publishes() {
         ),
         None
     );
-    // A majority whose lowest member is a sibling: that sibling publishes.
+    // Raft chooses the publisher; a lower sibling address does not suppress the leader's plan.
     assert_eq!(
         run(
             "b",
@@ -76,9 +191,9 @@ async fn only_the_lowest_relay_of_a_majority_publishes() {
             &mut absent,
             now
         ),
-        None
+        Some(vec![Change::Set(ready("kv-1"))])
     );
-    // The lowest of the majority side publishes, even though a lower relay exists elsewhere.
+    // A majority can plan while a lower relay is unreachable.
     assert_eq!(
         run(
             "b",
@@ -140,6 +255,48 @@ async fn an_absent_member_is_removed_after_the_grace_period() {
     let expired = almost + GRACE;
     assert_eq!(
         run("a", &[], siblings, &published, &mut absent, expired),
+        Some(vec![Change::Delete(key(&ready("kv-1")))])
+    );
+}
+
+#[tokio::test]
+async fn follower_observations_restart_grace_before_leadership_returns() {
+    let start = crate::monotonic_now();
+    let mut absent = BTreeMap::new();
+    let published = members(&[ready("kv-1")]);
+    let empty = Members::new();
+    let relays = relays();
+    let remote = BTreeMap::from([("b".into(), Some(Members::new())), ("c".into(), None)]);
+    let mut observe = |leader, local: &Members, now| {
+        publication_plan(
+            &Observed {
+                me: "a",
+                relays: &relays,
+                cell: "eu-1a",
+                local,
+                remote: &remote,
+            },
+            &published,
+            &mut absent,
+            now,
+            GRACE,
+            leader,
+        )
+    };
+    assert_eq!(observe(true, &empty, start), Some(Vec::new()));
+    // A follower may observe an expired absence, but cannot publish the deletion.
+    assert_eq!(observe(false, &empty, start + GRACE), None);
+    let reconnect = start + GRACE + Duration::from_secs(1);
+    assert_eq!(observe(false, &published, reconnect), None);
+    let disconnect = reconnect + Duration::from_secs(1);
+    assert_eq!(observe(false, &empty, disconnect), None);
+    // On re-election, only the latest continuous absence counts toward grace.
+    assert_eq!(
+        observe(true, &empty, disconnect + GRACE - Duration::from_millis(1)),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        observe(true, &empty, disconnect + GRACE),
         Some(vec![Change::Delete(key(&ready("kv-1")))])
     );
 }
@@ -428,7 +585,7 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
 }
 
 #[test]
-fn placement_filters_members_and_health_per_dataset() {
+fn quicksilver_placement_ignores_auth_dataset_membership() {
     let node = |id: &str, datasets: &[&str], unhealthy: &[&str]| pb::Member {
         service: "quicksilver".into(),
         roles: vec!["l2".into()],
@@ -477,13 +634,7 @@ fn placement_filters_members_and_health_per_dataset() {
             .into_iter()
             .collect()
     );
-    assert_eq!(
-        assigned("auth"),
-        ["auth-only", "both"]
-            .map(String::from)
-            .into_iter()
-            .collect()
-    );
+    assert!(assigned("auth").is_empty());
     assert!(
         place(
             "kv",
@@ -506,7 +657,7 @@ fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
         service: "quicksilver".into(),
         roles: vec!["l2".into()],
         failure_domain: id.into(),
-        datasets: vec!["auth".into(), "quicksilver".into()],
+        datasets: vec!["quicksilver".into()],
         status: status as i32,
         ..ready(id)
     };
@@ -522,21 +673,21 @@ fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
         owner("b", State::Populating),
         owner("c", State::Populating),
     ];
-    let directories = Directories::from([
-        ("auth".into(), Directory::from([(0, initial.clone())])),
-        (
-            "quicksilver".into(),
-            Directory::from([(0, initial.clone())]),
-        ),
-    ]);
+    let directories = Directories::from([(
+        "quicksilver".into(),
+        Directory::from([(0, initial.clone())]),
+    )]);
     let ready = siblings::Ready::from([
         (
-            (("quicksilver".into(), "a".into()), "auth".into()),
+            (("quicksilver".into(), "a".into()), "quicksilver".into()),
             vec![(0, 0)],
         ),
-        ((("cdn".into(), "b".into()), "auth".into()), vec![(0, 0)]),
         (
-            (("quicksilver".into(), "c".into()), "auth".into()),
+            (("cdn".into(), "b".into()), "quicksilver".into()),
+            vec![(0, 0)],
+        ),
+        (
+            (("quicksilver".into(), "c".into()), "quicksilver".into()),
             vec![(1, 0)],
         ),
     ]);
@@ -544,7 +695,7 @@ fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
         place("quicksilver", &actual, &directories, &ready, &[]),
         vec![Change::Range {
             service: "quicksilver".into(),
-            dataset: "auth".into(),
+            dataset: "quicksilver".into(),
             start: 0,
             owners: vec![
                 owner("old", State::Leaving),
@@ -563,25 +714,25 @@ fn malformed_dataset_range_entries_are_reported_as_data_loss() {
     let prefix = b"quicksilver.eu-1a\0";
     for suffix in [
         "range//0000000000000000",
-        "range/auth!/0000000000000000",
-        "range/auth/000000000000000",
-        "range/auth/00000000000000000",
-        "range/auth/000000000000000g",
-        "range/auth/0000000000000000/extra",
+        "range/quicksilver!/0000000000000000",
+        "range/quicksilver/000000000000000",
+        "range/quicksilver/00000000000000000",
+        "range/quicksilver/000000000000000g",
+        "range/quicksilver/0000000000000000/extra",
     ] {
         let key = [prefix.as_slice(), suffix.as_bytes()].concat();
         engine.put(&key, &encode(&[])).unwrap();
         assert_eq!(
-            view.directory("auth").unwrap_err().code(),
+            view.directory("quicksilver").unwrap_err().code(),
             tonic::Code::DataLoss,
             "{suffix}"
         );
         engine.delete(&key).unwrap();
     }
-    let key = [prefix.as_slice(), b"range/auth/0000000000000000"].concat();
+    let key = [prefix.as_slice(), b"range/quicksilver/0000000000000000"].concat();
     engine.put(&key, &[0xff]).unwrap();
     assert_eq!(
-        view.directory("auth").unwrap_err().code(),
+        view.directory("quicksilver").unwrap_err().code(),
         tonic::Code::DataLoss
     );
 }
@@ -664,5 +815,45 @@ async fn a_failed_write_abandons_the_rest_of_its_services_plan() {
     assert_eq!(
         written,
         BTreeMap::from([("a".to_string(), 6), ("b".to_string(), 9)])
+    );
+}
+
+#[test]
+fn drain_records_sit_beside_members_and_corruption_is_an_error() {
+    use crate::reconciliation::drain::{Drain, Scope, State as Drained};
+    let (view, _) = View::new("cdn", "eu-1a");
+    let published = &view.published;
+    let at = |key: &str| [b"cdn.eu-1a\0".as_slice(), key.as_bytes()].concat();
+    let member = pb::Member {
+        service: "cdn".into(),
+        ..ready("cdn-1")
+    };
+    published
+        .engine
+        .put(&at("cdn-1"), &member.encode_to_vec())
+        .unwrap();
+    let record = Drain {
+        scope: Scope::Node("cdn-1".into()),
+        datasets: Vec::new(),
+        namespace: None,
+        state: Drained::Draining,
+        rate: 1,
+    };
+    published
+        .engine
+        .put(&at(&Drain::key("d1")), &record.encode())
+        .unwrap();
+    // A drain is not a member, and no directory reads it.
+    assert_eq!(published.members().unwrap().len(), 1);
+    assert!(published.read().unwrap().1.is_empty());
+    assert_eq!(published.drains().unwrap(), [("d1".into(), record)]);
+    // Cancelling is a delete.
+    published.engine.delete(&at(&Drain::key("d1"))).unwrap();
+    assert!(published.drains().unwrap().is_empty());
+    // An undecodable record is corruption, never a missing drain.
+    published.engine.put(&at(&Drain::key("bad")), b"{").unwrap();
+    assert_eq!(
+        published.drains().unwrap_err().code(),
+        tonic::Code::DataLoss
     );
 }

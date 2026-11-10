@@ -837,7 +837,7 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
 
 #[test]
 fn a_quarantined_scope_asks_for_no_recovery_until_its_rebuild() {
-    let health = crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+    let health = crate::health::storage::StorageHealth::new(&crate::admin::Admin::new());
     let engine = health.wrap_replication("auth", "engine", Arc::new(MemoryEngine::new("auth")));
     let mut consumer = Consumer::new(Target {
         engine,
@@ -1033,8 +1033,7 @@ async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets()
         let mut batch = WriteBatch::default();
         batch.set_revision(marker, 1);
         data.write(batch).unwrap();
-        let health =
-            crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+        let health = crate::health::storage::StorageHealth::new(&crate::admin::Admin::new());
         let engine = health.wrap_replication("auth", "engine", data.clone());
         let me: Scope = ("membership".into(), "quicksilver.c1".into(), None);
         let membership = view(7, &[]);
@@ -1393,7 +1392,7 @@ async fn rebuild_counts_only_after_a_fresh_verified_bootstrap() {
 
 #[tokio::test]
 async fn a_member_announces_only_the_ranged_datasets_it_follows() {
-    let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
+    let peers = Arc::new(Peers::new(&crate::admin::Admin::new()));
     let member = pb::Member {
         node_id: "q1".into(),
         service: "quicksilver".into(),
@@ -1453,7 +1452,7 @@ async fn a_damaged_engine_does_not_stop_the_session_starting() {
     let engine: Arc<dyn StorageEngine> = engine;
     let ranged = BTreeMap::from([("quicksilver".to_string(), engine)]);
     let (_, view) = crate::membership::View::new("quicksilver", "c1");
-    let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
+    let peers = Arc::new(Peers::new(&crate::admin::Admin::new()));
     let relays = vec!["10.0.0.1:7000".to_string()];
     Session::join(peers, relays, vec![view], member, ranged).unwrap();
 }
@@ -1484,7 +1483,7 @@ async fn damage_in_a_later_range_does_not_stop_the_session_starting() {
         );
     sim.write(batch).unwrap();
     sim.damage(&late);
-    let health = crate::health::storage::StorageHealth::new(&crate::transport::admin::Admin::new());
+    let health = crate::health::storage::StorageHealth::new(&crate::admin::Admin::new());
     let engine = health.wrap_replication("quicksilver", "engine", sim);
     let member = pb::Member {
         node_id: "q1".into(),
@@ -1496,7 +1495,7 @@ async fn damage_in_a_later_range_does_not_stop_the_session_starting() {
     };
     let ranged = BTreeMap::from([("quicksilver".to_string(), engine)]);
     let (_, view) = crate::membership::View::new("quicksilver", "c1");
-    let peers = Arc::new(Peers::new(&crate::transport::admin::Admin::new()));
+    let peers = Arc::new(Peers::new(&crate::admin::Admin::new()));
     let relays = vec!["10.0.0.1:7000".to_string()];
     Session::join(peers, relays, vec![view], member, ranged).unwrap();
     assert!(health.unhealthy().contains("quicksilver"));

@@ -1,7 +1,7 @@
 //! Drain nodes, cells and single namespaces (#68 / B-21b, `feature-drafts.md` §4 decision 11).
 //!
-//! A drain is a [`Drain`] record at `topology/drains/{id}` in Quicksilver, changed by ordinary ordered writes; deleting
-//! it cancels the drain. There is no membership or placement epoch: the record only changes what the desired state
+//! A drain is a [`Drain`] record at `drain/{id}` in the cell's membership namespace, changed by ordinary ordered writes;
+//! deleting it cancels the drain. There is no membership or placement epoch: the record only changes what the desired state
 //! excludes. Each dataset's [`Hook`] says what that means for the units it holds on the target: moves still needed,
 //! nothing to move, or an explicit [`Error::Unsupported`], never a silent no-op.
 //!
@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::membership::{self, View};
 use crate::placement::Directory;
 use crate::replication::pb;
 
-/// Drain records are keys of Quicksilver's `infrastructure` namespace: `topology/drains/{id}`.
-pub const PREFIX: &str = "topology/drains/";
+/// Drain records are keys of a cell's membership namespace `{service}.{cell}`: `drain/{id}`. A cell drain is written to
+/// each ranged service's namespace in the cell (`docs/spec/membership.md`, Drain records).
+pub const PREFIX: &str = "drain/";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +135,9 @@ impl std::fmt::Display for Error {
 pub trait Hook: Send + Sync {
     fn dataset(&self) -> &str;
 
+    /// Whether this dataset can act on the requested target before any record is committed.
+    fn validate(&self, scope: &Scope, namespace: Option<&str>) -> Result<(), Error>;
+
     /// The units still on the target for `scope`, narrowed to `namespace` when given.
     fn drain(&self, scope: &Scope, namespace: Option<&str>) -> Result<Outcome, Error>;
 }
@@ -148,7 +151,7 @@ pub fn unsupported(dataset: &str, scope: &Scope, namespace: Option<&str>) -> Err
     }
 }
 
-/// An L2 dataset placed in hash ranges (`quicksilver`, `auth`, `cdn`): a node drain is the ranges it is still listed in,
+/// An L2 dataset placed in hash ranges (`quicksilver`, `cdn`): a node drain is the ranges it is still listed in,
 /// a cell drain has nothing to move because every cell holds its own copy, and one namespace cannot leave a cell
 /// because a range covers all of the dataset's namespaces.
 pub struct Ranged {
@@ -174,10 +177,12 @@ impl Hook for Ranged {
         self.dataset
     }
 
+    fn validate(&self, scope: &Scope, namespace: Option<&str>) -> Result<(), Error> {
+        validate_ranged_scope(self.dataset, scope, namespace)
+    }
+
     fn drain(&self, scope: &Scope, namespace: Option<&str>) -> Result<Outcome, Error> {
-        if namespace.is_some() {
-            return Err(unsupported(self.dataset, scope, namespace));
-        }
+        self.validate(scope, namespace)?;
         let Scope::Node(node) = scope else {
             return Ok(Outcome::NothingToMove);
         };
@@ -194,6 +199,43 @@ impl Hook for Ranged {
     }
 }
 
+fn validate_ranged_scope(
+    dataset: &str,
+    scope: &Scope,
+    namespace: Option<&str>,
+) -> Result<(), Error> {
+    if namespace.is_some() {
+        return Err(unsupported(dataset, scope, namespace));
+    }
+    Ok(())
+}
+
+/// Validate the relay's supported ranged hooks before a control record is committed.
+pub(crate) fn validate_ranged_selection(service: &str, drain: &Drain) -> Result<(), Error> {
+    let available = || crate::datasets::capabilities::ranged_datasets(service);
+    if available().next().is_none() {
+        return Err(unsupported(
+            "any dataset",
+            &drain.scope,
+            drain.namespace.as_deref(),
+        ));
+    }
+    let mut selected = std::collections::BTreeSet::new();
+    for dataset in &drain.datasets {
+        if !selected.insert(dataset.as_str()) || !available().any(|allowed| allowed == dataset) {
+            return Err(unsupported(
+                dataset,
+                &drain.scope,
+                drain.namespace.as_deref(),
+            ));
+        }
+    }
+    for dataset in available().filter(|dataset| drain.selects(dataset)) {
+        validate_ranged_scope(dataset, &drain.scope, drain.namespace.as_deref())?;
+    }
+    Ok(())
+}
+
 /// A dataset every node or cell holds whole and independently: nothing to move for a node or a cell, and one namespace
 /// cannot be removed from it.
 pub struct Everywhere(pub &'static str);
@@ -203,16 +245,25 @@ impl Hook for Everywhere {
         self.0
     }
 
+    fn validate(&self, scope: &Scope, namespace: Option<&str>) -> Result<(), Error> {
+        if namespace.is_some() {
+            return Err(unsupported(self.0, scope, namespace));
+        }
+        Ok(())
+    }
+
     fn drain(&self, scope: &Scope, namespace: Option<&str>) -> Result<Outcome, Error> {
+        self.validate(scope, namespace)?;
         match namespace {
-            Some(_) => Err(unsupported(self.0, scope, namespace)),
             None => Ok(Outcome::NothingToMove),
+            Some(_) => unreachable!("validated above"),
         }
     }
 }
 
 /// `members` with those `drains` cover marked `draining`, so placement treats them as it does a node shutting down.
-/// Only drains still in progress count, and only for a dataset the member carries when the drain selects datasets.
+/// Every committed drain, including `Drained`, excludes its target from new placement. Only `Draining` records pace
+/// handoffs, and a dataset applies a record only when it selects that dataset.
 pub fn apply(
     members: &BTreeMap<String, pb::Member>,
     drains: &[Drain],
@@ -222,12 +273,9 @@ pub fn apply(
         .iter()
         .map(|(id, member)| {
             let mut member = member.clone();
-            let drained = drains.iter().any(|d| {
-                d.state == State::Draining
-                    && d.namespace.is_none()
-                    && d.selects(dataset)
-                    && d.covers(&member)
-            });
+            let drained = drains
+                .iter()
+                .any(|d| d.namespace.is_none() && d.selects(dataset) && d.covers(&member));
             if drained {
                 member.status = pb::member::Status::Draining as i32;
             }
@@ -247,6 +295,7 @@ pub fn moving(drains: &[Drain], limit: usize) -> usize {
 
 /// Units left per selected dataset. A selected dataset without a hook is `Unsupported`, as is any the hook refuses.
 pub fn left(hooks: &[Arc<dyn Hook>], drain: &Drain) -> Result<BTreeMap<String, u64>, Error> {
+    validate(hooks, drain)?;
     let mut left = BTreeMap::new();
     for hook in hooks.iter().filter(|h| drain.selects(h.dataset())) {
         let units = match hook.drain(&drain.scope, drain.namespace.as_deref())? {
@@ -255,8 +304,27 @@ pub fn left(hooks: &[Arc<dyn Hook>], drain: &Drain) -> Result<BTreeMap<String, u
         };
         left.insert(hook.dataset().to_owned(), units);
     }
+    Ok(left)
+}
+
+/// Validates every selected dataset without reading its state.
+pub fn validate(hooks: &[Arc<dyn Hook>], drain: &Drain) -> Result<(), Error> {
+    let mut selected = BTreeMap::new();
+    for hook in hooks.iter().filter(|h| drain.selects(h.dataset())) {
+        hook.validate(&drain.scope, drain.namespace.as_deref())?;
+        if selected.insert(hook.dataset(), ()).is_some() {
+            return Err(Error::Corrupt(format!(
+                "duplicate drain hook for {}",
+                hook.dataset()
+            )));
+        }
+    }
+    let mut requested = std::collections::BTreeSet::new();
     for dataset in &drain.datasets {
-        if !left.contains_key(dataset) {
+        if !requested.insert(dataset.as_str()) {
+            return Err(Error::Corrupt(format!("duplicate drain dataset {dataset}")));
+        }
+        if !selected.contains_key(dataset.as_str()) {
             return Err(unsupported(
                 dataset,
                 &drain.scope,
@@ -264,7 +332,14 @@ pub fn left(hooks: &[Arc<dyn Hook>], drain: &Drain) -> Result<BTreeMap<String, u
             ));
         }
     }
-    Ok(left)
+    if selected.is_empty() {
+        return Err(unsupported(
+            "any dataset",
+            &drain.scope,
+            drain.namespace.as_deref(),
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the drain is complete: every selected dataset reports zero units left.
@@ -272,14 +347,31 @@ pub fn complete(left: &BTreeMap<String, u64>) -> bool {
     left.values().all(|units| *units == 0)
 }
 
-/// The hash-range datasets a service places, for building its [`Ranged`] hooks.
-pub fn ranged(service: &str, view: &Arc<View>) -> Vec<Arc<dyn Hook>> {
-    membership::ranged_datasets(service)
-        .iter()
-        .map(|&dataset| {
-            let view = view.clone();
-            let directory = move || view.directory(dataset).map_err(|e| e.to_string());
-            Arc::new(Ranged::new(dataset, directory)) as Arc<dyn Hook>
+/// Returns the completed record only after every selected dataset reports zero units left.
+pub fn completed(hooks: &[Arc<dyn Hook>], drain: &Drain) -> Result<Option<Drain>, Error> {
+    if drain.state == State::Drained {
+        return Ok(None);
+    }
+    let left = left(hooks, drain)?;
+    if complete(&left) {
+        let mut completed = drain.clone();
+        completed.state = State::Drained;
+        Ok(Some(completed))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Builds ranged hooks from a service-specific directory reader.
+pub fn ranged_with(
+    service: &str,
+    directory: impl Fn(&str) -> Result<Directory, String> + Send + Sync + 'static,
+) -> Vec<Arc<dyn Hook>> {
+    let directory = Arc::new(directory);
+    crate::datasets::capabilities::ranged_datasets(service)
+        .map(|dataset| {
+            let directory = directory.clone();
+            Arc::new(Ranged::new(dataset, move || directory(dataset))) as Arc<dyn Hook>
         })
         .collect()
 }

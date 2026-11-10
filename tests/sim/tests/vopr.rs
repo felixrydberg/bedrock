@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::membership::View;
 use bedrock_lib::node::{
     ApiConfig, Budget, ConfigError, Location, MembershipSettings, NodeConfig, RelayConfig,
@@ -38,11 +39,10 @@ use bedrock_lib::sim::{Hooks, install};
 use bedrock_lib::storage::namespace::NamespaceFactory;
 use bedrock_lib::storage::sim::{
     Access, Bug, Disks, Fault, Faults, Fingerprint, Frozen, SimEngine, SimFactory, StoreAccess,
-    StoreFault, StoreFaults, StoreObserver,
+    StoreFault, StoreFaults,
 };
 use bedrock_lib::storage::{KeyRange, Snapshot, StorageEngine, l2_parts, l2_span};
 use bedrock_lib::transport::Peers;
-use bedrock_lib::transport::admin::Admin;
 use bedrock_sim::history::{
     History, Key, OwnerState, Placement, Range, Stream, Value, Violation, check_coverage,
     check_handoff, check_held, check_routing, within,
@@ -62,10 +62,12 @@ use tokio::time::{Instant, sleep};
 /// mistake is fixed in the harness, and its seed leaves the list.
 const OPEN: &[(u64, &str)] = &[];
 
-/// Seeds that found a product bug, now fixed, under the bug and the test that holds the fix without the seed. Harness changes
+/// Seeds that found a product or harness bug, now fixed, under the bug and the test that holds the fix without the seed. Harness changes
 /// move what a seed does, so that test is the lasting proof. "Traced" seeds were followed to the bug; "grouped" ones stopped
 /// failing in the same sweep as that fix, without being traced themselves.
 const REGRESSIONS: &[(u64, &str)] = &[
+    // The convergence campaign must preserve a durable cell quorum; majority corruption needs disaster recovery.
+    (198, ALL),
     // health/scrub.rs: a crash took back a quarantine record and its rebuild, and the damage returned where nothing read it.
     // Traced, on 3 nodes per service with BEDROCK_VOPR_SECONDS=30; it no longer reaches that path as it stands here.
     // `damage_in_a_cold_key_is_found`, storage.rs `a_crash_can_undo_a_quarantine_and_its_rebuild_but_the_record_still_fails_a_read`.
@@ -169,14 +171,13 @@ const OBSERVER: &str = "10.0.5.51";
 const CLIENT: &str = "10.0.5.52";
 
 /// The workload's streams: every pushed dataset's namespaces.
-const STREAMS: [(&str, &str); 4] = [
+const STREAMS: [(&str, &str); 3] = [
     ("quicksilver", "infrastructure"),
-    ("auth", "keys"),
     ("cdn", "pages"),
     ("cdn", "workers"),
 ];
 /// Streams the external subscriber follows whole.
-const FOLLOWED: [(&str, &str); 2] = [("auth", "keys"), ("cdn", "pages")];
+const FOLLOWED: [(&str, &str); 2] = [("quicksilver", "infrastructure"), ("cdn", "pages")];
 const GRACE: Duration = Duration::from_secs(5);
 /// How long the safety phase runs unless `BEDROCK_VOPR_SECONDS` says otherwise.
 const SAFETY: Duration = Duration::from_secs(60);
@@ -234,7 +235,7 @@ enum Deliberate {
     LostFlush,
     /// Retry records never reach the store.
     LostRetries,
-    /// Directory writes around the publisher, as a bug in it would make.
+    /// Synthetic invalid directory observations proving the oracle detects planner failures.
     Rogue(Rogue),
     /// A process's disks stop answering for good.
     Wedged(&'static str),
@@ -394,9 +395,8 @@ struct Chaos {
     cell: Mutex<Cell>,
 }
 
-/// The directory invariants, checked at the store: there every durable member and directory write arrives in commit order,
-/// and a write planned from an older view is refused before it gets here. A sampled view can stall across a member's whole
-/// departure or recovery, and every allowance for that hid real failures or missed some.
+/// Directory invariants checked on every committed relay event in namespace order. A sampled view can skip a member's
+/// whole departure or recovery, so the independent observer retains exact cursors and refuses gaps.
 #[derive(Default)]
 struct Cell {
     members: BTreeMap<String, pb::Member>,
@@ -500,46 +500,114 @@ fn store_faults(chaos: &Arc<Chaos>, bug: Option<Deliberate>) -> StoreFaults {
     })
 }
 
-/// Feeds durable membership writes to [`Cell`].
-fn watch_membership(chaos: &Arc<Chaos>) -> StoreObserver {
-    use pb::range::owner::State as Pb;
-    let chaos = chaos.clone();
-    Arc::new(move |instance, changes| {
-        if !instance.starts_with("membership/") {
-            return;
-        }
-        let mut cell = chaos.cell.lock().unwrap();
-        for (key, value) in changes {
-            let Some(id) = key.strip_prefix(b"v") else {
-                continue;
-            };
-            let id = String::from_utf8_lossy(id).into_owned();
-            if let Some(range) = id.strip_prefix("range/") {
-                let (dataset, start) = range.rsplit_once('/').expect("a directory key");
-                let start = u64::from_str_radix(start, 16).expect("a directory key");
-                let owners = value.as_ref().map(|value| {
-                    let range = pb::Range::decode(value.as_slice()).expect("a directory record");
-                    let owner = |owner: pb::range::Owner| Owner {
-                        state: match Pb::try_from(owner.state) {
-                            Ok(Pb::Ready) => State::Ready,
-                            Ok(Pb::Leaving) => State::Leaving,
-                            _ => State::Populating,
-                        },
-                        node: owner.node_id,
-                    };
-                    range.owners.into_iter().map(owner).collect()
-                });
-                cell.range(dataset, start, owners);
-            } else if let Some(value) = value {
-                let member = pb::Member::decode(value.as_slice()).expect("a member record");
-                cell.members.insert(id, member);
-            } else {
-                cell.members.remove(&id);
+/// Checks every committed membership transition through the public relay stream, in namespace order.
+/// The observer is outside the fault driver; losing history is an explicit harness failure, never a skipped check.
+async fn watch_membership(chaos: Arc<Chaos>, peers: Arc<Peers>) {
+    let mut next: BTreeMap<String, u64> = ["quicksilver", "cdn", "kv"]
+        .into_iter()
+        .map(|service| (format!("{service}.{CELL}"), 1))
+        .collect();
+    loop {
+        for address in relay_addresses() {
+            let attempt = async {
+                let (tx, rx) = tokio::sync::mpsc::channel(32);
+                tx.send(pb::RelayRequest { kind: Some(pb::relay_request::Kind::Hello(pb::Hello {
+                    version: 1, tier: 0, member: None, moved: false,
+                })) }).await.unwrap();
+                let channel = peers.channel(&address, bedrock_lib::transport::Class::Control)
+                    .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+                let mut client = pb::relay_client::RelayClient::new(channel);
+                let mut frames = client.session(tokio_stream::wrappers::ReceiverStream::new(rx)).await?.into_inner();
+                for (n, (namespace, from)) in next.iter().enumerate() {
+                    tx.send(pb::RelayRequest { kind: Some(pb::relay_request::Kind::Follow(pb::Follow {
+                        dataset: "membership".into(), namespace: namespace.clone(), from: *from,
+                        follow: n as u64 + 1, ..Default::default()
+                    })) }).await.map_err(|_| tonic::Status::unavailable("observer requests closed"))?;
+                }
+                let mut progress = tokio::time::interval(bedrock_lib::relays::PROGRESS);
+                loop {
+                    let frame = tokio::select! {
+                        _ = progress.tick() => {
+                            tx.send(pb::RelayRequest { kind: Some(pb::relay_request::Kind::Progress(true)) })
+                                .await.map_err(|_| tonic::Status::unavailable("observer requests closed"))?;
+                            continue;
+                        }
+                        frame = tokio::time::timeout(bedrock_lib::relays::IDLE, frames.message()) =>
+                            frame.map_err(|_| tonic::Status::deadline_exceeded("membership observer idle"))??,
+                    }.ok_or_else(|| tonic::Status::unavailable("membership observer closed"))?;
+                    match frame.kind {
+                        Some(pb::relay_frame::Kind::Delivery(delivery)) => {
+                            let cursor = next.get_mut(&delivery.namespace).expect("followed membership namespace");
+                            assert_eq!(delivery.from, *cursor, "membership oracle coverage gap");
+                            for bytes in delivery.events {
+                                let event = pb::Event::decode(bytes).expect("membership event");
+                                assert_eq!(event.dataset, "membership");
+                                assert_eq!(event.namespace, delivery.namespace);
+                                assert_eq!(event.sequence, *cursor, "membership oracle event gap");
+                                observe_membership(&chaos, event);
+                                *cursor += 1;
+                            }
+                            assert_eq!(*cursor, delivery.through + 1, "membership oracle incomplete coverage");
+                            tx.send(pb::RelayRequest { kind: Some(pb::relay_request::Kind::Ack(pb::Ack {
+                                dataset: delivery.dataset, namespace: delivery.namespace,
+                                applied: delivery.through, span: None,
+                            })) }).await.map_err(|_| tonic::Status::unavailable("observer requests closed"))?;
+                        }
+                        Some(pb::relay_frame::Kind::Bootstrap(_)) => {
+                            chaos.cell.lock().unwrap().violation.get_or_insert(Violation {
+                                invariant: "MembershipHistory", detail: "observer lost committed transition history".into(),
+                            });
+                            return Ok::<(), tonic::Status>(());
+                        }
+                        Some(pb::relay_frame::Kind::Error(error)) => return Err(tonic::Status::new(
+                            tonic::Code::from_i32(error.code as i32), error.detail)),
+                        _ => {}
+                    }
+                }
+            }.await;
+            if attempt.is_ok() {
+                return;
             }
         }
-    })
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
+fn observe_membership(chaos: &Chaos, event: pb::Event) {
+    use pb::range::owner::State as Pb;
+    let id = String::from_utf8(event.key).expect("membership key");
+    let value = event.value;
+    let mut cell = chaos.cell.lock().unwrap();
+    if let Some(range) = id.strip_prefix("range/") {
+        let (dataset, start) = range.rsplit_once('/').expect("a directory key");
+        let start = u64::from_str_radix(start, 16).expect("a directory key");
+        let owners = value.map(|value| {
+            let range = pb::Range::decode(value.as_slice()).expect("a directory record");
+            range
+                .owners
+                .into_iter()
+                .map(|owner| Owner {
+                    state: match Pb::try_from(owner.state) {
+                        Ok(Pb::Ready) => State::Ready,
+                        Ok(Pb::Leaving) => State::Leaving,
+                        _ => State::Populating,
+                    },
+                    node: owner.node_id,
+                })
+                .collect()
+        });
+        cell.range(dataset, start, owners);
+    } else if !id.starts_with("drain/") {
+        if let Some(value) = value {
+            cell.members.insert(
+                id,
+                pb::Member::decode(value.as_slice()).expect("a member record"),
+            );
+        } else {
+            cell.members.remove(&id);
+        }
+    }
+}
 /// A copy of one stream's selected keys, sampled during the run and checked against the finished history.
 struct Sample {
     node: String,
@@ -711,7 +779,12 @@ fn relay(name: &str, ip: &str, replay_max_bytes: Option<u64>) -> RelayConfig {
             ..ReplaySettings::default()
         },
         membership: Some(MembershipSettings {
-            api: format!("{API}:7002"),
+            voter_ids: RELAYS
+                .iter()
+                .enumerate()
+                .map(|(id, peer)| (format!("{peer}:7000"), format!("relay-{}", id + 1)))
+                .collect(),
+            bootstrap: true,
             grace_ms: GRACE.as_millis() as u64,
         }),
         write_token: Some(TOKEN.into()),
@@ -823,11 +896,11 @@ fn start_cluster(run: &Arc<Run>) -> Vec<Process> {
     }
     for (i, ip) in QUICKSILVERS.iter().enumerate() {
         let name = format!("quicksilver-{}", i + 1);
-        let config = service(&name, ip, &["quicksilver", "auth"]);
+        let config = service(&name, ip, &["quicksilver"]);
         let id = spawn(run, &name, ip, move || {
             bedrock_quicksilver::run(config.clone())
         });
-        add(name, ip, &["quicksilver", "auth"], true, id);
+        add(name, ip, &["quicksilver"], true, id);
     }
     for (i, ip) in CDNS.iter().enumerate() {
         let name = format!("cdn-{}", i + 1);
@@ -900,6 +973,7 @@ fn start_observer(run: &Arc<Run>) {
         let peers = Arc::new(Peers::new(&Admin::new()));
         let targets = vec![quicksilver_target, cdn_target, kv_target];
         let session = Session::start(peers.clone(), relay_addresses(), targets).unwrap();
+        tokio::spawn(watch_membership(run.chaos.clone(), peers.clone()));
         loop {
             sleep(Duration::from_millis(200)).await;
             for view in [&views.quicksilver, &views.cdn, &views.kv] {
@@ -1215,7 +1289,7 @@ async fn retry(run: &Run, (stream, id, key, value): Acknowledged) {
     }
 }
 
-/// Writes around the publisher until a checker notices.
+/// Oracle sentinel: injects invalid observations until a checker notices; never writes to the product authority.
 async fn rogue(run: Arc<Run>, kind: Rogue) {
     use pb::range::owner::State as Pb;
     const FIRST: &str = "range/quicksilver/0000000000000000";
@@ -1238,7 +1312,6 @@ async fn rogue(run: Arc<Run>, kind: Rogue) {
             break (directory[&0].clone(), members);
         }
     };
-    let stream = ("membership".to_owned(), format!("quicksilver.{CELL}"));
     let owner = |node: &str, state: Pb| pb::range::Owner {
         node_id: node.to_owned(),
         state: state as i32,
@@ -1275,9 +1348,18 @@ async fn rogue(run: Arc<Run>, kind: Rogue) {
             }
         };
         for (key, value) in writes {
-            let id = format!("rogue-{}", run.started.elapsed().as_nanos());
-            let address = format!("{API}:7002");
-            submit(&address, &stream, &id, key.as_bytes(), value.as_deref()).await;
+            // Oracle sentinel only: operators cannot write membership or directory records.
+            // Feed the same committed-event checker an invalid transition without mutating the product.
+            observe_membership(
+                &run.chaos,
+                pb::Event {
+                    dataset: "membership".into(),
+                    namespace: format!("quicksilver.{CELL}"),
+                    key: key.into_bytes(),
+                    value,
+                    ..Default::default()
+                },
+            );
         }
         sleep(Duration::from_millis(20)).await;
     }
@@ -1331,6 +1413,24 @@ async fn driver(run: Arc<Run>, processes: Vec<Process>, deadline: Instant) {
             // External subscribers own their recovery; they have no health manager to notice.
             3 if chaos.on(Class::Corruption) && a.probed => {
                 for engine in run.disks.of(&a.dir) {
+                    if run
+                        .disks
+                        .get(&a.dir, "control")
+                        .is_some_and(|control| Arc::ptr_eq(&control, &engine))
+                    {
+                        let damaged = processes
+                            .iter()
+                            .filter_map(|process| run.disks.get(&process.dir, "control"))
+                            .filter(|control| control.frozen().damaged())
+                            .count();
+                        // This campaign checks convergence after faults stop. A permanently damaged majority has no
+                        // recoverable authority; separate control tests check that it fails closed.
+                        if engine.frozen().damaged()
+                            || damaged >= RELAYS.len() - (RELAYS.len() / 2 + 1)
+                        {
+                            continue;
+                        }
+                    }
                     if let Some(key) = damage(&engine) {
                         run.record(format!("corrupt {} {}", a.name, key.escape_ascii()));
                         chaos.count(Class::Corruption);
@@ -1404,7 +1504,7 @@ fn unconverged(run: &Run, processes: &[Process]) -> Option<Violation> {
         return waiting("Converged", "no observer yet".into());
     };
     let history = run.history.lock().unwrap();
-    for dataset in ["quicksilver", "auth", "cdn"] {
+    for dataset in ["quicksilver", "cdn"] {
         let view = views.of(dataset);
         let (Ok(directory), Ok(members)) = (view.directory(dataset), view.members()) else {
             return waiting("RedundancyRestored", format!("no {dataset} view"));
@@ -1622,9 +1722,7 @@ async fn scenario(options: Options) -> Result<Outcome, Violation> {
         losable,
         fingerprint.clone(),
     ));
-    let store = SimFactory::new(store_faults(&chaos, options.bug))
-        .recorded(fingerprint.clone())
-        .observed(watch_membership(&chaos));
+    let store = SimFactory::new(store_faults(&chaos, options.bug)).recorded(fingerprint.clone());
     install(Hooks {
         engine: {
             let disks = disks.clone();

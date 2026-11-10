@@ -2,6 +2,7 @@
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 \* The single shared Relay.Session transport implements these transitions.
 \* Removing the superseded B-10 wire service does not add a second delivery path.
+\* The pushed range set and its directory revision come from the same atomic applied snapshot.
 \* #22 / B-21: one stream per dataset and range carries every namespace of the dataset, each
 \* with its own revisions. The relay pushes whether the subscriber owns the range; dropping it
 \* is the revoke, and the subscriber deletes the range.

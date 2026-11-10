@@ -193,5 +193,5 @@ impl Future for RuntimeSleep {
 impl hyper::rt::Sleep for RuntimeSleep {}
 
 #[cfg(test)]
-#[path = "../../tests/unit/transport/admin.rs"]
+#[path = "../tests/unit/admin.rs"]
 mod tests;

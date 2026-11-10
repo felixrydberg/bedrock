@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use prometheus_client::metrics::gauge::Gauge;
 
-use super::admin::Admin;
+use crate::admin::Admin;
 use crate::node::{ConfigError, NodeConfig};
 
 #[cfg(not(madsim))]
@@ -71,9 +71,9 @@ mod sim {
     use tonic::transport::{Channel, Endpoint};
 
     use super::Identity;
+    use crate::admin::Admin;
     use crate::node::{ConfigError, TlsConfig};
     use crate::transport::Io;
-    use crate::transport::admin::Admin;
 
     /// Uninhabited: simulation runs plaintext.
     pub struct Tls(Infallible);
@@ -84,7 +84,7 @@ mod sim {
                 "tls is not simulated; leave it unset under madsim".into(),
             ))
         }
-        pub fn channel(&self, _: Endpoint) -> Channel {
+        pub fn channel(&self, _: Endpoint, _: Option<Identity>) -> Channel {
             match self.0 {}
         }
         pub async fn dial(&self, _: &str) -> std::io::Result<Box<dyn Io>> {
@@ -135,8 +135,8 @@ mod adapter {
     use x509_parser::extensions::GeneralName;
 
     use super::Identity;
+    use crate::admin::Admin;
     use crate::node::{ConfigError, TlsConfig};
-    use crate::transport::admin::Admin;
     use crate::transport::{Caller, Io, parse_identity};
 
     /// How often the files are checked for renewals.
@@ -257,17 +257,22 @@ mod adapter {
         }
 
         /// A lazily connecting channel that dials through TLS and accepts only [`SERVERS`].
-        pub fn channel(self: &Arc<Self>, endpoint: Endpoint) -> Channel {
-            endpoint.connect_with_connector_lazy(Connector(self.clone()))
+        pub fn channel(
+            self: &Arc<Self>,
+            endpoint: Endpoint,
+            expected: Option<Identity>,
+        ) -> Channel {
+            endpoint.connect_with_connector_lazy(Connector(self.clone(), expected))
         }
 
         pub async fn dial(&self, addr: &str) -> io::Result<Box<dyn Io>> {
-            Ok(Box::new(self.connect(addr).await?))
+            Ok(Box::new(self.connect(addr, None).await?))
         }
 
         async fn connect(
             &self,
             addr: &str,
+            expected: Option<&Identity>,
         ) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
             let name = ServerName::try_from(crate::transport::host_of(addr).to_owned())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -288,6 +293,16 @@ mod adapter {
                         "{addr} is {} {}, not a relay or api",
                         server.service, server.node_id
                     ),
+                ));
+            }
+            if let Some(expected) = expected
+                && (server.service != expected.service
+                    || server.cell != expected.cell
+                    || server.node_id != expected.node_id)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "peer certificate differs from configured control identity",
                 ));
             }
             Ok(stream)
@@ -524,7 +539,7 @@ mod adapter {
 
     /// Dials for tonic channels.
     #[derive(Clone)]
-    struct Connector(Arc<Tls>);
+    struct Connector(Arc<Tls>, Option<Identity>);
 
     impl tower_service::Service<Uri> for Connector {
         type Response = TokioIo<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -537,12 +552,13 @@ mod adapter {
 
         fn call(&mut self, uri: Uri) -> Self::Future {
             let tls = self.0.clone();
+            let expected = self.1.clone();
             Box::pin(async move {
                 let addr = uri
                     .authority()
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no authority"))?
                     .to_string();
-                Ok(TokioIo::new(tls.connect(&addr).await?))
+                Ok(TokioIo::new(tls.connect(&addr, expected.as_ref()).await?))
             })
         }
     }

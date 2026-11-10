@@ -7,10 +7,10 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::health::fallback::{self, Found, Limited, Read, ReadKey, SourceChain, Tier};
 use bedrock_lib::health::protection::{self, Limiter, S3_FETCHES};
 use bedrock_lib::storage::{StorageError, StorageResult};
-use bedrock_lib::transport::admin::Admin;
 use madsim::rand::{Rng, thread_rng};
 use madsim::runtime::Runtime;
 use tokio::time::sleep;

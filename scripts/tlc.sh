@@ -6,11 +6,12 @@
 #   scripts/tlc.sh bugs     Only the bugs: under a minute.
 #   scripts/tlc.sh relays   One model and its bugs.
 #
-# Needs Java 11 or later and the TLA+ tools jar from https://github.com/tlaplus/tlaplus/releases, at TLA2TOOLS or by
-# default .codex-tmp/tla2tools.jar. Paths stay relative, so Windows Java works from Git Bash too.
+# Needs Java 11 or later. The TLA+ tools jar (v1.8.0 from https://github.com/tlaplus/tlaplus/releases, sha256
+# e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f) is checked in beside this script; set TLA2TOOLS to use another. Paths stay relative, so Windows Java works
+# from Git Bash too.
 set -euo pipefail
 cd "$(dirname "$0")/../docs/spec"
-jar="${TLA2TOOLS:-../../.codex-tmp/tla2tools.jar}"
+jar="${TLA2TOOLS:-../../scripts/tla2tools.jar}"
 work=../../target/tlc
 rm -rf "$work" && mkdir -p "$work"
 
@@ -18,6 +19,10 @@ rm -rf "$work" && mkdir -p "$work"
 # catches mistakes in the model itself. handoff's single point cannot split a range, so membership checks
 # DirectoryCoverage.
 BUGS='
+cell buffered DurableCommit
+cell uncommitted CommittedApply
+cell cas OrderedCAS
+cell torn AtomicApply
 relays skip OrderedCoverage
 relays lease ProtectedBootstrap
 relays gc ProtectedTail
@@ -39,11 +44,19 @@ membership minority OnePublisher
 membership clock ClockBound
 membership gap DirectoryCoverage
 membership draining NewOwnersPublished
+membership drain-record NewOwnersPublished
+membership early-completion DrainCompletionAfterHandoff
 membership sick NoUnhealthyRouting
 membership early-drop NoDropBeforeReady
 membership early-removal NoEarlyRemoval
 membership minority-write Freeze
 membership merge-unequal NoDropBeforeReady
+service_isolation global-freeze HealthyServiceEnabled
+service_isolation stale-clock ClockBound
+service_isolation stale-clock NoEarlyRemoval
+service_isolation cas OrderedCAS
+service_isolation unreadable-write ServiceFreeze
+service_isolation minority-write Freeze
 handoff unready ReadyHasData
 handoff view ServesHeld
 handoff keep OwnedOrLeaving
@@ -60,7 +73,7 @@ merge drift OneCursor
 
 tlc() {
     local name="$1" config="$2" model="$3"
-    java -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers auto -noGenerateSpecTE -metadir "$work/$name" \
+    java -Xmx4g -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 2 -noGenerateSpecTE -metadir "$work/$name" \
         -config "$config" "$model.tla" 2>&1
 }
 
@@ -93,7 +106,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership handoff"
+models="relays follows merge materialized publisher membership service_isolation handoff cell"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::transport::admin::Admin;
+use crate::admin::Admin;
 
 fn hub() -> Hub {
     Hub::relay(
@@ -104,6 +104,215 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
         },
         closed,
     )
+}
+
+#[tokio::test]
+async fn cell_bootstrap_preserves_coherent_boundary_live_order_and_wire_checksum() {
+    let hub = hub();
+    let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    let key = (("membership".into(), "kv.cell".into()), None);
+    {
+        let mut subscribers = hub.0.subscribers.lock().unwrap();
+        let follows = &mut subscribers.get_mut(&1).unwrap().follows;
+        let interest = follows
+            .remove(&(("auth".into(), "keys".into()), None))
+            .unwrap();
+        follows.insert(key.clone(), interest);
+    }
+    let view = crate::replication::materialized::View {
+        dataset: key.0.0.clone(),
+        namespace: key.0.1.clone(),
+        sequence: 400,
+        committed_at: 1234,
+        values: (0u64..300)
+            .rev()
+            .map(|k| (k.to_be_bytes().to_vec(), vec![42]))
+            .collect(),
+        retries: Default::default(),
+        pruned_through: 400,
+        raft: None,
+    };
+    assert!(hub.control_bootstrap(1, &key, 1, view).await.unwrap());
+    let mut keys = Vec::new();
+    let mut chunks = 0;
+    loop {
+        let frame = tokio_stream::StreamExt::next(&mut frames)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame.encoded_len() <= MAX_BYTES);
+        let Some(pb::relay_frame::Kind::Bootstrap(chunk)) = frame.kind else {
+            panic!("expected bootstrap");
+        };
+        assert_eq!(
+            (chunk.boundary, chunk.committed_at, chunk.follow),
+            (400, 1234, 101)
+        );
+        assert_eq!((&chunk.dataset, &chunk.namespace), (&key.0.0, &key.0.1));
+        assert_eq!(chunk.begin, chunks == 0);
+        assert!(chunk.entries.len() <= 256);
+        for entry in chunk.entries {
+            assert_eq!(entry.value, vec![42]);
+            keys.push(u64::from_be_bytes(entry.key.try_into().unwrap()));
+        }
+        chunks += 1;
+        if chunk.end {
+            // SHA-256 of the protocol's length-prefixed scope, boundary, timestamp and 300 live entries.
+            let checksum: String = chunk.checksum.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(
+                checksum,
+                "889f6c7362be120b0a63f0bea68c2b7e639e2c41021fd971c497e2a82f96674b"
+            );
+            break;
+        }
+        assert!(chunk.checksum.is_empty());
+    }
+    assert_eq!(keys, (0..300).collect::<Vec<_>>());
+    assert_eq!(chunks, 4);
+}
+
+#[tokio::test]
+async fn cell_bootstrap_rejects_an_entry_larger_than_the_bounded_frame() {
+    let hub = hub();
+    let (_frames, closed) = subscriber(&hub, 1, MAX_EVENTS);
+    let key: StreamKey = (("auth".into(), "keys".into()), None);
+    let view = crate::replication::materialized::View {
+        dataset: key.0.0.clone(),
+        namespace: key.0.1.clone(),
+        sequence: 1,
+        committed_at: 1234,
+        values: BTreeMap::from([(vec![1], vec![42; MAX_BYTES])]),
+        retries: Default::default(),
+        pruned_through: 1,
+        raft: None,
+    };
+    let error = hub.control_bootstrap(1, &key, 1, view).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(!closed.get());
+}
+
+#[tokio::test]
+async fn cell_membership_uses_local_control_despite_central_history_and_unavailable_upstream() {
+    use crate::membership::control::{Config, Control};
+    let peers = Arc::new(Peers::new(&Admin::new()));
+    let (control, actor) = Control::start(
+        Arc::new(crate::storage::memory::MemoryEngine::new("cell-control")),
+        peers.clone(),
+        Config {
+            region: "region".into(),
+            dc: "dc".into(),
+            cell: "cell".into(),
+            me: "one:7000".into(),
+            voters: vec!["one:7000".into(), "two:7000".into(), "three:7000".into()],
+            voter_ids: ["one", "two", "three"]
+                .into_iter()
+                .map(|id| (format!("{id}:7000"), id.into()))
+                .collect(),
+            clock: || 1234,
+            operator_token: None,
+            bootstrap: true,
+        },
+    )
+    .unwrap();
+    // Reading the committed view must work without elections or any live control/product peer.
+    actor.abort();
+    let replay = Arc::new(
+        Replay::open(
+            Arc::new(crate::storage::memory::MemoryEngine::new("central-history")),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let mut central = replay_event(1);
+    central.dataset = "membership".into();
+    central.namespace = "kv.cell".into();
+    replay.append(&central, 1).unwrap();
+    let hub = Hub::relay(
+        "one".into(),
+        1,
+        peers,
+        vec!["unavailable:7000".into()],
+        Vec::new(),
+        Some(replay),
+    )
+    .with_cell("cell".into())
+    .with_control(control);
+    hub.publish(central);
+    let key = (("membership".into(), "kv.cell".into()), None);
+    hub.observe_head(&key.0, 99);
+    assert_eq!(hub.source_head(&key.0), Some(0));
+    assert!(hub.read(&key.0, 1).await.unwrap().is_empty());
+    for namespace in ["kv.other", "unknown.cell", ""] {
+        let foreign = ("membership".into(), namespace.into());
+        assert_eq!(hub.source_head(&foreign), None);
+        assert_eq!(
+            hub.read(&foreign, 1).await.err().unwrap().code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+    let (mut frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    {
+        let mut subscribers = hub.0.subscribers.lock().unwrap();
+        let follows = &mut subscribers.get_mut(&1).unwrap().follows;
+        let mut interest = follows
+            .remove(&(("auth".into(), "keys".into()), None))
+            .unwrap();
+        interest.from = 0;
+        follows.insert(key.clone(), interest);
+    }
+    let sibling_follow = pb::Follow {
+        dataset: "membership".into(),
+        namespace: "cdn.cell".into(),
+        from: 1,
+        ..Default::default()
+    };
+    let mut shared = siblings::Shared::default();
+    shared.live = Some(BTreeMap::from([(
+        (("membership".into(), "cdn.cell".into()), None),
+        sibling_follow,
+    )]));
+    hub.0.shared.lock().unwrap().insert("two".into(), shared);
+    let (_product_frames, _) = subscriber(&hub, 2, MAX_EVENTS);
+    let interests = hub.interests();
+    assert_eq!(interests.len(), 1);
+    assert_eq!(interests.values().next().unwrap().dataset, "auth");
+    let (desired, datasets) = hub.desired();
+    assert_eq!(
+        desired,
+        BTreeMap::from([(("auth".into(), "keys".into()), 1)])
+    );
+    assert!(datasets.is_empty());
+    let pumping = hub.clone();
+    let task = tokio::spawn(async move { pumping.pump(1, key, 1, Vec::new(), true).await });
+    let mut began = false;
+    let mut ended = false;
+    loop {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio_stream::StreamExt::next(&mut frames),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        match frame.kind.unwrap() {
+            pb::relay_frame::Kind::Range(range) => {
+                assert_eq!((range.first, range.last, range.head), (0, 0, 0));
+                if range.recovered {
+                    assert!(began && ended);
+                    break;
+                }
+            }
+            pb::relay_frame::Kind::Bootstrap(chunk) => {
+                assert_eq!((chunk.boundary, chunk.committed_at), (0, 0));
+                assert!(chunk.entries.is_empty());
+                began |= chunk.begin;
+                ended |= chunk.end;
+            }
+            _ => panic!("expected local bootstrap or range"),
+        }
+    }
+    task.abort();
 }
 
 #[tokio::test]

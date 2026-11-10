@@ -1,9 +1,11 @@
 bedrock/crates/
 ├── lib/                  # bedrock-lib: shared distributed core (library only)
+│   ├── admin             # shared metrics registry and administrative HTTP endpoint
 │   ├── membership
 │   ├── health
 │   ├── buckets
 │   ├── placement
+│   ├── raft_runtime      # durable Raft ready processing and state-machine contract
 │   ├── replication
 │   ├── relays
 │   ├── reconciliation
@@ -16,7 +18,7 @@ bedrock/crates/
 ├── api/                  # bedrock-api: write API
 ├── relay/                # bedrock-relay: relay process, built on lib
 │
-├── quicksilver/          # bedrock-quicksilver: quicksilver and auth datasets
+├── quicksilver/          # bedrock-quicksilver: quicksilver dataset; Auth awaits Gateway
 │   ├── storage
 │   └── namespaces
 │
@@ -34,6 +36,13 @@ bedrock/crates/
 Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-quicksilver`, `bedrock-kv`, `bedrock-cdn`) runs as its own process, depends on
 `bedrock-lib` and never on another binary crate. Each binary crate is a library with a `run(config)` entry point
 (service-specific code) plus a `main.rs` that only initialises logging, loads config and calls `run`.
+
+`lib/membership/control` embeds each cell's fixed-voter Raft authority in its existing relays, backed by a separate durable
+local control store. Membership, placement and drain revisions originate there and are delivered only within that cell.
+`lib/raft_runtime` owns the reusable durable Raft storage and ready-processing lifecycle; membership owns the state machine,
+admission and operator policy. `lib/datasets/capabilities` declares relay delivery, fixed namespaces and active range placement.
+They do not depend on the API, S3 or upstream relay services. Peer group identity must match region, DC, cell and voter
+addresses; failure domains may differ. Product-data replication retains the upstream relay tree.
 
 `bedrock/tests/sim` (`bedrock-sim`, B-23a) holds the deterministic simulation tests. It boots those same `run`
 functions as simulated nodes, so tests and production execute the same code. Most only compile under
@@ -111,6 +120,7 @@ The I/O rules in `clippy.toml` apply to every crate; adapters opt out with an ex
 
 | Module           | Responsibility                                                        |
 | ---------------- | --------------------------------------------------------------------- |
+| `admin`          | Shared metrics registry, health/readiness endpoints and introspection |
 | `membership`     | Cell membership and the L2 placement directory from relay streams, published as one namespace |
 | `health`         | Per-peer reachability from real traffic, storage health and scrubbing, availability |
 | `buckets`        | 64-bit key hash, hash ranges and owner checks (`feature-drafts.md` §4 decision 13) |
@@ -122,7 +132,7 @@ The I/O rules in `clippy.toml` apply to every crate; adapters opt out with an ex
 | `datasets`       | Dataset → namespace model and policy resolution                       |
 | `node`           | Node config (file + `BEDROCK_*` env), roles, logging and graceful shutdown |
 | `s3`             | Namespace-engine object I/O and checksummed CDN artifact storage     |
-| `transport`      | Node-to-node transport and observability baseline                     |
-| `quicksilver/storage` | Quicksilver/Auth L1/L2 hash-range keyspaces and eviction, on top of `lib/storage` |
+| `transport`      | Node-to-node transport and mutual TLS                     |
+| `quicksilver/storage` | Quicksilver L1/L2 hash-range keyspace and eviction, on top of `lib/storage`; Auth awaits Gateway |
 | `kv/storage`     | Customer-KV reader residency and cache eviction (B-28, B-39)          |
 

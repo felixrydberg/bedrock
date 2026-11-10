@@ -21,6 +21,10 @@ tokio-stream = "0.1"
 tonic.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+raft.workspace = true
+protobuf.workspace = true
+slog.workspace = true
+subtle.workspace = true
 
 # RocksDB runs real threads and files, so simulation builds use the in-memory engine (B-23a).
 # Native object I/O stays outside simulation; namespace I/O uses its deterministic adapter model.

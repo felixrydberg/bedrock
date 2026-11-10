@@ -33,7 +33,7 @@ fn ranged(nodes: &[&[&str]]) -> Ranged {
 fn a_record_round_trips_and_corruption_is_an_error() {
     let record = drain(Scope::Node("n1".into()));
     assert_eq!(Drain::decode(&record.encode()), Ok(record));
-    assert_eq!(Drain::key("d1"), "topology/drains/d1");
+    assert_eq!(Drain::key("d1"), "drain/d1");
     assert!(matches!(Drain::decode(b"{"), Err(Error::Corrupt(_))));
     let mut zero = drain(Scope::Cell("c".into()));
     zero.rate = 0;
@@ -89,7 +89,7 @@ fn left_counts_selected_datasets_and_refuses_unsupported_ones() {
 }
 
 #[test]
-fn apply_marks_the_scope_draining_and_only_while_it_runs() {
+fn apply_keeps_completed_drains_out_of_placement() {
     let member = |id: &str, cell: &str| pb::Member {
         node_id: id.into(),
         cell: cell.into(),
@@ -110,7 +110,78 @@ fn apply_marks_the_scope_draining_and_only_while_it_runs() {
     assert_eq!(status(&apply(&members, &[other], "cdn"), "a"), 0);
     let mut done = drain(Scope::Node("a".into()));
     done.state = State::Drained;
-    assert_eq!(status(&apply(&members, &[done], "cdn"), "a"), 0);
+    assert_eq!(
+        status(&apply(&members, &[done], "cdn"), "a"),
+        draining,
+        "a completed drain must still prevent new placement"
+    );
+}
+
+#[test]
+fn completion_waits_for_every_selected_hook_and_supports_cell_scope() {
+    let held: Vec<Arc<dyn Hook>> = vec![
+        Arc::new(ranged(&[&["a"]])),
+        Arc::new(Ranged::new("auth", || Ok(Directory::new()))),
+    ];
+    let mut record = drain(Scope::Node("a".into()));
+    record.datasets = vec!["quicksilver".into(), "auth".into()];
+    assert_eq!(completed(&held, &record).unwrap(), None);
+
+    let empty: Vec<Arc<dyn Hook>> = vec![
+        Arc::new(Ranged::new("quicksilver", || Ok(Directory::new()))),
+        Arc::new(Ranged::new("auth", || Ok(Directory::new()))),
+    ];
+    let mut expected = record.clone();
+    expected.state = State::Drained;
+    assert_eq!(completed(&empty, &record).unwrap(), Some(expected));
+
+    record.scope = Scope::Cell("c".into());
+    assert_eq!(
+        completed(&held, &record).unwrap().unwrap().state,
+        State::Drained
+    );
+}
+
+#[test]
+fn unsupported_drain_selection_is_rejected_before_reading_units() {
+    let hooks: Vec<Arc<dyn Hook>> = vec![Arc::new(ranged(&[&["a"]]))];
+    let mut record = drain(Scope::Node("a".into()));
+    record.datasets = vec!["kv".into()];
+    assert!(matches!(
+        validate(&hooks, &record),
+        Err(Error::Unsupported { .. })
+    ));
+    assert!(matches!(
+        left(&[], &drain(Scope::Node("a".into()))),
+        Err(Error::Unsupported { .. })
+    ));
+}
+
+#[test]
+fn admission_matches_the_runtime_ranged_hooks() {
+    for service in ["quicksilver", "cdn", "kv"] {
+        let hooks = ranged_with(service, |_| {
+            Err("validation must not read a directory".into())
+        });
+        for datasets in [
+            vec![],
+            vec!["quicksilver".into()],
+            vec!["cdn".into()],
+            vec!["auth".into()],
+            vec!["cdn".into(), "cdn".into()],
+        ] {
+            for namespace in [None, Some("one".to_owned())] {
+                let mut record = drain(Scope::Node("node".into()));
+                record.datasets = datasets.clone();
+                record.namespace = namespace;
+                assert_eq!(
+                    validate_ranged_selection(service, &record).is_ok(),
+                    validate(&hooks, &record).is_ok(),
+                    "service={service} record={record:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

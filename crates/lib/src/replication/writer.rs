@@ -19,9 +19,9 @@ use super::materialized::{
     Committed, Materialized, Persisted, Retention, Retries, RetryRecord, View, validate_scope,
 };
 use super::{Event, Operation, stream};
+use crate::admin::Admin;
 use crate::storage::namespace::NamespaceFactory;
 use crate::storage::{ErrorContext, StorageError, StorageResult};
-use crate::transport::admin::Admin;
 
 pub const EPOCH: u64 = 1;
 /// A recovery lease lapses after this long without transfer progress.

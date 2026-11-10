@@ -12,9 +12,9 @@
 ## Architecture boundaries
 
 - Put the shared distributed core in `crates/lib`. `quicksilver`, `kv`, `cdn`, `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
-- `bedrock-quicksilver` hosts `quicksilver` and `auth`; `bedrock-kv` hosts customer `kv` only, with no virtual buckets and no dataset subscriptions; `bedrock-cdn` hosts `cdn` retention metadata and artifact bytes. Each subscribes only to its own datasets.
+- `bedrock-quicksilver` hosts `quicksilver`; `auth` serving awaits the future Gateway binary. `bedrock-kv` hosts customer `kv` only, with no virtual buckets and no dataset subscriptions; `bedrock-cdn` hosts `cdn` retention metadata and artifact bytes. Each subscribes only to its own datasets.
 - The write API and relays are generic over datasets. Retention is ordinary SET/DELETE replication interpreted only by CDN apply hooks.
-- `StorageEngine` and its adapters belong in `lib/storage`; Quicksilver/Auth keyspaces and eviction belong in `quicksilver/storage`, customer-KV reader residency in `kv/storage`. Keep CDN artifact caching behind its separate `CacheStorage` contract.
+- `StorageEngine` and its adapters belong in `lib/storage`; Quicksilver keyspaces and eviction belong in `quicksilver/storage`, customer-KV reader residency in `kv/storage`. Keep CDN artifact caching behind its separate `CacheStorage` contract.
 - Membership comes from relay subscriber streams; peer reachability comes from real traffic. Do not introduce a separate heartbeat/gossip protocol or membership/placement epoch. Writer fencing is a separate concern.
 - KV and CDN are backing services. Workers, Pages, activation and rollback belong to the future Compute/deploy control plane.
 - Keep metrics labels low-cardinality. Expose namespace/key/hash/subscriber detail through introspection or the agreed top-N mechanism. Preserve the writer's `committed_at` through every hop.
@@ -69,3 +69,11 @@ Choose the cheapest available model that can reliably complete and verify the ta
 - When you spawn a worker, worktree or test environment, or create a new `CARGO_TARGET_DIR`, clean up WSL space as part of the task. Delete only build caches and Docker artifacts that no running task uses, and list what you removed in the report.
 - Defer VHDX compaction to the user, or obtain explicit approval after affected work has stopped. To compact the distro's `ext4.vhdx` and Docker Desktop's `docker_data.vhdx`, quit Docker Desktop, run `wsl --shutdown`, then `Optimize-VHD -Mode Full` from an elevated PowerShell. Deleting alone does not return space to Windows.
 - Compaction needs an elevated shell. If you cannot run that step, say so in the report and leave it to the user.
+
+## Power and host resources
+
+- We want to limit power and resource use on the development PC.
+- Run at most one heavy job at a time: TLC (`scripts/tlc.sh`), a full `cargo test --workspace`, or a madsim seed sweep. Do not start a second one while another is running.
+- Cap parallelism for every heavy run: use `cargo ... -j 4` or `CARGO_BUILD_JOBS=4`, and do not pass `-workers auto` to TLC. Use a fixed TLC worker count of at most 4, and bound the JVM heap (for example `JDK_JAVA_OPTIONS=-Xmx4g`).
+- Do not run seed sweeps or long TLC checks in a worker alongside the lead's own builds. Run them in sequence and report the cap used.
+- If a run is interrupted or the machine reboots, do not retry at the same parallelism. Lower the cap, record the cap in the report, and tell the user.

@@ -14,11 +14,11 @@ use bedrock_lib::replication::pb::relay_server::RelayServer;
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
 use bedrock_lib::storage::sim::MemoryFactory;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::replication::Operation;
 use bedrock_lib::storage::StorageEngine;
 use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::transport::Peers;
-use bedrock_lib::transport::admin::Admin;
 use madsim::runtime::{Handle, Runtime};
 use tokio::time::{sleep, timeout};
 

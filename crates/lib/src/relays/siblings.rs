@@ -30,7 +30,7 @@ pub type Interests = BTreeMap<StreamKey, pb::Follow>;
 /// How often a relay rechecks what it shares with its siblings and expires what a lost sibling left.
 const READINESS: Duration = Duration::from_secs(1);
 /// Sibling interests a relay follows beyond its own. The rest stay cold, are reported, and fail over as before. A cell
-/// shares at most six, so this holds about 1,300 cells below one upper-tier relay.
+/// control authority never forwards its membership namespaces; this cap bounds product-data and other sibling interests.
 pub const MAX_INTERESTS: usize = 4096;
 
 /// What one sibling shares.
@@ -117,7 +117,10 @@ impl Hub {
         let shared = self.0.shared.lock().unwrap();
         let mut wanted = BTreeMap::new();
         for (key, follow) in shared.values().flat_map(Shared::interests) {
-            if !datasets.contains(&key.0.0) && !namespaces.contains_key(&key.0) {
+            if self.external(&follow.dataset)
+                && !datasets.contains(&key.0.0)
+                && !namespaces.contains_key(&key.0)
+            {
                 wanted
                     .entry((!follow.namespace.is_empty(), key))
                     .and_modify(|held| lowest(held, follow))
@@ -187,6 +190,7 @@ impl pb::siblings_server::Siblings for Server {
         if let Some(caller) = Caller::of(&request) {
             caller.require(&["relay"], cell_tier.then(|| self.0.cell()))?;
         }
+        validate_control(&self.0, request.get_ref().control.as_ref())?;
         let (tx, rx) = mpsc::channel(16);
         let hub = self.0.clone();
         tokio::spawn(async move {
@@ -236,6 +240,11 @@ impl pb::siblings_server::Siblings for Server {
                         .map(|key| wire(key, &[])),
                 );
                 let update = pb::SiblingUpdate {
+                    control: if synced {
+                        None
+                    } else {
+                        hub.0.control.get().map(|control| control.identity())
+                    },
                     members: current
                         .iter()
                         .filter(|(key, member)| sent.get(*key) != Some(*member))
@@ -294,6 +303,18 @@ fn empty(update: &pb::SiblingUpdate) -> bool {
         && update.ready.is_empty()
         && update.interests.is_empty()
         && update.interests_removed.is_empty()
+        && update.control.is_none()
+}
+
+/// Both ends agree on whether this stream belongs to a cell authority before sharing observations.
+fn validate_control(hub: &Hub, peer: Option<&pb::ControlAck>) -> Result<(), Status> {
+    match (hub.0.control.get(), peer) {
+        (Some(control), Some(peer)) => control.validate_peer(peer),
+        (None, None) => Ok(()),
+        _ => Err(Status::permission_denied(
+            "sibling cell authority configuration mismatch",
+        )),
+    }
 }
 
 fn wire(((service, node_id), dataset): &(MemberKey, String), spans: &[(u64, u64)]) -> pb::Ready {
@@ -424,7 +445,9 @@ impl Siblings {
                     sibling,
                     Class::Control,
                     TIMEOUT,
-                    client.watch(pb::SiblingWatch {}),
+                    client.watch(pb::SiblingWatch {
+                        control: self.hub.0.control.get().map(|control| control.identity()),
+                    }),
                 )
                 .await?
                 .into_inner();
@@ -432,12 +455,21 @@ impl Siblings {
             let mut ready = Ready::new();
             let mut interests = Interests::new();
             let mut synced = false;
+            let mut identified = false;
             loop {
                 let update = self
                     .peers
                     .call(sibling, Class::Control, IDLE, stream.message())
                     .await?
                     .ok_or_else(|| Status::unavailable("sibling relay closed"))?;
+                if !identified {
+                    validate_control(&self.hub, update.control.as_ref())?;
+                    identified = true;
+                } else if update.control.is_some() {
+                    return Err(Status::invalid_argument(
+                        "sibling identity repeated after initial snapshot",
+                    ));
+                }
                 if synced && empty(&update) {
                     continue;
                 }

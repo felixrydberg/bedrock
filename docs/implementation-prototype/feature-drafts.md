@@ -16,6 +16,10 @@ Sources: `docs/implementation-prototype/kv.md`, `cdn.md`, `code-structure.md`, `
 > A second amendment below assigns generic writer materialization/recovery to #11 / B-11 before #25 / B-23;
 > B-39 is later customer-KV reader/cache integration. Seven additional materialized-state issue amendments are posted and linked in §5.
 
+> User decision, 2026-11-09: Quicksilver no longer hosts or places the Auth dataset. Auth serving is deferred until
+> the Gateway binary exists. This supersedes earlier references in this document to Quicksilver hosting Auth ranges;
+> the generic writer and relay contracts remain available for future Auth integration.
+
 ---
 
 ## 1. Strategy
@@ -28,7 +32,7 @@ not KV-specific behaviour. So the order is:
 1. **Foundation.** Workspace, the `bedrock-quicksilver`, `bedrock-kv` and `bedrock-cdn` binaries, roles, transport.
 2. **Shared core (`lib/`).** Everything KV *and* CDN need. It has to be built and hardened
    first, with its own test harness, before either product uses it.
-3. **First KV** (`quicksilver/` for Quicksilver/Auth, `kv/` for customer KV) and **first CDN** (`cdn/`). Thin product layers on the hardened core.
+3. **First KV** (`quicksilver/` for Quicksilver, `kv/` for customer KV) and **first CDN** (`cdn/`). Thin product layers on the hardened core.
    The two tracks can run in parallel.
 4. **KV refinements** and **CDN refinements**. Product-specific depth: optimisations,
    extra adapters, advanced retention. These can also run in parallel.
@@ -57,7 +61,7 @@ crates/
 │   └── storage  datasets  s3  transport                                              (decided in B-01, see §4)
 ├── api/          # bedrock/api — write API (B-09)                                         → binary `bedrock-api`
 ├── relay/        # bedrock/relay — relay process: tiers, fan-out, replay, membership      → binary `bedrock-relay`
-├── quicksilver/  # bedrock/quicksilver — quicksilver + auth: storage (hash-range keyspaces), namespaces → binary `bedrock-quicksilver`
+├── quicksilver/  # bedrock/quicksilver — quicksilver storage and namespaces → binary `bedrock-quicksilver`
 ├── kv/           # bedrock/kv  — customer KV: S3 namespace readers, cache residency, operations → binary `bedrock-kv`
 └── cdn/          # bedrock/cdn — artifact_storage, artifact_transfer, paths, retention → binary `bedrock-cdn`
 ```
@@ -195,6 +199,10 @@ Rules this implies:
 | [B-61](https://github.com/felixrydberg/bedrock/issues/66) | Simulation speed: more simulated seconds per real second | Shared infrastructure | `tests/sim`, `scripts/vopr.sh` | B-23 |
 | B-62 | Partial quarantine: rebuild only the damaged range | Shared core | `lib/health` + `lib/reconciliation` + `lib/relays` | B-14, B-21, B-22, B-23 |
 | B-63 | Operational scenarios: scale out, drain, cancel and rolling restart under load | Shared core | `tests/sim`, `tests/crash` | B-23, B-21b |
+| B-64 | Appointed writer per namespace group, with a small controller log (design and model first) | Shared core | `docs/spec/`, later `lib/replication` | B-09b, B-11, B-23 |
+| B-65 | Shared durable log store with one group-committed fsync for every writer group on a node | Shared core | `lib/replication` log store | B-09b; B-64 for more than one group |
+| B-66 | Safety versus discovery: stale or unreachable discovery inputs may only cost availability | Shared core | `docs/spec/`, `tests/sim`, `tests/crash` | B-23; B-09b and B-57 for their parts |
+| B-67 | Explicit operator-controlled membership changes for the API Raft group | Shared core | `lib/replication` + `api` bin | B-09b |
 
 ### Parallel work inside the shared core
 
@@ -572,6 +580,10 @@ Membership-only cases that need no data (failover, restart, cut-off, drain and f
 #### B-21b — Drain nodes, cells and namespaces
 
 Created: [#68](https://github.com/felixrydberg/bedrock/issues/68) — Feature 🚀: Generic drain for nodes, cells and single namespaces, with a per-dataset drain hook
+
+Amended 2026-11-08 in an issue comment: the drain record is `drain/{id}` in the cell's membership namespace `{service}.{cell}`
+(a cell drain is written to each ranged service's namespace), not `topology/drains/{id}` in Quicksilver. It shares the
+namespace's revision order, so it needs no Quicksilver dependency; `docs/spec/membership.md` has the model.
 
 ---
 
@@ -1495,7 +1507,8 @@ announces, so a host that reaches a relay can join membership under another node
 
 **Describe the solution you'd like**
 - **Enabled by configuration, fail closed.** `NodeConfig` gains an optional `tls = { cert, key, ca }` (file paths).
-  - Absent: plaintext as today, with a startup warning and the gauge `transport_tls_enabled 0`.
+  - Absent: plaintext with a startup warning and the gauge `transport_tls_enabled 0`, except production cell relays
+    with membership enabled, which require TLS and fail startup without it.
   - Present: mTLS is required on every node-to-node listener and connection. Until the files load, `/ready` stays false;
     if they do not load within a fixed startup timeout, the process exits with an error. A configured node never falls
     back to plaintext. A file appearing at a path does not by itself enable TLS.
@@ -1555,7 +1568,8 @@ announces, so a host that reaches a relay can join membership under another node
   - A leaf announcing another `node_id`, another cell or an address outside its SANs is rejected before it joins
     membership.
   - With `tls` set and the files missing, the node stays unready and then exits; it never serves plaintext. Without
-    `tls`, it serves plaintext and reports `transport_tls_enabled 0`.
+    `tls`, non-membership nodes serve plaintext and report `transport_tls_enabled 0`; production cell membership
+    rejects startup without TLS.
   - Replacing the files in place and by symlink swap changes the certificate on new handshakes without dropping
     sessions; a corrupt or mismatched renewal keeps the old certificate and is reported.
   - Normal and `cfg(madsim)` builds pass the existing seeds; bulk-transfer throughput with TLS is measured against
@@ -1601,7 +1615,8 @@ keep traffic private.
   - Host keys are generated on the machine; only the public key is signed (open question 2 covers where the CA key lives).
   - Removing a machine: its fingerprint goes into `pki.blocklist` on every host, with `pki.disconnect_invalid: true`.
     Its TLS certificate then expires within its lifetime because the machine can no longer renew.
-- `deploy/config/*.toml` show a commented `[tls]` section; `docker-compose.local.yml` stays plaintext.
+- Non-membership examples may leave `[tls]` commented out. Production cell membership examples require TLS and
+  an explicit `membership.voter_ids` mapping; simulations retain their plaintext exception.
 
 **Additional context**
 - **Implementation:** Foundation (deployment). Documentation and example configuration; no Rust changes.
@@ -1820,15 +1835,177 @@ nodes in turn, with real binaries and writes running.
 **Additional context**
 - **Implementation:** Test support only; no product code.
 - **Module:** `tests/sim`, `tests/crash`.
-- **Depends on:** B-23, B-21b. The drain-record cases also need B-24 (#55) to read `topology/drains`. The operator path needs an
-  operator API that does not exist yet; until then the real-binary drain announces `draining` from the node. Consider splitting
-  the real-binary half into its own issue once an operator API exists.
+- **Depends on:** B-23, B-21b. The drain record is `drain/{id}` in the cell's membership namespace (amendment on #68), so no
+  other dataset is needed. Amendment 2026-11-09: authenticated cell-local `CellControl.Write` now provides ordered drain
+  writes and cancellation; the operator CLI remains deferred. This draft still owns the proposed real-binary held-drain
+  scenario; the existing real-binary drain announces `draining` from the node.
 - **Acceptance criteria:**
   - Every scenario above passes for the required seeds and replays to the same trace.
   - A drain leaves the target holding nothing for any dataset, with no read going backwards.
   - Cancelling a drain leaves no partial copies and makes the target eligible again.
   - A drain never takes a range below its replica count.
   - The real-binary run completes a scale-out, a drain and a rolling restart with every invariant intact.
+
+#### B-64 — Appointed writer per namespace group, with a small controller log
+
+```
+Title:  Feature 🚀: Appointed writer per namespace group, controlled by a small root log (design and model first)
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+B-09b starts with one Raft group for the whole core region, so one leader orders every namespace. `future-development.md`
+proposes several Raft groups, each owning a set of namespaces. Independent election groups pay timers, heartbeats and
+elections per group, and moving a namespace between groups needs a single authority to decide it anyway. Enroute v0.4.0
+(`docs/internals/consensus.md`, `ledger-and-compute.md`) runs one log per repository without any of that: a small root
+Raft log is the controller and appoints each log's sequencer. This draft evaluates that shape against the plain
+multi-group design before anyone builds either. It is not needed until B-09b is implemented and hardened.
+
+**Describe the solution you'd like**
+Write and model-check the alternative, then decide:
+- **Controller.** The B-09b Raft group is the root. It records each writer group's replicas, sequencer and term, and the
+  namespace-to-group assignment. Only it changes them.
+- **Appointed sequencer.** A group's log has no timers, heartbeats or elections of its own; only its appointed sequencer
+  appends. Failure detection is per node, from real traffic (B-13), not per group.
+- **Failover.** The controller seals the group at term + 1 on its replicas; a seal raises the replica's fence and reports
+  where its log ends. After a majority answered, it appoints one of the most up-to-date answers with a compare-and-swap on the
+  root. A seal majority meets every commit majority, so the new sequencer holds every committed entry.
+- **Commit rule.** The commit point moves to the highest position a majority holds, only for a position of the
+  sequencer's own term. A new term starts with a no-op (Raft's rule against its Figure 8).
+- **Reads** that need the latest state check with a majority that the sequencer's term is still open.
+- **Fencing.** The B-11 publisher fence follows the appointed term, so a stale sequencer cannot publish an older manifest.
+- Output is a TLA+ specification and a written decision against N openraft groups (idle cost, failover time, what
+  `openraft` already gives, implementation risk). If appointed sequencers win, the implementation sits behind the write contract
+  B-09b defines. If not, record why and leave `future-development.md` as it is.
+
+**Describe alternatives you've considered**
+- Keep one group: simplest, and still the starting point.
+- N `openraft` groups as in `future-development.md`: reuses a library, but each group elects on its own.
+
+**Additional context**
+- **Implementation:** Design draft; no product code until the decision is accepted. Draft only, no GitHub issue created.
+  **Deferred:** this stays a draft and is not started until a GitHub issue is created for it. B-09b's single group comes
+  first, and B-65's multi-group support waits for this.
+- **Module:** `docs/spec/` first; later `lib/replication`.
+- **Reference:** Enroute v0.4.0 docs (reference only, no dependency). Namespace handoff between groups stays the separate
+  design in `future-development.md`.
+- **Depends on:** B-09b, B-11, B-23. A protocol change updates the TLA+ specification first.
+- **Acceptance criteria:**
+  - The specification checks failover, a stale sequencer, reads and fencing in TLC.
+  - Negative checks fail as stated: committing without a seal majority, appointing a replica that is not among the most up
+    to date, and counting a previous-term entry as committed each violate an invariant.
+  - A written decision exists. Nothing else is built before it.
+
+#### B-65 — Shared durable log store with one group-committed fsync
+
+```
+Title:  Feature 🚀: One durable log store per API node with a group-committed fsync for all writer groups
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+B-09b acknowledges a write once a majority has fsynced it, so fsync time is commit time and throughput depends on how
+many writes share one fsync. With one log file per group, many busy groups on a node would each sync on their own and
+destroy that batching. Enroute keeps one physical log store per node, with many logical logs, so one fsync covers every
+group written in a batch.
+
+**Describe the solution you'd like**
+- One log store per API node. Each writer group is a logical log under its group id: entries, hard state (term, fence,
+  vote, commit point) and where the log starts.
+- Concurrent writes from all groups join one batch and one fsync; a write is acknowledged only after the sync that covers it.
+- Recovery returns every group to its last durable position; a torn tail is discarded, never an acknowledged entry.
+- Truncation and purge per group follow B-09b's rule: only after a verified recoverable native checkpoint covers every affected
+  namespace.
+- Start with the single group of B-09b (concurrent writes of one group share an fsync). Support several group ids once
+  B-64 accepts them. If B-09b's log store already batches that way, this draft reduces to adding the group id.
+- Metrics: fsync batch size and fsync latency, with no group or namespace label.
+
+**Additional context**
+- **Implementation:** Shared core; draft only, no GitHub issue created.
+- **Module:** `lib/replication` log store, with direct filesystem access only in its adapter (B-23a). The simulation
+  adapter models buffered versus committed state.
+- **Depends on:** B-09b; B-64 for more than one group.
+- **Acceptance criteria:**
+  - Writes from several groups in one batch cost one fsync, measured.
+  - Crash tests kill during a batch and during a torn write; every acknowledged entry survives and each group recovers to a
+    consistent position.
+  - Deterministic simulation drives buffered-versus-committed loss with replayable seeds.
+  - Groups stay isolated: one group's truncation or damage does not alter another's log.
+
+#### B-66 — Safety versus discovery: stale or unreachable inputs may only cost availability
+
+```
+Title:  Feature 🚀: Audit and test that stale or unreachable discovery never breaks safety
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+Several parts learn who owns something, or where to send it, from sources that can be stale or unreachable: the cell
+membership view and regional directory (published by the relay majority), the relay peer lists in config, S3 for namespace
+opens and recent state, the current-leader view that clients and relays hold after a B-09b failover, and the Gateway's auth
+copy. The specifications already freeze without a relay majority (`Freeze` in `membership.tla` and `handoff.tla`) and
+decision 15 makes the Gateway fail closed within 30 seconds. There is no one statement of which inputs are safety-critical,
+and no test that every one failing costs only availability. Enroute states this separation explicitly: its object-store
+`cluster/` listing is only discovery, and safety lives in the root log.
+
+**Describe the solution you'd like**
+- A table in `docs/spec/`: each discovery input, its source, who uses it, what stale or unreachable can cause, and the
+  mechanism that keeps it safe (owner check, fence, term, freeze, fail-closed).
+- The rule: a stale or unreachable input may cause a retry, an error or a freeze. It never causes a second writer, a write
+  accepted by a non-owner, a read below its minimum revision, or a revoked key accepted past its bound.
+- Simulation scenarios in `tests/sim`, seeded and replayable, each checked against the writer:
+  - the regional directory stale on callers during a handoff;
+  - S3 unreachable on open and recent-state paths while relays are healthy;
+  - the old leader still addressed after a B-09b failover (its writes are rejected and never applied);
+  - a relay cut off from its parent while a Gateway depends on it.
+- Fix what this finds, each as a focused regression test. A protocol change updates the TLA+ specification first.
+
+**Additional context**
+- **Implementation:** Shared core audit plus tests; draft only, no GitHub issue created.
+- **Module:** `docs/spec/`, `tests/sim`, `tests/crash`.
+- **Depends on:** B-23. The leader scenario needs B-09b and the Gateway scenario needs B-57.
+- **Acceptance criteria:**
+  - Every input in the table has a mechanism, and a scenario or existing test that makes it fail.
+  - No scenario produces a second writer, a non-owner write, a read below its minimum revision or a stale key accepted.
+  - Failing seeds go to OPEN, then REGRESSIONS, with a focused test.
+
+#### B-67 — Explicit operator-controlled membership changes for the API Raft group
+
+```
+Title:  Feature 🚀: API Raft membership changes only by explicit operator command, with safety checks
+Labels: enhancement
+```
+
+**Is your feature request related to a problem? Please describe.**
+A node that is down looks the same as a node that is gone. Relay-derived membership removes a missing Quicksilver, KV or CDN
+node after a grace period, which is safe because their L2 and cache data is never the only copy. A B-09b voter is
+different: it may hold committed entries not yet SlateDB-durable (see B-09b's known limits), and removing a partitioned voter
+automatically would shrink the quorum. Enroute makes removal an explicit operator act for the same reason.
+
+**Describe the solution you'd like**
+- Voters are added, promoted and removed only by explicit commands on the API's authenticated control endpoint. No code path
+  changes voters because a node is unreachable or absent.
+- A new voter joins as a learner and is promoted only after it has caught up.
+- A removal is refused when it would leave fewer voters than the configured minimum, drop below distinct failure domains
+  (`node.location.failure_domain`, for example one availability zone per voter), or remove a voter that is still reachable
+  and has not been stopped or drained. A `force` flag overrides the last two for a lost node and is logged.
+- A removed voter that restarts cannot start an election, serve reads or publish.
+- A partitioned voter stays a voter: writes stop without a majority instead of the group shrinking itself.
+- The command-line front end is shared with the deferred operator CLI for drains; only the control endpoint is in scope here.
+
+**Describe alternatives you've considered**
+- Remove an absent voter after a grace period, as relay membership does: rejected for voters, as above.
+- Fixed voters in config only: simpler, but replacing a lost node would need a restart of the whole group.
+
+**Additional context**
+- **Implementation:** Shared core; draft only, no GitHub issue created.
+- **Module:** `lib/replication` plus the `api` crate.
+- **Depends on:** B-09b. Failure-domain checks reuse the placement helpers where they fit.
+- **Acceptance criteria:**
+  - No membership change happens without a command; simulation shows a long partition changes no voters.
+  - Each refusal above is tested, and `force` is logged.
+  - A learner is never promoted before it has caught up, and a removed voter cannot disturb the group after it restarts.
+  - A removal while the leader crashes leaves exactly one consistent membership, replayable per seed.
 
 ## 4. Open decisions
 
@@ -1855,6 +2032,29 @@ nodes in turn, with real binaries and writes running.
    It hashes `(namespace, key)` directly and uses no ranges or buckets (decisions 12, 13).
 5. **Cells.** A cell (one DC by default) has its own membership, placement directory, L2 and relays. No fixed bucket count
    caps its size (decision 13); the actual size is chosen for blast radius. Large sites run several cells.
+   Amended 2026-11-09: the cell's relays own authoritative membership, placement and drain state. Publishing, reading,
+   bootstrapping and recovering this control state must not require the central write API, upstream relays, Quicksilver,
+   S3 or another service. Acknowledged control writes must survive relay process restarts and publisher failover through
+   durable replication within the cell. A healthy cell-relay quorum can change membership and placement and accept or
+   cancel drains while every external service is unreachable. Without that quorum, new control writes fail; nodes keep
+   serving their last committed view. Already committed changes may still reach lagging nodes. Membership observations
+   continue to come from existing subscriber streams, and there is no new membership or placement epoch. Handoffs
+   still require verified range data and the existing readiness and revoke checks. The existing cell relays embed
+   a Raft quorum, using a separate durable local control store; no separate service is deployed. Internal Raft terms
+   fence leadership and are not membership or placement epochs. The protocol and implementation are described in
+   `docs/spec/membership.md` and `cell.tla`. This supersedes decision 13's API-backed publication path and B-21b's allowance for API drain
+   writes without a cell-relay quorum.
+   A cell behaves as an independent cluster. Its identity and local membership, placement, readiness and maintenance
+   decisions do not depend on the identities, number or arrangement of external relays and gateways between it and
+   the Writer. The cell boundary needs configured immediate upstream endpoints; intermediate routing and failover
+   belong to the transport layer. Replacing an external path must not reconfigure the cell's Raft group or reset its
+   directory, drain intent or applied product-data revisions. External gateways route requests to the cell; they do
+   not participate in its control quorum or decide its internal placement.
+   Product-data writes and upstream replication retain their existing contracts. Loss of every external path can
+   delay new product data and leave reads unable to meet a requested revision or freshness bound; it must not stop
+   local cluster management. Recovery through another path resumes from validated revisions, preserving the
+   Writer's order and original commit times. Cell consensus cannot substitute for missing product data or proof
+   of Writer freshness.
    Customer-KV misses read shared S3 namespace state; minimum-revision reads can use the home writer's recent-state path.
    There is no mandatory regional KV tier or origin cell. Moving client traffic between cells is out of scope for now.
 6. **Relay tree.** Relays form tiers in static config (region top → optional DC → cell). The downstream dials and the upstream
@@ -1865,7 +2065,8 @@ nodes in turn, with real binaries and writes running.
 8. **Observability policy.**
    - **Cardinality:** metrics are labelled only by low-cardinality dimensions (dataset, tier, cell, service, node). Anything per
      namespace, key, hash or subscriber goes through an introspection API, or a top-N metric.
-   - **End-to-end lag:** every event carries `committed_at`, set once by `bedrock-api` (B-08). Every hop reports `now - committed_at`
+   - **End-to-end lag:** every event carries `committed_at`, set once by its authoritative writer (`bedrock-api` for product data,
+     the cell Raft leader for control state). Every hop reports `now - committed_at`
      as a histogram, so write-to-anywhere latency needs no tracing infrastructure.
    - **Every draft names its metrics** in its solution or acceptance criteria, on top of the B-03 baseline (logging, metrics endpoint, health).
    - Relays expose per-namespace state through the B-18b introspection API.
@@ -1975,7 +2176,8 @@ nodes in turn, with real binaries and writes running.
       ranges per node and one component that decides and executes moves, reusing the existing majority publisher and the
       #41 / B-12b sibling stream.
     - **Cost:** relays become the most critical cell component; a wrong assignment affects the whole cell; placement freezes
-      without a majority; asymmetric relay partitions can flap assignments as they can flap membership. Relay-pushed interests
+      without a majority. Amendment 2026-11-09: embedded cell Raft serializes directory changes even with asymmetric relay
+      partitions; member observations can still differ during failover. Relay-pushed interests
       and revokes change `Relay.Session`. Estimated 2026-10-31 at about 10–14 weeks for one developer including
       specification and simulation; load-based splitting adds 3–4 weeks.
     - **Specification first:** `membership.tla` gains the directory writes and a single assigner; a handoff model checks that

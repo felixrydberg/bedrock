@@ -1,10 +1,27 @@
 use super::*;
+use crate::admin::Admin;
 use crate::health::storage::StorageHealth;
 use crate::storage::memory::MemoryEngine;
 use crate::storage::{
     ErrorContext, KeyRange, Scan, Snapshot, StorageError, StorageStats, WriteBatch,
 };
-use crate::transport::admin::Admin;
+
+#[test]
+fn relay_capabilities_keep_delivery_placement_and_fixed_namespaces_distinct() {
+    use capabilities::{
+        AUTH, CDN, KV, MEMBERSHIP, QUICKSILVER, namespaces, pushed, ranged_datasets,
+    };
+
+    assert!(pushed(QUICKSILVER) && pushed(AUTH) && pushed(CDN) && pushed(MEMBERSHIP));
+    assert!(!pushed(KV) && !pushed("unknown"));
+    assert_eq!(namespaces(AUTH), ["keys"]);
+    assert_eq!(
+        ranged_datasets("quicksilver").collect::<Vec<_>>(),
+        [QUICKSILVER]
+    );
+    assert_eq!(ranged_datasets("cdn").collect::<Vec<_>>(), [CDN]);
+    assert_eq!(ranged_datasets("kv").count(), 0);
+}
 
 #[test]
 fn namespace_ids_are_nul_free() {

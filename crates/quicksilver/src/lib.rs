@@ -1,4 +1,4 @@
-//! `bedrock-quicksilver`: hosts the `quicksilver` and `auth` datasets (control-plane data in relay-assigned L2 hash ranges).
+//! `bedrock-quicksilver`: hosts the `quicksilver` dataset (control-plane data in relay-assigned L2 hash ranges).
 
 mod namespaces {}
 mod operations {}
@@ -8,27 +8,16 @@ use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, Replic
 use bedrock_lib::health::storage::StorageHealth;
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
-use bedrock_lib::reconciliation::drain::{self, Hook};
 
 pub const DATASETS: &[Dataset] = &[
     // Routing and deployment metadata, complete in every datacenter (`kv.md` §4).
-    dataset("quicksilver", ReplicationPolicy::FullReplica, 60),
-    dataset("auth", ReplicationPolicy::OnDemand, 0),
-];
-
-const fn dataset(
-    name: &'static str,
-    replication: ReplicationPolicy,
-    l1_recent_window_seconds: u64,
-) -> Dataset {
     Dataset {
-        name,
+        name: datasets::capabilities::QUICKSILVER,
         defaults: Policy {
-            replication,
+            replication: ReplicationPolicy::FullReplica,
             cache: CachePolicy {
-                l1_recent_window_seconds,
-                // `full_replica` keeps the complete namespace in L2.
-                l2_eviction: !matches!(replication, ReplicationPolicy::FullReplica),
+                l1_recent_window_seconds: 60,
+                l2_eviction: false,
                 pinned_prefixes: Vec::new(),
             },
             budget: Budget {
@@ -37,14 +26,8 @@ const fn dataset(
                 disk_mb: None,
             },
         },
-    }
-}
-
-/// The drain hooks of `quicksilver` and `auth` (#68 / B-21b): both sit in L2 hash ranges, so a node drain is the ranges
-/// it is listed in, a cell drain has nothing to move, and one namespace is `Unsupported`.
-pub fn drain_hooks(view: &std::sync::Arc<membership::View>) -> Vec<std::sync::Arc<dyn Hook>> {
-    drain::ranged("quicksilver", view)
-}
+    },
+];
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
 /// Enabled datasets whose engines cannot open or are unhealthy at startup are skipped and keep the node unready until

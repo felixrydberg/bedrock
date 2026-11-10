@@ -22,8 +22,8 @@ use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 
+use crate::admin::Admin;
 use crate::storage::{StorageEngine, StorageError, StorageResult, WriteBatch};
-use crate::transport::admin::Admin;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
@@ -36,7 +36,8 @@ pub struct Event {
     pub sequence: u64,
     /// Writer epoch. Fencing belongs to the write path; appliers pass it on unchanged.
     pub epoch: u64,
-    /// Commit time in milliseconds since the Unix epoch. Set once by `bedrock-api`; every hop passes it on unchanged
+    /// Commit time in milliseconds since the Unix epoch. Set once by the authoritative writer (the API for product
+    /// data, the cell Raft leader for local control); every hop passes it on unchanged
     /// and reports `now - committed_at` as end-to-end lag.
     pub committed_at: u64,
     pub key: Vec<u8>,

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::placement::hash_of;
 use bedrock_lib::relays::Hub;
 use bedrock_lib::relays::replay::{Replay, ReplayConfig};
@@ -20,7 +21,6 @@ use bedrock_lib::storage::StorageEngine;
 use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::storage::rocksdb::{RocksDbAdapter, RocksDbOptions};
 use bedrock_lib::storage::sim::MemoryFactory;
-use bedrock_lib::transport::admin::Admin;
 use bedrock_lib::transport::{Class, Peers};
 use prost::Message;
 use tokio::sync::mpsc;

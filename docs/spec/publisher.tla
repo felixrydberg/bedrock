@@ -22,7 +22,8 @@ Refresh(r) == /\ view' = [view EXCEPT ![r] = [rev |-> rev + IF Bug = "ahead" THE
 Plan(r) == /\ rev < MaxRevision
            /\ inflight' = inflight \cup {[base |-> view[r].rev, stage |-> view[r].stage + 1]}
            /\ UNCHANGED <<rev, stage, view>>
-\* The writer accepts a write only at the revision it was planned from.
+\* Ordered application (the cell Raft state machine for membership/placement) accepts
+\* a write only at the service revision it was planned from.
 Land(w) == /\ inflight' = inflight \ {w}
            /\ IF Bug = "unconditional" \/ w.base = rev
                  THEN /\ rev < MaxRevision /\ rev' = rev + 1 /\ stage' = w.stage

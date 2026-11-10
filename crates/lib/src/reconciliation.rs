@@ -27,8 +27,8 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use tokio::time::{Instant, sleep, timeout};
 
+use crate::admin::Admin;
 use crate::monotonic_now;
-use crate::transport::admin::Admin;
 
 #[async_trait::async_trait]
 pub trait Reconcile: Send + Sync + 'static {

@@ -1,8 +1,8 @@
 //! Cell membership from relay subscriber streams (#15 / B-12, `docs/spec/membership.md`).
 //!
 //! A `bedrock-quicksilver`, `bedrock-kv` or `bedrock-cdn` process announces a [`pb::Member`] on its leaf relay session. Cell relays watch
-//! each other's connected lists over the sibling stream ([`crate::relays::siblings`]), and the lowest relay of a
-//! majority writes the union to dataset [`DATASET`], namespace `{service}.{cell}`, through `bedrock-api`. Nodes subscribe to that namespace
+//! each other's connected lists over the sibling stream ([`crate::relays::siblings`]). The cell's embedded Raft leader
+//! writes the union to dataset [`DATASET`], namespace `{service}.{cell}`, on a durable local quorum. Nodes subscribe to that namespace
 //! like any other ([`View`]). A disconnected node stays a member for the grace period, so failover to another cell
 //! relay changes nothing; a drained node leaves at once. Without a majority, or before the relay has caught up with
 //! the published view, nothing is written and the view freezes.
@@ -16,42 +16,31 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use http_body_util::{BodyExt, Full};
-use hyper::body::Bytes;
-use hyper::header::{AUTHORIZATION, HOST, IF_MATCH};
-use hyper_util::rt::TokioIo;
 use prost::Message;
 use tokio::time::Instant;
 use tonic::Status;
 
+use crate::datasets::capabilities::ranged_datasets;
 use crate::node::{MembershipSettings, ServiceConfig};
 use crate::placement::{self, Directory, Owner, State};
 use crate::reconciliation::drain::{self, Drain};
-use crate::relays::client::{Selection, Session, Target};
+use crate::relays::client::{Selection, Session, Target, applied_at};
 pub use crate::relays::siblings::Members;
 use crate::relays::siblings::{self, Siblings};
 use crate::relays::{Hub, IDLE, MemberKey};
 use crate::replication::pb;
 use crate::storage::memory::MemoryEngine;
-use crate::storage::{KeyRange, StorageEngine};
+use crate::storage::{KeyRange, Snapshot, StorageEngine};
 use crate::transport::Peers;
 
-pub const DATASET: &str = "membership";
+pub mod control;
+
+pub const DATASET: &str = crate::datasets::capabilities::MEMBERSHIP;
 /// Each service has its own namespace per cell; members of different services never mix.
-pub const SERVICES: [&str; 3] = ["quicksilver", "kv", "cdn"];
+pub use crate::datasets::capabilities::SERVICES;
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-plans at least this often, which is what expires grace periods.
 const RECONCILE: Duration = Duration::from_secs(1);
-/// Services whose L2 is placed in hash ranges, and the datasets each places; every dataset has its own ranges (§4
-/// decisions 13 and 14). Customer KV ranks its readers instead (#18 / B-15).
-const RANGED: [(&str, &[&str]); 2] = [("quicksilver", &["quicksilver", "auth"]), ("cdn", &["cdn"])];
-/// The datasets a service places in hash ranges; empty for a service that places none.
-pub fn ranged_datasets(service: &str) -> &'static [&'static str] {
-    RANGED
-        .iter()
-        .find(|(s, _)| *s == service)
-        .map_or(&[], |(_, datasets)| datasets)
-}
 /// Directory keys are `range/{dataset}/{start:016x}`; node IDs cannot contain `/`.
 const RANGE: &str = "range/";
 /// Dataset → its placement directory.
@@ -121,10 +110,18 @@ pub fn member(config: &ServiceConfig, service: &str) -> pb::Member {
 }
 
 /// One service's published members in a cell, held in memory; a restarted node bootstraps it again.
+#[derive(Clone)]
 struct Published {
     engine: Arc<MemoryEngine>,
     prefix: Vec<u8>,
 }
+
+type ServiceSnapshot = (
+    BTreeMap<String, pb::Member>,
+    Directories,
+    Vec<(String, Drain)>,
+    Option<u64>,
+);
 
 impl Published {
     fn new(service: &str, cell: &str) -> (Self, Target) {
@@ -148,6 +145,49 @@ impl Published {
         read(&*self.engine, &self.prefix)
     }
 
+    fn validated(
+        &self,
+        service: &str,
+        cell: &str,
+        hooks: &[Arc<dyn drain::Hook>],
+    ) -> Result<ServiceSnapshot, Status> {
+        let snapshot = self
+            .engine
+            .snapshot()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let (members, directory) = read_snapshot(&*snapshot, &self.prefix)?;
+        let records = read_drains(&*snapshot, &self.prefix)?;
+        for (id, record) in &records {
+            control::validate_drain(cell, service, id, record)?;
+            drain::validate(hooks, record).map_err(|error| Status::data_loss(error.to_string()))?;
+        }
+        let revision = applied_at(
+            &*snapshot,
+            DATASET,
+            &namespace(service, cell),
+            &self.prefix,
+            None,
+        )
+        .map_err(|error| Status::internal(error.to_string()))?;
+        Ok((members, directory, records, revision))
+    }
+
+    fn directory(&self, dataset: &str) -> Result<Directory, String> {
+        self.read()
+            .map(|(_, mut directories)| directories.remove(dataset).unwrap_or_default())
+            .map_err(|error| error.to_string())
+    }
+
+    /// The drain records written to this namespace. A record that does not decode is corruption, never a missing drain.
+    #[cfg(test)]
+    fn drains(&self) -> Result<Vec<(String, Drain)>, Status> {
+        let snapshot = self
+            .engine
+            .snapshot()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        read_drains(&*snapshot, &self.prefix)
+    }
+
     fn members(&self) -> Result<BTreeMap<String, pb::Member>, Status> {
         let scan = self
             .engine
@@ -157,7 +197,7 @@ impl Published {
         for entry in scan {
             let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
             let key = &key[self.prefix.len()..];
-            if key.starts_with(RANGE.as_bytes()) {
+            if key.starts_with(RANGE.as_bytes()) || key.starts_with(drain::PREFIX.as_bytes()) {
                 continue;
             }
             let key = String::from_utf8(key.to_vec())
@@ -170,6 +210,29 @@ impl Published {
     }
 }
 
+fn read_drains(
+    snapshot: &dyn Snapshot,
+    namespace_prefix: &[u8],
+) -> Result<Vec<(String, Drain)>, Status> {
+    let mut prefix = namespace_prefix.to_vec();
+    prefix.extend_from_slice(drain::PREFIX.as_bytes());
+    let scan = snapshot
+        .scan(&KeyRange::prefix(prefix))
+        .map_err(|e| Status::internal(e.to_string()))?;
+    let mut drains = Vec::new();
+    for entry in scan {
+        let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
+        let id = std::str::from_utf8(&key[namespace_prefix.len() + drain::PREFIX.len()..])
+            .map_err(|_| Status::data_loss("drain key is not UTF-8"))?
+            .to_owned();
+        drains.push((
+            id,
+            Drain::decode(&value).map_err(|e| Status::data_loss(e.to_string()))?,
+        ));
+    }
+    Ok(drains)
+}
+
 /// Node ID → entry, and the placement directories, as stored under `prefix` by a subscription to the membership
 /// namespace. An undecodable entry is corruption, never a missing one.
 /// Storage scan failures return an internal status; malformed keys or entries return a data-loss status.
@@ -177,15 +240,28 @@ pub(crate) fn read(
     engine: &dyn StorageEngine,
     prefix: &[u8],
 ) -> Result<(BTreeMap<String, pb::Member>, Directories), Status> {
+    let snapshot = engine
+        .snapshot()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    read_snapshot(&*snapshot, prefix)
+}
+
+fn read_snapshot(
+    snapshot: &dyn Snapshot,
+    prefix: &[u8],
+) -> Result<(BTreeMap<String, pb::Member>, Directories), Status> {
     let mut members = BTreeMap::new();
     let mut directories = Directories::new();
-    let scan = engine
+    let scan = snapshot
         .scan(&KeyRange::prefix(prefix.to_vec()))
         .map_err(|e| Status::internal(e.to_string()))?;
     for entry in scan {
         let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
         let key = String::from_utf8(key[prefix.len()..].to_vec())
             .map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
+        if key.starts_with(drain::PREFIX) {
+            continue;
+        }
         if let Some(range) = key.strip_prefix(RANGE) {
             let (dataset, start) = range
                 .split_once('/')
@@ -316,6 +392,11 @@ pub enum Change {
         dataset: String,
         start: u64,
     },
+    Drain {
+        service: String,
+        id: String,
+        record: Drain,
+    },
 }
 
 impl Change {
@@ -324,7 +405,8 @@ impl Change {
             Change::Set(member) => &member.service,
             Change::Delete((service, _))
             | Change::Range { service, .. }
-            | Change::Merge { service, .. } => service,
+            | Change::Merge { service, .. }
+            | Change::Drain { service, .. } => service,
         }
     }
 }
@@ -368,7 +450,7 @@ pub struct Observed<'a> {
 }
 
 /// The desired-vs-published diff of `docs/spec/membership.tla`. Advances this relay's absence clocks, then returns the
-/// writes only if this relay is the lowest of a live majority of the cell's relays.
+/// writes only with a live majority of the cell's relays. The caller must hold Raft leadership before committing it.
 pub fn plan(
     seen: &Observed,
     actual: &Members,
@@ -395,7 +477,7 @@ pub fn plan(
     for key in actual.keys().filter(|key| !held.contains_key(*key)) {
         absent.entry(key.clone()).or_insert(now);
     }
-    if !majority(seen) || live(seen).any(|relay| relay < seen.me) {
+    if !majority(seen) {
         return None;
     }
     let mut changes: Vec<_> = held
@@ -415,6 +497,19 @@ pub fn plan(
     Some(changes)
 }
 
+/// Followers still observe reconnects and restart absence clocks before they can publish again.
+fn publication_plan(
+    seen: &Observed,
+    actual: &Members,
+    absent: &mut BTreeMap<MemberKey, Instant>,
+    now: Instant,
+    grace: Duration,
+    leader: bool,
+) -> Option<Vec<Change>> {
+    let changes = plan(seen, actual, absent, now, grace);
+    if leader { changes } else { None }
+}
+
 /// This relay and its synced siblings.
 fn live<'a>(seen: &Observed<'a>) -> impl Iterator<Item = &'a str> {
     std::iter::once(seen.me).chain(
@@ -423,6 +518,29 @@ fn live<'a>(seen: &Observed<'a>) -> impl Iterator<Item = &'a str> {
             .filter(|(_, list)| list.is_some())
             .map(|(relay, _)| relay.as_str()),
     )
+}
+
+/// A failed service view must not create changes from live observations or retain stale absence clocks.
+fn retain_readable(
+    readable: &BTreeSet<&str>,
+    local: &mut Members,
+    remote: &mut BTreeMap<String, Option<Members>>,
+    absent: &mut BTreeMap<MemberKey, Instant>,
+) {
+    local.retain(|(service, _), _| readable.contains(service.as_str()));
+    for members in remote.values_mut().flatten() {
+        members.retain(|(service, _), _| readable.contains(service.as_str()));
+    }
+    absent.retain(|(service, _), _| readable.contains(service.as_str()));
+}
+
+fn validated_revision(snapshot: Option<u64>, applied: Option<u64>, empty: bool) -> Option<u64> {
+    match (snapshot, applied) {
+        (Some(snapshot), Some(applied)) if snapshot <= applied => Some(snapshot),
+        // A fresh validated empty stream has no persisted cursor until its first event or bootstrap.
+        (None, Some(0)) if empty => Some(0),
+        _ => None,
+    }
 }
 
 /// Whether this relay's live side is a strict majority of the cell's relays; without one, nothing is written.
@@ -440,18 +558,15 @@ pub fn place(
     ready: &siblings::Ready,
     drains: &[Drain],
 ) -> Vec<Change> {
-    let Some((_, datasets)) = RANGED.iter().find(|(s, _)| *s == service) else {
-        return Vec::new();
-    };
     let mut changes = Vec::new();
-    for dataset in *datasets {
+    for dataset in ranged_datasets(service) {
         let members: BTreeMap<_, _> = actual
             .iter()
             .filter(|((s, _), member)| s == service && member.datasets.iter().any(|d| d == dataset))
             .map(|((_, id), member)| (id.clone(), member.clone()))
             .collect();
         let empty = Directory::new();
-        let directory = directories.get(*dataset).unwrap_or(&empty);
+        let directory = directories.get(dataset).unwrap_or(&empty);
         let ready: BTreeSet<(String, u64)> = ready
             .iter()
             .filter(|(((s, _), d), _)| s == service && d == dataset)
@@ -486,13 +601,13 @@ pub fn place(
         };
         changes.extend(entries.into_iter().map(|(start, owners)| Change::Range {
             service: service.into(),
-            dataset: (*dataset).into(),
+            dataset: dataset.into(),
             start,
             owners,
         }));
         changes.extend(merges.into_iter().map(|start| Change::Merge {
             service: service.into(),
-            dataset: (*dataset).into(),
+            dataset: dataset.into(),
             start,
         }));
     }
@@ -510,6 +625,27 @@ fn owned(directory: &Directory, node: &str) -> Vec<pb::Span> {
         }
     }
     spans
+}
+
+/// A placement view and the exact membership revision captured with it.
+struct DirectoryAt {
+    revision: u64,
+    directories: Directories,
+}
+
+impl DirectoryAt {
+    fn ranges(&self, dataset: &str, node: &str) -> pb::Ranges {
+        let spans = self
+            .directories
+            .get(dataset)
+            .map(|directory| owned(directory, node))
+            .unwrap_or_default();
+        pb::Ranges {
+            dataset: dataset.into(),
+            revision: self.revision,
+            spans,
+        }
+    }
 }
 
 /// What a cell relay's publisher sees and does, for relay introspection (#17 / B-18b).
@@ -558,9 +694,8 @@ pub struct Cell {
     relays: Vec<String>,
     cell: String,
     grace: Duration,
-    api: String,
-    write_token: String,
-    peers: Arc<Peers>,
+    control: Arc<control::Control>,
+    drain_hooks: BTreeMap<String, Vec<Arc<dyn drain::Hook>>>,
 }
 
 impl Cell {
@@ -570,22 +705,27 @@ impl Cell {
     pub fn start(
         hub: Hub,
         peers: Arc<Peers>,
-        upstreams: Vec<String>,
         siblings: Arc<Siblings>,
         settings: &MembershipSettings,
         me: String,
         cell: String,
-        write_token: String,
+        control: Arc<control::Control>,
     ) -> Result<(tokio::task::JoinHandle<()>, Arc<Publisher>), Status> {
         let mut published = Vec::new();
         let mut targets = Vec::new();
+        let mut drain_hooks = BTreeMap::new();
         for service in SERVICES {
             let (view, target) = Published::new(service, &cell);
+            let hooks = drain::ranged_with(service, {
+                let view = view.clone();
+                move |dataset| view.directory(dataset)
+            });
+            drain_hooks.insert(service.to_owned(), hooks);
             published.push((service, view));
             targets.push(target);
         }
-        // The relay reads the published view through its own upstreams, like any subscriber.
-        let session = Session::start(peers.clone(), upstreams, targets)?;
+        // Bootstrap and delivery come from this relay's durable cell authority, never an upstream service.
+        let session = Session::start(peers, vec![me.clone()], targets)?;
         let relays = std::iter::once(me.clone())
             .chain(siblings.state().into_keys())
             .collect();
@@ -602,9 +742,8 @@ impl Cell {
             relays,
             cell,
             grace: Duration::from_millis(settings.grace_ms),
-            api: settings.api.clone(),
-            write_token,
-            peers,
+            control,
+            drain_hooks,
         };
         Ok((
             tokio::spawn(async move { cell.publish(session).await }),
@@ -629,34 +768,58 @@ impl Cell {
             }
             // Writing from a stale view could resurrect or remove the wrong entries; freeze instead.
             if !session.ready() {
+                // Reconnects may pass unseen while the local view is recovering; restart grace conservatively.
+                absent.clear();
                 continue;
             }
-            // Revisions first: an apply landing in between then makes a plan look older than it is, which only gets it
-            // refused. Writes carry them, so a delayed write or a second publisher cannot undo newer state.
-            let based: BTreeMap<String, u64> = published
-                .iter()
-                .map(|(service, _)| {
-                    let applied = session.applied(DATASET, &namespace(service, &self.cell));
-                    ((*service).to_owned(), applied.unwrap_or(0))
-                })
-                .collect();
+            // Read each directory, its drains and its cursor from one applied snapshot.
+            let mut based = BTreeMap::new();
             let mut actual = Members::new();
             let mut directories = Vec::new();
-            let read: Result<(), Status> = published.iter().try_for_each(|(service, view)| {
-                let (members, directory) = view.read()?;
+            let mut drains = BTreeMap::new();
+            let mut drain_records = BTreeMap::new();
+            let mut readable = BTreeSet::new();
+            for (service, view) in published {
+                let hooks = self
+                    .drain_hooks
+                    .get(*service)
+                    .map_or(&[][..], Vec::as_slice);
+                let (members, directory, records, revision) = match view
+                    .validated(service, &self.cell, hooks)
+                {
+                    Ok(read) => read,
+                    Err(error) => {
+                        tracing::warn!(%error, service, "published service unreadable; not publishing it");
+                        continue;
+                    }
+                };
+                let applied = session.applied(DATASET, &namespace(service, &self.cell));
+                let empty = members.is_empty() && directory.is_empty() && records.is_empty();
+                let Some(revision) = validated_revision(revision, applied, empty) else {
+                    continue;
+                };
+                based.insert((*service).to_owned(), revision);
+                readable.insert(*service);
+                drains.insert(
+                    *service,
+                    records.iter().map(|(_, record)| record.clone()).collect(),
+                );
+                drain_records.insert(*service, records);
                 for (id, member) in members {
                     actual.insert(((*service).into(), id), member);
                 }
-                directories.push((*service, directory));
-                Ok(())
-            });
-            if let Err(error) = read {
-                tracing::warn!(%error, "published membership unreadable; not publishing");
-                continue;
+                directories.push((
+                    *service,
+                    DirectoryAt {
+                        revision,
+                        directories: directory,
+                    },
+                ));
             }
-            let local = self.hub.members();
-            self.push(&local, &directories, &session);
-            let remote = self.siblings.state();
+            let mut local = self.hub.members();
+            let mut remote = self.siblings.state();
+            retain_readable(&readable, &mut local, &mut remote, &mut absent);
+            self.push(&local, &directories);
             let seen = Observed {
                 me: &self.me,
                 relays: &self.relays,
@@ -672,12 +835,15 @@ impl Cell {
                     (false, Some(_)) => {}
                 }
             }
-            let Some(mut changes) = plan(
+            // Every relay observes membership and pushes its committed view; only Raft's leader writes.
+            let term = self.control.term();
+            let Some(mut changes) = publication_plan(
                 &seen,
                 &actual,
                 &mut absent,
                 crate::monotonic_now(),
                 self.grace,
+                self.control.is_leader(),
             ) else {
                 continue;
             };
@@ -686,13 +852,41 @@ impl Cell {
                 // Readiness comes from each member's holding relay: this one, or a live sibling.
                 let mut ready = self.hub.ready();
                 ready.extend(self.siblings.ready());
-                for (service, directories) in &directories {
-                    changes.extend(place(service, &actual, directories, &ready, &[]));
+                for (service, snapshot) in &directories {
+                    let drains = drains.get(service).map_or(&[][..], Vec::as_slice);
+                    changes.extend(place(
+                        service,
+                        &actual,
+                        &snapshot.directories,
+                        &ready,
+                        drains,
+                    ));
+                }
+            }
+            if changes.is_empty() {
+                for (service, records) in &drain_records {
+                    let hooks = self
+                        .drain_hooks
+                        .get(*service)
+                        .map_or(&[][..], Vec::as_slice);
+                    for (id, record) in records {
+                        match drain::completed(hooks, record) {
+                            Ok(Some(record)) => changes.push(Change::Drain {
+                                service: (*service).to_owned(),
+                                id: id.clone(),
+                                record,
+                            }),
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::warn!(%error, service, id, "drain progress unavailable");
+                            }
+                        }
+                    }
                 }
             }
             let written = commit(changes, based, |change, base| async move {
                 tracing::debug!(relay = %self.me, base, ?change, "membership write");
-                match tokio::time::timeout(TIMEOUT, self.write(&change, base)).await {
+                match tokio::time::timeout(TIMEOUT, self.write(&change, base, term)).await {
                     Ok(Ok(revision)) => {
                         if matches!(change, Change::Range { .. } | Change::Merge { .. }) {
                             *self
@@ -728,98 +922,61 @@ impl Cell {
 
     /// Pushes each of this relay's leaf members in the cell the ranges it owns of each dataset its service places,
     /// from the published directory at the revision applied (#22 / B-21).
-    fn push(&self, local: &Members, directories: &[(&str, Directories)], session: &Session) {
+    fn push(&self, local: &Members, directories: &[(&str, DirectoryAt)]) {
         for ((service, node), member) in local {
-            let (Some((_, datasets)), Some((_, published))) = (
-                RANGED.iter().find(|(s, _)| s == service),
-                directories.iter().find(|(s, _)| s == service),
-            ) else {
-                continue;
-            };
-            let Some(revision) = session.applied(DATASET, &namespace(service, &self.cell)) else {
+            let Some((_, published)) = directories.iter().find(|(s, _)| s == service) else {
                 continue;
             };
             if member.cell != self.cell {
                 continue;
             }
-            for dataset in *datasets {
-                let spans = published
-                    .get(*dataset)
-                    .map(|directory| owned(directory, node))
-                    .unwrap_or_default();
-                let frame = pb::Ranges {
-                    dataset: (*dataset).into(),
-                    revision,
-                    spans,
-                };
+            for dataset in ranged_datasets(service) {
+                let frame = published.ranges(dataset, node);
                 self.hub
                     .push_ranges(&(service.clone(), node.clone()), frame);
             }
         }
     }
 
-    /// One write through `bedrock-api`; returns the committed revision.
-    /// Commits `change`, planned from revision `base` of its namespace.
-    async fn write(&self, change: &Change, base: u64) -> Result<u64, String> {
-        let (method, (service, key), body) = match change {
-            Change::Set(member) => (hyper::Method::PUT, key(member), member.encode_to_vec()),
-            Change::Delete(key) => (hyper::Method::DELETE, key.clone(), Vec::new()),
+    /// Commits a plan through the cell quorum, fenced by its original service revision and Raft leadership term.
+    async fn write(&self, change: &Change, base: u64, term: u64) -> Result<u64, String> {
+        let ((service, key), value) = match change {
+            Change::Set(member) => (key(member), Some(member.encode_to_vec())),
+            Change::Delete(key) => (key.clone(), None),
             Change::Range {
                 service,
                 dataset,
                 start,
                 owners,
             } => (
-                hyper::Method::PUT,
                 (service.clone(), format!("{RANGE}{dataset}/{start:016x}")),
-                encode(owners),
+                Some(encode(owners)),
             ),
             Change::Merge {
                 service,
                 dataset,
                 start,
             } => (
-                hyper::Method::DELETE,
                 (service.clone(), format!("{RANGE}{dataset}/{start:016x}")),
-                Vec::new(),
+                None,
             ),
+            Change::Drain {
+                service,
+                id,
+                record,
+            } => ((service.clone(), Drain::key(id)), Some(record.encode())),
         };
-        let uri = format!("/v1/{DATASET}/{}/{key}", namespace(&service, &self.cell));
-        let stream = self
-            .peers
-            .dial(&self.api)
+        self.control
+            .write(pb::ControlWrite {
+                namespace: namespace(&service, &self.cell),
+                key: key.into_bytes(),
+                value,
+                expected: Some(base),
+                idempotency_key: String::new(),
+                expected_term: term,
+            })
             .await
-            .map_err(|e| e.to_string())?;
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(|e| e.to_string())?;
-        tokio::spawn(connection);
-        let request = hyper::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header(HOST, &self.api)
-            .header(IF_MATCH, base)
-            .header(AUTHORIZATION, format!("Bearer {}", self.write_token))
-            .body(Full::new(Bytes::from(body)))
-            .map_err(|e| e.to_string())?;
-        let response = sender
-            .send_request(request)
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = response.status();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| e.to_string())?
-            .to_bytes();
-        let body = String::from_utf8_lossy(&body);
-        if !status.is_success() {
-            return Err(format!("{status}: {body}"));
-        }
-        body.trim()
-            .parse()
-            .map_err(|_| format!("unexpected response {body:?}"))
+            .map_err(|error| error.to_string())
     }
 }
 

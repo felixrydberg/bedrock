@@ -10,7 +10,7 @@ are deployment choices; this guide covers Kubernetes, Docker hosts and bare meta
 ## What the binaries do
 
 - **Off by default.** Without a `[tls]` section, a node speaks plaintext, logs a warning at startup and reports
-  `bedrock_transport_tls_enabled 0`.
+  `bedrock_transport_tls_enabled 0`. Production cell relays with `[membership]` require TLS and reject this configuration.
 - **Required once configured.** With `[tls]`, every node-to-node listener and connection uses TLS 1.3 with client
   certificates. Until the three files load, `/ready` stays false; after 60 seconds the process exits. It never falls
   back to plaintext.
@@ -46,6 +46,11 @@ Any CA works if each process's certificate has:
 
 Startup rejects a certificate that names another service, cell or node, or lacks the advertised host. Processes on one
 machine need one certificate each, since the service is part of the identity.
+
+Cell Raft voters additionally pin each address to a distinct certificate node ID in `[membership.voter_ids]`.
+Every voter uses the same complete map, including itself. A host SAN does not grant another process's voter identity,
+even when voters share a host or a certificate has multiple host SANs. Cell operator RPCs use the relay's mTLS listener
+and additionally require the bearer token.
 
 **CA rotation.** `[tls] ca` is a trust bundle distributed on its own, the same on every node, not the issuing CA
 that comes with each leaf certificate. Before any leaf is issued from a new CA, roll out a bundle holding both the old

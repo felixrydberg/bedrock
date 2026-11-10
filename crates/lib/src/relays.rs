@@ -64,10 +64,7 @@ fn selects(stream: &StreamKey, hash: u64) -> bool {
 
 /// Customer KV persists through the writer but has no pushed delivery contract.
 pub fn pushed(dataset: &str) -> bool {
-    matches!(
-        dataset,
-        "quicksilver" | "auth" | "cdn" | crate::membership::DATASET
-    )
+    crate::datasets::capabilities::pushed(dataset)
 }
 
 /// Whether a follow, or a sibling's interest, selects a pushed namespace or hash range.
@@ -89,6 +86,17 @@ pub fn tier_rank(tier: crate::node::Tier) -> u32 {
     }
 }
 
+/// A cell-local source of committed dataset history and coherent recovery views.
+pub trait LocalControlSource: Send + Sync {
+    fn validate_namespace(&self, cell: &str, namespace: &str) -> Result<(), Status>;
+    fn identity(&self) -> pb::ControlAck;
+    fn validate_peer(&self, peer: &pb::ControlAck) -> Result<(), Status>;
+    fn changed(&self) -> Arc<Watched<u64>>;
+    fn head(&self, namespace: &str) -> Result<u64, Status>;
+    fn read(&self, namespace: &str, from: u64, limit: usize) -> Result<Vec<Event>, Status>;
+    fn view(&self, namespace: &str) -> Result<crate::replication::materialized::View, Status>;
+}
+
 #[derive(Clone)]
 pub struct Hub(Arc<Inner>);
 
@@ -97,6 +105,7 @@ struct Inner {
     tier: u32,
     /// The relay's cell; with TLS, leaf callers must belong to it (B-55).
     cell: OnceLock<String>,
+    control: OnceLock<Arc<dyn LocalControlSource>>,
     peers: Arc<Peers>,
     upstreams: Vec<String>,
     replay_peers: Vec<String>,
@@ -241,6 +250,7 @@ impl Hub {
             id,
             tier,
             cell: OnceLock::new(),
+            control: OnceLock::new(),
             peers,
             upstreams,
             replay_peers,
@@ -270,6 +280,23 @@ impl Hub {
     pub fn with_cell(self, cell: String) -> Self {
         let _ = self.0.cell.set(cell);
         self
+    }
+    pub fn with_control(self, control: Arc<dyn LocalControlSource>) -> Self {
+        let _ = self.0.control.set(control);
+        self
+    }
+    /// Cell control never follows membership through the product replication hierarchy.
+    pub(super) fn external(&self, dataset: &str) -> bool {
+        dataset != crate::membership::DATASET || self.0.control.get().is_none()
+    }
+    fn local_control(&self, key: &Key) -> Result<Option<&Arc<dyn LocalControlSource>>, Status> {
+        if self.external(&key.0) {
+            return Ok(None);
+        }
+        if let Some(control) = self.0.control.get() {
+            control.validate_namespace(self.cell(), &key.1)?;
+        }
+        Ok(self.0.control.get())
     }
     fn cell(&self) -> &str {
         self.0.cell.get().map_or("", String::as_str)
@@ -496,6 +523,11 @@ impl Hub {
             .clone()
     }
     fn source_head(&self, key: &Key) -> Option<u64> {
+        match self.local_control(key) {
+            Ok(Some(control)) => return control.head(&key.1).ok(),
+            Err(_) => return None,
+            Ok(None) => {}
+        }
         if let Some(writer) = &self.0.writer {
             return Some(writer.log().head(&key.0, &key.1).get());
         }
@@ -956,6 +988,23 @@ impl Hub {
         self.observe_head(&key, sequence);
     }
     async fn read(&self, key: &Key, from: u64) -> Result<Vec<Encoded>, Status> {
+        if let Some(control) = self.local_control(key)? {
+            return control.read(&key.1, from, 256).map(|events| {
+                events
+                    .into_iter()
+                    .map(|e| {
+                        let hash = hash_of(&e.dataset, &e.namespace, &e.key);
+                        (
+                            e.sequence,
+                            EncodedEvent {
+                                bytes: Bytes::from(pb::Event::from(e).encode_to_vec()),
+                                hash,
+                            },
+                        )
+                    })
+                    .collect()
+            });
+        }
         if let Some(writer) = &self.0.writer {
             return writer
                 .log()
@@ -1016,6 +1065,10 @@ impl Hub {
                 &key,
                 Status::invalid_argument("invalid pushed subscription scope"),
             );
+            return;
+        }
+        if let Err(error) = self.local_control(&key.0) {
+            self.error(id, &key, error);
             return;
         }
         match key.1.filter(|_| follow.namespace.is_empty()) {
@@ -1112,6 +1165,8 @@ impl Hub {
         visited: Vec<String>,
         force: bool,
     ) -> Result<(), Status> {
+        let control = self.local_control(&key.0)?.cloned();
+        let control_changes = control.as_ref().map(|control| control.changed());
         let opened = crate::monotonic_now();
         let Some((changes, mut moved)) =
             self.0.subscribers.lock().unwrap().get(&id).and_then(|s| {
@@ -1126,6 +1181,7 @@ impl Hub {
         let mut announced = false;
         let mut forced = force;
         let mut lease: Option<Arc<RecoveryLease>> = None;
+        let mut local_recovery = false;
         let mut renewed_through = 0;
         let mut recovery_permit = None;
         // One timer for the whole stream: a new sleep on every pass leaves one behind per event, for its full length (B-61).
@@ -1136,11 +1192,16 @@ impl Hub {
         let arrival = self.arrival(&key.0);
         loop {
             let arrived = arrival.get();
+            let control_version = control_changes.as_ref().map(|changed| changed.get());
             let local_version = changes.get();
             let Some((from, acked)) = self.current(id, &key, generation) else {
                 return Ok(());
             };
-            let h = self.source_head(&key.0);
+            let h = if let Some(control) = &control {
+                Some(control.head(&key.0.1)?)
+            } else {
+                self.source_head(&key.0)
+            };
             if let Some(at) = moved
                 && h.is_some_and(|head| acked >= head)
             {
@@ -1148,12 +1209,15 @@ impl Hub {
                 moved = None;
             }
             if !announced && let Some(head) = h {
-                let ranges = self
-                    .0
-                    .replay
-                    .as_ref()
-                    .map(|r| r.ranges(&key.0.0, &key.0.1))
-                    .unwrap_or_default();
+                let ranges = if control.is_some() {
+                    Vec::new()
+                } else {
+                    self.0
+                        .replay
+                        .as_ref()
+                        .map(|r| r.ranges(&key.0.0, &key.0.1))
+                        .unwrap_or_default()
+                };
                 let (first, last) = ranges.first().copied().unwrap_or((0, 0));
                 if !self
                     .send_scoped(
@@ -1175,6 +1239,28 @@ impl Hub {
                     return Ok(());
                 }
                 announced = true;
+            }
+            if local_recovery && h.is_some_and(|head| acked >= head) {
+                if !self
+                    .send_scoped(
+                        id,
+                        &key,
+                        generation,
+                        pb::relay_frame::Kind::Range(pb::ReplayRange {
+                            dataset: key.0.0.clone(),
+                            namespace: key.0.1.clone(),
+                            head: h.unwrap_or(0),
+                            recovered: true,
+                            span: span(key.1),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+                local_recovery = false;
+                drop(recovery_permit.take());
             }
             if let Some(pin) = &lease {
                 if !pin.valid() {
@@ -1293,6 +1379,21 @@ impl Hub {
                         continue;
                     }
                     Err(error) if error.code() == tonic::Code::OutOfRange => {
+                        if let Some(control) = &control {
+                            if recovery_permit.is_none() {
+                                recovery_permit = Some(self.recovery_permit().await?);
+                            }
+                            let view = control.view(&key.0.1)?;
+                            let boundary = view.sequence;
+                            if !self.control_bootstrap(id, &key, generation, view).await? {
+                                return Ok(());
+                            }
+                            self.advance(id, &key, generation, boundary);
+                            self.baseline(id, &key, generation, boundary);
+                            local_recovery = true;
+                            forced = false;
+                            continue;
+                        }
                         if let Some(writer) = &self.0.writer {
                             recovery_permit = Some(self.recovery_permit().await?);
                             let (view, pin) = writer
@@ -1432,7 +1533,12 @@ impl Hub {
                     _ => {}
                 }
             }
-            if let Some(writer) = &self.0.writer {
+            if let Some(changed) = &control_changes {
+                tokio::select! {biased;
+                    _=changes.wait_until(|v|*v!=local_version)=>{},
+                    _=changed.wait_until(|v|Some(*v)!=control_version)=>{},
+                }
+            } else if let Some(writer) = &self.0.writer {
                 let head = writer.log().head(&key.0.0, &key.0.1);
                 tokio::select! {biased;
                     _=changes.wait_until(|v|*v!=local_version)=>{},
@@ -1447,6 +1553,107 @@ impl Hub {
                 }
             }
         }
+    }
+
+    /// A coherent cell snapshot needs no writer recovery lease: a trimmed tail restarts here.
+    async fn control_bootstrap(
+        &self,
+        id: u64,
+        key: &StreamKey,
+        generation: u64,
+        view: crate::replication::materialized::View,
+    ) -> Result<bool, Status> {
+        let mut hash =
+            client::bootstrap_digest(&key.0.0, &key.0.1, view.sequence, view.committed_at);
+        let base = pb::Bootstrap {
+            dataset: key.0.0.clone(),
+            namespace: key.0.1.clone(),
+            boundary: view.sequence,
+            committed_at: view.committed_at,
+            span: span(key.1),
+            ..Default::default()
+        };
+        if !self
+            .send_scoped(
+                id,
+                key,
+                generation,
+                pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                    begin: true,
+                    ..base.clone()
+                }),
+            )
+            .await
+        {
+            return Ok(false);
+        }
+        let mut entries = Vec::new();
+        let mut bytes = base.encoded_len() + 128;
+        for (k, v) in view.values {
+            if !selects(key, hash_of(&key.0.0, &key.0.1, &k)) {
+                continue;
+            }
+            let entry = pb::StateEntry { key: k, value: v };
+            let size = entry.encoded_len() + 16;
+            if base.encoded_len().saturating_add(128).saturating_add(size) > MAX_BYTES {
+                return Err(Status::resource_exhausted(
+                    "cell state entry cannot fit bounded bootstrap frame",
+                ));
+            }
+            if !entries.is_empty()
+                && (entries.len() >= 256 || bytes.saturating_add(size) > 64 * 1024)
+            {
+                if !self
+                    .send_scoped(
+                        id,
+                        key,
+                        generation,
+                        pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                            entries: std::mem::take(&mut entries),
+                            ..base.clone()
+                        }),
+                    )
+                    .await
+                {
+                    return Ok(false);
+                }
+                bytes = base.encoded_len() + 128;
+                tokio::task::yield_now().await;
+            }
+            for part in [&entry.key, &entry.value] {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part);
+            }
+            bytes = bytes.saturating_add(size);
+            entries.push(entry);
+        }
+        if !entries.is_empty()
+            && !self
+                .send_scoped(
+                    id,
+                    key,
+                    generation,
+                    pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                        entries,
+                        ..base.clone()
+                    }),
+                )
+                .await
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .send_scoped(
+                id,
+                key,
+                generation,
+                pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                    end: true,
+                    checksum: hash.finalize().to_vec(),
+                    ..base
+                }),
+            )
+            .await)
     }
 
     /// A slot among this relay's concurrent recoveries. Waiting keeps them moving: a refusal costs the subscriber its next
@@ -1686,8 +1893,16 @@ impl Hub {
         let mut namespaces = BTreeMap::new();
         let mut datasets = BTreeSet::new();
         for sub in self.0.subscribers.lock().unwrap().values() {
-            datasets.extend(sub.ranges.iter().map(|(dataset, _)| dataset.clone()));
+            datasets.extend(
+                sub.ranges
+                    .iter()
+                    .filter(|(dataset, _)| self.external(dataset))
+                    .map(|(dataset, _)| dataset.clone()),
+            );
             for ((key, _), interest) in &sub.follows {
+                if !self.external(&key.0) {
+                    continue;
+                }
                 namespaces
                     .entry(key.clone())
                     .and_modify(|from: &mut u64| *from = (*from).min(interest.from))
@@ -1704,6 +1919,9 @@ impl Hub {
         let (mut namespaces, mut datasets) = self.own();
         let (followed, _) = self.derived(&namespaces, &datasets);
         for follow in followed {
+            if !self.external(&follow.dataset) {
+                continue;
+            }
             let ranged = follow.namespace.is_empty();
             let scopes = if ranged {
                 self.namespaces(&follow.dataset)

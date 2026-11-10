@@ -981,9 +981,14 @@ impl Disks {
         engines
             .entry(key)
             .or_insert_with(|| {
-                // The replay log stays correct: a bug belongs to what applies a dataset.
-                let bug = self.bug.filter(|_| name != "replay");
-                let engine = SimEngine::new(name, self.faults.clone(), bug, self.losable);
+                // Applier bugs and cache-tail loss target disposable replicas, not the cell's fsynced Raft authority.
+                let bug = self.bug.filter(|_| name != "replay" && name != "control");
+                let engine = SimEngine::new(
+                    name,
+                    self.faults.clone(),
+                    bug,
+                    self.losable && name != "control",
+                );
                 Arc::new(engine.recorded(self.fingerprint.clone()))
             })
             .clone()

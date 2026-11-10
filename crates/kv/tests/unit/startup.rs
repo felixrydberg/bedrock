@@ -35,12 +35,22 @@ fn hosts_no_datasets() {
 }
 
 #[test]
-fn a_kv_drain_has_nothing_to_move_for_any_scope_and_namespace() {
-    use bedrock_lib::reconciliation::drain::Outcome;
+fn kv_drains_fail_closed_until_reader_lifecycle_exists() {
+    use bedrock_lib::reconciliation::drain::{self, Drain, Scope, State};
+    let hooks = drain::ranged_with("kv", |_| unreachable!());
     for scope in [Scope::Node("kv-1".into()), Scope::Cell("eu-1a".into())] {
         for namespace in [None, Some("customer")] {
-            assert_eq!(Readers.drain(&scope, namespace), Ok(Outcome::NothingToMove));
+            let record = Drain {
+                scope: scope.clone(),
+                datasets: Vec::new(),
+                namespace: namespace.map(str::to_owned),
+                state: State::Draining,
+                rate: 1,
+            };
+            assert!(matches!(
+                drain::validate(&hooks, &record),
+                Err(drain::Error::Unsupported { .. })
+            ));
         }
     }
-    assert_eq!(drain_hooks().len(), 1);
 }

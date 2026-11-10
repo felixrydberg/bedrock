@@ -35,10 +35,11 @@ services:
     profiles: [relay]
     build: { context: .., dockerfile: deploy/Dockerfile, args: { BIN: bedrock-relay } }
     image: bedrock-relay
-    volumes: [/var/lib/bedrock/relay:/data, ./config/relay.toml:/etc/bedrock/config.toml:ro]
+    volumes: [/var/lib/bedrock/relay:/data, ./config/relay.toml:/etc/bedrock/config.toml:ro, ./tls/relay:/etc/bedrock/tls:ro]
     environment:
-      # Cell relays publish membership through the write API.
-      BEDROCK_WRITE_TOKEN: "${BEDROCK_WRITE_TOKEN:?Set a random write API bearer token}"
+      # Cell membership uses Raft; this token authorizes operator drain writes over mTLS.
+      # Issue this relay's certificate and CA bundle into deploy/tls/relay before startup.
+      BEDROCK_WRITE_TOKEN: "${BEDROCK_WRITE_TOKEN:?Set a random cell operator bearer token}"
     cpus: 1
     mem_limit: 2g
 

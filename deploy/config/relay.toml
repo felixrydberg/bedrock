@@ -15,20 +15,32 @@ replay_peers = ["relay-eu-1a-2:7300", "relay-eu-1a-3:7300"]
 region = "eu"
 dc = "eu-1"
 cell = "eu-1a"
+# Optional rack/power domain; it may differ among relays in the same cell.
+# failure_domain = "rack-1"
 
 # Cell membership (B-12), cell tier only. The cell's relays are this one and its replay_peers; publishing needs a
-# majority, so run at least three. The write credential comes from BEDROCK_WRITE_TOKEN.
+# majority, so run at least three. Membership, placement and drains use their local control stores, not the API.
+# BEDROCK_WRITE_TOKEN optionally authenticates operator drain writes to this relay.
 [membership]
-api = "api.core:7002"
+# Set true only for deliberate first creation of an empty cell quorum, then disable it.
+# A replacement disk must recover existing control state before it can vote.
+bootstrap = false
 grace_ms = 20000
+
+# Identical on every voter; values are certificate URI node IDs, not host names.
+[membership.voter_ids]
+"relay-eu-1a-1:7300" = "relay-eu-1a-1"
+"relay-eu-1a-2:7300" = "relay-eu-1a-2"
+"relay-eu-1a-3:7300" = "relay-eu-1a-3"
 
 [replay]
 max_bytes = 1073741824
 window_ms = 300000
 # Region/DC defaults are 3600000/900000 ms. Higher dataset priorities retain longer.
 
-# Mutual TLS between nodes (B-55); unset means plaintext. Issuing the files: docs/deployment/security.md.
-# [tls]
-# cert = "/etc/bedrock/tls/tls.crt"
-# key = "/etc/bedrock/tls/tls.key"
-# ca = "/etc/bedrock/tls/ca.crt"
+# Mutual TLS is required for production cell membership, including operator writes.
+# Issuing the files: docs/deployment/security.md.
+[tls]
+cert = "/etc/bedrock/tls/tls.crt"
+key = "/etc/bedrock/tls/tls.key"
+ca = "/etc/bedrock/tls/ca.crt"
