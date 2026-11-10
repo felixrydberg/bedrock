@@ -35,6 +35,7 @@ fn subscribe(
             follow: 0,
             baseline: from - 1,
             confirming: false,
+            bootstrap_acked: false,
             target: None,
             woken: Default::default(),
         };

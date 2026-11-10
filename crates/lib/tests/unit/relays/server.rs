@@ -74,6 +74,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             follow: id + 100,
             baseline: 0,
             confirming: false,
+            bootstrap_acked: false,
             target: None,
             woken: Default::default(),
         },
@@ -315,10 +316,12 @@ async fn cell_membership_uses_local_control_despite_central_history_and_unavaila
     task.abort();
 }
 
-/// A cell at head 5 whose committed view is always coherent; nothing ever changes.
-struct StillCell(Arc<Watched<u64>>);
+struct RecoveryCell {
+    head: Arc<Watched<u64>>,
+    advance_during_bootstrap: bool,
+}
 
-impl LocalControlSource for StillCell {
+impl LocalControlSource for RecoveryCell {
     fn validate_namespace(&self, _: &str, _: &str) -> Result<(), Status> {
         Ok(())
     }
@@ -329,34 +332,46 @@ impl LocalControlSource for StillCell {
         Ok(())
     }
     fn changed(&self) -> Arc<Watched<u64>> {
-        self.0.clone()
+        self.head.clone()
     }
     fn head(&self, _: &str) -> Result<u64, Status> {
-        Ok(5)
+        Ok(self.head.get())
     }
-    fn read(&self, _: &str, _: u64, _: usize) -> Result<Vec<Event>, Status> {
-        Ok(Vec::new())
+    fn read(&self, namespace: &str, from: u64, _: usize) -> Result<Vec<Event>, Status> {
+        Ok((from..=self.head.get())
+            .map(|sequence| Event {
+                dataset: "membership".into(),
+                namespace: namespace.into(),
+                ..replay_event(sequence)
+            })
+            .collect())
     }
     fn view(&self, namespace: &str) -> Result<crate::replication::materialized::View, Status> {
+        let sequence = self.head.get();
+        if self.advance_during_bootstrap {
+            self.head.update(|head| *head += 1);
+        }
         Ok(crate::replication::materialized::View {
             dataset: "membership".into(),
             namespace: namespace.into(),
-            sequence: 5,
+            sequence,
             committed_at: 1234,
             values: Default::default(),
             retries: Default::default(),
-            pruned_through: 5,
+            pruned_through: sequence,
             raft: None,
         })
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_cell_recovery_never_acknowledged_gives_up_its_slot() {
+fn cell_recovery(boundary: u64, advance_during_bootstrap: bool) -> (Hub, Frames, StreamKey) {
     let hub = hub()
         .with_cell("cell".into())
-        .with_control(Arc::new(StillCell(Arc::new(Watched::new(0)))));
-    let (_frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+        .with_control(Arc::new(RecoveryCell {
+            head: Arc::new(Watched::new(boundary)),
+            advance_during_bootstrap,
+        }));
+    let (frames, _) = subscriber(&hub, 1, MAX_EVENTS);
     let key = (("membership".into(), "kv.cell".into()), None);
     {
         let mut subscribers = hub.0.subscribers.lock().unwrap();
@@ -366,6 +381,13 @@ async fn a_cell_recovery_never_acknowledged_gives_up_its_slot() {
             .unwrap();
         follows.insert(key.clone(), interest);
     }
+    (hub, frames, key)
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn a_cell_recovery_never_acknowledged_gives_up_its_slot() {
+    let (hub, _frames, key) = cell_recovery(5, false);
     let permits = hub.0.recoveries.available_permits();
     let pumping = hub.clone();
     let task = tokio::spawn(async move { pumping.pump(1, key, 1, Vec::new(), true).await });
@@ -379,6 +401,65 @@ async fn a_cell_recovery_never_acknowledged_gives_up_its_slot() {
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
     assert_eq!(hub.0.recoveries.available_permits(), permits);
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn a_cell_bootstrap_ack_renews_recovery_while_the_tail_is_pending() {
+    for boundary in [0, 5] {
+        bootstrap_ack_renews_recovery(boundary).await;
+    }
+}
+
+async fn bootstrap_ack_renews_recovery(boundary: u64) {
+    let (hub, mut frames, key) = cell_recovery(boundary, true);
+    let head = boundary + 1;
+    let permits = hub.0.recoveries.available_permits();
+    let pumping = hub.clone();
+    let task = tokio::spawn(async move { pumping.pump(1, key, 1, Vec::new(), true).await });
+    let mut next = async || {
+        tokio::time::timeout(PROGRESS, tokio_stream::StreamExt::next(&mut frames))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .kind
+            .unwrap()
+    };
+    loop {
+        if let pb::relay_frame::Kind::Bootstrap(chunk) = next().await
+            && chunk.end
+        {
+            assert_eq!(chunk.boundary, boundary);
+            break;
+        }
+    }
+
+    assert!(
+        matches!(next().await, pb::relay_frame::Kind::Delivery(d) if (d.from, d.through) == (head, head))
+    );
+    let acknowledge = |applied| {
+        hub.acknowledge(
+            1,
+            pb::Ack {
+                dataset: "membership".into(),
+                namespace: "kv.cell".into(),
+                applied,
+                span: None,
+            },
+        );
+    };
+    tokio::time::sleep(IDLE / 2).await;
+    acknowledge(boundary);
+    tokio::time::sleep(IDLE / 2 + PROGRESS + Duration::from_secs(1)).await;
+    assert_eq!(hub.0.recoveries.available_permits(), permits - 1);
+
+    acknowledge(head);
+    assert!(
+        matches!(next().await, pb::relay_frame::Kind::Range(r) if r.recovered && r.head == head)
+    );
+    assert_eq!(hub.0.recoveries.available_permits(), permits);
+    task.abort();
 }
 
 #[tokio::test]
@@ -453,7 +534,7 @@ async fn bootstrap_boundary_does_not_consume_the_event_acknowledgement_window() 
     hub.advance(1, &key, 1, 100_000);
     hub.baseline(1, &key, 1, 100_000);
     assert_eq!(hub.outstanding(1, &key), 0);
-    assert_eq!(hub.current(1, &key, 1), Some((100_001, 0)));
+    assert_eq!(hub.current(1, &key, 1), Some((100_001, 0, false)));
     hub.advance(1, &key, 1, 100_256);
     assert_eq!(hub.outstanding(1, &key), 256);
 }
@@ -480,6 +561,7 @@ async fn unsubscribe_wakes_a_full_window_without_dropping_other_interests() {
                 follow: 0,
                 baseline: 0,
                 confirming: false,
+                bootstrap_acked: false,
                 target: None,
                 woken: Default::default(),
             },
@@ -839,6 +921,7 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
         follow: 0,
         baseline: 0,
         confirming: false,
+        bootstrap_acked: false,
         target: None,
         woken: Default::default(),
     };

@@ -166,6 +166,8 @@ struct Interest {
     baseline: u64,
     /// A bootstrap was sent and its recovered confirmation not yet.
     confirming: bool,
+    /// Acknowledgement of the queued bootstrap end, including when the revision did not advance.
+    bootstrap_acked: bool,
     /// The head this stream must be acknowledged through to count as ready, fixed when it first could.
     target: Option<u64>,
     /// Wakes this stream's pump: its acknowledgements and its end. A subscriber-wide signal would wake every stream the
@@ -759,6 +761,7 @@ impl Hub {
                         interest.from = from;
                         if let Some(baseline) = baseline {
                             interest.baseline = baseline;
+                            interest.bootstrap_acked = false;
                         }
                     }
                     if let Some(confirming) = confirming {
@@ -784,7 +787,7 @@ impl Hub {
             }
         }
     }
-    fn current(&self, id: u64, key: &StreamKey, generation: u64) -> Option<(u64, u64)> {
+    fn current(&self, id: u64, key: &StreamKey, generation: u64) -> Option<(u64, u64, bool)> {
         self.0
             .subscribers
             .lock()
@@ -793,7 +796,7 @@ impl Hub {
             .follows
             .get(key)
             .filter(|f| f.generation == generation)
-            .map(|f| (f.from, f.acked))
+            .map(|f| (f.from, f.acked, f.bootstrap_acked))
     }
     /// Where a recovery asks its next source to start, and whether that is a full recovery. A bootstrap sent but not yet
     /// confirmed makes it one: only a full recovery ends in the confirmation the subscriber is waiting for.
@@ -874,6 +877,9 @@ impl Hub {
             if let Some(interest) = sub.follows.get_mut(&key) {
                 if ack.applied < interest.from {
                     interest.acked = interest.acked.max(ack.applied);
+                    if interest.confirming && ack.applied >= interest.baseline {
+                        interest.bootstrap_acked = true;
+                    }
                 }
                 interest.woken.update(|v| *v = v.wrapping_add(1));
             }
@@ -1130,6 +1136,7 @@ impl Hub {
                     follow,
                     baseline: from.max(1) - 1,
                     confirming: false,
+                    bootstrap_acked: false,
                     target: None,
                     woken: Arc::default(),
                 },
@@ -1183,6 +1190,7 @@ impl Hub {
         let mut lease: Option<Arc<RecoveryLease>> = None;
         let mut local_recovery = false;
         let mut renewed_through = 0;
+        let mut local_renewed_through = None;
         let mut local_deadline = crate::monotonic_now();
         let mut recovery_permit = None;
         // One timer for the whole stream: a new sleep on every pass leaves one behind per event, for its full length (B-61).
@@ -1195,7 +1203,7 @@ impl Hub {
             let arrived = arrival.get();
             let control_version = control_changes.as_ref().map(|changed| changed.get());
             let local_version = changes.get();
-            let Some((from, acked)) = self.current(id, &key, generation) else {
+            let Some((from, acked, bootstrap_acked)) = self.current(id, &key, generation) else {
                 return Ok(());
             };
             let h = if let Some(control) = &control {
@@ -1243,8 +1251,8 @@ impl Hub {
             }
             if local_recovery {
                 // Like the writer's lease: acknowledgement progress renews the slot, silence for IDLE gives it up.
-                if acked > renewed_through {
-                    renewed_through = acked;
+                if local_renewed_through.map_or(bootstrap_acked, |through| acked > through) {
+                    local_renewed_through = Some(acked);
                     local_deadline = crate::monotonic_now() + IDLE;
                 } else if crate::monotonic_now() >= local_deadline {
                     return Err(Status::deadline_exceeded(
@@ -1403,7 +1411,7 @@ impl Hub {
                             self.advance(id, &key, generation, boundary);
                             self.baseline(id, &key, generation, boundary);
                             local_recovery = true;
-                            renewed_through = boundary;
+                            local_renewed_through = None;
                             local_deadline = crate::monotonic_now() + IDLE;
                             forced = false;
                             continue;
@@ -1800,7 +1808,7 @@ impl Hub {
                             }
                             if !recovering && self
                                 .current(id, key, generation)
-                                .is_some_and(|(from, acked)| {
+                                .is_some_and(|(from, acked, _)| {
                                     from > range.head && acked >= range.head
                                 })
                             {
@@ -1815,7 +1823,7 @@ impl Hub {
                             self.advance(id, key, generation, through);
                             tokio::time::timeout(IDLE, async {
                                 loop {
-                                    let Some((_, acked)) = self.current(id, key, generation)
+                                    let Some((_, acked, _)) = self.current(id, key, generation)
                                     else {
                                         return Err(Status::cancelled("subscription closed"));
                                     };
@@ -1859,7 +1867,7 @@ impl Hub {
                                 // Keep this connection (and its lease) until downstream install is acknowledged.
                                 tokio::time::timeout(IDLE, async {
                                     loop {
-                                        let Some((_, acked)) = self.current(id, key, generation)
+                                        let Some((_, acked, _)) = self.current(id, key, generation)
                                         else {
                                             return Ok(());
                                         };
