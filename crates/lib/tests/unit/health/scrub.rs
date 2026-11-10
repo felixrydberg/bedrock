@@ -2,12 +2,12 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use super::*;
+use crate::admin::Admin;
 use crate::health::storage::{State, StorageHealth};
 use crate::storage::memory::MemoryEngine;
 use crate::storage::{
     ErrorContext, Scan, Snapshot, StorageError, StorageStats, WriteBatch, l2_key,
 };
-use crate::transport::admin::Admin;
 
 const ENGINE: &str = "engine";
 

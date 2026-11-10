@@ -58,6 +58,14 @@ impl NamespaceFactory for Factory {
 
 #[async_trait]
 impl NamespaceDatabase for Database {
+    async fn snapshot(
+        &self,
+        prefix: &[u8],
+        lifetime: std::time::Duration,
+    ) -> StorageResult<Box<dyn crate::storage::namespace::NamespaceScan>> {
+        self.inner.snapshot(prefix, lifetime).await
+    }
+
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.inner.get(key).await
     }

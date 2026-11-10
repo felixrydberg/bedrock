@@ -11,7 +11,7 @@ use bedrock_lib::membership;
 use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
 
 pub const DATASETS: &[Dataset] = &[Dataset {
-    name: "cdn",
+    name: datasets::capabilities::CDN,
     // Global retention namespaces (`workers`, `pages`; B-32). A range's L2 owners never evict its records; idle artifact
     // bytes are evicted through `CacheStorage` (B-44).
     defaults: Policy {

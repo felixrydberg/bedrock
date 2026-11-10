@@ -21,11 +21,11 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 
 use super::{Hub, Key, MemberKey, StreamKey};
+use crate::admin::Admin;
 use crate::membership::Publisher;
 use crate::placement::State;
 use crate::replication::log::Log;
 use crate::replication::pb;
-use crate::transport::admin::Admin;
 
 /// Namespaces in each top-N gauge.
 pub const TOP: usize = 20;

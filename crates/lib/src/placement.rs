@@ -21,12 +21,7 @@ use crate::replication::pb;
 /// The namespaces of a dataset placed in L2 ranges, fixed in code; empty for every other dataset. The writer accepts no
 /// other namespace of a ranged dataset, and a member is ready for a range only once it holds all of them (#22 / B-21).
 pub fn namespaces(dataset: &str) -> &'static [&'static str] {
-    match dataset {
-        "quicksilver" => &["infrastructure"],
-        "auth" => &["keys"],
-        "cdn" => &["pages", "workers"],
-        _ => &[],
-    }
+    crate::datasets::capabilities::namespaces(dataset)
 }
 
 /// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.
@@ -84,7 +79,8 @@ pub type Directory = BTreeMap<u64, Vec<Owner>>;
 /// The entries to write so every range has `replicas` owners, in distinct failure domains when possible, and members
 /// hold their capacity-weighted share. At most `max_moving` ranges are in handoff at once, counting those already moving.
 /// Ranges of members missing from `members` (removed after the grace period) are reassigned; draining, unhealthy and
-/// non-`l2` members get nothing new. Decreasing `replicas` removes excess owners through bounded leaving handoffs.
+/// non-`l2` members get nothing new, and the ranges a draining member holds hand off like any `leaving` owner's
+/// (#68 / B-21b). Decreasing `replicas` removes excess owners through bounded leaving handoffs.
 pub fn assign(
     directory: &Directory,
     members: &BTreeMap<String, pb::Member>,
@@ -253,6 +249,20 @@ impl<'a> Plan<'a> {
                 continue;
             }
             let held: Vec<_> = owners.iter().filter(|o| o.holds()).collect();
+            // A drain (#68 / B-21b) hands each range of a draining owner to an eligible member. With none to take it
+            // the owner stays, so a drain never costs a range its redundancy.
+            let draining = held
+                .iter()
+                .find(|o| self.members[&o.node].status == pb::member::Status::Draining as i32)
+                .map(|o| o.node.clone());
+            if let Some(old) = draining {
+                if let Some(new) = self.pick(start, 1).first().copied() {
+                    self.mark_leaving(start, &old);
+                    self.add(start, new);
+                    self.moving += 1;
+                }
+                continue;
+            }
             if held.len() > replicas {
                 let old = held[0].node.clone();
                 self.mark_leaving(start, &old);

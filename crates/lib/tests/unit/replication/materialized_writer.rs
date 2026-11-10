@@ -597,3 +597,173 @@ async fn a_write_planned_from_an_old_revision_is_refused() {
     assert_eq!(view.values[b"key".as_slice()], b"second");
     assert_eq!(writer.commit(planned("third", 2)).await, Ok(3));
 }
+
+/// A paged baseline must not mix in later writes, including changes before its scan cursor.
+#[tokio::test]
+async fn recovery_pages_keep_their_boundary_while_writes_continue() {
+    let factories: Vec<Arc<dyn NamespaceFactory>> = vec![Arc::new(MemoryFactory::default())];
+    #[cfg(not(madsim))]
+    let factories = {
+        let mut factories = factories;
+        factories.push(Arc::new(crate::storage::slate::SlateFactory::new(
+            Arc::new(object_store::memory::InMemory::new()),
+        )));
+        factories
+    };
+    for factory in factories {
+        let original = |i| {
+            if i == 300 {
+                vec![42; 64 * 1024]
+            } else {
+                b"original".to_vec()
+            }
+        };
+        let initial = Materialized::open(factory.as_ref(), "kv", "one")
+            .await
+            .unwrap();
+        let entries: Vec<_> = (0..600)
+            .map(|i| Committed {
+                event: Event {
+                    dataset: "kv".into(),
+                    namespace: "one".into(),
+                    stream: stream("kv", 0),
+                    sequence: i + 1,
+                    epoch: 1,
+                    committed_at: 1000,
+                    key: format!("{i:04}").into_bytes(),
+                    operation: Operation::Set(original(i)),
+                },
+                retry_key: None,
+                retry_expires_at: 0,
+            })
+            .collect();
+        initial.persist(&entries, None).await.unwrap();
+        initial.close().await.unwrap();
+        let writer = Writer::open(
+            early,
+            config(factory, Retention::default(), PersistenceMetrics::default()),
+        )
+        .await
+        .unwrap();
+        let (mut snapshot, lease) = writer.begin_recovery("kv", "one").await.unwrap();
+        assert_eq!((snapshot.sequence, snapshot.committed_at), (600, 1000));
+        let mut baseline = snapshot.next_page().await.unwrap();
+        assert_eq!(baseline.len(), 256);
+        for (key, value) in [
+            ("0000", Some("changed")),
+            ("0300", Some("changed")),
+            ("0500", None),
+            ("0050a", Some("inserted")),
+            ("0700", Some("inserted")),
+        ] {
+            writer
+                .commit(Write {
+                    key: key.as_bytes().to_vec(),
+                    ..write(value, None)
+                })
+                .await
+                .unwrap();
+        }
+        loop {
+            let page = snapshot.next_page().await.unwrap();
+            assert!(page.len() <= 256);
+            assert!(
+                page.iter()
+                    .take(page.len().saturating_sub(1))
+                    .map(|(key, value)| key.len() + value.len())
+                    .sum::<usize>()
+                    < 64 * 1024
+            );
+            if page.is_empty() {
+                break;
+            }
+            baseline.extend(page);
+        }
+        let expected: Vec<_> = (0..600)
+            .map(|i| (format!("{i:04}").into_bytes(), original(i)))
+            .collect();
+        assert_eq!(baseline, expected);
+        let tail = writer
+            .recovery_events("kv", "one", 601, &lease)
+            .await
+            .unwrap();
+        assert_eq!(
+            tail.iter()
+                .map(|event| (
+                    event.sequence,
+                    event.key.as_slice(),
+                    event.operation.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (601, b"0000".as_slice(), Operation::Set(b"changed".to_vec())),
+                (602, b"0300".as_slice(), Operation::Set(b"changed".to_vec())),
+                (603, b"0500".as_slice(), Operation::Delete),
+                (
+                    604,
+                    b"0050a".as_slice(),
+                    Operation::Set(b"inserted".to_vec())
+                ),
+                (
+                    605,
+                    b"0700".as_slice(),
+                    Operation::Set(b"inserted".to_vec())
+                ),
+            ]
+        );
+        writer.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn recovery_scan_errors_abort_export() {
+    let failed = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(SimFactory::new({
+        let failed = failed.clone();
+        Arc::new(move |access| {
+            (access == StoreAccess::Read && failed.load(Ordering::SeqCst))
+                .then_some(StoreFault::Unavailable)
+        })
+    }));
+    let writer = Writer::open(
+        early,
+        config(factory, Retention::default(), PersistenceMetrics::default()),
+    )
+    .await
+    .unwrap();
+    writer.commit(write(Some("value"), None)).await.unwrap();
+    let (mut snapshot, _lease) = writer.begin_recovery("kv", "one").await.unwrap();
+    failed.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        snapshot.next_page().await,
+        Err(StorageError::Unavailable(_))
+    ));
+    failed.store(false, Ordering::SeqCst);
+    writer.close().await.unwrap();
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn recovery_capture_is_bounded_before_the_tail_lease_starts() {
+    let delayed = Arc::new(AtomicBool::new(false));
+    let factory = Arc::new(SimFactory::new({
+        let delayed = delayed.clone();
+        Arc::new(move |access| {
+            (access == StoreAccess::Read && delayed.load(Ordering::SeqCst))
+                .then_some(StoreFault::Delay(RECOVERY_LEASE + Duration::from_secs(1)))
+        })
+    }));
+    let writer = Writer::open(
+        early,
+        config(factory, Retention::default(), PersistenceMetrics::default()),
+    )
+    .await
+    .unwrap();
+    writer.commit(write(Some("value"), None)).await.unwrap();
+    idle(&writer).await;
+    delayed.store(true, Ordering::SeqCst);
+    let result = writer.begin_recovery("kv", "one").await;
+    assert!(matches!(result, Err(StorageError::Unavailable(_))));
+    delayed.store(false, Ordering::SeqCst);
+    writer.close().await.unwrap();
+}

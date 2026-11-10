@@ -1,6 +1,6 @@
 //! #15 / B-12 acceptance: cell membership from relay streams; #19 / B-16: the L2 placement directory published
 //! beside it, with #13 / B-14 storage health in member updates; #22 / B-21: range handoff with data following
-//! ownership while writes run. All through the real `bedrock-api` and `bedrock-relay` entry points. Replay one seed
+//! ownership while writes run. Uses real relay entry points and the API only for product data. Replay one seed
 //! with `BEDROCK_MEMBERSHIP_SEED=42` and the documented simulation flags.
 #![cfg(madsim)]
 
@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::health::storage::StorageHealth;
 use bedrock_lib::membership::{self, View};
 use bedrock_lib::node::{
@@ -16,13 +17,16 @@ use bedrock_lib::node::{
 };
 use bedrock_lib::placement::hash_of;
 use bedrock_lib::placement::{Directory, State};
+use bedrock_lib::reconciliation::drain::{self, Drain, Scope};
 use bedrock_lib::relays::client::Session;
 use bedrock_lib::replication::pb;
 use bedrock_lib::s3::S3Config;
+use bedrock_lib::sim::{Hooks, install};
 use bedrock_lib::storage::memory::MemoryEngine;
+use bedrock_lib::storage::namespace::NamespaceFactory;
+use bedrock_lib::storage::sim::{Disks, Fingerprint, MemoryFactory};
 use bedrock_lib::storage::{KeyRange, StorageEngine, l2_parts};
 use bedrock_lib::transport::Peers;
-use bedrock_lib::transport::admin::Admin;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
@@ -33,10 +37,51 @@ use tokio::time::sleep;
 const API: &str = "10.0.2.1";
 const CELL_RELAYS: [&str; 3] = ["10.0.2.11", "10.0.2.12", "10.0.2.13"];
 const OTHER_RELAY: &str = "10.0.2.14";
+const OTHER_RELAYS: [&str; 3] = [OTHER_RELAY, "10.0.2.15", "10.0.2.16"];
 const TOKEN: &str = "simulation-writer-token";
 const GRACE: Duration = Duration::from_secs(20);
 /// A silent peer is noticed within the relay stream deadline.
 const IDLE: Duration = bedrock_lib::relays::IDLE;
+
+fn install_disks() {
+    let disks = Arc::new(Disks::new(
+        Arc::new(|_| None),
+        None,
+        false,
+        Fingerprint::new(),
+    ));
+    let namespaces = Arc::new(MemoryFactory::default());
+    install(Hooks {
+        engine: Box::new(move |dir, name| disks.open(dir, name) as Arc<dyn StorageEngine>),
+        namespaces: Box::new(move || namespaces.clone() as Arc<dyn NamespaceFactory>),
+        rpc: Box::new(|_| Box::pin(async { Ok(None) })),
+    });
+}
+
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)] // Test adapter for the operator retry timestamp.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+async fn control_write(ip: &str, request: pb::ControlWrite) -> Result<u64, tonic::Status> {
+    let peers = Peers::new(&Admin::new());
+    let address = format!("{ip}:7000");
+    let channel = peers
+        .channel(&address, bedrock_lib::transport::Class::Control)
+        .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+    let mut client = pb::cell_control_client::CellControlClient::new(channel);
+    let mut request = tonic::Request::new(request);
+    request
+        .metadata_mut()
+        .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    tokio::time::timeout(Duration::from_secs(12), client.write(request))
+        .await
+        .map_err(|_| tonic::Status::deadline_exceeded("operator write timeout"))?
+        .map(|response| response.into_inner().revision)
+}
 
 fn node(name: &str, ip: &str, cell: &str) -> NodeConfig {
     NodeConfig {
@@ -75,8 +120,11 @@ fn api() -> ApiConfig {
 }
 
 fn relay(name: &str, ip: &str, cell: &str, relays: &[&str]) -> RelayConfig {
+    let mut relay_node = node(name, ip, cell);
+    // Stable process identities even when scenarios give runtime nodes different display names.
+    relay_node.node_id = ip.into();
     RelayConfig {
-        node: node(name, ip, cell),
+        node: relay_node,
         tier: Tier::Cell,
         upstreams: vec![format!("{API}:7000")],
         replay_peers: relays
@@ -86,7 +134,11 @@ fn relay(name: &str, ip: &str, cell: &str, relays: &[&str]) -> RelayConfig {
             .collect(),
         replay: Default::default(),
         membership: Some(MembershipSettings {
-            api: format!("{API}:7002"),
+            voter_ids: relays
+                .iter()
+                .map(|peer| (format!("{peer}:7000"), (*peer).into()))
+                .collect(),
+            bootstrap: true,
             grace_ms: GRACE.as_millis() as u64,
         }),
         write_token: Some(TOKEN.into()),
@@ -301,7 +353,7 @@ async fn scenario() -> Vec<String> {
     let mark = |trace: &mut Vec<String>, event: &str| {
         trace.push(format!("{} {event}", started.elapsed().as_millis()));
     };
-    spawn("api", API, || bedrock_api::run(api()));
+    install_disks();
     let relays: Vec<NodeHandle> = CELL_RELAYS
         .iter()
         .enumerate()
@@ -311,10 +363,11 @@ async fn scenario() -> Vec<String> {
             spawn(&name, ip, move || bedrock_relay::run(config.clone()))
         })
         .collect();
-    let other = relay("relay-b", OTHER_RELAY, "eu-1b", &[OTHER_RELAY]);
-    spawn("relay-b", OTHER_RELAY, move || {
-        bedrock_relay::run(other.clone())
-    });
+    for (i, ip) in OTHER_RELAYS.iter().enumerate() {
+        let name = format!("relay-b-{i}");
+        let config = relay(&name, ip, "eu-1b", &OTHER_RELAYS);
+        spawn(&name, ip, move || bedrock_relay::run(config.clone()));
+    }
     let ordered = |first: usize| -> Vec<String> {
         (0..3)
             .map(|i| format!("{}:7000", CELL_RELAYS[(first + i) % 3]))
@@ -434,16 +487,19 @@ async fn placement() -> Vec<String> {
     let handle = Handle::current();
     let mut trace = Vec::new();
     let started = bedrock_lib::monotonic_now();
+    install_disks();
+    // Placement's initial product ranges need a verified empty bootstrap before readiness.
     spawn("api", API, || bedrock_api::run(api()));
     for (i, ip) in CELL_RELAYS.iter().enumerate() {
         let name = format!("relay-{}", i + 1);
         let config = relay(&name, ip, "eu-1a", &CELL_RELAYS);
         spawn(&name, ip, move || bedrock_relay::run(config.clone()));
     }
-    let other = relay("relay-b", OTHER_RELAY, "eu-1b", &[OTHER_RELAY]);
-    spawn("relay-b", OTHER_RELAY, move || {
-        bedrock_relay::run(other.clone())
-    });
+    for (i, ip) in OTHER_RELAYS.iter().enumerate() {
+        let name = format!("relay-b-{i}");
+        let config = relay(&name, ip, "eu-1b", &OTHER_RELAYS);
+        spawn(&name, ip, move || bedrock_relay::run(config.clone()));
+    }
     let relays: Vec<String> = CELL_RELAYS.iter().map(|ip| format!("{ip}:7000")).collect();
     let names = ["cdn-1", "cdn-2", "cdn-3", "cdn-4"];
     let leaves: Vec<(NodeHandle, Arc<Leaf>)> = names
@@ -547,34 +603,49 @@ struct Model {
 }
 
 /// One write through `bedrock-api`'s HTTP endpoint; `None` deletes.
-async fn write(namespace: &str, key: &[u8], value: Option<&[u8]>, idempotency: u64) -> bool {
+async fn write(
+    dataset: &str,
+    namespace: &str,
+    key: &[u8],
+    value: Option<&[u8]>,
+    idempotency: &str,
+) -> Result<(), String> {
     let attempt = async {
         let stream = tokio::net::TcpStream::connect(format!("{API}:7002"))
             .await
-            .ok()?;
+            .map_err(|error| format!("connect: {error}"))?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
-            .ok()?;
+            .map_err(|error| format!("handshake: {error}"))?;
         tokio::spawn(connection);
         let key = String::from_utf8(key.to_vec()).unwrap();
         let request = hyper::Request::builder()
             .method(if value.is_some() { "PUT" } else { "DELETE" })
-            .uri(format!("/v1/cdn/{namespace}/{key}"))
+            .uri(format!("/v1/{dataset}/{namespace}/{key}"))
             .header("host", "api")
             .header("authorization", format!("Bearer {TOKEN}"))
             .header("idempotency-key", format!("handoff-{idempotency}"))
             .body(Full::new(Bytes::from(value.unwrap_or_default().to_vec())))
             .unwrap();
-        let response = sender.send_request(request).await.ok()?;
-        let ok = response.status().is_success();
-        response.into_body().collect().await.ok()?;
-        Some(ok)
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|error| format!("request: {error}"))?;
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|error| format!("response body: {error}"))?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(format!("HTTP {status}: {:?}", body.to_bytes()))
+        }
     };
     tokio::time::timeout(Duration::from_secs(5), attempt)
         .await
-        .ok()
-        .flatten()
-        == Some(true)
+        .map_err(|_| "write timed out after 5 s".to_string())?
 }
 
 /// Writes throughout: every 100 ms one key of one namespace is set, or every fifth time deleted. A failed write is
@@ -591,7 +662,10 @@ async fn writer(model: Arc<Model>) {
         let namespace = NAMESPACES[(n % 2) as usize];
         let key = format!("k{:02}", (n / 2 * 7) % KEYS).into_bytes();
         let value = (n % 5 != 4).then(|| format!("v{n}").into_bytes());
-        while !write(namespace, &key, value.as_deref(), n).await {
+        while write("cdn", namespace, &key, value.as_deref(), &n.to_string())
+            .await
+            .is_err()
+        {
             sleep(Duration::from_millis(200)).await;
         }
         {
@@ -851,6 +925,7 @@ async fn replication() -> Vec<String> {
             leaf.directory_of("cdn").len()
         ));
     };
+    install_disks();
     spawn("api", API, || bedrock_api::run(api()));
     let relays: Vec<NodeHandle> = CELL_RELAYS
         .iter()
@@ -868,7 +943,7 @@ async fn replication() -> Vec<String> {
     };
     let model = Arc::new(Model::default());
     let writing = model.clone();
-    Handle::current()
+    let writer_node = Handle::current()
         .create_node()
         .name("writer")
         .ip(WRITER.parse().unwrap())
@@ -974,6 +1049,82 @@ async fn replication() -> Vec<String> {
     check_data("healed", &model, &q1, &holders).await;
     mark(&mut trace, "healed", &q1);
 
+    // A drain record (#68 / B-21b) hands a member's ranges off while it stays connected, within the drain's rate, and
+    // cancelling it makes the member eligible again. The record sits beside the members in the cell's namespace.
+    // The main test node has no IP; operator calls run on the writer's simulated network node.
+    let order = |record: Option<Drain>| {
+        writer_node.spawn(async move {
+            let key = Drain::key("holder-1").into_bytes();
+            let value = record.as_ref().map(Drain::encode);
+            let request = pb::ControlWrite {
+                namespace: "cdn.eu-1a".into(),
+                key,
+                expected: None,
+                expected_term: 0,
+                idempotency_key: format!("{}:drain-{}", now(), value.is_some()),
+                value,
+            };
+            for attempt in 1..=15 {
+                match control_write(CELL_RELAYS[(attempt - 1) % 3], request.clone()).await {
+                    Ok(_) => return,
+                    Err(error) => {
+                        assert!(
+                            attempt < 15,
+                            "drain write failed after {attempt} attempts: {error}"
+                        );
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        })
+    };
+    let record = Drain {
+        scope: Scope::Node("holder-1".into()),
+        datasets: Vec::new(),
+        namespace: None,
+        state: drain::State::Draining,
+        rate: 1,
+    };
+    order(Some(record)).await.unwrap();
+    let holds = |leaf: &Leaf, node: &str| {
+        entries(&leaf.directory_of("cdn"))
+            .iter()
+            .any(|(_, owners)| owners.iter().any(|o| o.node == node))
+    };
+    let deadline = bedrock_lib::monotonic_now() + Duration::from_secs(180);
+    while holds(&q1, "holder-1") {
+        let moving = entries(&q1.directory_of("cdn"))
+            .iter()
+            .filter(|(_, owners)| owners.iter().any(|o| o.state != State::Ready))
+            .count();
+        assert!(
+            moving <= 1,
+            "a drain with rate 1 had {moving} ranges moving"
+        );
+        assert!(
+            bedrock_lib::monotonic_now() < deadline,
+            "the drained member still holds ranges"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    settled("drain record", &q1, &["holder-2", "holder-3", "holder-4"]).await;
+    check_data("drain record", &model, &q1, &holders).await;
+    assert!(
+        q1.members().contains(&"holder-1".to_string()),
+        "a drain record removed the member"
+    );
+    mark(&mut trace, "drain ordered", &q1);
+    order(None).await.unwrap();
+    until(
+        "the cancelled drain's member to take ranges",
+        GRACE * 3,
+        || holds(&q1, "holder-1"),
+    )
+    .await;
+    settled("drain cancelled", &q1, &four).await;
+    check_data("drain cancelled", &model, &q1, &holders).await;
+    mark(&mut trace, "drain cancelled", &q1);
+
     // A killed member's ranges are rebuilt elsewhere after the grace period. The publishing relay dies mid-handoff, and
     // its siblings finish from published state (#41 / B-12b).
     handle.kill(q4_node.id());
@@ -1041,6 +1192,198 @@ async fn replication() -> Vec<String> {
     trace
 }
 
+/// A healthy cell keeps its authority through isolation and a complete relay restart.
+async fn autonomous_cell() -> Vec<String> {
+    install_disks();
+    let handle = Handle::current();
+    let api_node = spawn("api", API, || bedrock_api::run(api()));
+    let relays: Vec<_> = CELL_RELAYS
+        .iter()
+        .enumerate()
+        .map(|(i, ip)| {
+            let name = format!("relay-{i}");
+            let mut config = relay(&name, ip, "eu-1a", &CELL_RELAYS);
+            // Failure domains may differ within the configured cell quorum.
+            config.node.location.failure_domain = format!("rack-{i}");
+            spawn(&name, ip, move || bedrock_relay::run(config.clone()))
+        })
+        .collect();
+    let addresses: Vec<_> = CELL_RELAYS.iter().map(|ip| format!("{ip}:7000")).collect();
+    let names = ["cdn-1", "cdn-2", "cdn-3", "cdn-4"];
+    let leaves: Vec<_> = names
+        .iter()
+        .zip(["10.0.2.31", "10.0.2.32", "10.0.2.33", "10.0.2.34"])
+        .map(|(name, ip)| spawn_leaf(name, ip, "cdn", "eu-1a", addresses.clone()))
+        .collect();
+    settled("before isolation", &leaves[0].1, &names).await;
+    handle.kill(api_node.id());
+    let operator = handle
+        .create_node()
+        .name("operator")
+        .ip(WRITER.parse().unwrap())
+        .build();
+    // Identity is checked before even parsing a Raft packet or delivering it to consensus.
+    operator
+        .spawn(async {
+            let peers = Peers::new(&Admin::new());
+            let channel = peers
+                .channel(
+                    &format!("{}:7000", CELL_RELAYS[0]),
+                    bedrock_lib::transport::Class::Control,
+                )
+                .unwrap();
+            let mut client = pb::cell_control_client::CellControlClient::new(channel);
+            let mut voters: Vec<_> = CELL_RELAYS.iter().map(|ip| format!("{ip}:7000")).collect();
+            voters.sort();
+            let packet = pb::ControlPacket {
+                region: "eu".into(),
+                dc: "eu-1".into(),
+                cell: "eu-1a".into(),
+                voters,
+                voter_ids: CELL_RELAYS
+                    .iter()
+                    .map(|ip| (format!("{ip}:7000"), (*ip).into()))
+                    .collect(),
+                payload: vec![0xff],
+            };
+            for mismatch in 0..4 {
+                let mut wrong = packet.clone();
+                match mismatch {
+                    0 => wrong.region = "other".into(),
+                    1 => wrong.dc = "other".into(),
+                    2 => wrong.cell = "other".into(),
+                    _ => wrong.voters[0] = "10.0.2.99:7000".into(),
+                }
+                assert_eq!(
+                    client.step(wrong).await.unwrap_err().code(),
+                    tonic::Code::PermissionDenied
+                );
+            }
+            assert_eq!(
+                client.step(packet).await.unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        })
+        .await
+        .unwrap();
+    let record = Drain {
+        scope: Scope::Node("cdn-1".into()),
+        datasets: Vec::new(),
+        namespace: None,
+        state: drain::State::Draining,
+        rate: 1,
+    };
+    let request = pb::ControlWrite {
+        namespace: "cdn.eu-1a".into(),
+        key: Drain::key("cdn-1").into_bytes(),
+        value: Some(record.encode()),
+        expected: None,
+        expected_term: 0,
+        idempotency_key: format!("{}:autonomous-drain", now()),
+    };
+    let apply = |request: pb::ControlWrite| {
+        operator.spawn(async move {
+            for attempt in 0..15 {
+                match control_write(CELL_RELAYS[attempt % 3], request.clone()).await {
+                    Ok(revision) => return revision,
+                    Err(error) => {
+                        assert!(attempt < 14, "cell operator write failed: {error}");
+                        sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+            unreachable!()
+        })
+    };
+    let drain_revision = apply(request.clone()).await.unwrap();
+    settled("drain without API/upstream", &leaves[1].1, &names[1..]).await;
+    assert_eq!(leaves[1].1.members(), names);
+    for relay in &relays {
+        handle.kill(relay.id());
+    }
+    sleep(Duration::from_secs(3)).await;
+    for relay in &relays {
+        handle.restart(relay.id());
+    }
+    // A fresh subscriber proves the restarted authority serves the drained placement, not a leaf's cached view.
+    let dashboard = Arc::new(Leaf::default());
+    let observed = dashboard.clone();
+    let fresh = handle
+        .create_node()
+        .name("fresh-dashboard")
+        .ip("10.0.2.39".parse().unwrap())
+        .build();
+    fresh.spawn(async move {
+        let (view, target) = View::new("cdn", "eu-1a");
+        let view = Arc::new(view);
+        *observed.view.lock().unwrap() = Some(view.clone());
+        let peers = Arc::new(Peers::new(&Admin::new()));
+        let session = Session::start(peers.clone(), addresses, vec![target]).unwrap();
+        loop {
+            sleep(Duration::from_millis(100)).await;
+            if let Some(revision) = session.applied("membership", "cdn.eu-1a") {
+                observed.revision.store(revision, Ordering::Relaxed);
+            }
+            view.refresh(&session, &peers).unwrap();
+        }
+    });
+    until(
+        "durable drained view after all relay restarts",
+        Duration::from_secs(60),
+        || {
+            dashboard.revision.load(Ordering::Relaxed) >= drain_revision
+                && dashboard.members() == names
+                && placed(&dashboard.directory(), &names[1..])
+        },
+    )
+    .await;
+    assert_eq!(
+        apply(request.clone()).await.unwrap(),
+        drain_revision,
+        "durable operator retry changed revision"
+    );
+    let cancel = pb::ControlWrite {
+        value: None,
+        idempotency_key: format!("{}:autonomous-cancel", now()),
+        ..request.clone()
+    };
+    apply(cancel).await.unwrap();
+    settled("cancel without API/upstream", &dashboard, &names).await;
+    assert!(
+        dashboard
+            .directory()
+            .values()
+            .any(|owners| owners.iter().any(|o| o.node == "cdn-1"))
+    );
+    // A single surviving configured voter cannot acknowledge an operator mutation.
+    handle.kill(relays[1].id());
+    handle.kill(relays[2].id());
+    sleep(IDLE + Duration::from_secs(5)).await;
+    let before = dashboard.revision.load(Ordering::Relaxed);
+    let minority = pb::ControlWrite {
+        idempotency_key: format!("{}:minority-drain", now()),
+        ..request
+    };
+    let result = operator
+        .spawn(async move { control_write(CELL_RELAYS[0], minority).await })
+        .await
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "a minority acknowledged an operator mutation"
+    );
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        dashboard.revision.load(Ordering::Relaxed),
+        before,
+        "minority published a mutation"
+    );
+    vec![
+        format!("drain revision {drain_revision}"),
+        format!("cancel revision {before}"),
+    ]
+}
+
 #[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
 fn run<F: Future<Output = Vec<String>> + 'static>(seed: u64, scenario: fn() -> F) -> Vec<String> {
     std::thread::spawn(move || {
@@ -1089,5 +1432,18 @@ fn placement_follows_membership_and_replays_per_seed() {
         let first = run(seed, placement);
         assert_eq!(first, run(seed, placement), "seed {seed} changed its trace");
         println!("placement seed {seed}: {first:?}");
+    }
+}
+
+#[test]
+fn cell_authority_survives_upstream_loss_restart_and_minority_and_replays_per_seed() {
+    for seed in seeds() {
+        let first = run(seed, autonomous_cell);
+        assert_eq!(
+            first,
+            run(seed, autonomous_cell),
+            "seed {seed} changed its trace"
+        );
+        println!("autonomous cell seed {seed}: {first:?}");
     }
 }

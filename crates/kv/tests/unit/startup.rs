@@ -33,3 +33,24 @@ fn hosts_no_datasets() {
         assert!(check_hosts_nothing_pushed(&with_dataset).is_err());
     }
 }
+
+#[test]
+fn kv_drains_fail_closed_until_reader_lifecycle_exists() {
+    use bedrock_lib::reconciliation::drain::{self, Drain, Scope, State};
+    let hooks = drain::ranged_with("kv", |_| unreachable!());
+    for scope in [Scope::Node("kv-1".into()), Scope::Cell("eu-1a".into())] {
+        for namespace in [None, Some("customer")] {
+            let record = Drain {
+                scope: scope.clone(),
+                datasets: Vec::new(),
+                namespace: namespace.map(str::to_owned),
+                state: State::Draining,
+                rate: 1,
+            };
+            assert!(matches!(
+                drain::validate(&hooks, &record),
+                Err(drain::Error::Unsupported { .. })
+            ));
+        }
+    }
+}

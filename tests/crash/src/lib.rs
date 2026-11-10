@@ -26,14 +26,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::membership::View;
+use bedrock_lib::node::TlsConfig;
 use bedrock_lib::placement::{Directory, State, hash_of};
 use bedrock_lib::relays::client::{Selection, Session, Target, applied_at, applied_ranges};
 use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::storage::rocksdb::RocksDbAdapter;
 use bedrock_lib::storage::{KeyRange, StorageEngine, WriteBatch, l2_key, l2_parts, l2_span};
-use bedrock_lib::transport::Peers;
-use bedrock_lib::transport::admin::Admin;
+use bedrock_lib::transport::tls::{Identity, Tls};
+use bedrock_lib::transport::{Io, Peers};
 use bedrock_sim::history::{
     History, Key, OwnerState, Placement, Range, Stream, Value, Violation, check_coverage,
     check_held, within,
@@ -43,6 +45,10 @@ use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose, SanType,
+};
 use tokio::time::sleep;
 
 use proxy::{Mode, Proxy};
@@ -50,14 +56,13 @@ use proxy::{Mode, Proxy};
 const TOKEN: &str = "crash-writer-token";
 const CELL: &str = "eu-1a";
 /// The workload's streams, as in the simulation: every pushed dataset's namespaces.
-const STREAMS: [(&str, &str); 4] = [
+const STREAMS: [(&str, &str); 3] = [
     ("quicksilver", "infrastructure"),
-    ("auth", "keys"),
     ("cdn", "pages"),
     ("cdn", "workers"),
 ];
 /// Streams the harness's own subscriber follows whole.
-const FOLLOWED: [(&str, &str); 2] = [("auth", "keys"), ("cdn", "pages")];
+const FOLLOWED: [(&str, &str); 2] = [("quicksilver", "infrastructure"), ("cdn", "pages")];
 const WRITERS: usize = 4;
 /// Fault drivers at once, as in the simulation's busier profiles.
 const DRIVERS: u64 = 2;
@@ -177,7 +182,7 @@ impl Kind {
 
     fn datasets(self) -> &'static [&'static str] {
         match self {
-            Kind::Quicksilver => &["quicksilver", "auth"],
+            Kind::Quicksilver => &["quicksilver"],
             Kind::Cdn => &["cdn"],
             _ => &[],
         }
@@ -220,6 +225,60 @@ fn free_port(reserved: &mut Vec<std::net::TcpListener>) -> u16 {
     port
 }
 
+fn certificate_paths(dir: &Path, name: &str) -> TlsConfig {
+    let dir = dir.join("tls");
+    TlsConfig {
+        cert: dir.join(format!("{name}.crt")),
+        key: dir.join(format!("{name}.key")),
+        ca: dir.join("ca.crt"),
+    }
+}
+
+/// Every process and the harness trust one run's CA; disk faults leave these credentials intact.
+fn certificates(dir: &Path, nodes: &[Arc<Node>]) -> TlsConfig {
+    fs::create_dir_all(dir.join("tls")).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let ca = params.self_signed(&key).unwrap();
+    fs::write(dir.join("tls/ca.crt"), ca.pem()).unwrap();
+    let issuer = Issuer::new(params, key);
+    let identities = nodes
+        .iter()
+        .map(|node| {
+            (
+                node.name.as_str(),
+                node.kind.binary().trim_start_matches("bedrock-"),
+            )
+        })
+        .chain(std::iter::once(("harness", "relay")));
+    for (name, service) in identities {
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![
+            SanType::URI(
+                format!("bedrock://{service}/{CELL}/{name}")
+                    .try_into()
+                    .unwrap(),
+            ),
+            SanType::IpAddress("127.0.0.1".parse().unwrap()),
+        ];
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let cert = params.signed_by(&key, &issuer).unwrap();
+        let paths = certificate_paths(dir, name);
+        fs::write(paths.cert, cert.pem()).unwrap();
+        fs::write(paths.key, key.serialize_pem()).unwrap();
+    }
+    certificate_paths(dir, "harness")
+}
+
 /// The cluster of the simulation, on loopback: an API, two region relays, three cell relays publishing membership,
 /// four `bedrock-quicksilver`, four `bedrock-cdn` and two `bedrock-kv`, so nodes differ in what they own.
 pub struct Cluster {
@@ -228,6 +287,7 @@ pub struct Cluster {
     nodes: Vec<Arc<Node>>,
     /// What the API dials for S3.
     s3: Proxy,
+    tls: Arc<Tls>,
 }
 
 impl Cluster {
@@ -282,11 +342,24 @@ impl Cluster {
         drop(reserved);
         // Every run writes a fresh bucket: the API would otherwise open an earlier run's namespaces.
         let bucket = format!("crash-{}-{}", options.seed, std::process::id());
+        let tls = Tls::start(
+            &certificates(&options.dir, &nodes),
+            Identity {
+                service: "relay".into(),
+                cell: CELL.into(),
+                node_id: "harness".into(),
+                host: "127.0.0.1".into(),
+            },
+            &Admin::new(),
+        )
+        .await
+        .unwrap();
         let cluster = Cluster {
             options,
             bucket,
             nodes,
             s3,
+            tls,
         };
         for node in &cluster.nodes {
             fs::write(&node.config, cluster.config(node)).unwrap();
@@ -336,6 +409,11 @@ impl Cluster {
             node.data,
         );
         let mut tables = format!("[location]\nregion = \"eu\"\ndc = \"eu-1\"\ncell = {CELL:?}\n");
+        let tls = certificate_paths(&self.options.dir, &node.name);
+        tables += &format!(
+            "[tls]\ncert = {:?}\nkey = {:?}\nca = {:?}\n",
+            tls.cert, tls.key, tls.ca
+        );
         let replay = format!("[replay]\nwindow_ms = {REPLAY_WINDOW_MS}\n");
         match node.kind {
             Kind::Api => {
@@ -365,10 +443,11 @@ impl Cluster {
                     others(Kind::Relay),
                 );
                 tables += &replay;
-                tables += &format!(
-                    "[membership]\napi = {:?}\ngrace_ms = {GRACE_MS}\n",
-                    self.write_address()
-                );
+                tables += &format!("[membership]\nbootstrap = true\ngrace_ms = {GRACE_MS}\n");
+                tables += "[membership.voter_ids]\n";
+                for voter in self.of(Kind::Relay) {
+                    tables += &format!("{:?} = {:?}\n", voter.address(), voter.name);
+                }
             }
             Kind::Quicksilver | Kind::Cdn | Kind::Kv => {
                 let datasets: Vec<String> = node
@@ -425,6 +504,7 @@ impl Cluster {
     async fn create_bucket(&self) {
         let endpoint = self.options.s3.trim_start_matches("http://");
         let status = request(
+            None,
             endpoint,
             "PUT",
             &format!("/{}", self.bucket),
@@ -450,6 +530,7 @@ impl Cluster {
 
 /// One HTTP/1.1 request to `address`; `None` when there is no answer.
 async fn request(
+    tls: Option<&Tls>,
     address: &str,
     method: &str,
     path: &str,
@@ -457,8 +538,11 @@ async fn request(
     body: Vec<u8>,
 ) -> Option<(u16, Bytes)> {
     let attempt = async {
-        let tcp = tokio::net::TcpStream::connect(address).await.ok()?;
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
+        let io: Box<dyn Io> = match tls {
+            Some(tls) => tls.dial(address).await.ok()?,
+            None => Box::new(tokio::net::TcpStream::connect(address).await.ok()?),
+        };
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(io))
             .await
             .ok()?;
         tokio::spawn(connection);
@@ -487,13 +571,14 @@ async fn request(
 
 async fn ready(node: &Node) -> bool {
     let address = format!("127.0.0.1:{}", node.admin);
-    request(&address, "GET", "/ready", &[], Vec::new())
+    request(None, &address, "GET", "/ready", &[], Vec::new())
         .await
         .is_some_and(|(status, _)| status == 200)
 }
 
 /// One write, returning its sequence. `None` means the outcome is unknown.
 async fn submit(
+    tls: &Tls,
     address: &str,
     (dataset, namespace): &Stream,
     id: &str,
@@ -508,6 +593,7 @@ async fn submit(
     let method = if value.is_some() { "PUT" } else { "DELETE" };
     let path = format!("/v1/{dataset}/{namespace}/{key}");
     let (status, body) = request(
+        Some(tls),
         address,
         method,
         &path,
@@ -664,6 +750,8 @@ fn covers(outer: Range, inner: Range) -> bool {
 struct Views {
     quicksilver: View,
     cdn: View,
+    observer: Arc<Session>,
+    unavailable: Mutex<BTreeMap<&'static str, String>>,
 }
 
 impl Views {
@@ -671,6 +759,62 @@ impl Views {
         match dataset {
             "cdn" => &self.cdn,
             _ => &self.quicksilver,
+        }
+    }
+
+    fn read<T, E: std::fmt::Display>(
+        &self,
+        dataset: &str,
+        read: impl FnOnce(&View) -> Result<T, E>,
+    ) -> Result<T, String> {
+        let unavailable = self.unavailable.lock().unwrap();
+        if let Some(error) = unavailable.get(dataset) {
+            return Err(error.clone());
+        }
+        if !self.observer.ready() {
+            return Err("observer has no validated membership revision".into());
+        }
+        let namespace = bedrock_lib::membership::namespace(dataset, CELL);
+        let revision = self
+            .observer
+            .applied(bedrock_lib::membership::DATASET, &namespace)
+            .ok_or("observer has no validated membership revision")?;
+        let value = read(self.of(dataset)).map_err(|error| error.to_string())?;
+        if !self.observer.ready()
+            || self
+                .observer
+                .applied(bedrock_lib::membership::DATASET, &namespace)
+                != Some(revision)
+        {
+            return Err("observer revision changed during read".into());
+        }
+        Ok(value)
+    }
+
+    fn refresh(&self, peers: &Peers) {
+        let mut unavailable = self.unavailable.lock().unwrap();
+        for dataset in ["quicksilver", "cdn"] {
+            let namespace = bedrock_lib::membership::namespace(dataset, CELL);
+            let refreshed = if !self.observer.ready()
+                || self
+                    .observer
+                    .applied(bedrock_lib::membership::DATASET, &namespace)
+                    .is_none()
+            {
+                Err("observer has no validated membership revision".to_owned())
+            } else {
+                self.of(dataset)
+                    .refresh(&self.observer, peers)
+                    .map_err(|error| error.to_string())
+            };
+            match refreshed {
+                Ok(()) => {
+                    unavailable.remove(dataset);
+                }
+                Err(error) => {
+                    unavailable.insert(dataset, error);
+                }
+            }
         }
     }
 }
@@ -769,8 +913,15 @@ async fn writer(run: Arc<Run>, id: usize) {
         });
         loop {
             let address = run.cluster.write_address();
-            if let Some(sequence) =
-                submit(&address, &stream, &operation, &key, value.as_deref()).await
+            if let Some(sequence) = submit(
+                &run.cluster.tls,
+                &address,
+                &stream,
+                &operation,
+                &key,
+                value.as_deref(),
+            )
+            .await
             {
                 let acknowledged = run.history.lock().unwrap().acknowledged(
                     &stream,
@@ -956,8 +1107,8 @@ async fn sampler(run: Arc<Run>) {
         let copies = run.subscriber_copies();
         run.samples.lock().unwrap().extend(copies);
         run.check_samples();
-        for dataset in ["quicksilver", "auth", "cdn"] {
-            if let Ok(directory) = run.views.of(dataset).directory(dataset) {
+        for dataset in ["quicksilver", "cdn"] {
+            if let Ok(directory) = run.views.read(dataset, |view| view.directory(dataset)) {
                 let placed = placement(&directory);
                 if !placed.is_empty() {
                     run.check(check_coverage(&placed));
@@ -970,11 +1121,10 @@ async fn sampler(run: Arc<Run>) {
 /// Each dataset's current placement, which must cover the hash space.
 fn placements(run: &Run) -> Result<BTreeMap<&'static str, Placement>, Violation> {
     let mut placements = BTreeMap::new();
-    for dataset in ["quicksilver", "auth", "cdn"] {
+    for dataset in ["quicksilver", "cdn"] {
         let directory = run
             .views
-            .of(dataset)
-            .directory(dataset)
+            .read(dataset, |view| view.directory(dataset))
             .map_err(|error| Violation {
                 invariant: "RedundancyRestored",
                 detail: format!("no {dataset} directory: {error}"),
@@ -991,8 +1141,7 @@ fn placements(run: &Run) -> Result<BTreeMap<&'static str, Placement>, Violation>
 fn settled(run: &Run, node: &Node) -> bool {
     node.kind.datasets().iter().all(|dataset| {
         run.views
-            .of(dataset)
-            .directory(dataset)
+            .read(dataset, |view| view.directory(dataset))
             .is_ok_and(|directory| {
                 directory
                     .values()
@@ -1005,7 +1154,7 @@ fn settled(run: &Run, node: &Node) -> bool {
 /// Whether `node`'s published member record reports none of its datasets unhealthy.
 fn healthy(run: &Run, node: &Node) -> bool {
     node.kind.datasets().iter().all(|dataset| {
-        run.views.of(dataset).members().is_ok_and(|members| {
+        run.views.read(dataset, View::members).is_ok_and(|members| {
             members
                 .values()
                 .filter(|member| member.node_id == node.name)
@@ -1025,10 +1174,18 @@ async fn unconverged(run: &Run) -> Option<Violation> {
             return waiting("RedundancyRestored", format!("{} is not ready", node.name));
         }
     }
-    for dataset in ["quicksilver", "auth", "cdn"] {
-        let view = run.views.of(dataset);
-        let (Ok(directory), Ok(members)) = (view.directory(dataset), view.members()) else {
-            return waiting("RedundancyRestored", format!("no {dataset} view"));
+    for dataset in ["quicksilver", "cdn"] {
+        let observed = run.views.read(dataset, |view| {
+            Ok::<_, String>((
+                view.directory(dataset).map_err(|error| error.to_string())?,
+                view.members().map_err(|error| error.to_string())?,
+            ))
+        });
+        let (directory, members) = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                return waiting("RedundancyRestored", format!("no {dataset} view: {error}"));
+            }
         };
         if let Some(sick) = members
             .values()
@@ -1207,7 +1364,7 @@ pub async fn run(options: Options) -> Result<Outcome, Violation> {
     for node in &cluster.nodes {
         cluster.start(node);
     }
-    let peers = Arc::new(Peers::new(&Admin::new()));
+    let peers = Arc::new(Peers::new(&Admin::new()).with_tls(Some(cluster.tls.clone())));
     let subscribed = Arc::new(MemoryEngine::new("subscribed"));
     let targets = FOLLOWED
         .iter()
@@ -1225,8 +1382,9 @@ pub async fn run(options: Options) -> Result<Outcome, Violation> {
     let subscriber = Session::start(peers.clone(), relays.clone(), targets).unwrap();
     let (quicksilver, quicksilver_target) = View::new("quicksilver", CELL);
     let (cdn, cdn_target) = View::new("cdn", CELL);
-    let observer =
-        Session::start(peers.clone(), relays, vec![quicksilver_target, cdn_target]).unwrap();
+    let observer = Arc::new(
+        Session::start(peers.clone(), relays, vec![quicksilver_target, cdn_target]).unwrap(),
+    );
     let run = Arc::new(Run {
         cluster,
         history: Mutex::default(),
@@ -1239,15 +1397,22 @@ pub async fn run(options: Options) -> Result<Outcome, Violation> {
         faults: AtomicBool::new(true),
         busy: Mutex::default(),
         subscribed,
-        views: Views { quicksilver, cdn },
+        views: Views {
+            quicksilver,
+            cdn,
+            observer,
+            unavailable: Mutex::new(BTreeMap::from([
+                ("quicksilver", "observer has not refreshed".into()),
+                ("cdn", "observer has not refreshed".into()),
+            ])),
+        },
     });
     let refresher = {
         let (run, peers) = (run.clone(), peers.clone());
         tokio::spawn(async move {
             loop {
                 sleep(Duration::from_millis(200)).await;
-                let _ = run.views.quicksilver.refresh(&observer, &peers);
-                let _ = run.views.cdn.refresh(&observer, &peers);
+                run.views.refresh(&peers);
             }
         })
     };
@@ -1266,18 +1431,19 @@ fn checks_fire(run: &Run) -> Result<(), Violation> {
     let node = run.cluster.of(Kind::Quicksilver).next().unwrap();
     let clean = run.cluster.options.dir.join("damage/clean");
     run.cluster.kill(node);
-    copy_dir(&node.data, &clean);
+    let copied = copy_dir(&node.data, &clean);
     run.cluster.start(node);
+    let unnoticed = |detail: String| Violation {
+        invariant: "ChecksFire",
+        detail,
+    };
+    copied.map_err(|error| unnoticed(format!("copy clean fixture: {error}")))?;
     let datasets = node.kind.datasets();
     let history = run.history.lock().unwrap();
     let (samples, _) = read_disk("clean", &clean, datasets);
     for sample in &samples {
         sample.check(&history)?;
     }
-    let unnoticed = |detail: String| Violation {
-        invariant: "ChecksFire",
-        detail,
-    };
     let target = samples
         .iter()
         .find(|sample| !sample.held.is_empty())
@@ -1297,7 +1463,8 @@ fn checks_fire(run: &Run) -> Result<(), Violation> {
         ("ahead", "NoLostAck"),
     ] {
         let copy = run.cluster.options.dir.join("damage").join(damage);
-        copy_dir(&clean, &copy);
+        copy_dir(&clean, &copy)
+            .map_err(|error| unnoticed(format!("copy {damage} fixture: {error}")))?;
         {
             let engine =
                 RocksDbAdapter::open(&copy.join(dataset), dataset.clone(), &Default::default())
@@ -1341,18 +1508,28 @@ fn checks_fire(run: &Run) -> Result<(), Violation> {
     Ok(())
 }
 
-fn copy_dir(from: &Path, to: &Path) {
-    let _ = fs::remove_dir_all(to);
-    fs::create_dir_all(to).unwrap();
-    for entry in fs::read_dir(from).unwrap().flatten() {
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    match fs::remove_dir_all(to) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::create_dir_all(to)?;
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
-            copy_dir(&path, &to.join(entry.file_name()));
+        if entry.file_type()?.is_dir() {
+            copy_dir(&path, &to.join(entry.file_name()))?;
         } else {
-            fs::copy(&path, to.join(entry.file_name())).unwrap();
+            fs::copy(&path, to.join(entry.file_name()))?;
         }
     }
+    Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/checks.rs"]
+mod checks;
 
 async fn drive(run: &Arc<Run>) -> Result<Outcome, Violation> {
     let deadline = Instant::now() + run.cluster.options.safety;

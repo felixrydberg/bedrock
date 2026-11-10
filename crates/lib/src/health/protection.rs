@@ -22,9 +22,9 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
+use crate::admin::Admin;
 use crate::storage::namespace::{NamespaceDatabase, NamespaceFactory};
 use crate::storage::{ErrorContext, StorageError, StorageResult};
-use crate::transport::admin::Admin;
 
 /// Bounds for one source on one node.
 ///

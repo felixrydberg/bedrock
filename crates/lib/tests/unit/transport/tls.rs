@@ -266,7 +266,7 @@ async fn serve(tls: Arc<Tls>, hub: Hub) -> String {
 async fn watch(peers: &Peers, addr: &str) -> Result<(), tonic::Status> {
     let channel = peers.channel(addr, Class::Control).unwrap();
     let mut stream = pb::siblings_client::SiblingsClient::new(channel)
-        .watch(pb::SiblingWatch {})
+        .watch(pb::SiblingWatch::default())
         .await?
         .into_inner();
     stream.message().await?;
@@ -344,6 +344,134 @@ async fn clients_reject_servers_that_are_not_relays() {
         .await
         .unwrap_err();
     assert_eq!(status.code(), Code::Unavailable, "{status}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pinned_control_peers_require_the_configured_process_identity() {
+    let ca = Ca::new();
+    let relay = tls(&ca, "relay", "c1", "r1").await;
+    let addr = serve(relay.clone(), hub("c1", Arc::new(peers(Some(relay))))).await;
+    let client = tls(&ca, "relay", "c1", "r2").await;
+    // All these certificates cover the same host; only the configured URI identity is valid.
+    for (service, cell, node_id, accepted) in [
+        ("relay", "c1", "r1", true),
+        ("relay", "c1", "r3", false),
+        ("relay", "c2", "r1", false),
+        ("api", "c1", "r1", false),
+    ] {
+        let peers = peers(Some(client.clone())).with_identities(std::collections::BTreeMap::from(
+            [(addr.clone(), identity(service, cell, node_id))],
+        ));
+        assert_eq!(watch(&peers, &addr).await.is_ok(), accepted);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn distinct_voters_on_one_host_elect_and_forward_operator_writes_over_tls() {
+    use crate::membership::control::{Config, Control, Server};
+    use crate::reconciliation::drain::{Drain, Scope, State};
+    use crate::storage::memory::MemoryEngine;
+
+    let ca = Ca::new();
+    let mut listeners = Vec::new();
+    for _ in 0..3 {
+        listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+    }
+    let voters: Vec<_> = listeners
+        .iter()
+        .map(|l| l.local_addr().unwrap().to_string())
+        .collect();
+    let voter_ids: std::collections::BTreeMap<_, _> = voters
+        .iter()
+        .enumerate()
+        .map(|(id, address)| (address.clone(), format!("r{id}")))
+        .collect();
+    drop(listeners);
+    let identities: std::collections::BTreeMap<_, _> = voter_ids
+        .iter()
+        .map(|(address, id)| (address.clone(), identity("relay", "c1", id)))
+        .collect();
+    let mut controls = Vec::new();
+    let mut tasks = Vec::new();
+    for (id, address) in voters.iter().enumerate() {
+        let tls = tls(&ca, "relay", "c1", &format!("r{id}")).await;
+        let peers = Arc::new(peers(Some(tls.clone())).with_identities(identities.clone()));
+        let (control, actor) = Control::start(
+            Arc::new(MemoryEngine::new("control")),
+            peers,
+            Config {
+                region: "eu".into(),
+                dc: "dc".into(),
+                cell: "c1".into(),
+                me: address.clone(),
+                voters: voters.clone(),
+                voter_ids: voter_ids.clone(),
+                clock: || 1000,
+                operator_token: Some("operator".into()),
+                bootstrap: true,
+            },
+        )
+        .unwrap();
+        let router = crate::transport::server(Some(&tls)).add_service(
+            pb::cell_control_server::CellControlServer::new(Server(Some(control.clone()))),
+        );
+        let listen = address.parse().unwrap();
+        tasks.push(actor);
+        tasks.push(tokio::spawn(async move {
+            crate::transport::serve(router, listen, Some(tls))
+                .await
+                .unwrap();
+        }));
+        controls.push(control);
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !controls.iter().any(|control| control.is_leader()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let follower = controls
+            .iter()
+            .position(|control| !control.is_leader())
+            .unwrap();
+        let operator =
+            peers(Some(tls(&ca, "relay", "c1", "operator").await)).with_identities(identities);
+        let channel = operator.channel(&voters[follower], Class::Control).unwrap();
+        let mut client = pb::cell_control_client::CellControlClient::new(channel);
+        let mut request = tonic::Request::new(pb::ControlWrite {
+            namespace: "cdn.c1".into(),
+            key: b"drain/cell".to_vec(),
+            value: Some(
+                Drain {
+                    scope: Scope::Cell("c1".into()),
+                    datasets: Vec::new(),
+                    namespace: None,
+                    state: State::Draining,
+                    rate: 1,
+                }
+                .encode(),
+            ),
+            expected: None,
+            expected_term: 0,
+            idempotency_key: "1000:operator".into(),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", "Bearer operator".parse().unwrap());
+        assert_eq!(
+            client.write(request).await.unwrap().into_inner().revision,
+            1
+        );
+        while controls
+            .iter()
+            .any(|control| control.head("cdn.c1").unwrap() != 1)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for task in tasks {
+        task.abort();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

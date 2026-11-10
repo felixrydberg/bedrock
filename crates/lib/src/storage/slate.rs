@@ -9,12 +9,15 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use object_store::ObjectStore;
 use slatedb::{CloseReason, Db, ErrorKind, Settings, WriteBatch};
 
-use super::namespace::{Changes, NamespaceDatabase, NamespaceFactory, valid_identity};
+use super::namespace::{
+    Changes, NamespaceDatabase, NamespaceFactory, NamespaceScan, valid_identity,
+};
 use super::{Entry, ErrorContext, KeyRange, StorageError, StorageResult};
 
 pub struct SlateFactory {
@@ -30,6 +33,25 @@ impl SlateFactory {
 struct SlateDatabase {
     db: Db,
     instance: String,
+    snapshot_lifetime: Duration,
+}
+
+struct SlateScan {
+    // Pins historical versions; native compactor checkpoints protect the iterator's files.
+    _snapshot: Arc<slatedb::DbSnapshot>,
+    iter: slatedb::DbIterator,
+    instance: String,
+}
+
+#[async_trait]
+impl NamespaceScan for SlateScan {
+    async fn next(&mut self) -> StorageResult<Option<Entry>> {
+        self.iter
+            .next()
+            .await
+            .map(|entry| entry.map(|entry| (entry.key.to_vec(), entry.value.to_vec())))
+            .map_err(|error| engine_error(&self.instance, "snapshot next", error))
+    }
 }
 
 fn context(instance: &str, detail: String) -> ErrorContext {
@@ -135,17 +157,53 @@ impl NamespaceFactory for SlateFactory {
             object_store_max_retries: Some(0),
             ..Settings::default()
         };
+        let snapshot_lifetime = settings
+            .compactor_options
+            .as_ref()
+            .map_or(Duration::MAX, |options| options.checkpoint_lifetime);
         let db = Db::builder(format!("{instance}/state"), self.store.clone())
             .with_settings(settings)
             .build()
             .await
             .map_err(|error| engine_error(&instance, "open", error))?;
-        Ok(Arc::new(SlateDatabase { db, instance }))
+        Ok(Arc::new(SlateDatabase {
+            db,
+            instance,
+            snapshot_lifetime,
+        }))
     }
 }
 
 #[async_trait]
 impl NamespaceDatabase for SlateDatabase {
+    async fn snapshot(
+        &self,
+        prefix: &[u8],
+        lifetime: Duration,
+    ) -> StorageResult<Box<dyn NamespaceScan>> {
+        if lifetime >= self.snapshot_lifetime {
+            return Err(StorageError::Unsupported(context(
+                &self.instance,
+                "snapshot lifetime exceeds native compaction protection".into(),
+            )));
+        }
+        let snapshot = self
+            .db
+            .snapshot()
+            .await
+            .map_err(|error| engine_error(&self.instance, "snapshot", error))?;
+        let range = KeyRange::prefix(prefix);
+        let iter = snapshot
+            .scan(range.bounds().expect("prefix range is never empty"))
+            .await
+            .map_err(|error| engine_error(&self.instance, "snapshot scan", error))?;
+        Ok(Box::new(SlateScan {
+            _snapshot: snapshot,
+            iter,
+            instance: self.instance.clone(),
+        }))
+    }
+
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.db
             .get(key)

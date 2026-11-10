@@ -15,7 +15,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::memory::MemoryEngine;
-use super::namespace::{Changes, NamespaceDatabase, NamespaceFactory, valid_identity};
+use super::namespace::{
+    Changes, NamespaceDatabase, NamespaceFactory, NamespaceScan, valid_identity,
+};
 use super::{
     Entry, ErrorContext, KeyRange, Scan, Snapshot, StorageEngine, StorageError, StorageResult,
     StorageStats, WriteBatch, WriteOp,
@@ -86,6 +88,16 @@ struct MemoryDatabase {
     instance: String,
     generation: Arc<()>,
     view: Mutex<View>,
+}
+
+// The deterministic model copies its baseline; the native adapter pins MVCC versions instead.
+struct MemoryScan(std::vec::IntoIter<Entry>);
+
+#[async_trait]
+impl NamespaceScan for MemoryScan {
+    async fn next(&mut self) -> StorageResult<Option<Entry>> {
+        Ok(self.0.next())
+    }
 }
 
 fn context(engine: &'static str, instance: &str, detail: &str) -> ErrorContext {
@@ -210,6 +222,14 @@ impl NamespaceFactory for MemoryFactory {
 
 #[async_trait]
 impl NamespaceDatabase for MemoryDatabase {
+    async fn snapshot(
+        &self,
+        prefix: &[u8],
+        _lifetime: std::time::Duration,
+    ) -> StorageResult<Box<dyn NamespaceScan>> {
+        Ok(Box::new(MemoryScan(self.scan(prefix).await?.into_iter())))
+    }
+
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.with_active(|_, view| Ok(view.entries.get(key).cloned()))
     }
@@ -413,6 +433,19 @@ impl NamespaceFactory for SimFactory {
 
 #[async_trait]
 impl NamespaceDatabase for SimDatabase {
+    async fn snapshot(
+        &self,
+        prefix: &[u8],
+        lifetime: std::time::Duration,
+    ) -> StorageResult<Box<dyn NamespaceScan>> {
+        inject(&self.faults, StoreAccess::Read, &self.instance).await?;
+        Ok(Box::new(SimScan {
+            inner: self.inner.snapshot(prefix, lifetime).await?,
+            faults: self.faults.clone(),
+            instance: self.instance.clone(),
+        }))
+    }
+
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         inject(&self.faults, StoreAccess::Read, &self.instance).await?;
         self.inner.get(key).await
@@ -457,6 +490,20 @@ impl NamespaceDatabase for SimDatabase {
             self.durable();
         }
         finish(fault, &self.instance, closed)
+    }
+}
+
+struct SimScan {
+    inner: Box<dyn NamespaceScan>,
+    faults: StoreFaults,
+    instance: String,
+}
+
+#[async_trait]
+impl NamespaceScan for SimScan {
+    async fn next(&mut self) -> StorageResult<Option<Entry>> {
+        inject(&self.faults, StoreAccess::Read, &self.instance).await?;
+        self.inner.next().await
     }
 }
 
@@ -981,9 +1028,14 @@ impl Disks {
         engines
             .entry(key)
             .or_insert_with(|| {
-                // The replay log stays correct: a bug belongs to what applies a dataset.
-                let bug = self.bug.filter(|_| name != "replay");
-                let engine = SimEngine::new(name, self.faults.clone(), bug, self.losable);
+                // Applier bugs and cache-tail loss target disposable replicas, not the cell's fsynced Raft authority.
+                let bug = self.bug.filter(|_| name != "replay" && name != "control");
+                let engine = SimEngine::new(
+                    name,
+                    self.faults.clone(),
+                    bug,
+                    self.losable && name != "control",
+                );
                 Arc::new(engine.recorded(self.fingerprint.clone()))
             })
             .clone()

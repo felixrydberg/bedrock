@@ -164,7 +164,7 @@ service Relay { rpc Session(stream RelayRequest) returns (stream RelayFrame); }
 // An empty update is a progress tick. A relay shares only what its own sessions hold, never what it
 // learned from a sibling. Cell relays share leaf members (B-12) and their range readiness (#22 / B-21); relays of every
 // tier share subscriber interests (#41 / B-12b).
-message SiblingWatch {}
+message SiblingWatch { ControlAck control = 1; }
 message SiblingUpdate {
   repeated Member members = 1;
   // Only service and node_id are set.
@@ -176,6 +176,8 @@ message SiblingUpdate {
   // own where to start and are not updated as they advance.
   repeated Follow interests = 5;
   repeated Unfollow interests_removed = 6;
+  // First snapshot identifies the cell control group before membership/readiness can be accepted.
+  ControlAck control = 7;
 }
 // The ranges of `dataset` a leaf member is ready for: its bootstrap is confirmed and it acknowledged through the head
 // after processing every pushed `Ranges` (#22 / B-21). Never the acknowledgements themselves.
@@ -186,3 +188,34 @@ message Ready {
   repeated Span spans = 4;
 }
 service Siblings { rpc Watch(SiblingWatch) returns (stream SiblingUpdate); }
+
+// Cell-local control authority. Raft packets never travel through the product-data relay tree.
+message ControlPacket {
+  string cell = 1;
+  bytes payload = 2;
+  string region = 3;
+  string dc = 4;
+  repeated string voters = 5;
+  map<string, string> voter_ids = 6;
+}
+message ControlAck {
+  string cell = 1;
+  string region = 2;
+  string dc = 3;
+  repeated string voters = 4;
+  map<string, string> voter_ids = 5;
+}
+message ControlWrite {
+  string namespace = 1;
+  bytes key = 2;
+  optional bytes value = 3;
+  optional uint64 expected = 4;
+  string idempotency_key = 5;
+  // Internal planner fencing. Zero lets an operator submit to the current leader.
+  uint64 expected_term = 6;
+}
+message ControlWritten { uint64 revision = 1; }
+service CellControl {
+  rpc Step(ControlPacket) returns (ControlAck);
+  rpc Write(ControlWrite) returns (ControlWritten);
+}

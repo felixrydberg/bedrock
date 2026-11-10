@@ -28,8 +28,8 @@ use sha2::{Digest, Sha256};
 
 use super::protection::{self, Coalescer, Limiter};
 use super::storage::StorageHealth;
+use crate::admin::Admin;
 use crate::storage::{ErrorContext, StorageEngine, StorageError, StorageResult, WriteBatch};
-use crate::transport::admin::Admin;
 
 /// A tier's answer: the value, or `None` for a proven absence, as of namespace view `revision`. A key last changed at
 /// revision 5 may be answered at view revision 100.

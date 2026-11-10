@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use bedrock_lib::transport::admin::Admin;
+use bedrock_lib::admin::Admin;
 use bedrock_lib::transport::{Class, Peers};
 use tokio::time::sleep;
 use tonic::{Request, Response, Status};

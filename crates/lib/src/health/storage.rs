@@ -28,11 +28,11 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 
 use super::CONSECUTIVE_FAILURES;
+use crate::admin::Admin;
 use crate::storage::{
     ErrorContext, KeyRange, Scan, Snapshot, StorageEngine, StorageError, StorageResult,
     StorageStats, WriteBatch,
 };
-use crate::transport::admin::Admin;
 
 /// The revision that records a quarantine in the quarantined engine.
 const QUARANTINED: &str = "health:quarantined";

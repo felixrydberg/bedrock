@@ -7,7 +7,6 @@
 //!
 //! With `tls` configured, connections use mutual TLS ([`tls`], B-55) and servers learn each verified [`Caller`].
 
-pub mod admin;
 pub mod tls;
 
 use std::collections::BTreeMap;
@@ -21,8 +20,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Status};
 
+use crate::admin::Admin;
 use crate::health::Health;
-use admin::Admin;
 use tls::Tls;
 
 /// HTTP/2 pings on idle connections, so a dead peer behind a quiet persistent stream is noticed (B-13).
@@ -60,6 +59,7 @@ pub struct Peers {
     calls: Family<CallLabels, Counter>,
     health: Health,
     tls: Option<Arc<Tls>>,
+    identities: BTreeMap<String, tls::Identity>,
 }
 
 impl Peers {
@@ -75,12 +75,20 @@ impl Peers {
             calls,
             health: Health::new(admin),
             tls: None,
+            identities: BTreeMap::new(),
         }
     }
 
     /// Dials peers over mutual TLS when `tls` is set (B-55).
     pub fn with_tls(mut self, tls: Option<Arc<Tls>>) -> Self {
         self.tls = tls;
+        self
+    }
+
+    /// Pins configured control peers to their certificate identities, including across reconnects.
+    pub fn with_identities(mut self, identities: BTreeMap<String, tls::Identity>) -> Self {
+        self.channels.get_mut().unwrap().clear();
+        self.identities = identities;
         self
     }
 
@@ -102,23 +110,11 @@ impl Peers {
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
             .keep_alive_while_idle(true);
         let channel = match &self.tls {
-            Some(tls) => tls.channel(endpoint),
+            Some(tls) => tls.channel(endpoint, self.identities.get(addr).cloned()),
             None => endpoint.connect_lazy(),
         };
         channels.insert((addr.to_owned(), class), channel.clone());
         Ok(channel)
-    }
-
-    /// A raw connection to `addr` for non-gRPC protocols (the B-12 membership writes), over TLS when configured.
-    pub async fn dial(&self, addr: &str) -> std::io::Result<Box<dyn Io>> {
-        #[cfg(madsim)]
-        if let Some(status) = crate::sim::rpc(addr).await.map_err(std::io::Error::other)? {
-            return Err(std::io::Error::other(status));
-        }
-        match &self.tls {
-            Some(tls) => tls.dial(addr).await,
-            None => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
-        }
     }
 
     /// Drops `addr`'s connections and breaker, e.g. once it left the cell's membership. Later use starts afresh.

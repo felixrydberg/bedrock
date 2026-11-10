@@ -4,6 +4,7 @@
 //! then overridden by `BEDROCK_*` environment variables. Nested keys use `__`, e.g.
 //! `BEDROCK_LOCATION__CELL=eu-1a`; lists use `[a, b]`, e.g. `BEDROCK_ROLES=[l1, l2]`.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -14,9 +15,9 @@ use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::admin::Admin;
 use crate::replication::materialized::Retention;
 use crate::s3::S3Config;
-use crate::transport::admin::Admin;
 
 /// Settings every binary has.
 #[derive(Debug, Clone, Deserialize)]
@@ -134,7 +135,7 @@ pub struct RelayConfig {
     /// Cell-tier membership publication (B-12); absent disables it.
     #[serde(default)]
     pub membership: Option<MembershipSettings>,
-    /// `bedrock-api` write credential, required with `membership`.
+    /// Optional cell-local operator credential for drain writes. Membership publication uses Raft, not this token.
     #[serde(default)]
     pub write_token: Option<String>,
 }
@@ -158,9 +159,14 @@ impl fmt::Debug for RelayConfig {
 
 /// The cell's relays are this relay and its `replay_peers`; publishing needs a majority of them.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MembershipSettings {
-    /// `bedrock-api` endpoint for writes, its `write_listen`.
-    pub api: String,
+    /// Every configured voter address, including this relay, mapped to its unique certificate node ID.
+    pub voter_ids: BTreeMap<String, String>,
+    /// Explicit first initialization of an empty fixed-voter control store. Disable after initial cluster creation;
+    /// a replacement disk must recover the existing cluster, never silently form a new voting replica.
+    #[serde(default)]
+    pub bootstrap: bool,
     /// How long a disconnected node stays a member; it may reconnect to any cell relay meanwhile.
     #[serde(default = "default_grace_ms")]
     pub grace_ms: u64,
@@ -188,10 +194,16 @@ impl RelayConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.upstreams.is_empty() {
-            return Err(ConfigError("upstreams must not be empty".into()));
+        if self.upstreams.is_empty() && self.membership.is_none() {
+            return Err(ConfigError(
+                "upstreams must not be empty without cell membership".into(),
+            ));
         }
         if let Some(membership) = &self.membership {
+            #[cfg(not(madsim))]
+            if self.node.tls.is_none() {
+                return Err(ConfigError("cell membership requires mutual TLS".into()));
+            }
             if self.tier != Tier::Cell {
                 return Err(ConfigError("membership requires a cell-tier relay".into()));
             }
@@ -210,9 +222,31 @@ impl RelayConfig {
                     "replay_peers must not list this relay's advertised address".into(),
                 ));
             }
-            if membership.api.is_empty() || self.write_token.as_deref().is_none_or(str::is_empty) {
+            let location = &self.node.location;
+            if ![&location.region, &location.dc, &location.cell]
+                .into_iter()
+                .all(|part| {
+                    !part.is_empty()
+                        && part
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+                })
+            {
                 return Err(ConfigError(
-                    "membership requires membership.api and write_token".into(),
+                    "cell control requires plain, nonempty region, dc and cell identifiers".into(),
+                ));
+            }
+            let mut voters = self.replay_peers.clone();
+            voters.sort();
+            if voters.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(ConfigError("replay_peers contains duplicate voters".into()));
+            }
+            voters.push(advertised.clone());
+            crate::membership::control::validate_voter_ids(&voters, &membership.voter_ids)
+                .map_err(ConfigError)?;
+            if membership.voter_ids.get(&advertised) != Some(&self.node.node_id) {
+                return Err(ConfigError(
+                    "local control voter identity differs from node_id".into(),
                 ));
             }
         }

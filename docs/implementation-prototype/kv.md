@@ -10,12 +10,12 @@ The platform initially supports two datasets:
 - **KV:** Customer key-value stores with home-region writes, one S3 database per namespace, and read-only caches in every cell.
 
 Both datasets share the **write API and sequence system**, but run as separate binaries:
-`bedrock-quicksilver` (Quicksilver and Auth, subscribed through regional relays into L1/L2 buckets) and `bedrock-kv`
+`bedrock-quicksilver` (Quicksilver, subscribed through regional relays into L1/L2 buckets) and `bedrock-kv`
 (customer KV, read from S3 by cache readers with no virtual buckets or dataset subscriptions; it uses the cell's relays
 only for membership). See `feature-drafts.md` §4 decisions 11 and 12, and §9
 "Customer KV: S3 Namespace Readers". Where this document still describes customer-KV origin cells, those decisions win.
 Decision 15 moves Auth and API-key checks to `bedrock-gateway`, and it wins where this document places them in
-`bedrock-quicksilver`.
+`bedrock-quicksilver`. Auth serving is deferred until Gateway exists; Quicksilver no longer hosts or places it.
 
 Storage engines are interchangeable through a common Rust abstraction.
 
@@ -101,7 +101,7 @@ There are no exposed application-level shards. Regional L2 hash-range partitioni
 | `on_demand` | Active subscribers only | Requested data |
 | `full_replica` | All eligible datacenters | Complete namespace |
 
-These push policies apply to Quicksilver and Auth. Customer KV has no push policy: it is read from its S3 namespace
+These push policies apply to Quicksilver; Auth serving awaits Gateway. Customer KV has no push policy: it is read from its S3 namespace
 database by `bedrock-kv` cache readers (§9 "Customer KV: S3 Namespace Readers"). The earlier `cached` and `home_only`
 policies described an origin cell and are superseded.
 
@@ -152,13 +152,13 @@ Each component is its own binary, all built on the shared `lib` crate.
 |---|---|
 | `bedrock-api` | Authoritative writes and sequence ordering |
 | `bedrock-relay` | Replication fan-out, replay and cell membership |
-| `bedrock-quicksilver`, role `l1` | Per-node local cache of Quicksilver/Auth |
-| `bedrock-quicksilver`, role `l2` | Cell-wide Quicksilver/Auth spread over relay-assigned hash ranges |
+| `bedrock-quicksilver`, role `l1` | Per-node local cache of Quicksilver |
+| `bedrock-quicksilver`, role `l2` | Cell-wide Quicksilver spread over relay-assigned hash ranges |
 | `bedrock-kv` | Customer KV: S3-backed namespace readers and caches, no virtual buckets |
 
 `l1` and `l2` can coexist in one `bedrock-quicksilver` process. Relays run as their own process on a few machines per cell.
-Customer KV runs in its own `bedrock-kv` process so tenant load cannot take down Quicksilver/Auth
-(`feature-drafts.md` §4 decision 12); the L1/L2 bucket model in this document applies to Quicksilver/Auth, not customer KV.
+Customer KV runs in its own `bedrock-kv` process so tenant load cannot take down Quicksilver
+(`feature-drafts.md` §4 decision 12); the L1/L2 bucket model in this document applies to Quicksilver, not customer KV.
 
 ### Requirements
 
@@ -441,7 +441,7 @@ The earlier origin-cell and regional-tier design is superseded by `feature-draft
 - **Adding capacity** adds value-cache capacity to a cell. A home-region reader may be reopened after eviction; a drain
   releases local handles/cache state, never S3 data.
 
-The L1/L2 bucket model in the rest of this document applies to pushed datasets (Quicksilver, Auth) and CDN.
+The L1/L2 bucket model in the rest of this document applies to Quicksilver and CDN; Auth serving awaits Gateway.
 
 ```text
             Home writer
@@ -933,7 +933,7 @@ Introduce regional relays, persistent update streams and bounded replay history.
 
 ### Phase 5 — Regional Caching
 
-Implement per-node L1, relay-assigned L2 hash ranges for Quicksilver/Auth, healthy-peer discovery, customer-KV S3 readers with cache-affinity routing, and automatic redistribution.
+Implement per-node L1, relay-assigned L2 hash ranges for Quicksilver, healthy-peer discovery, customer-KV S3 readers with cache-affinity routing, and automatic redistribution.
 
 ### Phase 6 — Advanced Optimization
 
@@ -943,7 +943,7 @@ Add `full_replica` placement, adaptive cache promotion, regional load balancing,
 
 ## Core Architectural Principles
 
-1. **Separate binaries** run Quicksilver/Auth (`bedrock-quicksilver`) and customer KV (`bedrock-kv`).
+1. **Separate binaries** run Quicksilver (`bedrock-quicksilver`) and customer KV (`bedrock-kv`); Auth awaits Gateway.
 2. **Dataset → Namespace** is the logical data hierarchy.
 3. **RocksDB and SurrealKV** implement a shared storage abstraction.
 4. **Each dataset has its own storage-engine instance** on applicable nodes.

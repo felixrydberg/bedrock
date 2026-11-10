@@ -2,6 +2,8 @@
 
 Relay protocol and recovery: [#14 / B-17 and #16 / B-18](relays.md).
 Cell membership from relay streams, the L2 placement directory and range handoff: [#15 / B-12, #19 / B-16 and #22 / B-21](membership.md).
+The cell's relays now own this control authority through embedded Raft; `cell.tla` models its durable commit/apply boundary.
+`service_isolation.tla` checks that an unreadable service freezes independently, including recovery clocks and conditional writes.
 
 The standalone writer persists directly to SlateDB in S3. See
 [the atomic namespace protocol model](materialized.md) for its bounded checks and
@@ -90,8 +92,15 @@ must remain recoverable, and stale publishers must remain fenced.
 constant, `"none"` in its config. Every other value is a bug that must break the invariant the script names beside
 it, checked with that invariant alone so no other one fires first. `scripts/tlc.sh bugs` runs only the bugs, in
 under a minute, and `scripts/tlc.sh relays` runs one model. It needs Java 11 or later and the
-[TLA+ tools jar](https://github.com/tlaplus/tlaplus/releases), by default at `.codex-tmp/tla2tools.jar`.
+[TLA+ tools jar](https://github.com/tlaplus/tlaplus/releases), checked in at `scripts/tla2tools.jar`.
 Every invariant and property has a bug except `TypeOK`, which only catches mistakes in a model.
+
+On 2026-11-09, the new `cell` integration model passed 1,975,881 generated states / 247,328 distinct states and its four
+negative controls. It abstracts Raft consensus and checks Bedrock's persistence, publication and conditional-apply boundary;
+this result does not establish the full hardening gate.
+
+On 2026-11-09, `service_isolation` passed 2,640,649 generated states / 182,408 distinct states; its six deliberate
+fault checks also detected their intended violations. The model checks independent enabling, not eventual progress.
 
 On 2026-11-08, TLC 1.8.0 passed every config and caught all 38 bugs:
 

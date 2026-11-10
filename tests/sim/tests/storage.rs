@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::health::storage::{State, StorageHealth};
 use bedrock_lib::storage::namespace::NamespaceFactory;
 use bedrock_lib::storage::sim::{
-    Access, Fault, Faults, SimEngine, SimFactory, StoreAccess, StoreFault,
+    Access, Disks, Fault, Faults, Fingerprint, SimEngine, SimFactory, StoreAccess, StoreFault,
 };
 use bedrock_lib::storage::{KeyRange, Snapshot, StorageEngine, StorageError, WriteBatch};
-use bedrock_lib::transport::admin::Admin;
 
 fn engine(faults: Faults) -> SimEngine {
     SimEngine::new("test", faults, None, true)
@@ -36,6 +36,21 @@ fn crash_takes_back_data_and_revision_together() {
     // What a crash left cannot be lost again by the next one.
     assert_eq!(engine.crash(1), 0);
     assert_eq!(engine.revision("n").unwrap(), Some(1));
+}
+
+#[tokio::test]
+async fn cache_tail_loss_does_not_erase_durable_cell_authority() {
+    let disks = Disks::new(Arc::new(|_| None), None, true, Fingerprint::new());
+    let dir = std::path::Path::new("relay");
+    let control = disks.open(dir, "control");
+    let replay = disks.open(dir, "replay");
+    committed(&control, 1);
+    committed(&replay, 1);
+    assert_eq!(replay.crash(1), 1);
+    assert_eq!(control.crash(1), 0);
+    let recovered = disks.open(dir, "control");
+    assert_eq!(recovered.revision("n").unwrap(), Some(1));
+    assert_eq!(recovered.get(b"k1").unwrap(), Some(b"v".to_vec()));
 }
 
 /// B-61: commits keep only what undoes them, and a crash must still land exactly where a full copy before each commit would.

@@ -25,7 +25,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use tokio::time::Instant;
 
-use crate::transport::admin::Admin;
+use crate::admin::Admin;
 
 pub const CONSECUTIVE_FAILURES: u32 = 5;
 pub const WINDOW: Duration = Duration::from_secs(10);

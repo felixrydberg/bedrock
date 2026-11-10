@@ -10,13 +10,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::replication::Operation;
 use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
 use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::storage::sim::MemoryFactory;
 use bedrock_lib::transport::Peers;
-use bedrock_lib::transport::admin::Admin;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
 const NAMESPACES: [&str; 2] = ["pages", "workers"];

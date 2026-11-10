@@ -2,6 +2,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::relays::Hub;
 use bedrock_lib::relays::client::{Selection, Session, Target};
 use bedrock_lib::relays::replay::{Replay, ReplayConfig};
@@ -12,7 +13,6 @@ use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, W
 use bedrock_lib::storage::StorageEngine;
 use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::storage::sim::MemoryFactory;
-use bedrock_lib::transport::admin::Admin;
 use bedrock_lib::transport::{Class, Peers};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -538,7 +538,7 @@ async fn gc_protects_the_bootstrap_tail_until_lease_is_released() {
     );
     drop(lease);
     writer.cleanup("auth", "keys").await.unwrap();
-    let (new_view, _) = writer.begin_recovery("auth", "keys").await.unwrap();
+    let new_view = writer.bootstrap("auth", "keys").await.unwrap();
     assert_eq!(new_view.pruned_through, 2);
     assert!(new_view.values.is_empty());
     writer.close().await.unwrap();

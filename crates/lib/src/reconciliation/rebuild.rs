@@ -18,11 +18,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{Config, Metrics, Reconcile, Reconciler};
+use crate::admin::Admin;
 use crate::health::storage::{State, StorageHealth};
 use crate::relays::client::{Rebuilder, Session};
 use crate::storage::memory::MemoryEngine;
 use crate::storage::{ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult};
-use crate::transport::admin::Admin;
 
 /// How often the coordinator looks for quarantined sources.
 pub const INTERVAL: Duration = Duration::from_secs(1);

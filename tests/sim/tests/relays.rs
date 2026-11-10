@@ -5,6 +5,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::health::State;
 use bedrock_lib::node::{Budget, Location, NodeConfig, Role, ServiceConfig};
 use bedrock_lib::relays::Hub;
@@ -20,7 +21,6 @@ use bedrock_lib::storage::{
     KeyRange, Scan, Snapshot, StorageEngine, StorageResult, StorageStats, WriteBatch,
 };
 use bedrock_lib::transport::Peers;
-use bedrock_lib::transport::admin::Admin;
 use madsim::rand::{Rng, thread_rng};
 use madsim::runtime::{Handle, NodeHandle, Runtime};
 use tokio::time::{sleep, timeout};

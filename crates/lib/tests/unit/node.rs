@@ -129,7 +129,7 @@ fn api_write_token_env_is_literal() {
 }
 
 #[test]
-fn relay_membership_needs_a_cell_relay_and_its_write_token() {
+fn relay_membership_is_cell_local_and_requires_a_valid_voter_location() {
     let relay = |extra: &str| {
         Figment::new()
             .merge(Toml::string(&format!(
@@ -147,7 +147,15 @@ fn relay_membership_needs_a_cell_relay_and_its_write_token() {
                 dc = "eu-1"
                 cell = "eu-1a"
                 [membership]
-                api = "api:7002"
+                bootstrap = true
+                [membership.voter_ids]
+                "relay-1:7300" = "relay-1"
+                "relay-2:7300" = "relay-2"
+                "relay-3:7300" = "relay-3"
+                [tls]
+                cert = "tls.crt"
+                key = "tls.key"
+                ca = "ca.crt"
                 "#
             )))
             .extract::<RelayConfig>()
@@ -158,6 +166,15 @@ fn relay_membership_needs_a_cell_relay_and_its_write_token() {
                 write_token = "private-writer-token""#,
     );
     config.validate().unwrap();
+    let mut plaintext = config.clone();
+    plaintext.node.tls = None;
+    #[cfg(not(madsim))]
+    assert!(plaintext.validate().unwrap_err().0.contains("mutual TLS"));
+    #[cfg(madsim)]
+    plaintext.validate().unwrap();
+    let mut wrong_identity = config.clone();
+    wrong_identity.node.node_id = "another-relay".into();
+    assert!(wrong_identity.validate().unwrap_err().0.contains("node_id"));
     assert_eq!(config.membership.as_ref().unwrap().grace_ms, 20_000);
     assert!(!format!("{config:?}").contains("private-writer-token"));
     // A relay is never its own sibling.
@@ -169,7 +186,25 @@ fn relay_membership_needs_a_cell_relay_and_its_write_token() {
         .validate()
         .is_err()
     );
-    assert!(relay(r#"advertise = "relay-1:7300""#).validate().is_err());
+    let mut independent = relay(r#"advertise = "relay-1:7300""#);
+    independent.upstreams.clear();
+    independent.validate().unwrap();
+    assert!(independent.write_token.is_none());
+    let mut invalid_location = independent.clone();
+    invalid_location.node.location.cell.clear();
+    assert!(invalid_location.validate().is_err());
+    let mut duplicate = independent;
+    duplicate
+        .replay_peers
+        .push(duplicate.replay_peers[0].clone());
+    assert!(duplicate.validate().is_err());
+    assert!(
+        Figment::new()
+            .merge(Toml::string("api = 'api:7002'"))
+            .extract::<MembershipSettings>()
+            .is_err(),
+        "old API-backed membership config must not be silently accepted"
+    );
     // Siblings cannot dial or rank an unspecified address.
     assert!(relay(r#"write_token = "t""#).validate().is_err());
     assert!(

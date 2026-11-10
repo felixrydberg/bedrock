@@ -64,10 +64,7 @@ fn selects(stream: &StreamKey, hash: u64) -> bool {
 
 /// Customer KV persists through the writer but has no pushed delivery contract.
 pub fn pushed(dataset: &str) -> bool {
-    matches!(
-        dataset,
-        "quicksilver" | "auth" | "cdn" | crate::membership::DATASET
-    )
+    crate::datasets::capabilities::pushed(dataset)
 }
 
 /// Whether a follow, or a sibling's interest, selects a pushed namespace or hash range.
@@ -89,6 +86,17 @@ pub fn tier_rank(tier: crate::node::Tier) -> u32 {
     }
 }
 
+/// A cell-local source of committed dataset history and coherent recovery views.
+pub trait LocalControlSource: Send + Sync {
+    fn validate_namespace(&self, cell: &str, namespace: &str) -> Result<(), Status>;
+    fn identity(&self) -> pb::ControlAck;
+    fn validate_peer(&self, peer: &pb::ControlAck) -> Result<(), Status>;
+    fn changed(&self) -> Arc<Watched<u64>>;
+    fn head(&self, namespace: &str) -> Result<u64, Status>;
+    fn read(&self, namespace: &str, from: u64, limit: usize) -> Result<Vec<Event>, Status>;
+    fn view(&self, namespace: &str) -> Result<crate::replication::materialized::View, Status>;
+}
+
 #[derive(Clone)]
 pub struct Hub(Arc<Inner>);
 
@@ -97,6 +105,7 @@ struct Inner {
     tier: u32,
     /// The relay's cell; with TLS, leaf callers must belong to it (B-55).
     cell: OnceLock<String>,
+    control: OnceLock<Arc<dyn LocalControlSource>>,
     peers: Arc<Peers>,
     upstreams: Vec<String>,
     replay_peers: Vec<String>,
@@ -157,6 +166,8 @@ struct Interest {
     baseline: u64,
     /// A bootstrap was sent and its recovered confirmation not yet.
     confirming: bool,
+    /// Acknowledgement of the queued bootstrap end, including when the revision did not advance.
+    bootstrap_acked: bool,
     /// The head this stream must be acknowledged through to count as ready, fixed when it first could.
     target: Option<u64>,
     /// Wakes this stream's pump: its acknowledgements and its end. A subscriber-wide signal would wake every stream the
@@ -241,6 +252,7 @@ impl Hub {
             id,
             tier,
             cell: OnceLock::new(),
+            control: OnceLock::new(),
             peers,
             upstreams,
             replay_peers,
@@ -270,6 +282,23 @@ impl Hub {
     pub fn with_cell(self, cell: String) -> Self {
         let _ = self.0.cell.set(cell);
         self
+    }
+    pub fn with_control(self, control: Arc<dyn LocalControlSource>) -> Self {
+        let _ = self.0.control.set(control);
+        self
+    }
+    /// Cell control never follows membership through the product replication hierarchy.
+    pub(super) fn external(&self, dataset: &str) -> bool {
+        dataset != crate::membership::DATASET || self.0.control.get().is_none()
+    }
+    fn local_control(&self, key: &Key) -> Result<Option<&Arc<dyn LocalControlSource>>, Status> {
+        if self.external(&key.0) {
+            return Ok(None);
+        }
+        if let Some(control) = self.0.control.get() {
+            control.validate_namespace(self.cell(), &key.1)?;
+        }
+        Ok(self.0.control.get())
     }
     fn cell(&self) -> &str {
         self.0.cell.get().map_or("", String::as_str)
@@ -496,6 +525,11 @@ impl Hub {
             .clone()
     }
     fn source_head(&self, key: &Key) -> Option<u64> {
+        match self.local_control(key) {
+            Ok(Some(control)) => return control.head(&key.1).ok(),
+            Err(_) => return None,
+            Ok(None) => {}
+        }
         if let Some(writer) = &self.0.writer {
             return Some(writer.log().head(&key.0, &key.1).get());
         }
@@ -727,6 +761,7 @@ impl Hub {
                         interest.from = from;
                         if let Some(baseline) = baseline {
                             interest.baseline = baseline;
+                            interest.bootstrap_acked = false;
                         }
                     }
                     if let Some(confirming) = confirming {
@@ -752,7 +787,7 @@ impl Hub {
             }
         }
     }
-    fn current(&self, id: u64, key: &StreamKey, generation: u64) -> Option<(u64, u64)> {
+    fn current(&self, id: u64, key: &StreamKey, generation: u64) -> Option<(u64, u64, bool)> {
         self.0
             .subscribers
             .lock()
@@ -761,7 +796,7 @@ impl Hub {
             .follows
             .get(key)
             .filter(|f| f.generation == generation)
-            .map(|f| (f.from, f.acked))
+            .map(|f| (f.from, f.acked, f.bootstrap_acked))
     }
     /// Where a recovery asks its next source to start, and whether that is a full recovery. A bootstrap sent but not yet
     /// confirmed makes it one: only a full recovery ends in the confirmation the subscriber is waiting for.
@@ -842,6 +877,9 @@ impl Hub {
             if let Some(interest) = sub.follows.get_mut(&key) {
                 if ack.applied < interest.from {
                     interest.acked = interest.acked.max(ack.applied);
+                    if interest.confirming && ack.applied >= interest.baseline {
+                        interest.bootstrap_acked = true;
+                    }
                 }
                 interest.woken.update(|v| *v = v.wrapping_add(1));
             }
@@ -956,6 +994,23 @@ impl Hub {
         self.observe_head(&key, sequence);
     }
     async fn read(&self, key: &Key, from: u64) -> Result<Vec<Encoded>, Status> {
+        if let Some(control) = self.local_control(key)? {
+            return control.read(&key.1, from, 256).map(|events| {
+                events
+                    .into_iter()
+                    .map(|e| {
+                        let hash = hash_of(&e.dataset, &e.namespace, &e.key);
+                        (
+                            e.sequence,
+                            EncodedEvent {
+                                bytes: Bytes::from(pb::Event::from(e).encode_to_vec()),
+                                hash,
+                            },
+                        )
+                    })
+                    .collect()
+            });
+        }
         if let Some(writer) = &self.0.writer {
             return writer
                 .log()
@@ -1018,6 +1073,10 @@ impl Hub {
             );
             return;
         }
+        if let Err(error) = self.local_control(&key.0) {
+            self.error(id, &key, error);
+            return;
+        }
         match key.1.filter(|_| follow.namespace.is_empty()) {
             Some(range) => self.follow_range(id, follow, range, visited),
             None => self.follow_stream(id, key, follow.from, follow.follow, visited, force),
@@ -1077,6 +1136,7 @@ impl Hub {
                     follow,
                     baseline: from.max(1) - 1,
                     confirming: false,
+                    bootstrap_acked: false,
                     target: None,
                     woken: Arc::default(),
                 },
@@ -1112,6 +1172,8 @@ impl Hub {
         visited: Vec<String>,
         force: bool,
     ) -> Result<(), Status> {
+        let control = self.local_control(&key.0)?.cloned();
+        let control_changes = control.as_ref().map(|control| control.changed());
         let opened = crate::monotonic_now();
         let Some((changes, mut moved)) =
             self.0.subscribers.lock().unwrap().get(&id).and_then(|s| {
@@ -1126,7 +1188,10 @@ impl Hub {
         let mut announced = false;
         let mut forced = force;
         let mut lease: Option<Arc<RecoveryLease>> = None;
+        let mut local_recovery = false;
         let mut renewed_through = 0;
+        let mut local_renewed_through = None;
+        let mut local_deadline = crate::monotonic_now();
         let mut recovery_permit = None;
         // One timer for the whole stream: a new sleep on every pass leaves one behind per event, for its full length (B-61).
         let mut recheck = std::pin::pin!(tokio::time::sleep(PROGRESS));
@@ -1136,11 +1201,16 @@ impl Hub {
         let arrival = self.arrival(&key.0);
         loop {
             let arrived = arrival.get();
+            let control_version = control_changes.as_ref().map(|changed| changed.get());
             let local_version = changes.get();
-            let Some((from, acked)) = self.current(id, &key, generation) else {
+            let Some((from, acked, bootstrap_acked)) = self.current(id, &key, generation) else {
                 return Ok(());
             };
-            let h = self.source_head(&key.0);
+            let h = if let Some(control) = &control {
+                Some(control.head(&key.0.1)?)
+            } else {
+                self.source_head(&key.0)
+            };
             if let Some(at) = moved
                 && h.is_some_and(|head| acked >= head)
             {
@@ -1148,12 +1218,15 @@ impl Hub {
                 moved = None;
             }
             if !announced && let Some(head) = h {
-                let ranges = self
-                    .0
-                    .replay
-                    .as_ref()
-                    .map(|r| r.ranges(&key.0.0, &key.0.1))
-                    .unwrap_or_default();
+                let ranges = if control.is_some() {
+                    Vec::new()
+                } else {
+                    self.0
+                        .replay
+                        .as_ref()
+                        .map(|r| r.ranges(&key.0.0, &key.0.1))
+                        .unwrap_or_default()
+                };
                 let (first, last) = ranges.first().copied().unwrap_or((0, 0));
                 if !self
                     .send_scoped(
@@ -1175,6 +1248,39 @@ impl Hub {
                     return Ok(());
                 }
                 announced = true;
+            }
+            if local_recovery {
+                // Like the writer's lease: acknowledgement progress renews the slot, silence for IDLE gives it up.
+                if local_renewed_through.map_or(bootstrap_acked, |through| acked > through) {
+                    local_renewed_through = Some(acked);
+                    local_deadline = crate::monotonic_now() + IDLE;
+                } else if crate::monotonic_now() >= local_deadline {
+                    return Err(Status::deadline_exceeded(
+                        "cell recovery acknowledgement stalled",
+                    ));
+                }
+            }
+            if local_recovery && h.is_some_and(|head| acked >= head) {
+                if !self
+                    .send_scoped(
+                        id,
+                        &key,
+                        generation,
+                        pb::relay_frame::Kind::Range(pb::ReplayRange {
+                            dataset: key.0.0.clone(),
+                            namespace: key.0.1.clone(),
+                            head: h.unwrap_or(0),
+                            recovered: true,
+                            span: span(key.1),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    return Ok(());
+                }
+                local_recovery = false;
+                drop(recovery_permit.take());
             }
             if let Some(pin) = &lease {
                 if !pin.valid() {
@@ -1293,12 +1399,30 @@ impl Hub {
                         continue;
                     }
                     Err(error) if error.code() == tonic::Code::OutOfRange => {
+                        if let Some(control) = &control {
+                            if recovery_permit.is_none() {
+                                recovery_permit = Some(self.recovery_permit().await?);
+                            }
+                            let view = control.view(&key.0.1)?;
+                            let boundary = view.sequence;
+                            if !self.control_bootstrap(id, &key, generation, view).await? {
+                                return Ok(());
+                            }
+                            self.advance(id, &key, generation, boundary);
+                            self.baseline(id, &key, generation, boundary);
+                            local_recovery = true;
+                            local_renewed_through = None;
+                            local_deadline = crate::monotonic_now() + IDLE;
+                            forced = false;
+                            continue;
+                        }
                         if let Some(writer) = &self.0.writer {
                             recovery_permit = Some(self.recovery_permit().await?);
-                            let (view, pin) = writer
-                                .begin_recovery(&key.0.0, &key.0.1)
-                                .await
-                                .map_err(|e| Status::unavailable(e.to_string()))?;
+                            let (mut view, pin) =
+                                writer
+                                    .begin_recovery(&key.0.0, &key.0.1)
+                                    .await
+                                    .map_err(|e| Status::unavailable(e.to_string()))?;
                             let mut hash = client::bootstrap_digest(
                                 &key.0.0,
                                 &key.0.1,
@@ -1331,57 +1455,63 @@ impl Hub {
                             {
                                 return Ok(());
                             }
-                            let mut entries = Vec::new();
-                            let mut bytes = 0;
-                            for (k, v) in view.values {
+                            loop {
+                                if self.current(id, &key, generation).is_none() {
+                                    return Ok(());
+                                }
                                 if !pin.valid() {
                                     return Err(Status::deadline_exceeded(
                                         "bootstrap lease expired during transfer",
                                     ));
                                 }
-                                if !selects(&key, hash_of(&key.0.0, &key.0.1, &k)) {
-                                    continue;
+                                let page = tokio::time::timeout(IDLE, view.next_page())
+                                    .await
+                                    .map_err(|_| {
+                                        Status::deadline_exceeded("bootstrap scan stalled")
+                                    })?
+                                    .map_err(|e| Status::unavailable(e.to_string()))?;
+                                if !pin.valid() {
+                                    return Err(Status::deadline_exceeded(
+                                        "bootstrap lease expired during transfer",
+                                    ));
                                 }
-                                for part in [&k, &v] {
-                                    hash.update((part.len() as u64).to_be_bytes());
-                                    hash.update(part);
+                                if page.is_empty() {
+                                    break;
                                 }
-                                bytes += k.len() + v.len();
-                                entries.push(pb::StateEntry { key: k, value: v });
-                                if entries.len() >= 256 || bytes >= 64 * 1024 {
-                                    if !self
-                                        .send_scoped(
-                                            id,
-                                            &key,
-                                            generation,
-                                            pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
-                                                entries: std::mem::take(&mut entries),
-                                                ..base.clone()
-                                            }),
-                                        )
-                                        .await
-                                    {
-                                        return Ok(());
+                                let mut entries = Vec::new();
+                                for (k, v) in page {
+                                    if !selects(&key, hash_of(&key.0.0, &key.0.1, &k)) {
+                                        continue;
                                     }
-                                    pin.renew();
-                                    bytes = 0;
-                                    tokio::task::yield_now().await;
+                                    for part in [&k, &v] {
+                                        hash.update((part.len() as u64).to_be_bytes());
+                                        hash.update(part);
+                                    }
+                                    entries.push(pb::StateEntry { key: k, value: v });
                                 }
-                            }
-                            if !entries.is_empty()
-                                && !self
+                                // Empty filtered pages still make scan progress visible downstream.
+                                let chunk = pb::Bootstrap {
+                                    entries,
+                                    ..base.clone()
+                                };
+                                if chunk.encoded_len().saturating_add(16) > MAX_BYTES {
+                                    return Err(Status::resource_exhausted(
+                                        "state entry cannot fit bounded bootstrap frame",
+                                    ));
+                                }
+                                if !self
                                     .send_scoped(
                                         id,
                                         &key,
                                         generation,
-                                        pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
-                                            entries,
-                                            ..base.clone()
-                                        }),
+                                        pb::relay_frame::Kind::Bootstrap(chunk),
                                     )
                                     .await
-                            {
-                                return Ok(());
+                                {
+                                    return Ok(());
+                                }
+                                pin.renew();
+                                tokio::task::yield_now().await;
                             }
                             if !pin.valid() {
                                 return Err(Status::deadline_exceeded(
@@ -1432,7 +1562,13 @@ impl Hub {
                     _ => {}
                 }
             }
-            if let Some(writer) = &self.0.writer {
+            if let Some(changed) = &control_changes {
+                tokio::select! {biased;
+                    _=changes.wait_until(|v|*v!=local_version)=>{},
+                    _=changed.wait_until(|v|Some(*v)!=control_version)=>{},
+                    _=recheck.as_mut(), if local_recovery=>recheck.as_mut().reset(crate::monotonic_now()+PROGRESS),
+                }
+            } else if let Some(writer) = &self.0.writer {
                 let head = writer.log().head(&key.0.0, &key.0.1);
                 tokio::select! {biased;
                     _=changes.wait_until(|v|*v!=local_version)=>{},
@@ -1447,6 +1583,107 @@ impl Hub {
                 }
             }
         }
+    }
+
+    /// A coherent cell snapshot needs no writer recovery lease: a trimmed tail restarts here.
+    async fn control_bootstrap(
+        &self,
+        id: u64,
+        key: &StreamKey,
+        generation: u64,
+        view: crate::replication::materialized::View,
+    ) -> Result<bool, Status> {
+        let mut hash =
+            client::bootstrap_digest(&key.0.0, &key.0.1, view.sequence, view.committed_at);
+        let base = pb::Bootstrap {
+            dataset: key.0.0.clone(),
+            namespace: key.0.1.clone(),
+            boundary: view.sequence,
+            committed_at: view.committed_at,
+            span: span(key.1),
+            ..Default::default()
+        };
+        if !self
+            .send_scoped(
+                id,
+                key,
+                generation,
+                pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                    begin: true,
+                    ..base.clone()
+                }),
+            )
+            .await
+        {
+            return Ok(false);
+        }
+        let mut entries = Vec::new();
+        let mut bytes = base.encoded_len() + 128;
+        for (k, v) in view.values {
+            if !selects(key, hash_of(&key.0.0, &key.0.1, &k)) {
+                continue;
+            }
+            let entry = pb::StateEntry { key: k, value: v };
+            let size = entry.encoded_len() + 16;
+            if base.encoded_len().saturating_add(128).saturating_add(size) > MAX_BYTES {
+                return Err(Status::resource_exhausted(
+                    "cell state entry cannot fit bounded bootstrap frame",
+                ));
+            }
+            if !entries.is_empty()
+                && (entries.len() >= 256 || bytes.saturating_add(size) > 64 * 1024)
+            {
+                if !self
+                    .send_scoped(
+                        id,
+                        key,
+                        generation,
+                        pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                            entries: std::mem::take(&mut entries),
+                            ..base.clone()
+                        }),
+                    )
+                    .await
+                {
+                    return Ok(false);
+                }
+                bytes = base.encoded_len() + 128;
+                tokio::task::yield_now().await;
+            }
+            for part in [&entry.key, &entry.value] {
+                hash.update((part.len() as u64).to_be_bytes());
+                hash.update(part);
+            }
+            bytes = bytes.saturating_add(size);
+            entries.push(entry);
+        }
+        if !entries.is_empty()
+            && !self
+                .send_scoped(
+                    id,
+                    key,
+                    generation,
+                    pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                        entries,
+                        ..base.clone()
+                    }),
+                )
+                .await
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .send_scoped(
+                id,
+                key,
+                generation,
+                pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
+                    end: true,
+                    checksum: hash.finalize().to_vec(),
+                    ..base
+                }),
+            )
+            .await)
     }
 
     /// A slot among this relay's concurrent recoveries. Waiting keeps them moving: a refusal costs the subscriber its next
@@ -1571,7 +1808,7 @@ impl Hub {
                             }
                             if !recovering && self
                                 .current(id, key, generation)
-                                .is_some_and(|(from, acked)| {
+                                .is_some_and(|(from, acked, _)| {
                                     from > range.head && acked >= range.head
                                 })
                             {
@@ -1586,7 +1823,7 @@ impl Hub {
                             self.advance(id, key, generation, through);
                             tokio::time::timeout(IDLE, async {
                                 loop {
-                                    let Some((_, acked)) = self.current(id, key, generation)
+                                    let Some((_, acked, _)) = self.current(id, key, generation)
                                     else {
                                         return Err(Status::cancelled("subscription closed"));
                                     };
@@ -1630,7 +1867,7 @@ impl Hub {
                                 // Keep this connection (and its lease) until downstream install is acknowledged.
                                 tokio::time::timeout(IDLE, async {
                                     loop {
-                                        let Some((_, acked)) = self.current(id, key, generation)
+                                        let Some((_, acked, _)) = self.current(id, key, generation)
                                         else {
                                             return Ok(());
                                         };
@@ -1686,8 +1923,16 @@ impl Hub {
         let mut namespaces = BTreeMap::new();
         let mut datasets = BTreeSet::new();
         for sub in self.0.subscribers.lock().unwrap().values() {
-            datasets.extend(sub.ranges.iter().map(|(dataset, _)| dataset.clone()));
+            datasets.extend(
+                sub.ranges
+                    .iter()
+                    .filter(|(dataset, _)| self.external(dataset))
+                    .map(|(dataset, _)| dataset.clone()),
+            );
             for ((key, _), interest) in &sub.follows {
+                if !self.external(&key.0) {
+                    continue;
+                }
                 namespaces
                     .entry(key.clone())
                     .and_modify(|from: &mut u64| *from = (*from).min(interest.from))
@@ -1704,6 +1949,9 @@ impl Hub {
         let (mut namespaces, mut datasets) = self.own();
         let (followed, _) = self.derived(&namespaces, &datasets);
         for follow in followed {
+            if !self.external(&follow.dataset) {
+                continue;
+            }
             let ranged = follow.namespace.is_empty();
             let scopes = if ranged {
                 self.namespaces(&follow.dataset)

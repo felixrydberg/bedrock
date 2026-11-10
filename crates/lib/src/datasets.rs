@@ -1,8 +1,10 @@
 //! Dataset → namespace model, policy resolution and per-dataset engine instances (B-06, `kv.md` §2–§4, §7).
 //!
 //! Each binary declares the datasets it hosts with their default policies; `lib` stays generic over datasets.
-//! `bedrock-quicksilver` hosts `quicksilver` and `auth`, `bedrock-cdn` hosts `cdn`, and neither opens the other's.
+//! `bedrock-quicksilver` hosts `quicksilver`, `bedrock-cdn` hosts `cdn`, and neither opens the other's.
 //! `bedrock-kv` (customer KV) hosts no relay-fed dataset.
+
+pub mod capabilities;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

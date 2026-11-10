@@ -1,10 +1,12 @@
 //! Shared distributed core linked by every Bedrock binary.
 
+pub mod admin;
 pub mod datasets;
 pub mod health;
 pub mod membership;
 pub mod node;
 pub mod placement;
+pub(crate) mod raft_runtime;
 pub mod reconciliation;
 pub mod relays;
 pub mod replication;

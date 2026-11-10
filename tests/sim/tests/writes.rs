@@ -16,8 +16,8 @@ use bedrock_lib::storage::{
 
 use bedrock_lib::storage::memory::MemoryEngine;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::transport::Peers;
-use bedrock_lib::transport::admin::Admin;
 use http_body_util::{BodyExt, Full};
 use hyper::StatusCode;
 use hyper::body::Bytes;

@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bedrock_lib::admin::Admin;
 use bedrock_lib::placement::hash_of;
 use bedrock_lib::relays::client::{Selection, Session, Target};
 use bedrock_lib::relays::replay::{Replay, ReplayConfig};
@@ -19,7 +20,6 @@ use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::storage::sim::MemoryFactory;
 use bedrock_lib::storage::{StorageEngine, l2_key};
 use bedrock_lib::transport::Peers;
-use bedrock_lib::transport::admin::Admin;
 use madsim::runtime::{Handle, NodeHandle, Runtime};
 use madsim::task::NodeId;
 use tokio::time::sleep;
