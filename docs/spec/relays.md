@@ -222,10 +222,21 @@ sent bootstrap chunks and advancing acknowledgements renew them, never beyond
 to dataset/namespace. There are at most four per namespace and four concurrent
 generated/proxied recoveries per source Hub. Pending confirmation is persisted with
 the installed state, so a restart cannot treat an unconfirmed baseline as ready.
-Disconnect, expiry and corruption leave a partial view unready. A full owned B-11
-view is retained during generation, so bootstrap memory scales with namespace size.
-The current B-11 view/tail APIs also materialize retained history; this is not a
-constant-memory bootstrap implementation.
+Disconnect, expiry and corruption leave a partial view unready. The writer captures
+the durable boundary and a pinned SlateDB snapshot scan under its namespace gate,
+then releases the gate so commits continue. It scans live values in sorted pages of
+at most 256 entries, stopping after 64 KiB of key/value data (or one larger entry),
+and filters each page by the requested hash range before transmission. Empty filtered
+pages report progress too. Oversized frames fail explicitly; no complete namespace
+view or retained event history is collected for this export. Dropping the scan releases
+its native version pin. Each page read has the session idle timeout, and all sends
+and the final checksum still require a valid recovery lease.
+Capture has a 60-second timeout. The requested scan lifetime includes capture and
+the ten-minute recovery ceiling, and must stay below the native compactor's SST
+protection window (15 minutes with the configured defaults).
+The member still stages its selected snapshot in memory before atomic installation;
+diagnostic full-view and startup history APIs also retain their existing materialization.
+This is bounded source export, not an end-to-end constant-memory bootstrap.
 
 ## Introspection and metrics (#17 / B-18b)
 

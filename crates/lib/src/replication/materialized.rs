@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use prost::Message;
 use serde::Deserialize;
@@ -10,7 +11,9 @@ use tokio::sync::Mutex;
 
 use super::pb;
 use super::{Event, Operation};
-use crate::storage::namespace::{Changes, NamespaceDatabase, NamespaceFactory, valid_identity};
+use crate::storage::namespace::{
+    Changes, NamespaceDatabase, NamespaceFactory, NamespaceScan, valid_identity,
+};
 use crate::storage::{
     Entry, ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, WriteBatch,
 };
@@ -253,6 +256,45 @@ pub struct Materialized {
     tracked: Mutex<Option<Tracked>>,
 }
 
+/// A coherent live-key export. Its pages retain the original boundary while writes continue.
+pub struct Snapshot {
+    pub sequence: u64,
+    pub committed_at: u64,
+    entries: Box<dyn NamespaceScan>,
+    last: Option<Vec<u8>>,
+    instance: String,
+}
+
+impl Snapshot {
+    /// At most 256 rows, stopping after 64 KiB of key/value data (or one larger row).
+    /// An empty page marks the end; no event history or retry records are exported.
+    /// A read error or cancelled page invalidates the export; discard this snapshot.
+    pub async fn next_page(&mut self) -> StorageResult<Vec<Entry>> {
+        let mut page = Vec::new();
+        let mut bytes = 0;
+        while page.len() < 256 && bytes < 64 * 1024 {
+            let Some((key, value)) = self.entries.next().await? else {
+                break;
+            };
+            let raw = key.strip_prefix(b"v").filter(|raw| !raw.is_empty());
+            if self.sequence == 0
+                || raw.is_none()
+                || self.last.as_ref().is_some_and(|last| *last >= key)
+            {
+                return Err(StorageError::Corruption(context(
+                    &self.instance,
+                    "invalid snapshot value key or revision",
+                )));
+            }
+            let raw = raw.unwrap().to_vec();
+            self.last = Some(key);
+            bytes += raw.len() + value.len();
+            page.push((raw, value));
+        }
+        Ok(page)
+    }
+}
+
 fn context(instance: &str, detail: impl Into<String>) -> ErrorContext {
     ErrorContext {
         engine: "namespace",
@@ -441,6 +483,22 @@ impl Materialized {
     pub async fn view(&self) -> StorageResult<View> {
         let _guard = self.tracked.lock().await;
         self.read_view().await
+    }
+
+    pub async fn snapshot(&self, lifetime: Duration) -> StorageResult<Snapshot> {
+        let mut slot = self.tracked.lock().await;
+        let progress = self.take_tracked(&mut slot).await?;
+        let (sequence, committed_at) = (progress.sequence, progress.committed_at);
+        *slot = Some(progress);
+        // Hold the mutation gate until both the boundary and native snapshot are captured.
+        let entries = self.db.snapshot(b"v", lifetime).await?;
+        Ok(Snapshot {
+            sequence,
+            committed_at,
+            entries,
+            last: None,
+            instance: format!("{}/{}", self.dataset, self.namespace),
+        })
     }
 
     pub async fn progress(&self) -> StorageResult<Progress> {

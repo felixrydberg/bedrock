@@ -321,6 +321,14 @@ impl NamespaceFactory for ScanCountingFactory {
 
 #[async_trait::async_trait]
 impl NamespaceDatabase for ScanCountingDatabase {
+    async fn snapshot(
+        &self,
+        prefix: &[u8],
+        lifetime: std::time::Duration,
+    ) -> StorageResult<Box<dyn crate::storage::namespace::NamespaceScan>> {
+        self.inner.snapshot(prefix, lifetime).await
+    }
+
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.inner.get(key).await
     }
@@ -394,6 +402,20 @@ async fn ordinary_reopen_apply_and_publish_do_not_scan_namespace_values() {
         factory.event_scans.load(Ordering::SeqCst),
         0,
         "ordinary commits and young-history cleanup must not scan retained event payloads"
+    );
+    let mut snapshot = materialized
+        .snapshot(Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.next_page().await.unwrap(),
+        vec![(b"key".to_vec(), b"new".to_vec())]
+    );
+    assert!(snapshot.next_page().await.unwrap().is_empty());
+    assert_eq!(
+        factory.value_scans.load(Ordering::SeqCst),
+        0,
+        "snapshot export must not use an eager scan"
     );
     assert_eq!(
         materialized.view().await.unwrap().values[b"key".as_slice()],

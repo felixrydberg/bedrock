@@ -170,6 +170,16 @@ fn factory() -> SlateFactory {
 }
 
 #[tokio::test]
+async fn snapshot_rejects_a_lifetime_beyond_native_file_protection() {
+    let db = factory().open("kv", "one").await.unwrap();
+    assert!(matches!(
+        db.snapshot(b"v", Duration::from_secs(60 * 60)).await,
+        Err(StorageError::Unsupported(_))
+    ));
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn namespace_discovery_finds_real_database() {
     let store = Arc::new(WalFaultStore::default());
     put_listing_object(&store, "unrelated/object").await;

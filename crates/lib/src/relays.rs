@@ -1396,10 +1396,11 @@ impl Hub {
                         }
                         if let Some(writer) = &self.0.writer {
                             recovery_permit = Some(self.recovery_permit().await?);
-                            let (view, pin) = writer
-                                .begin_recovery(&key.0.0, &key.0.1)
-                                .await
-                                .map_err(|e| Status::unavailable(e.to_string()))?;
+                            let (mut view, pin) =
+                                writer
+                                    .begin_recovery(&key.0.0, &key.0.1)
+                                    .await
+                                    .map_err(|e| Status::unavailable(e.to_string()))?;
                             let mut hash = client::bootstrap_digest(
                                 &key.0.0,
                                 &key.0.1,
@@ -1432,57 +1433,63 @@ impl Hub {
                             {
                                 return Ok(());
                             }
-                            let mut entries = Vec::new();
-                            let mut bytes = 0;
-                            for (k, v) in view.values {
+                            loop {
+                                if self.current(id, &key, generation).is_none() {
+                                    return Ok(());
+                                }
                                 if !pin.valid() {
                                     return Err(Status::deadline_exceeded(
                                         "bootstrap lease expired during transfer",
                                     ));
                                 }
-                                if !selects(&key, hash_of(&key.0.0, &key.0.1, &k)) {
-                                    continue;
+                                let page = tokio::time::timeout(IDLE, view.next_page())
+                                    .await
+                                    .map_err(|_| {
+                                        Status::deadline_exceeded("bootstrap scan stalled")
+                                    })?
+                                    .map_err(|e| Status::unavailable(e.to_string()))?;
+                                if !pin.valid() {
+                                    return Err(Status::deadline_exceeded(
+                                        "bootstrap lease expired during transfer",
+                                    ));
                                 }
-                                for part in [&k, &v] {
-                                    hash.update((part.len() as u64).to_be_bytes());
-                                    hash.update(part);
+                                if page.is_empty() {
+                                    break;
                                 }
-                                bytes += k.len() + v.len();
-                                entries.push(pb::StateEntry { key: k, value: v });
-                                if entries.len() >= 256 || bytes >= 64 * 1024 {
-                                    if !self
-                                        .send_scoped(
-                                            id,
-                                            &key,
-                                            generation,
-                                            pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
-                                                entries: std::mem::take(&mut entries),
-                                                ..base.clone()
-                                            }),
-                                        )
-                                        .await
-                                    {
-                                        return Ok(());
+                                let mut entries = Vec::new();
+                                for (k, v) in page {
+                                    if !selects(&key, hash_of(&key.0.0, &key.0.1, &k)) {
+                                        continue;
                                     }
-                                    pin.renew();
-                                    bytes = 0;
-                                    tokio::task::yield_now().await;
+                                    for part in [&k, &v] {
+                                        hash.update((part.len() as u64).to_be_bytes());
+                                        hash.update(part);
+                                    }
+                                    entries.push(pb::StateEntry { key: k, value: v });
                                 }
-                            }
-                            if !entries.is_empty()
-                                && !self
+                                // Empty filtered pages still make scan progress visible downstream.
+                                let chunk = pb::Bootstrap {
+                                    entries,
+                                    ..base.clone()
+                                };
+                                if chunk.encoded_len().saturating_add(16) > MAX_BYTES {
+                                    return Err(Status::resource_exhausted(
+                                        "state entry cannot fit bounded bootstrap frame",
+                                    ));
+                                }
+                                if !self
                                     .send_scoped(
                                         id,
                                         &key,
                                         generation,
-                                        pb::relay_frame::Kind::Bootstrap(pb::Bootstrap {
-                                            entries,
-                                            ..base.clone()
-                                        }),
+                                        pb::relay_frame::Kind::Bootstrap(chunk),
                                     )
                                     .await
-                            {
-                                return Ok(());
+                                {
+                                    return Ok(());
+                                }
+                                pin.renew();
+                                tokio::task::yield_now().await;
                             }
                             if !pin.valid() {
                                 return Err(Status::deadline_exceeded(

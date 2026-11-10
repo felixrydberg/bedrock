@@ -538,7 +538,7 @@ async fn gc_protects_the_bootstrap_tail_until_lease_is_released() {
     );
     drop(lease);
     writer.cleanup("auth", "keys").await.unwrap();
-    let (new_view, _) = writer.begin_recovery("auth", "keys").await.unwrap();
+    let new_view = writer.bootstrap("auth", "keys").await.unwrap();
     assert_eq!(new_view.pruned_through, 2);
     assert!(new_view.values.is_empty());
     writer.close().await.unwrap();

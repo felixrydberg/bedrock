@@ -58,6 +58,7 @@ Choose the cheapest available model that can reliably complete and verify the ta
 
 ## Keep changes small
 
+- Look for ways to simplify a component by moving predictable work into an existing library, platform capability or simpler data representation. A simple component paired with a well-understood transformation elsewhere can achieve the same result with less custom machinery. Compare the total code, operational cost and failure modes across both layers; preserve required guarantees and report specification changes before implementing them.
 - In every PR, inspect affected code and dependencies for dead code, superseded paths, duplicate abstractions and unused configuration. Remove what the change makes unnecessary after checking callers, and update the related tests and docs. Prefer existing dependency APIs over project wrappers that add no required behavior; keep unrelated cleanup out of the PR.
 - Reuse existing contracts, helpers and dependencies. Search affected callers before changing a shared interface and update all affected callers and tests.
 - Implement the issue's acceptance criteria without speculative features, dependencies or abstractions. Preserve validation, error handling and failure isolation.

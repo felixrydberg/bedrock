@@ -16,7 +16,8 @@ use tokio::sync::oneshot;
 
 use super::log::{Log, MemoryLog};
 use super::materialized::{
-    Committed, Materialized, Persisted, Retention, Retries, RetryRecord, View, validate_scope,
+    Committed, Materialized, Persisted, Retention, Retries, RetryRecord, Snapshot, View,
+    validate_scope,
 };
 use super::{Event, Operation, stream};
 use crate::admin::Admin;
@@ -334,7 +335,7 @@ impl Writer {
         &self,
         dataset: &str,
         namespace: &str,
-    ) -> StorageResult<(View, Arc<RecoveryLease>)> {
+    ) -> StorageResult<(Snapshot, Arc<RecoveryLease>)> {
         validate_scope(dataset, namespace)?;
         let ns = self.namespace(dataset, namespace);
         let mut state = ns.state.lock().await;
@@ -345,7 +346,19 @@ impl Writer {
         if state.recovery.len() >= 4 {
             return Err(unavailable("namespace recovery capacity exhausted"));
         }
-        let view = self.read_view(&mut state, dataset, namespace).await?;
+        let source = self.source(&mut state, dataset, namespace).await?;
+        // File protection outlasts bounded capture plus the absolute tail lease.
+        let view = tokio::time::timeout(
+            RECOVERY_LEASE,
+            source.snapshot(RECOVERY_MAX + 2 * RECOVERY_LEASE),
+        )
+        .await
+        .map_err(|_| unavailable("snapshot capture timed out"))
+        .and_then(|view| view);
+        if let Err(error) = &view {
+            Self::discard(&mut state, error);
+        }
+        let view = view?;
         let now = crate::monotonic_now();
         let lease = Arc::new(RecoveryLease {
             dataset: dataset.into(),
