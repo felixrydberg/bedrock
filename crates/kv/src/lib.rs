@@ -1,13 +1,72 @@
 //! `bedrock-kv`: customer KV. It hosts no relay-fed datasets; it only joins the cell membership as service `kv`.
+//! It reads the namespace directory from Quicksilver through the shared client and, with `manage_listen` set, serves
+//! namespace management ([`namespaces::routes`]).
+
+pub mod namespaces;
+
+use std::fmt;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use bedrock_lib::membership;
-use bedrock_lib::node::{self, ConfigError, ServiceConfig};
+use bedrock_lib::node::{self, ConfigError, NodeConfig, ServiceConfig};
+use serde::Deserialize;
+
+#[derive(Clone, Deserialize)]
+pub struct KvConfig {
+    #[serde(flatten)]
+    pub service: ServiceConfig,
+    /// Serves namespace management when set. Callers send `Authorization: Bearer <write_token>`: the credential that
+    /// already lets them write the directory through `bedrock-api`.
+    #[serde(default)]
+    pub manage_listen: Option<SocketAddr>,
+    /// `bedrock-api`'s write credential, required with `manage_listen`.
+    #[serde(default)]
+    pub write_token: Option<String>,
+}
+
+impl From<ServiceConfig> for KvConfig {
+    fn from(service: ServiceConfig) -> Self {
+        Self {
+            service,
+            manage_listen: None,
+            write_token: None,
+        }
+    }
+}
+
+impl AsRef<NodeConfig> for KvConfig {
+    fn as_ref(&self) -> &NodeConfig {
+        &self.service.node
+    }
+}
+
+impl fmt::Debug for KvConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KvConfig")
+            .field("service", &self.service)
+            .field("manage_listen", &self.manage_listen)
+            .field(
+                "write_token",
+                &self.write_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
 /// Returns configuration, admin startup, or relay session initialization errors.
-pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
+pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
+    let KvConfig {
+        service: config,
+        manage_listen,
+        write_token,
+    } = config;
     config.validate()?;
     check_hosts_nothing_pushed(&config)?;
+    if manage_listen.is_some() && write_token.is_none() {
+        return Err(ConfigError("manage_listen requires write_token".into()));
+    }
     tracing::info!(node_id = %config.node.node_id, "starting bedrock-kv");
     // ponytail: customer-KV readers (per-namespace S3 databases behind read-only caches) arrive with B-39; roles
     // are only logged until then.
@@ -16,10 +75,8 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     }
     let admin = node::start_admin(&config.node).await?;
     let (members, target) = membership::View::new("kv", &config.node.location.cell);
-    let peers = std::sync::Arc::new(
-        bedrock_lib::transport::Peers::new(&admin)
-            .with_tls(bedrock_lib::transport::tls::start(&config.node, "kv", &admin).await?),
-    );
+    let tls = bedrock_lib::transport::tls::start(&config.node, "kv", &admin).await?;
+    let peers = Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(tls.clone()));
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
@@ -29,6 +86,33 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         Default::default(),
     )
     .map_err(|e| ConfigError(e.to_string()))?;
+    // The directory is read from Quicksilver holders found through the cell relays, not from a local copy.
+    let client = Arc::new(bedrock_lib::client::Client::new(
+        &admin,
+        peers.clone(),
+        config.relays.clone(),
+        config.node.location.failure_domain.clone(),
+    ));
+    let manage = match (manage_listen, write_token) {
+        (Some(listen), Some(token)) => {
+            let directory = Arc::new(namespaces::Directory::new(
+                &admin,
+                client,
+                namespaces::Api {
+                    address: config.api.clone(),
+                    token: token.clone(),
+                    tls: tls.clone(),
+                },
+                config.node.location.region.clone(),
+            ));
+            let app = bedrock_lib::http::bearer(namespaces::routes(directory), &token)?;
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .map_err(|e| ConfigError(format!("manage_listen {listen}: {e}")))?;
+            Some(tokio::spawn(bedrock_lib::http::serve(listener, app, tls)))
+        }
+        _ => None,
+    };
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
@@ -43,6 +127,9 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         }
     }
     admin.set_ready(false);
+    if let Some(manage) = manage {
+        manage.abort();
+    }
     session.drain().await;
     tracing::info!("shutting down");
     Ok(())

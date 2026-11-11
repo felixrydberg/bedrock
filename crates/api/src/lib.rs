@@ -6,7 +6,8 @@
 //! `PUT /v1/{dataset}/{namespace}/{key}` sets the key to the request body and `DELETE` deletes it. The response body is
 //! the committed sequence. An `Idempotency-Key` retry returns the original sequence while it remains
 //! within the configured retry duration (24 hours by default). An expired retry is a new write. An `If-Match` header
-//! holding a revision commits only if that is still the namespace's head, otherwise it answers 412 and writes nothing.
+//! holding a revision commits only if that is still the namespace's head, otherwise it answers 412 with the head
+//! as the body and writes nothing.
 //! Every write requires `Authorization: Bearer <write_token>`; the configured token grants access to all writes.
 //! With `tls` configured, both listeners use TLS (B-55): relays need a node certificate, while write callers may
 //! present one but still authenticate with the token.
@@ -16,21 +17,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
 use axum::routing::put;
 use bedrock_lib::node::{self, ApiConfig, ConfigError};
 use bedrock_lib::replication::Operation;
 use bedrock_lib::replication::writer::{
     CommitError, Persistence, PersistenceMetrics, Write, Writer,
 };
-use bedrock_lib::transport::{self, tls::Tls};
-use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
-use hyper_util::service::TowerToHyperService;
-use subtle::ConstantTimeEq;
+use bedrock_lib::transport;
 use tokio::net::TcpListener;
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
@@ -63,7 +58,7 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     let writes = TcpListener::bind(config.write_listen)
         .await
         .map_err(|e| ConfigError(format!("write_listen {}: {e}", config.write_listen)))?;
-    let writes = tokio::spawn(serve(writes, app, tls.clone()));
+    let writes = tokio::spawn(bedrock_lib::http::serve(writes, app, tls.clone()));
     let router = transport::server(tls.as_ref()).add_service(
         bedrock_lib::replication::pb::relay_server::RelayServer::new(
             bedrock_lib::relays::Hub::writer(
@@ -95,69 +90,10 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
 
 /// The write routes over `writer`, restricted to holders of `write_token`.
 pub fn app(writer: Arc<Writer>, write_token: String) -> Result<Router, ConfigError> {
-    if write_token.is_empty() || !write_token.bytes().all(|b| b.is_ascii_graphic()) {
-        return Err(ConfigError(
-            "write_token must be nonempty printable ASCII without spaces".into(),
-        ));
-    }
-    Ok(Router::new()
+    let routes = Router::new()
         .route("/v1/{dataset}/{namespace}/{*key}", put(write).delete(write))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::<str>::from(write_token),
-            authorize,
-        ))
-        .with_state(writer))
-}
-
-async fn authorize(State(write_token): State<Arc<str>>, request: Request, next: Next) -> Response {
-    let mut credentials = request.headers().get_all(header::AUTHORIZATION).iter();
-    let authorized = match (credentials.next(), credentials.next()) {
-        (Some(value), None) => value
-            .to_str()
-            .ok()
-            .and_then(|value| value.split_once(' '))
-            .is_some_and(|(scheme, token)| {
-                scheme.eq_ignore_ascii_case("Bearer")
-                    && bool::from(token.as_bytes().ct_eq(write_token.as_bytes()))
-            }),
-        _ => false,
-    };
-    if !authorized {
-        return (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-        )
-            .into_response();
-    }
-    next.run(request).await
-}
-
-/// Serves `app` over HTTP/1 through hyper, over TLS when `tls` is set. `axum::serve` does not run under madsim (#9).
-pub async fn serve(listener: TcpListener, app: Router, tls: Option<Arc<Tls>>) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let service = TowerToHyperService::new(app.clone());
-                let Some(tls) = tls.clone() else {
-                    tokio::spawn(
-                        http1::Builder::new().serve_connection(TokioIo::new(stream), service),
-                    );
-                    continue;
-                };
-                tokio::spawn(async move {
-                    match tls.accept_optional(stream).await {
-                        Ok(stream) => {
-                            let _ = http1::Builder::new()
-                                .serve_connection(TokioIo::new(stream), service)
-                                .await;
-                        }
-                        Err(error) => tracing::debug!(%error, "write tls handshake rejected"),
-                    }
-                });
-            }
-            Err(error) => tracing::warn!(%error, "accepting a write connection failed"),
-        }
-    }
+        .with_state(writer);
+    bedrock_lib::http::bearer(routes, &write_token)
 }
 
 async fn write(
@@ -198,7 +134,10 @@ async fn write(
             let status = match error {
                 CommitError::Invalid(_) => StatusCode::BAD_REQUEST,
                 CommitError::Busy => StatusCode::TOO_MANY_REQUESTS,
-                CommitError::Conflict => StatusCode::PRECONDITION_FAILED,
+                // The body is the head, so the caller can re-read at it and plan again.
+                CommitError::Conflict { head } => {
+                    return (StatusCode::PRECONDITION_FAILED, head.to_string());
+                }
                 CommitError::Fenced | CommitError::Unavailable(_) => {
                     StatusCode::SERVICE_UNAVAILABLE
                 }

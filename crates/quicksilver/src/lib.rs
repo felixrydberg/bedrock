@@ -1,7 +1,7 @@
 //! `bedrock-quicksilver`: hosts the `quicksilver` dataset (control-plane data in relay-assigned L2 hash ranges).
 
 pub mod namespaces;
-mod operations {}
+pub mod operations;
 pub mod storage;
 
 use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, ReplicationPolicy};
@@ -70,10 +70,10 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     // recovery matters.
     let skipped = ranged.len() != datasets.iter().count();
     let (members, target) = membership::View::new("quicksilver", &config.node.location.cell);
+    let members = std::sync::Arc::new(members);
+    let tls = bedrock_lib::transport::tls::start(&config.node, "quicksilver", &admin).await?;
     let peers =
-        std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(
-            bedrock_lib::transport::tls::start(&config.node, "quicksilver", &admin).await?,
-        ));
+        std::sync::Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(tls.clone()));
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
@@ -99,11 +99,35 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
             })
             .collect(),
     );
+    // Owners answer the shared client's reads of their ranges (#56 / B-25).
+    let reads = operations::Reads {
+        node_id: config.node.node_id.clone(),
+        cell: config.node.location.cell.clone(),
+        members: members.clone(),
+        engines: datasets
+            .iter()
+            .filter_map(|instance| {
+                let engine = instance.engine.as_ref().ok()?.clone();
+                Some((instance.dataset.name.to_owned(), engine))
+            })
+            .collect(),
+    };
+    let router = bedrock_lib::transport::server(tls.as_ref())
+        .add_service(bedrock_lib::replication::pb::reads_server::ReadsServer::new(reads));
+    let mut serving = std::pin::pin!(bedrock_lib::transport::serve(
+        router,
+        config.node.listen,
+        tls
+    ));
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
         tokio::select! {biased;
             ()=&mut shutdown=>break,
+            served=&mut serving=>{
+                served.map_err(|e| ConfigError(format!("listen {}: {e}", config.node.listen)))?;
+                break;
+            },
             _=readiness.tick()=>{
                 // Quarantined datasets are routed around (B-14); they do not hold back the others.
                 let unhealthy = storage.unhealthy();

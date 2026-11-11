@@ -2276,6 +2276,33 @@ pub fn authorize(
 
 #[tonic::async_trait]
 impl pb::relay_server::Relay for Hub {
+    async fn routes(
+        &self,
+        request: Request<pb::RoutesRequest>,
+    ) -> Result<Response<pb::RoutesReply>, Status> {
+        if let Some(caller) = Caller::of(&request) {
+            caller.require(&crate::membership::SERVICES, Some(self.cell()))?;
+        }
+        let Some(control) = self.0.control.get() else {
+            return Err(Status::unavailable("only a cell relay serves routes"));
+        };
+        let service = &request.get_ref().service;
+        if !crate::membership::SERVICES.contains(&service.as_str()) {
+            return Err(Status::invalid_argument("unknown service"));
+        }
+        let namespace = crate::membership::namespace(service, self.cell());
+        control.validate_namespace(self.cell(), &namespace)?;
+        let view = control.view(&namespace)?;
+        Ok(Response::new(pb::RoutesReply {
+            revision: view.sequence,
+            entries: view
+                .values
+                .into_iter()
+                .map(|(key, value)| pb::StateEntry { key, value })
+                .collect(),
+        }))
+    }
+
     type SessionStream = Frames;
     async fn session(
         &self,

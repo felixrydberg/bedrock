@@ -52,10 +52,13 @@ enum Outcome {
     Timeout,
 }
 
+type Pinned = (Channel, Option<tls::Identity>);
+
 /// Outbound connections, one per `(peer, class)`, shared by every caller on the node.
 pub struct Peers {
     /// Departed cell members are dropped through [`Peers::forget`] (B-12).
-    channels: Mutex<BTreeMap<(String, Class), Channel>>,
+    /// Each with the identity its peer must present, if pinned.
+    channels: Mutex<BTreeMap<(String, Class), Pinned>>,
     calls: Family<CallLabels, Counter>,
     health: Health,
     tls: Option<Arc<Tls>>,
@@ -100,8 +103,30 @@ impl Peers {
     /// The connection to `addr` (`host:port`) for `class`. It connects on first use, reconnects after failures and is
     /// reused by every later caller.
     pub fn channel(&self, addr: &str, class: Class) -> Result<Channel, tonic::transport::Error> {
+        self.open(addr, class, self.identities.get(addr).cloned())
+    }
+
+    /// [`Peers::channel`] to a peer that must present `identity`, such as a holder a routing table names. A holder
+    /// replaced at the same address gets a new connection.
+    pub fn pinned(
+        &self,
+        addr: &str,
+        class: Class,
+        identity: tls::Identity,
+    ) -> Result<Channel, tonic::transport::Error> {
+        self.open(addr, class, Some(identity))
+    }
+
+    fn open(
+        &self,
+        addr: &str,
+        class: Class,
+        expected: Option<tls::Identity>,
+    ) -> Result<Channel, tonic::transport::Error> {
         let mut channels = self.channels.lock().unwrap();
-        if let Some(channel) = channels.get(&(addr.to_owned(), class)) {
+        if let Some((channel, pinned)) = channels.get(&(addr.to_owned(), class))
+            && *pinned == expected
+        {
             return Ok(channel.clone());
         }
         // The scheme only labels requests; with TLS the connector encrypts.
@@ -110,10 +135,10 @@ impl Peers {
             .keep_alive_timeout(KEEPALIVE_TIMEOUT)
             .keep_alive_while_idle(true);
         let channel = match &self.tls {
-            Some(tls) => tls.channel(endpoint, self.identities.get(addr).cloned()),
+            Some(tls) => tls.channel(endpoint, expected.clone()),
             None => endpoint.connect_lazy(),
         };
-        channels.insert((addr.to_owned(), class), channel.clone());
+        channels.insert((addr.to_owned(), class), (channel.clone(), expected));
         Ok(channel)
     }
 

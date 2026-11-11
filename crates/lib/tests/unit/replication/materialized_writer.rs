@@ -590,7 +590,7 @@ async fn a_write_planned_from_an_old_revision_is_refused() {
     assert_eq!(writer.commit(planned("second", 1)).await, Ok(2));
     assert_eq!(
         writer.commit(planned("late", 1)).await,
-        Err(CommitError::Conflict)
+        Err(CommitError::Conflict { head: 2 })
     );
     let view = writer.bootstrap("kv", "one").await.unwrap();
     assert_eq!(view.sequence, 2);

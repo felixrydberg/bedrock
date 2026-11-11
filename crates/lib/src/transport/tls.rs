@@ -22,7 +22,7 @@ use crate::node::{ConfigError, NodeConfig};
 pub use adapter::Tls;
 
 /// What the local certificate must name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub service: String,
     pub cell: String,
@@ -256,7 +256,7 @@ mod adapter {
             self.current.lock().unwrap().clone()
         }
 
-        /// A lazily connecting channel that dials through TLS and accepts only [`SERVERS`].
+        /// A lazily connecting channel that dials through TLS and accepts only `expected`, or else [`SERVERS`].
         pub fn channel(
             self: &Arc<Self>,
             endpoint: Endpoint,
@@ -286,24 +286,29 @@ mod adapter {
                 })??;
             let server = peer(stream.get_ref().1.peer_certificates())
                 .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
-            if !SERVERS.contains(&server.service.as_str()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "{addr} is {} {}, not a relay or api",
-                        server.service, server.node_id
-                    ),
-                ));
-            }
-            if let Some(expected) = expected
-                && (server.service != expected.service
-                    || server.cell != expected.cell
-                    || server.node_id != expected.node_id)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "peer certificate differs from configured control identity",
-                ));
+            // A pinned peer (a configured control peer, or a holder its routing table names) must be exactly that
+            // process; any other server must be a relay or the writer.
+            match expected {
+                Some(expected)
+                    if server.service != expected.service
+                        || server.cell != expected.cell
+                        || server.node_id != expected.node_id =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "peer certificate differs from the expected identity",
+                    ));
+                }
+                None if !SERVERS.contains(&server.service.as_str()) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "{addr} is {} {}, not a relay or api",
+                            server.service, server.node_id
+                        ),
+                    ));
+                }
+                _ => {}
             }
             Ok(stream)
         }

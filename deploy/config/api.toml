@@ -17,7 +17,7 @@ bucket = "bedrock"
 
 [location]
 region = "core"
-dc = "core-1"
+dc = "arn2"
 cell = "core-1a"
 
 # Writes acknowledge only after events, values, retries and progress are durable together.

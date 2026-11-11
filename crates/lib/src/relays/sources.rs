@@ -20,8 +20,8 @@ use crate::replication::pb;
 /// How long a holder's reported revision keeps it out of reads above that revision; then it is tried again.
 pub const RECHECK: Duration = Duration::from_secs(1);
 
-/// `(node, dataset, namespace)` → applied revision the holder reported, and when.
-type Behind = BTreeMap<(String, String, String), (u64, Instant)>;
+/// `(node, dataset, namespace, range start)` → applied revision the holder reported, and when.
+type Behind = BTreeMap<(String, String, String, u64), (u64, Instant)>;
 
 /// Holders that recently turned down a read for being behind.
 #[derive(Default)]
@@ -30,13 +30,27 @@ pub struct Sources {
 }
 
 impl Sources {
-    /// `node` rejected a read of `dataset`/`namespace` because it has only applied `applied`.
-    pub fn behind(&self, node: &str, dataset: &str, namespace: &str, applied: u64) {
+    /// `node` rejected a read of `dataset`/`namespace` in the range holding `hash` because it has only applied `applied`
+    /// there. Its other ranges progress separately and stay untouched.
+    pub fn behind(
+        &self,
+        directory: &Directory,
+        node: &str,
+        dataset: &str,
+        namespace: &str,
+        hash: u64,
+        applied: u64,
+    ) {
         let now = crate::monotonic_now();
         let mut behind = self.behind.lock().unwrap();
         behind.retain(|_, (_, at)| now.duration_since(*at) < RECHECK);
         behind.insert(
-            (node.into(), dataset.into(), namespace.into()),
+            (
+                node.into(),
+                dataset.into(),
+                namespace.into(),
+                placement::start_of(directory, hash),
+            ),
             (applied, now),
         );
     }
@@ -61,11 +75,17 @@ impl Sources {
     ) -> Vec<&'a pb::Member> {
         let now = crate::monotonic_now();
         let behind = self.behind.lock().unwrap();
+        let range = placement::start_of(directory, hash);
         let mut candidates: Vec<(&State, &pb::Member)> = placement::owners(directory, hash)
             .iter()
             .filter(|o| o.state != State::Populating)
             .filter(|o| {
-                let key = (o.node.clone(), dataset.to_owned(), namespace.to_owned());
+                let key = (
+                    o.node.clone(),
+                    dataset.to_owned(),
+                    namespace.to_owned(),
+                    range,
+                );
                 behind.get(&key).is_none_or(|(applied, at)| {
                     *applied >= min_revision || now.duration_since(*at) >= RECHECK
                 })

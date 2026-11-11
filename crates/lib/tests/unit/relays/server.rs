@@ -1127,3 +1127,89 @@ fn a_stream_started_past_this_relays_history_moves_its_head_to_the_cursor() {
         "a first follow proves nothing"
     );
 }
+
+/// A cell control group holding one published value in every membership namespace.
+struct PublishedCell;
+
+impl LocalControlSource for PublishedCell {
+    fn validate_namespace(&self, cell: &str, namespace: &str) -> Result<(), Status> {
+        let services = crate::membership::SERVICES;
+        match services
+            .iter()
+            .any(|s| namespace == crate::membership::namespace(s, cell))
+        {
+            true => Ok(()),
+            false => Err(Status::invalid_argument("outside this cell")),
+        }
+    }
+    fn identity(&self) -> pb::ControlAck {
+        Default::default()
+    }
+    fn validate_peer(&self, _: &pb::ControlAck) -> Result<(), Status> {
+        Ok(())
+    }
+    fn changed(&self) -> Arc<Watched<u64>> {
+        Arc::new(Watched::new(0))
+    }
+    fn head(&self, _: &str) -> Result<u64, Status> {
+        Ok(3)
+    }
+    fn read(&self, _: &str, _: u64, _: usize) -> Result<Vec<Event>, Status> {
+        Ok(Vec::new())
+    }
+    fn view(&self, namespace: &str) -> Result<crate::replication::materialized::View, Status> {
+        Ok(crate::replication::materialized::View {
+            dataset: "membership".into(),
+            namespace: namespace.into(),
+            sequence: 3,
+            committed_at: 0,
+            values: [(b"qs-1".to_vec(), namespace.as_bytes().to_vec())].into(),
+            retries: Default::default(),
+            pruned_through: 0,
+            raft: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn routes_return_a_services_published_namespace_to_callers_in_the_cell() {
+    use pb::relay_server::Relay as _;
+    let ask = |service: &str, from: Option<Caller>| {
+        let mut request = Request::new(pb::RoutesRequest {
+            service: service.into(),
+        });
+        if let Some(from) = from {
+            request.extensions_mut().insert(from);
+        }
+        request
+    };
+    // Only a cell relay with a control group answers.
+    let error = hub().routes(ask("quicksilver", None)).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    let hub = hub()
+        .with_cell("cell".into())
+        .with_control(Arc::new(PublishedCell));
+    let reply = hub
+        .routes(ask("quicksilver", Some(caller("kv", "cell", "kv-1"))))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reply.revision, 3);
+    assert_eq!(
+        reply.entries,
+        [pb::StateEntry {
+            key: b"qs-1".to_vec(),
+            value: b"quicksilver.cell".to_vec(),
+        }]
+    );
+    let foreign = hub.routes(ask("quicksilver", Some(caller("kv", "other", "kv-9"))));
+    assert_eq!(
+        foreign.await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let unknown = hub.routes(ask("nope", Some(caller("kv", "cell", "kv-1"))));
+    assert_eq!(
+        unknown.await.unwrap_err().code(),
+        tonic::Code::InvalidArgument
+    );
+}

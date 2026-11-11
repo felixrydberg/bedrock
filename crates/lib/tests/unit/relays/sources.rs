@@ -147,7 +147,7 @@ async fn stale_holder_is_skipped_for_newer_reads_until_recheck() {
 
     // Unknown revisions are tried: the holder checks freshness when it serves.
     assert_eq!(select("ns", 10), ["a", "b"]);
-    sources.behind("a", "quicksilver", "ns", 7);
+    sources.behind(&dir, "a", "quicksilver", "ns", H, 7);
     assert_eq!(select("ns", 10), ["b"]);
     // Reads it can serve, and other namespaces, still go to it.
     assert_eq!(select("ns", 7), ["a", "b"]);
@@ -156,6 +156,22 @@ async fn stale_holder_is_skipped_for_newer_reads_until_recheck() {
     // After RECHECK it is tried again, since it may have caught up.
     sleep(RECHECK).await;
     assert_eq!(select("ns", 10), ["a", "b"]);
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn a_holder_behind_in_one_range_still_serves_its_others() {
+    let health = Health::new(&Admin::new());
+    let members = members(&[("a", ""), ("b", "")]);
+    let split = 1 << 63;
+    let both = || vec![owner("a", State::Ready), owner("b", State::Ready)];
+    let dir = Directory::from([(0, both()), (split, both())]);
+    let sources = Sources::default();
+    let select =
+        |hash| ids(&sources.select(&members, &dir, &health, "", "quicksilver", "ns", hash, 10));
+    sources.behind(&dir, "a", "quicksilver", "ns", split - 1, 7);
+    assert_eq!(select(H), ["b"]);
+    assert_eq!(select(split), ["a", "b"]);
 }
 
 #[cfg_attr(not(madsim), tokio::test(start_paused = true))]

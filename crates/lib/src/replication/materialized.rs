@@ -19,7 +19,8 @@ use crate::storage::{
 };
 
 pub const DEFAULT_RETENTION_MS: u64 = 86_400_000;
-const FORMAT_VERSION: u32 = 2;
+/// The layout of namespace databases this code writes; customer-KV directory records note it (#56 / B-25).
+pub const FORMAT_VERSION: u32 = 2;
 const META_KEY: &[u8] = b"m";
 
 #[derive(Clone, Debug, Deserialize)]

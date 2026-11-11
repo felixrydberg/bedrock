@@ -17,7 +17,7 @@ fn config(extra: &str) -> ServiceConfig {
 
             [location]
             region = "eu"
-            dc = "eu-1"
+            dc = "arn1"
             cell = "eu-1a"
             "#
         )))

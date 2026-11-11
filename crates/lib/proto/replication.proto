@@ -158,7 +158,14 @@ message RelayFrame {
     Ranges ranges = 7;
   }
 }
-service Relay { rpc Session(stream RelayRequest) returns (stream RelayFrame); }
+// A service's published membership namespace in the relay's cell: members and placement directories, as the cell
+// control group stores them (#56 / B-25). Callers fetch it on demand instead of subscribing to every service they call.
+message RoutesRequest { string service = 1; }
+message RoutesReply { uint64 revision = 1; repeated StateEntry entries = 2; }
+service Relay {
+  rpc Session(stream RelayRequest) returns (stream RelayFrame);
+  rpc Routes(RoutesRequest) returns (RoutesReply);
+}
 
 // Sibling relays (`replay_peers`) watch each other: a snapshot completed by `synced`, then changes.
 // An empty update is a progress tick. A relay shares only what its own sessions hold, never what it
@@ -218,4 +225,28 @@ message ControlWritten { uint64 revision = 1; }
 service CellControl {
   rpc Step(ControlPacket) returns (ControlAck);
   rpc Write(ControlWrite) returns (ControlWritten);
+}
+
+// Read-only key reads served by a ranged dataset's L2 owners (#56 / B-25). An owner that does not serve the key's range
+// answers FAILED_PRECONDITION, and one whose range is below `min_revision` answers ABORTED; the caller tries the next
+// owner. `revision` is the answering range's applied revision, which proves both a value and an absence.
+message GetRequest { string dataset = 1; string namespace = 2; bytes key = 3; uint64 min_revision = 4; }
+message GetReply { uint64 revision = 1; optional bytes value = 2; }
+// Keys of one range with `prefix`, after `start_after`, in key order. `range_end` is where the caller's placement ends the
+// range (0 for the end of the ring); an owner whose placement or applied range ends elsewhere refuses, so a stale caller
+// never takes part of a range for all of it.
+message ListRequest {
+  string dataset = 1;
+  string namespace = 2;
+  bytes prefix = 3;
+  bytes start_after = 4;
+  uint32 limit = 5;
+  uint64 range_start = 6;
+  uint64 min_revision = 7;
+  uint64 range_end = 8;
+}
+message ListReply { uint64 revision = 1; repeated StateEntry entries = 2; bool more = 3; }
+service Reads {
+  rpc Get(GetRequest) returns (GetReply);
+  rpc List(ListRequest) returns (ListReply);
 }

@@ -346,6 +346,30 @@ async fn clients_reject_servers_that_are_not_relays() {
     assert_eq!(status.code(), Code::Unavailable, "{status}");
 }
 
+/// The shared client reads from the holder its routing table names, and only from that process.
+#[tokio::test(flavor = "multi_thread")]
+async fn clients_reach_a_holder_only_as_the_member_its_table_names() {
+    let ca = Ca::new();
+    let holder = tls(&ca, "quicksilver", "c1", "q1").await;
+    let addr = serve(holder.clone(), hub("c1", Arc::new(peers(Some(holder))))).await;
+    let client = peers(Some(tls(&ca, "relay", "c1", "r2").await));
+    for (node_id, accepted) in [("q1", true), ("q2", false)] {
+        let channel = client
+            .pinned(
+                &addr,
+                Class::Control,
+                identity("quicksilver", "c1", node_id),
+            )
+            .unwrap();
+        let watched = pb::siblings_client::SiblingsClient::new(channel)
+            .watch(pb::SiblingWatch::default())
+            .await;
+        assert_eq!(watched.is_ok(), accepted, "{node_id}");
+    }
+    // Unpinned, it is not a relay or api.
+    assert!(watch(&client, &addr).await.is_err());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pinned_control_peers_require_the_configured_process_identity() {
     let ca = Ca::new();
