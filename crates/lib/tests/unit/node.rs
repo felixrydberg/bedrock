@@ -237,6 +237,8 @@ fn data_centers_are_named_by_iata_code() {
         "arn-1",
         "arn1a",
         "stockholm",
+        "aé1",
+        "arné",
     ] {
         assert!(!valid_dc(dc), "{dc}");
     }

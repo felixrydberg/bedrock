@@ -547,6 +547,14 @@ pub fn owners(directory: &Directory, hash: u64) -> &[Owner] {
         .map_or(&[], |(_, owners)| owners)
 }
 
+/// The start of the range holding `hash`; 0 before the directory's first write.
+pub fn start_of(directory: &Directory, hash: u64) -> u64 {
+    directory
+        .range(..=hash)
+        .next_back()
+        .map_or(0, |(start, _)| *start)
+}
+
 /// The owner check: a node serves only ranges it holds as `ready` or `leaving` in its own view; a `populating` owner
 /// may not have the data yet (#22 / B-21). A caller routed by a stale view is rejected and retries the next owner.
 pub fn serves(directory: &Directory, node: &str, hash: u64) -> bool {

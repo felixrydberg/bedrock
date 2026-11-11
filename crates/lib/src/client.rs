@@ -24,7 +24,7 @@ use crate::membership::{self, Directories};
 use crate::placement;
 use crate::relays::sources::Sources;
 use crate::replication::pb;
-use crate::transport::{Class, Peers};
+use crate::transport::{Class, Peers, tls};
 
 /// A routing table not used for this long is dropped; the next read fetches a fresh one.
 pub const IDLE_TTL: Duration = Duration::from_secs(10 * 60);
@@ -134,7 +134,7 @@ impl Client {
                 service: service.into(),
             };
             let reply = self
-                .call(relay, |channel| async move {
+                .call(relay, None, |channel| async move {
                     pb::relay_client::RelayClient::new(channel)
                         .routes(request)
                         .await
@@ -290,7 +290,7 @@ impl Client {
         Fut: Future<Output = Result<tonic::Response<T>, Status>>,
     {
         let directory = table.directories.get(dataset).cloned().unwrap_or_default();
-        let candidates: Vec<(String, String)> = self
+        let candidates: Vec<(String, tls::Identity)> = self
             .sources
             .select(
                 &table.members,
@@ -303,16 +303,26 @@ impl Client {
                 min_revision,
             )
             .into_iter()
-            .map(|m| (m.node_id.clone(), m.address.clone()))
+            .map(|m| {
+                let identity = tls::Identity {
+                    service: m.service.clone(),
+                    cell: m.cell.clone(),
+                    node_id: m.node_id.clone(),
+                    host: crate::transport::host_of(&m.address).into(),
+                };
+                (m.address.clone(), identity)
+            })
             .collect();
         let mut last = Status::unavailable("no holder for the range");
-        for (node, address) in candidates {
-            match self.call(&address, &call).await {
+        for (address, identity) in candidates {
+            let node = identity.node_id.clone();
+            match self.call(&address, Some(identity), &call).await {
                 Ok(reply) => return Ok(reply),
                 Err(status) => {
                     if status.code() == tonic::Code::Aborted {
                         let applied = min_revision.saturating_sub(1);
-                        self.sources.behind(&node, dataset, namespace, applied);
+                        self.sources
+                            .behind(&directory, &node, dataset, namespace, hash, applied);
                     }
                     last = status;
                 }
@@ -321,15 +331,22 @@ impl Client {
         Err(last)
     }
 
-    async fn call<T, F, Fut>(&self, address: &str, call: F) -> Result<T, Status>
+    /// Calls `address`, which must present `identity` when given: a holder is the member its table names.
+    async fn call<T, F, Fut>(
+        &self,
+        address: &str,
+        identity: Option<tls::Identity>,
+        call: F,
+    ) -> Result<T, Status>
     where
         F: FnOnce(Channel) -> Fut,
         Fut: Future<Output = Result<tonic::Response<T>, Status>>,
     {
-        let channel = self
-            .peers
-            .channel(address, Class::Control)
-            .map_err(|e| Status::unavailable(e.to_string()))?;
+        let channel = match identity {
+            Some(identity) => self.peers.pinned(address, Class::Control, identity),
+            None => self.peers.channel(address, Class::Control),
+        }
+        .map_err(|e| Status::unavailable(e.to_string()))?;
         let reply = self
             .peers
             .call(address, Class::Control, TIMEOUT, call(channel))

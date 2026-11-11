@@ -14,7 +14,7 @@
 //!   lag the head; a 412 carries the head, and the operation re-reads at it and plans again.
 //! - **The management API** is Cloudflare's namespace API (`/client/v4/accounts/{tenant}/storage/kv/namespaces`): the
 //!   same paths, bodies, envelope and namespace object, so its clients work against a `bedrock-kv` host. Its additions
-//!   are each answer's directory `revision`, `?min_revision=` on reads, and quota fields on create.
+//!   are each answer's directory `revision`, `?min_revision=` on reads and lists, and quota fields on create.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -535,12 +535,16 @@ impl Directory {
         Err(Error::Contended)
     }
 
-    /// The tenant's active namespaces in ID order, with the lowest revision among the ranges read.
-    pub async fn list(&self, tenant: &str) -> Result<(Vec<Record>, u64), Error> {
-        let listed = self.scan(0).await.map(|(mut records, revision)| {
-            records.retain(|r| r.tenant == tenant && admit_open(r).is_ok());
-            (records, revision)
-        });
+    /// The tenant's active namespaces in ID order, with the lowest revision among the ranges read, each at least at
+    /// `min_revision`.
+    pub async fn list(&self, tenant: &str, min_revision: u64) -> Result<(Vec<Record>, u64), Error> {
+        let listed = self
+            .scan(min_revision)
+            .await
+            .map(|(mut records, revision)| {
+                records.retain(|r| r.tenant == tenant && admit_open(r).is_ok());
+                (records, revision)
+            });
         self.count("list", listed)
     }
 }
@@ -598,6 +602,8 @@ struct ListQuery {
     per_page: Option<usize>,
     order: Option<String>,
     direction: Option<String>,
+    #[serde(default)]
+    min_revision: u64,
 }
 
 fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
@@ -697,7 +703,7 @@ async fn list(
     if page == 0 || !(1..=1000).contains(&per_page) {
         return invalid("page starts at 1 and per_page is 1 to 1000");
     }
-    let (mut records, revision) = match directory.list(&tenant).await {
+    let (mut records, revision) = match directory.list(&tenant, query.min_revision).await {
         Ok(listed) => listed,
         Err(error) => return reply(Err(error), None),
     };

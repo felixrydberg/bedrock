@@ -155,3 +155,35 @@ fn a_list_returns_one_namespaces_prefix_in_key_order_and_pages() {
         tonic::Code::FailedPrecondition
     );
 }
+
+#[test]
+fn a_list_page_is_capped_however_large_the_limit() {
+    let keys = low_keys("p/", LIST_LIMIT as usize + 1);
+    let engine = engine(&keys.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let snapshot = engine.snapshot().unwrap();
+    let applied = vec![(NS.to_owned(), (0, HALF), 1)];
+    let dir = directory(State::Ready);
+    let view = View {
+        snapshot: &*snapshot,
+        applied: &applied,
+        directory: &dir,
+        node: "qs-1",
+    };
+    let page = list(
+        &view,
+        &pb::ListRequest {
+            dataset: DS.into(),
+            namespace: NS.into(),
+            prefix: b"p/".to_vec(),
+            limit: u32::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut smallest = keys.clone();
+    smallest.sort();
+    smallest.truncate(LIST_LIMIT as usize);
+    let listed: Vec<_> = page.entries.into_iter().map(|e| e.key).collect();
+    assert_eq!(listed, smallest);
+    assert!(page.more);
+}

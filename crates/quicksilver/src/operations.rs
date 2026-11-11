@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use bedrock_lib::client::LIST_LIMIT;
 use bedrock_lib::membership;
 use bedrock_lib::placement::{self, Directory};
 use bedrock_lib::relays::client::applied_ranges;
@@ -87,7 +88,8 @@ pub fn get(view: &View, request: &pb::GetRequest) -> Result<pb::GetReply, Status
     Ok(pb::GetReply { revision, value })
 }
 
-/// Keys of the range starting at `request.range_start` with the prefix, after `start_after`, in key order.
+/// Keys of the range starting at `request.range_start` with the prefix, after `start_after`, in key order: at most
+/// `request.limit`, capped at [`LIST_LIMIT`](bedrock_lib::client::LIST_LIMIT).
 pub fn list(view: &View, request: &pb::ListRequest) -> Result<pb::ListReply, Status> {
     let ((start, end), revision) = view.serving(
         &request.namespace,
@@ -97,11 +99,15 @@ pub fn list(view: &View, request: &pb::ListRequest) -> Result<pb::ListReply, Sta
     if start != request.range_start {
         return Err(Status::failed_precondition("not a range start"));
     }
+    let limit = match request.limit {
+        0 => LIST_LIMIT,
+        limit => limit.min(LIST_LIMIT),
+    } as usize;
     let mut marker = request.namespace.as_bytes().to_vec();
     marker.push(0);
-    let mut entries = Vec::new();
-    // ponytail: the span is hash-ordered, so every match is collected before sorting; a key-ordered index would stop
-    // at `limit`.
+    // The smallest `limit + 1` matches; one more than a page tells whether there is more.
+    let mut entries = BTreeMap::new();
+    // ponytail: the span is hash-ordered, so it is scanned whole; a key-ordered index would stop at `limit`.
     for entry in view
         .snapshot
         .scan(&l2_span(start, end))
@@ -116,22 +122,20 @@ pub fn list(view: &View, request: &pb::ListRequest) -> Result<pb::ListReply, Sta
             continue;
         };
         if key.starts_with(&request.prefix) && key > request.start_after.as_slice() {
-            entries.push(pb::StateEntry {
-                key: key.to_vec(),
-                value,
-            });
+            entries.insert(key.to_vec(), value);
+            if entries.len() > limit + 1 {
+                entries.pop_last();
+            }
         }
     }
-    entries.sort_by(|a, b| a.key.cmp(&b.key));
-    let limit = match request.limit {
-        0 => bedrock_lib::client::LIST_LIMIT,
-        limit => limit,
-    } as usize;
     let more = entries.len() > limit;
-    entries.truncate(limit);
     Ok(pb::ListReply {
         revision,
-        entries,
+        entries: entries
+            .into_iter()
+            .take(limit)
+            .map(|(key, value)| pb::StateEntry { key, value })
+            .collect(),
         more,
     })
 }

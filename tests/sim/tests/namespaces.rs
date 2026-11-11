@@ -302,16 +302,19 @@ async fn scenario() -> Vec<String> {
             assert_eq!(ids.len(), 3);
             trace.push(format!("concurrent creates through {head}"));
 
-            // Listing in the other cell pages a tenant's namespaces in ID order, or by title.
-            let listed = until("list", Duration::from_secs(60), 200, || async {
-                let (status, body) = call(kv_b, "GET", &theirs, "").await;
-                if body["result_info"]["total_count"] == ids.len() {
-                    (status, body)
-                } else {
-                    (0, body)
-                }
+            // Listing in the other cell at the creates' revision pages a tenant's namespaces in ID order, or by title.
+            let at_head = format!("{theirs}?min_revision={head}");
+            let listed = until("list", Duration::from_secs(60), 200, || {
+                call(kv_b, "GET", &at_head, "")
             })
             .await;
+            assert_eq!(listed["result_info"]["total_count"], ids.len());
+            let nobody = format!("{}?min_revision={head}", namespaces("customer-789"));
+            let (status, empty) = call(kv_b, "GET", &nobody, "").await;
+            assert_eq!(
+                (status, empty["result_info"]["total_count"].clone()),
+                (200, 0.into())
+            );
             let listed_ids = |body: &Value| -> Vec<String> {
                 body["result"]
                     .as_array()
