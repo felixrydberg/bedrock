@@ -232,7 +232,9 @@ service CellControl {
 // owner. `revision` is the answering range's applied revision, which proves both a value and an absence.
 message GetRequest { string dataset = 1; string namespace = 2; bytes key = 3; uint64 min_revision = 4; }
 message GetReply { uint64 revision = 1; optional bytes value = 2; }
-// Keys of one range with `prefix`, after `start_after`, in key order.
+// Keys of one range with `prefix`, after `start_after`, in key order. `range_end` is where the caller's placement ends the
+// range (0 for the end of the ring); an owner whose placement or applied range ends elsewhere refuses, so a stale caller
+// never takes part of a range for all of it.
 message ListRequest {
   string dataset = 1;
   string namespace = 2;
@@ -241,6 +243,7 @@ message ListRequest {
   uint32 limit = 5;
   uint64 range_start = 6;
   uint64 min_revision = 7;
+  uint64 range_end = 8;
 }
 message ListReply { uint64 revision = 1; repeated StateEntry entries = 2; bool more = 3; }
 service Reads {

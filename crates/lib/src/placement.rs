@@ -555,6 +555,14 @@ pub fn start_of(directory: &Directory, hash: u64) -> u64 {
         .map_or(0, |(start, _)| *start)
 }
 
+/// Where the range starting at `start` ends: the next range's start, or 0 at the end of the ring.
+pub fn end_of(directory: &Directory, start: u64) -> u64 {
+    start
+        .checked_add(1)
+        .and_then(|after| directory.range(after..).next())
+        .map_or(0, |(next, _)| *next)
+}
+
 /// The owner check: a node serves only ranges it holds as `ready` or `leaving` in its own view; a `populating` owner
 /// may not have the data yet (#22 / B-21). A caller routed by a stale view is rejected and retries the next owner.
 pub fn serves(directory: &Directory, node: &str, hash: u64) -> bool {

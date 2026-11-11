@@ -248,6 +248,7 @@ impl Client {
                     start_after: start_after.to_vec(),
                     limit,
                     range_start: start,
+                    range_end: placement::end_of(directory, start),
                     min_revision,
                 };
                 let reply = self

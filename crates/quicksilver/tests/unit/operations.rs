@@ -137,6 +137,7 @@ fn a_list_returns_one_namespaces_prefix_in_key_order_and_pages() {
         start_after: start_after.to_vec(),
         limit: 3,
         range_start: 0,
+        range_end: HALF,
         min_revision: 8,
     };
     let page = list(&view, &request(b"")).unwrap();
@@ -157,6 +158,13 @@ fn a_list_returns_one_namespaces_prefix_in_key_order_and_pages() {
     assert_eq!(
         list(&view_split, &request(b"")).unwrap_err().code(),
         tonic::Code::Aborted
+    );
+    // A caller whose placement ends the range elsewhere, as with a stale table after a split, is refused.
+    let mut stale_end = request(b"");
+    stale_end.range_end = 0;
+    assert_eq!(
+        list(&view, &stale_end).unwrap_err().code(),
+        tonic::Code::FailedPrecondition
     );
     let mut not_a_start = request(b"");
     not_a_start.range_start = 1;
@@ -186,6 +194,7 @@ fn a_list_page_is_capped_however_large_the_limit() {
             namespace: NS.into(),
             prefix: b"p/".to_vec(),
             limit: u32::MAX,
+            range_end: HALF,
             ..Default::default()
         },
     )
