@@ -1864,3 +1864,61 @@ fn merged_ranges_join_only_at_one_revision() {
         [&("auth".into(), whole)]
     );
 }
+
+/// Found by #56 / B-25's simulation: a range stream opens a namespace's consumer on its first frame, so a namespace
+/// nothing was written to never had stored progress, and its owners answered every read, even at revision 0, as behind.
+#[test]
+fn a_range_holds_a_never_written_namespace_at_revision_zero() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new("quicksilver"));
+    let range = (0, 1 << 63);
+    let opened = Consumer::missing("quicksilver", range, &engine, |_| false).unwrap();
+    let scopes: Vec<_> = opened.iter().map(Consumer::scope).collect();
+    assert_eq!(
+        scopes,
+        [("quicksilver".into(), "infrastructure".into(), Some(range))]
+    );
+    assert!(opened[0].validated());
+    let snapshot = engine.snapshot().unwrap();
+    assert_eq!(
+        applied_ranges(&*snapshot, "quicksilver").unwrap(),
+        [("infrastructure".to_owned(), range, 0)]
+    );
+    // A restart resumes it from the first revision; a namespace already open is not opened twice.
+    let group = Target {
+        selection: Selection {
+            dataset: "quicksilver".into(),
+            namespace: String::new(),
+        },
+        engine: engine.clone(),
+        prefix: Vec::new(),
+        span: Some(range),
+    };
+    let resumed = Consumer::resumed(&group, range).unwrap();
+    assert_eq!(
+        (resumed.len(), resumed[0].applied, resumed[0].resume()),
+        (1, 0, 1)
+    );
+    let held: BTreeSet<Scope> = resumed.iter().map(Consumer::scope).collect();
+    assert!(
+        Consumer::missing("quicksilver", range, &engine, |s| held.contains(s))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Data in a range without stored progress may be anything, so it is never claimed as revision 0.
+#[test]
+fn unexplained_range_data_is_never_held_at_revision_zero() {
+    let engine: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new("auth"));
+    let range = only(b"k");
+    let mut batch = WriteBatch::default();
+    batch.put(stored_at(b"k"), b"v".to_vec());
+    engine.write(batch).unwrap();
+    let consumer = ranged(engine.clone(), range);
+    assert!(!consumer.validated());
+    assert!(
+        applied_ranges(&*engine.snapshot().unwrap(), "auth")
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -231,20 +231,7 @@ async fn scenario() -> Vec<String> {
         .build();
     let trace = client
         .spawn(async move {
-            // EXPERIMENT: one infrastructure write before any read.
-            let request = hyper::Request::put("/v1/quicksilver/infrastructure/seed")
-                .header("host", "api")
-                .header("authorization", format!("Bearer {TOKEN}"))
-                .body(Full::new(Bytes::from_static(b"x")))
-                .unwrap();
-            let put = bedrock_lib::http::send(
-                &format!("{API}:7002"),
-                None,
-                request,
-                Duration::from_secs(30),
-            )
-            .await;
-            eprintln!("EXPERIMENT seed write: {put:?}");
+            // Nothing was ever written to `infrastructure`: owners prove its revision 0, so the very first create works.
             // Creating waits until cell a's Quicksilver ranges are placed and ready.
             let created = until("first create", Duration::from_secs(180), 201, || async {
                 call(
@@ -258,6 +245,7 @@ async fn scenario() -> Vec<String> {
             .await;
             let id = created["id"].as_str().unwrap().to_owned();
             let revision = created["revision"].as_u64().unwrap();
+            assert_eq!(revision, 1, "the first directory write of a fresh cluster");
             assert_eq!(created["storage"], format!("kv/{id}"));
             assert_eq!(created["state"], "active");
             trace.push(format!("created {id} at {revision}"));

@@ -298,6 +298,14 @@ impl Session {
                         }
                         resumed => resumed?,
                     };
+                    let mut resumed = resumed;
+                    let held: BTreeSet<Scope> = resumed.iter().map(Consumer::scope).collect();
+                    resumed.extend(Consumer::missing(
+                        &dataset,
+                        range,
+                        &target.engine,
+                        |scope| held.contains(scope),
+                    )?);
                     if groups.insert((dataset, range), target.engine).is_some() {
                         return Err(Status::invalid_argument("duplicate relay range"));
                     }
@@ -634,7 +642,7 @@ impl Consumer {
                         .map_err(storage)?
                         .is_some()));
         drop(snapshot);
-        Ok(Self {
+        let consumer = Self {
             target,
             marker,
             revision,
@@ -646,7 +654,45 @@ impl Consumer {
             awaiting_confirmation,
             bootstrap: None,
             rebuild: 0,
-        })
+        };
+        // A range consumer starting from nothing holds its namespace at revision 0, the empty state every namespace
+        // starts from: what its first commit would store for its own scope. Without it, a namespace no event has
+        // reached yet has no stored progress, and an owner could never prove even revision 0 to a reader (#56 / B-25).
+        if consumer.target.span.is_some() && !matches && !consumer.recover {
+            let mut batch = WriteBatch::default();
+            if let Some(marker) = &consumer.marker {
+                batch.set_revision(marker, 1);
+            }
+            batch
+                .set_revision(&consumer.active, 1)
+                .set_revision(&consumer.revision, 0);
+            consumer.target.engine.write(batch).map_err(storage)?;
+        }
+        Ok(consumer)
+    }
+
+    /// Consumers for the namespaces of `dataset` in `range` that `has` none yet. A namespace's first frame would open
+    /// its consumer, but a namespace nothing was written to sends none.
+    fn missing(
+        dataset: &str,
+        range: Range,
+        engine: &Arc<dyn StorageEngine>,
+        has: impl Fn(&Scope) -> bool,
+    ) -> Result<Vec<Self>, Status> {
+        let group = Target {
+            selection: Selection {
+                dataset: dataset.to_owned(),
+                namespace: String::new(),
+            },
+            engine: engine.clone(),
+            prefix: Vec::new(),
+            span: Some(range),
+        };
+        crate::placement::namespaces(dataset)
+            .iter()
+            .filter(|namespace| !has(&(dataset.to_owned(), (**namespace).to_owned(), Some(range))))
+            .map(|namespace| Self::in_range(&group, namespace, range))
+            .collect()
     }
 
     fn scope(&self) -> Scope {
@@ -1579,6 +1625,18 @@ async fn settle(
                 }
             }
             for range in plan.added.into_iter().filter(clear) {
+                for consumer in Consumer::missing(&dataset, range, &engine, |scope| {
+                    consumers.contains_key(scope)
+                })? {
+                    let scope = consumer.scope();
+                    changed(progress, changes, |state| {
+                        state.scopes.insert(
+                            scope.clone(),
+                            (consumer.applied, None, consumer.validated()),
+                        );
+                    });
+                    consumers.insert(scope, consumer);
+                }
                 pushed
                     .groups
                     .insert((dataset.clone(), range), engine.clone());
