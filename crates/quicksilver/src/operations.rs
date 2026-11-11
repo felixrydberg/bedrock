@@ -99,6 +99,15 @@ pub fn list(view: &View, request: &pb::ListRequest) -> Result<pb::ListReply, Sta
     if start != request.range_start {
         return Err(Status::failed_precondition("not a range start"));
     }
+    // Until its applied markers match the placement range (after a split or merge), a scan would miss keys or return
+    // another range's.
+    let placed = start
+        .checked_add(1)
+        .and_then(|after| view.directory.range(after..).next())
+        .map_or(0, |(next, _)| *next);
+    if end != placed {
+        return Err(Status::aborted("applied range differs from its placement"));
+    }
     let limit = match request.limit {
         0 => LIST_LIMIT,
         limit => limit.min(LIST_LIMIT),

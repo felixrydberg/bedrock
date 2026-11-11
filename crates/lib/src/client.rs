@@ -114,7 +114,7 @@ impl Client {
                 reason,
             })
             .inc();
-        let fetched = self.fetch(service).await?;
+        let fetched = self.fetch(service, stale).await?;
         let mut tables = self.tables.lock().unwrap();
         let entry = tables
             .entry(service.into())
@@ -127,8 +127,11 @@ impl Client {
         Ok(entry.0.clone())
     }
 
-    async fn fetch(&self, service: &str) -> Result<Arc<Table>, Status> {
+    /// The first relay table newer than `stale`. Relays apply the cell's view separately, so one may lag another; when
+    /// none is newer, the newest answer.
+    async fn fetch(&self, service: &str, stale: Option<u64>) -> Result<Arc<Table>, Status> {
         let mut last = Status::unavailable("no cell relays configured");
+        let mut best: Option<Arc<Table>> = None;
         for relay in &self.relays {
             let request = pb::RoutesRequest {
                 service: service.into(),
@@ -144,16 +147,25 @@ impl Client {
                 Ok(reply) => {
                     let (members, directories) =
                         membership::parse(reply.entries.into_iter().map(|e| Ok((e.key, e.value))))?;
-                    return Ok(Arc::new(Table {
+                    let table = Arc::new(Table {
                         revision: reply.revision,
                         members,
                         directories,
-                    }));
+                    });
+                    if stale.is_none_or(|stale| table.revision > stale) {
+                        return Ok(table);
+                    }
+                    if best
+                        .as_ref()
+                        .is_none_or(|best| table.revision > best.revision)
+                    {
+                        best = Some(table);
+                    }
                 }
                 Err(status) => last = status,
             }
         }
-        Err(last)
+        best.ok_or(last)
     }
 
     /// `key` of a ranged `dataset` served by `service`, from a holder at least at `min_revision`.

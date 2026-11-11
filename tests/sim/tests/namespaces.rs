@@ -315,6 +315,10 @@ async fn scenario() -> Vec<String> {
                 (status, empty["result_info"]["total_count"].clone()),
                 (200, 0.into())
             );
+            assert!(
+                empty["result_info"]["revision"].as_u64().unwrap() >= head,
+                "{empty}"
+            );
             let listed_ids = |body: &Value| -> Vec<String> {
                 body["result"]
                     .as_array()

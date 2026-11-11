@@ -208,6 +208,48 @@ async fn a_stale_table_is_refetched_after_its_owner_turns_the_read_away() {
     assert_eq!(relay.fetches.load(Ordering::Relaxed), 2);
 }
 
+/// Cell relays apply the view separately; a caller that needs a newer table asks past one that lags.
+#[tokio::test]
+async fn a_stale_caller_skips_a_relay_that_lags() {
+    let owner = holder(Mode::Serve, 7, &[("k", "v")]).await;
+    let (lagging, current) = (Relay::default(), Relay::default());
+    *lagging.table.lock().unwrap() = table(1, &[(0, &[("a", &owner)])]);
+    *current.table.lock().unwrap() = table(2, &[(0, &[("a", &owner)])]);
+    let mut relays = Vec::new();
+    for relay in [&lagging, &current] {
+        relays.push(
+            serve(
+                tonic::transport::Server::builder()
+                    .add_service(pb::relay_server::RelayServer::new(relay.clone())),
+            )
+            .await,
+        );
+    }
+    let admin = Admin::new();
+    let client = Client::new(&admin, Arc::new(Peers::new(&admin)), relays, String::new());
+    assert_eq!(
+        client.routes("quicksilver", None).await.unwrap().revision,
+        1
+    );
+    assert_eq!(
+        client
+            .routes("quicksilver", Some(1))
+            .await
+            .unwrap()
+            .revision,
+        2
+    );
+    // With no newer table anywhere, the newest one is used rather than failing.
+    assert_eq!(
+        client
+            .routes("quicksilver", Some(2))
+            .await
+            .unwrap()
+            .revision,
+        2
+    );
+}
+
 #[tokio::test]
 async fn a_behind_holder_passes_the_read_to_the_next_owner() {
     let behind = holder(Mode::Behind, 0, &[]).await;

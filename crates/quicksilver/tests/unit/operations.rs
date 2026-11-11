@@ -148,6 +148,16 @@ fn a_list_returns_one_namespaces_prefix_in_key_order_and_pages() {
     assert_eq!(rest.entries.len(), 1);
     assert_eq!(rest.entries[0].key, keys[3]);
     assert!(!rest.more);
+    // Applied markers not yet matching the placement range, as after a split, are behind rather than partial.
+    let split = vec![(NS.to_owned(), (0, HALF / 2), 8)];
+    let view_split = View {
+        applied: &split,
+        ..view
+    };
+    assert_eq!(
+        list(&view_split, &request(b"")).unwrap_err().code(),
+        tonic::Code::Aborted
+    );
     let mut not_a_start = request(b"");
     not_a_start.range_start = 1;
     assert_eq!(

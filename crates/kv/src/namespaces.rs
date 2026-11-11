@@ -290,12 +290,6 @@ impl Api {
     }
 }
 
-/// A planned write: the record to commit, or the unchanged record when there is nothing to write.
-enum Plan {
-    Write(Record),
-    Unchanged(Record),
-}
-
 pub struct Directory {
     client: Arc<Client>,
     api: Api,
@@ -417,20 +411,21 @@ impl Directory {
         }
     }
 
-    /// Plans a write from a [`scan`](Self::scan) and commits it, scanning again at the head after a conflict.
+    /// Plans a write from a [`scan`](Self::scan) and commits it, scanning again at the head after a conflict. A plan
+    /// that changes nothing is still committed, so its success proves the view it came from was the head.
     async fn commit(
         &self,
         operation: &str,
-        plan: impl Fn(Vec<Record>) -> Result<Plan, Error>,
+        plan: impl Fn(Vec<Record>) -> Result<Record, Error>,
     ) -> Result<(Record, u64), Error> {
         let mut floor = 0;
         for _ in 0..ATTEMPTS {
             let (records, revision) = self.scan(floor).await?;
-            let record = match plan(records)? {
-                Plan::Write(record) => record,
-                Plan::Unchanged(record) => return Ok((record, revision)),
-            };
-            let idempotency = format!("{operation}:{}:{revision}", record.id);
+            let record = plan(records)?;
+            // Retries of one payload share a key; another payload for the same record and revision gets its own.
+            let payload =
+                bedrock_lib::placement::hash_of(DATASET, NAMESPACE, &record.encode_to_vec());
+            let idempotency = format!("{operation}:{}:{revision}:{payload:016x}", record.id);
             match self.api.put(&record, revision, &idempotency).await? {
                 Put::Committed { revision } => return Ok((record, revision)),
                 Put::Conflict { head } => floor = head,
@@ -451,7 +446,7 @@ impl Directory {
                     if records.iter().any(|r| r.id == id) {
                         return Err(Error::Contended);
                     }
-                    Ok(Plan::Write(Record {
+                    Ok(Record {
                         format_version: FORMAT_VERSION,
                         storage: storage(&id),
                         id,
@@ -464,7 +459,7 @@ impl Directory {
                         cache_ttl_seconds: CACHE_TTL_SECONDS,
                         state: Lifecycle::Active as i32,
                         created_at: wall_ms(),
-                    }))
+                    })
                 })
                 .await
             }
@@ -490,11 +485,8 @@ impl Directory {
                         .into_iter()
                         .find(|r| r.id == id && r.tenant == tenant && admit_open(r).is_ok())
                         .ok_or(Error::NotFound)?;
-                    if record.title == title {
-                        return Ok(Plan::Unchanged(record));
-                    }
                     record.title = title.to_owned();
-                    Ok(Plan::Write(record))
+                    Ok(record)
                 })
                 .await
             }
@@ -724,6 +716,7 @@ async fn list(
         "per_page": per_page,
         "count": shown.len(),
         "total_count": records.len(),
+        "revision": revision,
     });
     reply(Ok(Value::Array(shown)), Some(info))
 }
