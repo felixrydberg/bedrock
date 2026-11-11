@@ -309,6 +309,30 @@ async fn flush_failures_before_and_after_durability_preserve_the_original_batch(
     }
 }
 
+/// A conflict's head may count earlier writes of its batch, so it is reported only once they are durable.
+#[tokio::test]
+async fn a_conflict_waits_for_its_batch_to_be_durable() {
+    let factory = Factory::default();
+    let writer = open(factory.clone()).await;
+    let planned = Write {
+        expected: Some(0),
+        ..set("a", "x", "late", None)
+    };
+    factory.controls.flush_fault.store(1, Ordering::SeqCst);
+    let (first, late) = tokio::join!(
+        writer.commit(set("a", "x", "first", None)),
+        writer.commit(planned.clone())
+    );
+    assert!(matches!(first, Err(CommitError::Unavailable(_))));
+    assert!(matches!(late, Err(CommitError::Unavailable(_))));
+    let (second, late) = tokio::join!(
+        writer.commit(set("a", "y", "second", None)),
+        writer.commit(planned)
+    );
+    assert_eq!(second, Ok(2));
+    assert_eq!(late, Err(CommitError::Conflict { head: 2 }));
+}
+
 #[tokio::test]
 async fn acknowledgement_waits_for_flush_of_one_atomic_event_state_retry_batch() {
     let factory = Factory::default();

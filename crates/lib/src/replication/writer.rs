@@ -548,6 +548,8 @@ impl Writer {
         let mut entries = Vec::new();
         let mut in_batch = BTreeMap::new();
         let mut waiting = Vec::new();
+        // Answered after persistence: `head` may count this batch's earlier writes, which a failed flush leaves unpublished.
+        let mut conflicts = Vec::new();
         for Queued { write, done } in queued {
             let key = write.idempotency_key;
             if let Some(sequence) = key
@@ -564,7 +566,7 @@ impl Writer {
             }
             let head = state.head + entries.len() as u64;
             if write.expected.is_some_and(|expected| expected != head) {
-                let _ = done.send(Err(CommitError::Conflict { head }));
+                conflicts.push((done, head));
                 continue;
             }
             let Some(sequence) = state
@@ -604,6 +606,9 @@ impl Writer {
         drop(state);
         for (done, sequence) in waiting {
             let _ = done.send(result.clone().map(|()| sequence));
+        }
+        for (done, head) in conflicts {
+            let _ = done.send(result.clone().and(Err(CommitError::Conflict { head })));
         }
         if result.is_ok() {
             self.schedule_cleanup(ns, dataset, name);

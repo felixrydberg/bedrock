@@ -206,3 +206,47 @@ fn a_list_page_is_capped_however_large_the_limit() {
     assert_eq!(listed, smallest);
     assert!(page.more);
 }
+
+/// A page also stops before its encoding passes what the caller decodes; an entry too large for any page is refused.
+#[test]
+fn a_list_page_is_bounded_by_its_encoded_size() {
+    let keys = low_keys("p/", 3);
+    let engine = engine(&keys.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    let request = pb::ListRequest {
+        dataset: DS.into(),
+        namespace: NS.into(),
+        prefix: b"p/".to_vec(),
+        range_end: HALF,
+        ..Default::default()
+    };
+    let dir = directory(State::Ready);
+    let list_with = |value: Vec<u8>| {
+        let mut batch = WriteBatch::default();
+        for key in &keys {
+            batch.put(
+                l2_key(placement::hash_of(DS, NS, key), NS, key),
+                value.clone(),
+            );
+        }
+        engine.write(batch).unwrap();
+        let snapshot = engine.snapshot().unwrap();
+        let applied = vec![(NS.to_owned(), (0, HALF), 1)];
+        list(
+            &View {
+                snapshot: &*snapshot,
+                applied: &applied,
+                directory: &dir,
+                node: "qs-1",
+            },
+            &request,
+        )
+    };
+    let page = list_with(vec![0; LIST_BYTES / 2 + 64]).unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert!(page.more);
+    assert!(prost::Message::encoded_len(&page) <= LIST_BYTES);
+    assert_eq!(
+        list_with(vec![0; LIST_BYTES]).unwrap_err().code(),
+        tonic::Code::ResourceExhausted
+    );
+}

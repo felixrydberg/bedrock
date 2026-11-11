@@ -356,6 +356,7 @@ dependencies = [
  "bedrock-lib",
  "madsim-tokio",
  "madsim-tonic",
+ "prost",
  "tracing",
 ]
 

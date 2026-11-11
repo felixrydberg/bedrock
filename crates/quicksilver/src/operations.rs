@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bedrock_lib::client::LIST_LIMIT;
+use bedrock_lib::client::{LIST_BYTES, LIST_LIMIT};
 use bedrock_lib::membership;
 use bedrock_lib::placement::{self, Directory};
 use bedrock_lib::relays::client::applied_ranges;
@@ -14,6 +14,7 @@ use bedrock_lib::relays::ranges::Range;
 use bedrock_lib::replication::pb;
 use bedrock_lib::storage::{Snapshot, StorageEngine, l2_key, l2_span};
 use bedrock_lib::transport::Caller;
+use prost::Message;
 use tonic::{Request, Response, Status};
 
 pub struct Reads {
@@ -89,7 +90,7 @@ pub fn get(view: &View, request: &pb::GetRequest) -> Result<pb::GetReply, Status
 }
 
 /// Keys of the range starting at `request.range_start` with the prefix, after `start_after`, in key order: at most
-/// `request.limit`, capped at [`LIST_LIMIT`](bedrock_lib::client::LIST_LIMIT).
+/// `request.limit`, capped at [`LIST_LIMIT`] and [`LIST_BYTES`].
 pub fn list(view: &View, request: &pb::ListRequest) -> Result<pb::ListReply, Status> {
     let ((start, end), revision) = view.serving(
         &request.namespace,
@@ -139,16 +140,32 @@ pub fn list(view: &View, request: &pb::ListRequest) -> Result<pb::ListReply, Sta
             }
         }
     }
-    let more = entries.len() > limit;
-    Ok(pb::ListReply {
+    let mut reply = pb::ListReply {
         revision,
-        entries: entries
-            .into_iter()
-            .take(limit)
-            .map(|(key, value)| pb::StateEntry { key, value })
-            .collect(),
-        more,
-    })
+        entries: Vec::new(),
+        more: entries.len() > limit,
+    };
+    // A page also stops before its encoding would pass [`LIST_BYTES`], which the caller cannot decode.
+    let mut size = pb::ListReply {
+        more: true,
+        ..reply.clone()
+    }
+    .encoded_len();
+    for (key, value) in entries.into_iter().take(limit) {
+        let entry = pb::StateEntry { key, value };
+        size += prost::encoding::message::encoded_len(2, &entry);
+        if size > LIST_BYTES {
+            if reply.entries.is_empty() {
+                return Err(Status::resource_exhausted(
+                    "an entry does not fit in a list reply",
+                ));
+            }
+            reply.more = true;
+            break;
+        }
+        reply.entries.push(entry);
+    }
+    Ok(reply)
 }
 
 /// `(namespace, range, revision)` of every range this node has validated progress for ([`applied_ranges`]).

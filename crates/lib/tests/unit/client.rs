@@ -20,6 +20,8 @@ const NS: &str = "infrastructure";
 #[derive(Clone)]
 enum Mode {
     Serve,
+    /// Serves one entry and reports more, as when the next would pass the reply size limit.
+    Short,
     NotOwner,
     Behind,
 }
@@ -58,8 +60,12 @@ impl pb::reads_server::Reads for Holder {
                 value: value.clone(),
             })
             .collect();
-        let more = entries.len() > request.limit as usize;
-        entries.truncate(request.limit as usize);
+        let limit = match self.mode {
+            Mode::Short => 1,
+            _ => request.limit as usize,
+        };
+        let more = entries.len() > limit;
+        entries.truncate(limit);
         Ok(Response::new(pb::ListReply {
             revision: self.revision,
             entries,
@@ -71,7 +77,7 @@ impl pb::reads_server::Reads for Holder {
 impl Holder {
     fn check(&self) -> Result<(), Status> {
         match self.mode {
-            Mode::Serve => Ok(()),
+            Mode::Serve | Mode::Short => Ok(()),
             Mode::NotOwner => Err(Status::failed_precondition("not an owner")),
             Mode::Behind => Err(Status::aborted("behind")),
         }
@@ -331,4 +337,24 @@ async fn a_list_merges_ranges_in_key_order_and_pages() {
         .unwrap();
     assert_eq!(rest.entries, vec![(b"p/d".to_vec(), b"4".to_vec())]);
     assert!(!rest.more);
+}
+
+/// A range that stopped early, for its byte limit, has keys after its last one; none of another range's may pass them.
+#[tokio::test]
+async fn a_list_page_ends_where_a_range_stopped_early() {
+    let short = holder(Mode::Short, 4, &[("p/b", "2"), ("p/d", "4")]).await;
+    let full = holder(Mode::Serve, 3, &[("p/a", "1"), ("p/c", "3")]).await;
+    let relay = Relay::default();
+    *relay.table.lock().unwrap() = table(
+        1,
+        &[(0, &[("short", &short)]), (1 << 63, &[("full", &full)])],
+    );
+    let client = client(&relay).await;
+    let page = client
+        .list("quicksilver", DATASET, NS, b"p/", b"", 3, 0)
+        .await
+        .unwrap();
+    let keys: Vec<_> = page.entries.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, [b"p/a".as_slice(), b"p/b"]);
+    assert!(page.more);
 }

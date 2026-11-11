@@ -33,6 +33,8 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const REFRESHES: usize = 2;
 /// Keys per range and page when a list sets no limit.
 pub const LIST_LIMIT: u32 = 1000;
+/// Encoded bytes of one range's list reply: tonic's default decode limit.
+pub const LIST_BYTES: usize = 4 * 1024 * 1024;
 
 /// A value, or `None` for a key proven absent, at the answering range's applied revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +241,8 @@ impl Client {
                 revision: u64::MAX,
                 ..Page::default()
             };
+            // A range that stopped early has unsent keys after its last one, so the merged page ends there.
+            let mut cut: Option<Vec<u8>> = None;
             // ponytail: asks every range for a full page and merges; a key-ordered index would ask fewer.
             for &start in directory.keys() {
                 let request = pb::ListRequest {
@@ -264,6 +268,12 @@ impl Client {
                 match reply {
                     Ok(reply) => {
                         page.revision = page.revision.min(reply.revision);
+                        if reply.more
+                            && let Some(last) = reply.entries.last()
+                            && cut.as_ref().is_none_or(|cut| last.key < *cut)
+                        {
+                            cut = Some(last.key.clone());
+                        }
                         page.more |= reply.more;
                         page.entries
                             .extend(reply.entries.into_iter().map(|e| (e.key, e.value)));
@@ -275,6 +285,9 @@ impl Client {
                 }
             }
             page.entries.sort();
+            if let Some(cut) = cut {
+                page.entries.retain(|(key, _)| *key <= cut);
+            }
             if page.entries.len() > limit as usize {
                 page.entries.truncate(limit as usize);
                 page.more = true;
