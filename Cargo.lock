@@ -319,6 +319,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "madsim",
  "madsim-tokio",
  "madsim-tonic",
  "madsim-tonic-build",

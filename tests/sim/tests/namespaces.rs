@@ -1,7 +1,8 @@
-//! #56 / B-25 acceptance: customer-KV namespaces managed through `bedrock-kv` and read from Quicksilver range owners
-//! through the shared client, in two cells. Every cell resolves the same record and storage identity, an empty
-//! namespace creates no database, concurrent creates commit through conditional retries, deletion is visible at the
-//! revision it returned, and a killed holder or a stale routing table only costs a retry. Replay one seed with
+//! #56 / B-25 acceptance: customer-KV namespaces managed through `bedrock-kv`'s Cloudflare-compatible API and read
+//! from Quicksilver range owners through the shared client, in two cells. Every cell resolves the same namespace, an
+//! empty namespace creates no database, titles are unique per tenant, concurrent creates commit through conditional
+//! retries, renames and deletions are visible at the revision they returned, and a killed holder or a stale routing
+//! table only costs a retry. Replay one seed with
 //! `BEDROCK_NAMESPACES_SEED=42` and the documented simulation flags.
 #![cfg(madsim)]
 
@@ -47,7 +48,7 @@ fn node(name: &str, ip: &str, cell: &str) -> NodeConfig {
         node_id: name.into(),
         location: Location {
             region: "eu".into(),
-            dc: "eu-1".into(),
+            dc: "arn1".into(),
             cell: cell.into(),
             failure_domain: String::new(),
         },
@@ -170,14 +171,19 @@ async fn until<F: Future<Output = (u16, Value)>>(
     }
 }
 
-fn create(account: &str, title: &str) -> String {
-    serde_json::json!({ "account": account, "title": title, "home_region": "eu", "storage_bytes": 1_000_000 })
-        .to_string()
+/// Cloudflare's namespace collection of `tenant`.
+fn namespaces(tenant: &str) -> String {
+    format!("/client/v4/accounts/{tenant}/storage/kv/namespaces")
 }
 
-/// The record without the revision it was read at, which differs between reads.
+fn create(title: &str) -> String {
+    serde_json::json!({ "title": title, "storage_bytes": 1_000_000 }).to_string()
+}
+
+/// The namespace an answer carries, without the revision it was read at, which differs between reads.
 fn record(body: &Value) -> Value {
-    let mut record = body.clone();
+    assert_eq!(body["success"], true, "{body}");
+    let mut record = body["result"].clone();
     record.as_object_mut().unwrap().remove("revision");
     record
 }
@@ -231,23 +237,22 @@ async fn scenario() -> Vec<String> {
         .build();
     let trace = client
         .spawn(async move {
+            let mine = namespaces("customer-123");
+            let theirs = namespaces("customer-456");
             // Nothing was ever written to `infrastructure`: owners prove its revision 0, so the very first create works.
             // Creating waits until cell a's Quicksilver ranges are placed and ready.
-            let created = until("first create", Duration::from_secs(180), 201, || async {
-                call(
-                    kv_a,
-                    "POST",
-                    "/v1/namespaces",
-                    &create("customer-123", "store-A"),
-                )
-                .await
+            let first = create("store-A");
+            let created = until("first create", Duration::from_secs(180), 200, || {
+                call(kv_a, "POST", &mine, &first)
             })
             .await;
-            let id = created["id"].as_str().unwrap().to_owned();
-            let revision = created["revision"].as_u64().unwrap();
+            let id = created["result"]["id"].as_str().unwrap().to_owned();
+            let revision = created["result"]["revision"].as_u64().unwrap();
             assert_eq!(revision, 1, "the first directory write of a fresh cluster");
-            assert_eq!(created["storage"], format!("kv/{id}"));
-            assert_eq!(created["state"], "active");
+            assert_eq!(
+                record(&created),
+                serde_json::json!({ "id": id, "title": "store-A", "jurisdiction": "eu" })
+            );
             trace.push(format!("created {id} at {revision}"));
 
             // An empty namespace is only its record: the writer opened no database for it.
@@ -257,8 +262,8 @@ async fn scenario() -> Vec<String> {
                 "{opened:?}"
             );
 
-            // Both cells resolve the same record and storage identity once they hold that revision.
-            let path = format!("/v1/namespaces/{id}?min_revision={revision}");
+            // Both cells resolve the same namespace once they hold that revision.
+            let path = format!("{mine}/{id}?min_revision={revision}");
             let in_a = until("cell a read", Duration::from_secs(60), 200, || {
                 call(kv_a, "GET", &path, "")
             })
@@ -269,85 +274,107 @@ async fn scenario() -> Vec<String> {
             .await;
             assert_eq!(record(&in_a), record(&created));
             assert_eq!(record(&in_b), record(&created));
+            // Another tenant does not see it, and a tenant's titles are unique.
+            let foreign = call(kv_a, "GET", &format!("{theirs}/{id}"), "").await;
+            assert_eq!(foreign.0, 404, "{}", foreign.1);
+            let duplicate = call(kv_b, "POST", &mine, &create("store-A")).await;
+            assert_eq!(duplicate.0, 400, "{}", duplicate.1);
+            assert_eq!(duplicate.1["success"], false);
 
             // Concurrent creates in both cells all commit, each with its own ID, through conditional retries.
             let creates = (0..3).map(|i| {
                 let kv = [kv_a, kv_b][i % 2];
+                let theirs = theirs.clone();
                 tokio::spawn(async move {
-                    call(
-                        kv,
-                        "POST",
-                        "/v1/namespaces",
-                        &create("customer-456", &format!("store-{i}")),
-                    )
-                    .await
+                    call(kv, "POST", &theirs, &create(&format!("store-{i}"))).await
                 })
             });
-            let mut ids = vec![id.clone()];
+            let mut ids = Vec::new();
             let mut head = revision;
             for created in creates.collect::<Vec<_>>() {
                 let (status, body) = created.await.unwrap();
-                assert_eq!(status, 201, "{body}");
-                ids.push(body["id"].as_str().unwrap().to_owned());
-                head = head.max(body["revision"].as_u64().unwrap());
+                assert_eq!(status, 200, "{body}");
+                ids.push(body["result"]["id"].as_str().unwrap().to_owned());
+                head = head.max(body["result"]["revision"].as_u64().unwrap());
             }
             ids.sort();
             ids.dedup();
-            assert_eq!(ids.len(), 4);
+            assert_eq!(ids.len(), 3);
             trace.push(format!("concurrent creates through {head}"));
 
-            // Listing in the other cell returns every namespace in ID order, filtered by account.
+            // Listing in the other cell pages a tenant's namespaces in ID order, or by title.
             let listed = until("list", Duration::from_secs(60), 200, || async {
-                let (status, body) = call(kv_b, "GET", "/v1/namespaces", "").await;
-                let count = body["namespaces"].as_array().map_or(0, Vec::len);
-                if count == ids.len() {
+                let (status, body) = call(kv_b, "GET", &theirs, "").await;
+                if body["result_info"]["total_count"] == ids.len() {
                     (status, body)
                 } else {
                     (0, body)
                 }
             })
             .await;
-            let listed: Vec<_> = listed["namespaces"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|n| n["id"].as_str().unwrap().to_owned())
-                .collect();
-            assert_eq!(listed, ids);
-            let (_, mine) = call(kv_b, "GET", "/v1/namespaces?account=customer-123", "").await;
-            assert_eq!(mine["namespaces"].as_array().unwrap().len(), 1);
+            let listed_ids = |body: &Value| -> Vec<String> {
+                body["result"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n["id"].as_str().unwrap().to_owned())
+                    .collect()
+            };
+            assert_eq!(listed_ids(&listed), ids);
+            let (_, second) = call(kv_b, "GET", &format!("{theirs}?per_page=2&page=2"), "").await;
+            assert_eq!(listed_ids(&second), ids[2..]);
+            assert_eq!(second["result_info"]["count"], 1);
+            let (_, by_title) = call(
+                kv_b,
+                "GET",
+                &format!("{theirs}?order=title&direction=desc"),
+                "",
+            )
+            .await;
+            assert_eq!(by_title["result"][0]["title"], "store-2");
+            let (_, own) = call(kv_b, "GET", &mine, "").await;
+            assert_eq!(own["result_info"]["total_count"], 1);
+
+            // A rename in cell a is visible in cell b at the revision it returned; the ID stays.
+            let target = format!("{mine}/{id}");
+            let renamed = until("rename", Duration::from_secs(60), 200, || {
+                call(kv_a, "PUT", &target, r#"{"title":"store-renamed"}"#)
+            })
+            .await;
+            let at = renamed["result"]["revision"].as_u64().unwrap();
+            let path = format!("{mine}/{id}?min_revision={at}");
+            let seen = until("rename seen", Duration::from_secs(60), 200, || {
+                call(kv_b, "GET", &path, "")
+            })
+            .await;
+            assert_eq!(seen["result"]["title"], "store-renamed");
+            assert_eq!(seen["result"]["id"], id.as_str());
 
             // Deleting in cell b is visible in cell a at the revision it returned.
-            let target = format!("/v1/namespaces/{id}");
+            let target = format!("{mine}/{id}");
             let deleted = until("delete", Duration::from_secs(60), 200, || {
                 call(kv_b, "DELETE", &target, "")
             })
             .await;
-            assert_eq!(deleted["state"], "deleting");
-            let at = deleted["revision"].as_u64().unwrap();
-            let path = format!("/v1/namespaces/{id}?min_revision={at}");
-            let seen = until("deletion seen", Duration::from_secs(60), 200, || {
+            let at = deleted["result"]["revision"].as_u64().unwrap();
+            let path = format!("{mine}/{id}?min_revision={at}");
+            until("deletion seen", Duration::from_secs(60), 404, || {
                 call(kv_a, "GET", &path, "")
             })
             .await;
-            assert_eq!(seen["state"], "deleting");
             trace.push(format!("deleted at {at}"));
-            // Deleting again changes nothing; an unknown ID is not found.
-            let again = call(kv_a, "DELETE", &format!("/v1/namespaces/{id}"), "").await;
-            assert_eq!(
-                (again.0, &again.1["state"]),
-                (200, &Value::from("deleting"))
-            );
-            let unknown = call(
-                kv_a,
-                "GET",
-                &format!("/v1/namespaces/{}", "0".repeat(32)),
-                "",
-            )
+            // Deleting again changes nothing; the title is free again; an unknown ID is not found.
+            assert_eq!(call(kv_a, "DELETE", &target, "").await.0, 200);
+            let again = create("store-renamed");
+            let reused = until("title reuse", Duration::from_secs(60), 200, || {
+                call(kv_a, "POST", &mine, &again)
+            })
             .await;
+            assert_ne!(reused["result"]["id"], id.as_str());
+            let unknown = call(kv_a, "GET", &format!("{mine}/{}", "0".repeat(32)), "").await;
             assert_eq!(unknown.0, 404);
             // A wrong token never reaches the directory.
-            let request = hyper::Request::get("/v1/namespaces")
+            let request = hyper::Request::get(mine.as_str())
                 .header("host", "kv")
                 .header("authorization", "Bearer wrong")
                 .body(Full::new(Bytes::new()))
@@ -361,15 +388,15 @@ async fn scenario() -> Vec<String> {
             .await
             .unwrap();
             assert_eq!(status.as_u16(), 401);
-            (trace, id)
+            let title = listed["result"][0]["title"].as_str().unwrap().to_owned();
+            (trace, format!("{theirs}/{}", ids[0]), title)
         })
         .await
         .unwrap();
-    let (mut trace, id) = trace;
+    let (mut trace, path, title) = trace;
 
     // A killed holder in cell a: reads go to its sibling owner, then to a fresher table once ranges move.
     handle.kill(holders[0].id());
-    let path = format!("/v1/namespaces/{id}");
     let client = handle
         .create_node()
         .name("client-2")
@@ -384,11 +411,11 @@ async fn scenario() -> Vec<String> {
                 || call(kv_a, "GET", &path, ""),
             )
             .await;
-            found["state"].as_str().unwrap().to_owned()
+            found["result"]["title"].as_str().unwrap().to_owned()
         })
         .await
         .unwrap();
-    assert_eq!(state, "deleting");
+    assert_eq!(state, title);
     trace.push("read survived a killed holder".into());
     trace
 }

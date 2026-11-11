@@ -12,7 +12,7 @@ s3_endpoint = "https://s3.example.internal"
 
 [location]
 region = "eu"
-dc = "eu-1"
+dc = "arn1"
 cell = "eu-1a"
 
 [budget]

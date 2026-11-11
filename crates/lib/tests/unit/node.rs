@@ -14,7 +14,7 @@ const NODE_TOML: &str = r#"
 
         [location]
         region = "eu"
-        dc = "eu-1"
+        dc = "arn1"
         cell = "eu-1a"
     "#;
 
@@ -57,7 +57,7 @@ fn relay_tier_and_upstreams() {
         jail.set_env("BEDROCK_ADMIN_LISTEN", "0.0.0.0:7301");
         jail.set_env("BEDROCK_DATA_DIR", "data");
         jail.set_env("BEDROCK_LOCATION__REGION", "eu");
-        jail.set_env("BEDROCK_LOCATION__DC", "eu-1");
+        jail.set_env("BEDROCK_LOCATION__DC", "arn1");
         jail.set_env("BEDROCK_LOCATION__CELL", "eu-1a");
         jail.set_env("BEDROCK_TIER", "cell");
         jail.set_env("BEDROCK_UPSTREAMS", "[]");
@@ -144,7 +144,7 @@ fn relay_membership_is_cell_local_and_requires_a_valid_voter_location() {
                 {extra}
                 [location]
                 region = "eu"
-                dc = "eu-1"
+                dc = "arn1"
                 cell = "eu-1a"
                 [membership]
                 bootstrap = true
@@ -221,4 +221,23 @@ fn relay_membership_is_cell_local_and_requires_a_valid_voter_location() {
     );
     dc.tier = Tier::Dc;
     assert!(dc.validate().is_err());
+}
+
+#[test]
+fn data_centers_are_named_by_iata_code() {
+    for dc in ["arn1", "osl12"] {
+        assert!(valid_dc(dc), "{dc}");
+    }
+    for dc in [
+        "",
+        "ar",
+        "arn",
+        "ARN1",
+        "eu-1",
+        "arn-1",
+        "arn1a",
+        "stockholm",
+    ] {
+        assert!(!valid_dc(dc), "{dc}");
+    }
 }

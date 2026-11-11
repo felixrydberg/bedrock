@@ -648,7 +648,13 @@ Created: [#56](https://github.com/felixrydberg/bedrock/issues/56) — Feature �
 
 Amended 2026-11-11 (user decision): B-25 also builds Quicksilver reads (`Reads` on range owners) and the shared client's
 routing-table slice (§4 decision 15 amendment). Records live at `kv/namespaces/{id}` in `quicksilver/infrastructure`; IDs
-are 32 hex characters, so storage is `kv/{id}/`. Deletion marks the record `Deleting`; removing S3 objects waits for B-39.
+are random version 4 UUIDs as 32 hex characters (`bedrock_lib::uuid`, seeded under madsim), so storage is `kv/{id}/`.
+Deletion marks the record `Deleting`; removing S3 objects waits for B-39. Records name their `tenant` (Cloudflare's
+account). `bedrock-kv` serves Cloudflare's namespace API at `/client/v4/accounts/{tenant}/storage/kv/namespaces` (create,
+get, rename, delete, paged list, response envelope, per-tenant unique titles); `jurisdiction` is the home region.
+The home stays a region; a region-tier router picks the DC (decision 15). DCs are named by the IATA code of the nearest
+airport and a mandatory number (`arn1`), checked when node configs load. Open question for B-26/B-39: a home DC, cell or
+node that owns a namespace's L3 reads and writes, and whether SlateDB writer fencing supports that.
 The dated scope amendment comment on #56 is pending; add its GitHub comment link here after it is posted.
 
 ---

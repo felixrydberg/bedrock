@@ -24,3 +24,18 @@ pub mod transport;
 pub fn monotonic_now() -> tokio::time::Instant {
     tokio::time::Instant::now()
 }
+
+/// A random version 4 UUID as 32 lowercase hex digits without dashes, the shape of a Cloudflare namespace ID. The
+/// runtime's RNG draws it: seeded under madsim, so a seed replays the same IDs.
+// madsim's `rand` re-exports the real crate in normal builds; this is the one place that reads it.
+#[allow(clippy::disallowed_methods)]
+pub fn uuid() -> String {
+    let bits: u128 = madsim::rand::random();
+    // RFC 9562: version 4 in bits 76..80, variant `10` in bits 62..64.
+    let bits = (bits & !(0xf << 76) & !(0x3 << 62)) | (0x4 << 76) | (0x2 << 62);
+    format!("{bits:032x}")
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/lib.rs"]
+mod tests;

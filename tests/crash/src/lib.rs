@@ -408,7 +408,7 @@ impl Cluster {
             node.admin,
             node.data,
         );
-        let mut tables = format!("[location]\nregion = \"eu\"\ndc = \"eu-1\"\ncell = {CELL:?}\n");
+        let mut tables = format!("[location]\nregion = \"eu\"\ndc = \"arn1\"\ncell = {CELL:?}\n");
         let tls = certificate_paths(&self.options.dir, &node.name);
         tables += &format!(
             "[tls]\ncert = {:?}\nkey = {:?}\nca = {:?}\n",

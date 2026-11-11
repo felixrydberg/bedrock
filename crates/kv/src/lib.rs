@@ -103,7 +103,7 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
                     token: token.clone(),
                     tls: tls.clone(),
                 },
-                config.node.node_id.clone(),
+                config.node.location.region.clone(),
             ));
             let app = bedrock_lib::http::bearer(namespaces::routes(directory), &token)?;
             let listener = tokio::net::TcpListener::bind(listen)

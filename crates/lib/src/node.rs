@@ -56,6 +56,16 @@ impl NodeConfig {
     }
 }
 
+/// A data center is named by the IATA code of the nearest airport, lowercase, and its number in that city: `arn1`,
+/// `osl2`. ponytail: shape only; nothing checks the code against IATA's list.
+pub fn valid_dc(dc: &str) -> bool {
+    let (code, number) = dc.split_at(dc.len().min(3));
+    code.len() == 3
+        && code.bytes().all(|b| b.is_ascii_lowercase())
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Location {
     pub region: String,
@@ -337,6 +347,13 @@ pub fn load<T: DeserializeOwned + AsRef<NodeConfig>>() -> Result<T, ConfigError>
             ConfigError(format!("config ({path}): {e}"))
         }
     })?;
+    let location = &config.as_ref().location;
+    if !valid_dc(&location.dc) {
+        return Err(ConfigError(format!(
+            "config ({path}): location.dc {:?} must be an IATA airport code and a number, like arn1",
+            location.dc
+        )));
+    }
     let dir = &config.as_ref().data_dir;
     std::fs::create_dir_all(dir)
         .map_err(|e| ConfigError(format!("data_dir {}: {e}", dir.display())))?;

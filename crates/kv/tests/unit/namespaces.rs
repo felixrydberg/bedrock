@@ -4,7 +4,7 @@ fn record(id: &str) -> Record {
     Record {
         format_version: FORMAT_VERSION,
         id: id.into(),
-        account: "customer-123".into(),
+        tenant: "customer-123".into(),
         title: "store-A".into(),
         home_region: "eu".into(),
         storage: storage(id),
@@ -17,30 +17,21 @@ fn record(id: &str) -> Record {
     }
 }
 
+/// Fixed IDs, so assertions do not depend on the RNG.
+fn id(n: u8) -> String {
+    format!("{n:032x}")
+}
+
 #[test]
-fn ids_are_valid_identities_and_spread_by_time_and_counter() {
-    let ids = [
-        new_id("kv-1", 1, 0),
-        new_id("kv-1", 1, 1),
-        new_id("kv-1", 2, 0),
-        new_id("kv-2", 1, 0),
-    ];
-    for id in &ids {
-        assert!(valid_id(id), "{id}");
-    }
-    let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
-    assert_eq!(distinct.len(), ids.len());
-    assert_eq!(
-        new_id("kv-1", 1, 0),
-        ids[0],
-        "deterministic, so a seed replays"
-    );
+fn generated_ids_are_valid_identities() {
+    let generated = bedrock_lib::uuid();
+    assert!(valid_id(&generated), "{generated}");
     for bad in [
         "",
         "ABCDEF0123456789abcdef0123456789",
         "abc",
         "customer-123/store-A",
-        &format!("{}0", ids[0]),
+        &format!("{generated}0"),
     ] {
         assert!(!valid_id(bad), "{bad}");
     }
@@ -48,7 +39,7 @@ fn ids_are_valid_identities_and_spread_by_time_and_counter() {
 
 #[test]
 fn every_region_decodes_the_same_identity_from_the_same_bytes() {
-    let id = new_id("kv-1", 1, 0);
+    let id = id(0);
     let bytes = record(&id).encode_to_vec();
     let (eu, us) = (decode(&id, &bytes).unwrap(), decode(&id, &bytes).unwrap());
     assert_eq!(eu, us);
@@ -58,8 +49,8 @@ fn every_region_decodes_the_same_identity_from_the_same_bytes() {
 
 #[test]
 fn records_that_do_not_match_their_key_or_contract_are_corrupt() {
-    let id = new_id("kv-1", 1, 0);
-    let other = new_id("kv-1", 1, 1);
+    // Not id(0): one mutation swaps in the all-zero ID.
+    let (id, other) = (id(1), id(2));
     let mutations: [fn(&mut Record); 5] = [
         |r| r.format_version = 2,
         |r| r.storage = "kv/elsewhere".into(),
@@ -84,8 +75,8 @@ fn records_that_do_not_match_their_key_or_contract_are_corrupt() {
 
 #[test]
 fn a_namespaces_key_and_storage_never_cover_a_siblings() {
-    let a = new_id("kv-1", 1, 0);
-    let b = new_id("kv-1", 1, 1);
+    let a = id(0);
+    let b = id(1);
     assert!(!key(&b).starts_with(&key(&a)) && !key(&a).starts_with(&key(&b)));
     // The writer stores namespace `a` under `kv/{a}/`; with fixed-length IDs no other namespace shares that prefix.
     assert!(!format!("{}/", storage(&b)).starts_with(&format!("{}/", storage(&a))));
@@ -94,7 +85,7 @@ fn a_namespaces_key_and_storage_never_cover_a_siblings() {
 
 #[test]
 fn deletion_and_quota_are_checked_on_every_admission() {
-    let id = new_id("kv-1", 1, 0);
+    let id = id(0);
     let mut namespace = record(&id);
     assert_eq!(admit_open(&namespace), Ok(()));
     assert_eq!(admit_write(&namespace, 60, 40), Ok(()));
@@ -111,9 +102,9 @@ fn deletion_and_quota_are_checked_on_every_admission() {
 }
 
 #[test]
-fn create_requests_need_bounded_printable_labels() {
+fn create_requests_need_bounded_printable_labels_within_cloudflares_limits() {
     let ok = Create {
-        account: "customer-123".into(),
+        tenant: "customer-123".into(),
         title: "store-A".into(),
         home_region: "eu".into(),
         ..Create::default()
@@ -121,7 +112,7 @@ fn create_requests_need_bounded_printable_labels() {
     assert_eq!(ok.validate(), Ok(()));
     for bad in [
         Create {
-            account: String::new(),
+            tenant: String::new(),
             ..ok.clone()
         },
         Create {
@@ -129,10 +120,23 @@ fn create_requests_need_bounded_printable_labels() {
             ..ok.clone()
         },
         Create {
-            home_region: "x".repeat(MAX_LABEL + 1),
+            home_region: "x".repeat(MAX_REGION + 1),
             ..ok.clone()
         },
     ] {
         assert!(matches!(bad.validate(), Err(Error::Invalid(_))));
     }
+}
+
+#[test]
+fn a_tenant_cannot_reuse_an_active_title() {
+    let mut records = vec![record(&id(0))];
+    assert!(taken(&records, "customer-123", "store-A", ""));
+    // Renaming a namespace to its own title, another tenant and other titles are free.
+    assert!(!taken(&records, "customer-123", "store-A", &id(0)));
+    assert!(!taken(&records, "customer-456", "store-A", ""));
+    assert!(!taken(&records, "customer-123", "store-B", ""));
+    // A deleted namespace frees its title.
+    records[0].set_state(Lifecycle::Deleting);
+    assert!(!taken(&records, "customer-123", "store-A", ""));
 }

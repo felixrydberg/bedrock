@@ -2,9 +2,9 @@
 //! `kv/namespaces/{id}` in Quicksilver's `infrastructure` namespace, so every region resolves the same storage identity
 //! and home region from the same replicated bytes.
 //!
-//! - **IDs** are 32 lowercase hex characters, generated here and never reused. They are valid writer and storage
-//!   identities, so a namespace's database lives at `kv/{id}/` (the writer's `{dataset}/{namespace}` layout). Bindings
-//!   reference the ID; `account` and `title` are descriptive only.
+//! - **IDs** are random version 4 UUIDs as 32 lowercase hex characters (Cloudflare's namespace ID shape), never
+//!   reused. They are valid writer and storage identities, so a namespace's database lives at `kv/{id}/` (the writer's
+//!   `{dataset}/{namespace}` layout). Bindings reference the ID; `tenant` and `title` are descriptive only.
 //! - **Nothing locational** is recorded: no cell, origin or cache holder. Adding a cell changes no record.
 //! - **Create** writes only the record. The writer opens the namespace's database on its first data write, so an empty
 //!   namespace has no engine objects.
@@ -12,9 +12,11 @@
 //!   waits for B-39's reader lifecycle ([`retire_storage`]).
 //! - Writes are planned from a read and committed with `If-Match` on the `infrastructure` head. The answering range may
 //!   lag the head; a 412 carries the head, and the operation re-reads at it and plans again.
+//! - **The management API** is Cloudflare's namespace API (`/client/v4/accounts/{tenant}/storage/kv/namespaces`): the
+//!   same paths, bodies, envelope and namespace object, so its clients work against a `bedrock-kv` host. Its additions
+//!   are each answer's directory `revision`, `?min_revision=` on reads, and quota fields on create.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
@@ -33,6 +35,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prost::Message;
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 /// Where the directory lives.
 pub const SERVICE: &str = "quicksilver";
@@ -46,8 +49,10 @@ pub const CACHE_TTL_SECONDS: u32 = 60;
 /// Reads, writes and conflicts one operation may go through before giving up.
 const ATTEMPTS: usize = 4;
 const API_TIMEOUT: Duration = Duration::from_secs(10);
-/// Longest `account`, `title` and `home_region`.
-const MAX_LABEL: usize = 256;
+/// Cloudflare's limits: a tenant is an account ID, a title at most 512 bytes.
+const MAX_TENANT: usize = 32;
+const MAX_TITLE: usize = 512;
+const MAX_REGION: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
 #[repr(i32)]
@@ -64,10 +69,11 @@ pub struct Record {
     #[prost(string, tag = "2")]
     pub id: String,
     #[prost(string, tag = "3")]
-    pub account: String,
+    pub tenant: String,
     #[prost(string, tag = "4")]
     pub title: String,
-    /// The only region that opens the namespace's database; its writer is that region's API writer.
+    /// The only region that opens the namespace's database; its writer is that region's API writer. Cloudflare's
+    /// `jurisdiction`.
     #[prost(string, tag = "5")]
     pub home_region: String,
     /// The namespace's S3 database prefix, `kv/{id}`.
@@ -94,6 +100,8 @@ pub struct Record {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     NotFound,
+    /// The tenant already has an active namespace with this title.
+    Duplicate,
     Invalid(String),
     /// Quota or deletion refused the operation.
     Rejected(Rejected),
@@ -114,6 +122,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => f.write_str("namespace not found"),
+            Self::Duplicate => f.write_str("a namespace with this title already exists"),
             Self::Invalid(detail) => write!(f, "invalid request: {detail}"),
             Self::Rejected(Rejected::Deleted) => f.write_str("namespace is being deleted"),
             Self::Rejected(Rejected::StorageQuota) => {
@@ -141,15 +150,6 @@ pub fn valid_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
-/// A fresh namespace ID from this node, a wall-clock time and a per-process counter. Collisions are caught by the
-/// conditional create, so this need not be secret, only spread out.
-pub fn new_id(node: &str, at: u64, counter: u64) -> String {
-    let input = [at.to_be_bytes(), counter.to_be_bytes()].concat();
-    let high = bedrock_lib::placement::hash_of("kv-namespace-id", node, &input);
-    let low = bedrock_lib::placement::hash_of("kv-namespace-id-low", node, &input);
-    format!("{high:016x}{low:016x}")
 }
 
 /// A stored record, validated: unknown versions, mismatched keys and identities, and other cache policies are
@@ -198,6 +198,41 @@ pub async fn retire_storage(_id: &str) {
     todo!("#57 / B-39: account for open readers and checkpoints, then delete kv/{{id}}/ only")
 }
 
+/// What a caller asks for when creating a namespace.
+#[derive(Debug, Clone, Default)]
+pub struct Create {
+    pub tenant: String,
+    pub title: String,
+    pub home_region: String,
+    pub storage_bytes: Option<u64>,
+    pub permissions: Vec<String>,
+}
+
+impl Create {
+    fn validate(&self) -> Result<(), Error> {
+        label("tenant", &self.tenant, MAX_TENANT)?;
+        label("title", &self.title, MAX_TITLE)?;
+        label("home_region", &self.home_region, MAX_REGION)
+    }
+}
+
+fn label(field: &str, value: &str, max: usize) -> Result<(), Error> {
+    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+        return Err(Error::Invalid(format!(
+            "{field} must be 1 to {max} bytes without control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether an active namespace of `tenant` other than `id` is titled `title`. Cloudflare refuses a duplicate title
+/// until its holder is deleted.
+fn taken(records: &[Record], tenant: &str, title: &str, id: &str) -> bool {
+    records
+        .iter()
+        .any(|r| r.tenant == tenant && r.title == title && r.id != id && admit_open(r).is_ok())
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct OperationLabels {
     operation: &'static str,
@@ -222,16 +257,10 @@ enum Put {
 }
 
 impl Api {
-    async fn put(
-        &self,
-        id: &str,
-        record: &Record,
-        expected: u64,
-        idempotency: &str,
-    ) -> Result<Put, Error> {
+    async fn put(&self, record: &Record, expected: u64, idempotency: &str) -> Result<Put, Error> {
         let path = format!(
             "/v1/{DATASET}/{NAMESPACE}/{}",
-            String::from_utf8(key(id)).expect("hex IDs are UTF-8")
+            String::from_utf8(key(&record.id)).expect("hex IDs are UTF-8")
         );
         let request = hyper::Request::put(path)
             .header("host", bedrock_lib::transport::host_of(&self.address))
@@ -261,46 +290,23 @@ impl Api {
     }
 }
 
+/// A planned write: the record to commit, or the unchanged record when there is nothing to write.
+enum Plan {
+    Write(Record),
+    Unchanged(Record),
+}
+
 pub struct Directory {
     client: Arc<Client>,
     api: Api,
-    node: String,
-    ids: AtomicU64,
+    /// Home region of namespaces created without a jurisdiction: this node's region.
+    region: String,
     operations: Family<OperationLabels, Counter>,
     quota_rejections: Family<QuotaLabels, Counter>,
 }
 
-/// What a caller asks for when creating a namespace.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Create {
-    pub account: String,
-    pub title: String,
-    pub home_region: String,
-    #[serde(default)]
-    pub storage_bytes: Option<u64>,
-    #[serde(default)]
-    pub permissions: Vec<String>,
-}
-
-impl Create {
-    fn validate(&self) -> Result<(), Error> {
-        for (field, value) in [
-            ("account", &self.account),
-            ("title", &self.title),
-            ("home_region", &self.home_region),
-        ] {
-            if value.is_empty() || value.len() > MAX_LABEL || value.chars().any(char::is_control) {
-                return Err(Error::Invalid(format!(
-                    "{field} must be 1 to {MAX_LABEL} bytes without control characters"
-                )));
-            }
-        }
-        Ok(())
-    }
-}
-
 impl Directory {
-    pub fn new(admin: &Admin, client: Arc<Client>, api: Api, node: String) -> Self {
+    pub fn new(admin: &Admin, client: Arc<Client>, api: Api, region: String) -> Self {
         let operations = Family::default();
         admin.register(
             "kv_namespace_operations",
@@ -316,17 +322,17 @@ impl Directory {
         Self {
             client,
             api,
-            node,
-            ids: AtomicU64::new(0),
+            region,
             operations,
             quota_rejections,
         }
     }
 
-    fn count<T>(&self, operation: &'static str, result: &Result<T, Error>) {
-        let outcome = match result {
+    fn count<T>(&self, operation: &'static str, result: Result<T, Error>) -> Result<T, Error> {
+        let outcome = match &result {
             Ok(_) => "ok",
             Err(Error::NotFound) => "not_found",
+            Err(Error::Duplicate) => "duplicate",
             Err(Error::Invalid(_)) => "invalid",
             Err(Error::Rejected(_)) => "rejected",
             Err(Error::Contended) => "contended",
@@ -336,6 +342,7 @@ impl Directory {
         self.operations
             .get_or_create(&OperationLabels { operation, outcome })
             .inc();
+        result
     }
 
     /// [`admit_write`], counted for the quota metrics. Only B-26's write path calls it.
@@ -353,12 +360,14 @@ impl Directory {
         admitted
     }
 
-    /// Namespace `id` and the directory revision that proves it, from a holder at least at `min_revision`.
+    /// Namespace `id` in any state and the directory revision that proves it, from a holder at least at
+    /// `min_revision`.
     pub async fn get(&self, id: &str, min_revision: u64) -> Result<(Record, u64), Error> {
-        let found = self.read(id, min_revision).await;
-        self.count("get", &found);
-        let (record, revision) = found?;
-        Ok((record.ok_or(Error::NotFound)?, revision))
+        let found = self
+            .read(id, min_revision)
+            .await
+            .and_then(|(record, revision)| Ok((record.ok_or(Error::NotFound)?, revision)));
+        self.count("get", found)
     }
 
     async fn read(&self, id: &str, min_revision: u64) -> Result<(Option<Record>, u64), Error> {
@@ -374,42 +383,55 @@ impl Directory {
         Ok((record, found.revision))
     }
 
-    /// Creates a namespace and returns it with the directory revision that holds it.
-    pub async fn create(&self, request: Create) -> Result<(Record, u64), Error> {
-        let created = self.try_create(request).await;
-        self.count("create", &created);
-        created
+    /// Every record, and the lowest revision among the ranges read, each at least at `min_revision`. A commit with
+    /// `If-Match` on that revision succeeds only if every range was at the head, so nothing read has changed.
+    /// ponytail: create, rename and list read the whole directory; a per-tenant title index when that gets slow.
+    async fn scan(&self, min_revision: u64) -> Result<(Vec<Record>, u64), Error> {
+        let mut records = Vec::new();
+        let mut revision = u64::MAX;
+        let mut start_after = Vec::new();
+        loop {
+            let page = self
+                .client
+                .list(
+                    SERVICE,
+                    DATASET,
+                    NAMESPACE,
+                    PREFIX.as_bytes(),
+                    &start_after,
+                    0,
+                    min_revision,
+                )
+                .await
+                .map_err(|status| Error::Unavailable(status.message().to_owned()))?;
+            revision = revision.min(page.revision);
+            for (key, value) in page.entries {
+                let id = String::from_utf8(key[PREFIX.len()..].to_vec())
+                    .map_err(|_| Error::Corrupt("directory key is not UTF-8".into()))?;
+                records.push(decode(&id, &value)?);
+                start_after = key;
+            }
+            if !page.more {
+                return Ok((records, revision));
+            }
+        }
     }
 
-    async fn try_create(&self, request: Create) -> Result<(Record, u64), Error> {
-        request.validate()?;
+    /// Plans a write from a [`scan`](Self::scan) and commits it, scanning again at the head after a conflict.
+    async fn commit(
+        &self,
+        operation: &str,
+        plan: impl Fn(Vec<Record>) -> Result<Plan, Error>,
+    ) -> Result<(Record, u64), Error> {
         let mut floor = 0;
         for _ in 0..ATTEMPTS {
-            let at = wall_ms();
-            let id = new_id(&self.node, at, self.ids.fetch_add(1, Ordering::Relaxed));
-            let (existing, revision) = self.read(&id, floor).await?;
-            if existing.is_some() {
-                continue;
-            }
-            let record = Record {
-                format_version: FORMAT_VERSION,
-                id: id.clone(),
-                account: request.account.clone(),
-                title: request.title.clone(),
-                home_region: request.home_region.clone(),
-                storage: storage(&id),
-                storage_format: bedrock_lib::replication::materialized::FORMAT_VERSION,
-                storage_bytes: request.storage_bytes,
-                permissions: request.permissions.clone(),
-                cache_ttl_seconds: CACHE_TTL_SECONDS,
-                state: Lifecycle::Active as i32,
-                created_at: at,
+            let (records, revision) = self.scan(floor).await?;
+            let record = match plan(records)? {
+                Plan::Write(record) => record,
+                Plan::Unchanged(record) => return Ok((record, revision)),
             };
-            match self
-                .api
-                .put(&id, &record, revision, &format!("create:{id}"))
-                .await?
-            {
+            let idempotency = format!("{operation}:{}:{revision}", record.id);
+            match self.api.put(&record, revision, &idempotency).await? {
                 Put::Committed { revision } => return Ok((record, revision)),
                 Put::Conflict { head } => floor = head,
             }
@@ -417,26 +439,92 @@ impl Directory {
         Err(Error::Contended)
     }
 
-    /// Marks namespace `id` `Deleting` and returns it with the directory revision that holds that; deleting one that already
-    /// is changes nothing. A read at that revision or later, in any region, sees the deletion.
-    pub async fn delete(&self, id: &str) -> Result<(Record, u64), Error> {
-        let deleted = self.try_delete(id).await;
-        self.count("delete", &deleted);
-        deleted
+    /// Creates a namespace and returns it with the directory revision that holds it.
+    pub async fn create(&self, request: Create) -> Result<(Record, u64), Error> {
+        let created = match request.validate() {
+            Ok(()) => {
+                self.commit("create", |records| {
+                    if taken(&records, &request.tenant, &request.title, "") {
+                        return Err(Error::Duplicate);
+                    }
+                    let id = bedrock_lib::uuid();
+                    if records.iter().any(|r| r.id == id) {
+                        return Err(Error::Contended);
+                    }
+                    Ok(Plan::Write(Record {
+                        format_version: FORMAT_VERSION,
+                        storage: storage(&id),
+                        id,
+                        tenant: request.tenant.clone(),
+                        title: request.title.clone(),
+                        home_region: request.home_region.clone(),
+                        storage_format: bedrock_lib::replication::materialized::FORMAT_VERSION,
+                        storage_bytes: request.storage_bytes,
+                        permissions: request.permissions.clone(),
+                        cache_ttl_seconds: CACHE_TTL_SECONDS,
+                        state: Lifecycle::Active as i32,
+                        created_at: wall_ms(),
+                    }))
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        self.count("create", created)
     }
 
-    async fn try_delete(&self, id: &str) -> Result<(Record, u64), Error> {
+    /// Retitles the tenant's active namespace `id`; its ID and storage stay.
+    pub async fn rename(
+        &self,
+        tenant: &str,
+        id: &str,
+        title: &str,
+    ) -> Result<(Record, u64), Error> {
+        let renamed = match label("title", title, MAX_TITLE) {
+            Ok(()) => {
+                self.commit("rename", |records| {
+                    if taken(&records, tenant, title, id) {
+                        return Err(Error::Duplicate);
+                    }
+                    let mut record = records
+                        .into_iter()
+                        .find(|r| r.id == id && r.tenant == tenant && admit_open(r).is_ok())
+                        .ok_or(Error::NotFound)?;
+                    if record.title == title {
+                        return Ok(Plan::Unchanged(record));
+                    }
+                    record.title = title.to_owned();
+                    Ok(Plan::Write(record))
+                })
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        self.count("rename", renamed)
+    }
+
+    /// Marks the tenant's namespace `id` `Deleting` and returns it with the directory revision that holds that;
+    /// deleting one that already is changes nothing. A read at that revision or later, in any region, sees the
+    /// deletion.
+    pub async fn delete(&self, tenant: &str, id: &str) -> Result<(Record, u64), Error> {
+        let deleted = self.try_delete(tenant, id).await;
+        self.count("delete", deleted)
+    }
+
+    async fn try_delete(&self, tenant: &str, id: &str) -> Result<(Record, u64), Error> {
         let mut floor = 0;
         for _ in 0..ATTEMPTS {
             let (record, revision) = self.read(id, floor).await?;
-            let mut record = record.ok_or(Error::NotFound)?;
+            let mut record = record
+                .filter(|r| r.tenant == tenant)
+                .ok_or(Error::NotFound)?;
             if record.state() == Lifecycle::Deleting {
                 return Ok((record, revision));
             }
             record.set_state(Lifecycle::Deleting);
             match self
                 .api
-                .put(id, &record, revision, &format!("delete:{id}"))
+                .put(&record, revision, &format!("delete:{id}"))
                 .await?
             {
                 // Storage stays until B-39 can retire it safely (`retire_storage`).
@@ -447,59 +535,17 @@ impl Directory {
         Err(Error::Contended)
     }
 
-    /// Up to `limit` namespaces after ID `after`, in ID order, optionally of one account, with the cursor for the next
-    /// page and the lowest revision among the ranges read. ponytail: the account filter applies after paging, so a page may come back short.
-    pub async fn list(
-        &self,
-        account: Option<&str>,
-        after: &str,
-        limit: u32,
-    ) -> Result<(Vec<Record>, Option<String>, u64), Error> {
-        let listed = self.try_list(account, after, limit).await;
-        self.count("list", &listed);
-        listed
-    }
-
-    async fn try_list(
-        &self,
-        account: Option<&str>,
-        after: &str,
-        limit: u32,
-    ) -> Result<(Vec<Record>, Option<String>, u64), Error> {
-        let start_after = if after.is_empty() {
-            Vec::new()
-        } else {
-            key(after)
-        };
-        let page = self
-            .client
-            .list(
-                SERVICE,
-                DATASET,
-                NAMESPACE,
-                PREFIX.as_bytes(),
-                &start_after,
-                limit,
-                0,
-            )
-            .await
-            .map_err(|status| Error::Unavailable(status.message().to_owned()))?;
-        let mut records = Vec::new();
-        let mut last = None;
-        for (key, value) in page.entries {
-            let id = String::from_utf8(key[PREFIX.len()..].to_vec())
-                .map_err(|_| Error::Corrupt("directory key is not UTF-8".into()))?;
-            let record = decode(&id, &value)?;
-            if account.is_none_or(|account| record.account == account) {
-                records.push(record);
-            }
-            last = Some(id);
-        }
-        Ok((records, last.filter(|_| page.more), page.revision))
+    /// The tenant's active namespaces in ID order, with the lowest revision among the ranges read.
+    pub async fn list(&self, tenant: &str) -> Result<(Vec<Record>, u64), Error> {
+        let listed = self.scan(0).await.map(|(mut records, revision)| {
+            records.retain(|r| r.tenant == tenant && admit_open(r).is_ok());
+            (records, revision)
+        });
+        self.count("list", listed)
     }
 }
 
-/// Wall time is the point here (IDs and `created_at`); madsim simulates it.
+/// Wall time is the point here (`created_at`); madsim simulates it.
 #[allow(clippy::disallowed_methods)]
 fn wall_ms() -> u64 {
     SystemTime::now()
@@ -508,12 +554,36 @@ fn wall_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// `POST/GET /v1/namespaces` and `GET/DELETE /v1/namespaces/{id}`. Callers authenticate in front of these.
+/// Cloudflare's KV namespace routes, at the same paths as under `api.cloudflare.com`. Callers authenticate in front of
+/// these.
 pub fn routes(directory: Arc<Directory>) -> Router {
     Router::new()
-        .route("/v1/namespaces", get(list).post(create))
-        .route("/v1/namespaces/{id}", get(read).delete(delete))
+        .route(
+            "/client/v4/accounts/{tenant}/storage/kv/namespaces",
+            get(list).post(create),
+        )
+        .route(
+            "/client/v4/accounts/{tenant}/storage/kv/namespaces/{id}",
+            get(read).put(rename).delete(delete),
+        )
         .with_state(directory)
+}
+
+#[derive(Deserialize)]
+struct CreateBody {
+    title: String,
+    /// The home region; the serving node's region when absent.
+    jurisdiction: Option<String>,
+    /// KV Instant is not offered.
+    mode: Option<String>,
+    storage_bytes: Option<u64>,
+    #[serde(default)]
+    permissions: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RenameBody {
+    title: String,
 }
 
 #[derive(Deserialize)]
@@ -524,88 +594,172 @@ struct GetQuery {
 
 #[derive(Deserialize)]
 struct ListQuery {
-    account: Option<String>,
-    #[serde(default)]
-    cursor: String,
-    #[serde(default)]
-    limit: u32,
+    page: Option<usize>,
+    per_page: Option<usize>,
+    order: Option<String>,
+    direction: Option<String>,
 }
 
-async fn create(State(directory): State<Arc<Directory>>, body: Bytes) -> Response {
-    let request: Create = match serde_json::from_slice(&body) {
-        Ok(request) => request,
-        Err(error) => return failure(Error::Invalid(error.to_string())),
-    };
-    match directory.create(request).await {
-        Ok((record, revision)) => {
-            (StatusCode::CREATED, Json(json(&record, revision))).into_response()
+fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
+    serde_json::from_slice(bytes).map_err(|error| Error::Invalid(error.to_string()))
+}
+
+async fn create(
+    State(directory): State<Arc<Directory>>,
+    Path(tenant): Path<String>,
+    bytes: Bytes,
+) -> Response {
+    let created = match body::<CreateBody>(&bytes) {
+        Ok(CreateBody { mode: Some(_), .. }) => Err(Error::Invalid("mode is not supported".into())),
+        Ok(request) => {
+            let request = Create {
+                tenant,
+                title: request.title,
+                home_region: request
+                    .jurisdiction
+                    .unwrap_or_else(|| directory.region.clone()),
+                storage_bytes: request.storage_bytes,
+                permissions: request.permissions,
+            };
+            directory.create(request).await
         }
-        Err(error) => failure(error),
-    }
+        Err(error) => Err(error),
+    };
+    reply(
+        created.map(|(record, revision)| namespace(&record, revision)),
+        None,
+    )
 }
 
 async fn read(
     State(directory): State<Arc<Directory>>,
-    Path(id): Path<String>,
+    Path((tenant, id)): Path<(String, String)>,
     Query(query): Query<GetQuery>,
 ) -> Response {
-    match directory.get(&id, query.min_revision).await {
-        Ok((record, revision)) => Json(json(&record, revision)).into_response(),
-        Err(error) => failure(error),
-    }
-}
-
-async fn delete(State(directory): State<Arc<Directory>>, Path(id): Path<String>) -> Response {
-    match directory.delete(&id).await {
-        Ok((record, revision)) => Json(json(&record, revision)).into_response(),
-        Err(error) => failure(error),
-    }
-}
-
-async fn list(State(directory): State<Arc<Directory>>, Query(query): Query<ListQuery>) -> Response {
-    match directory
-        .list(query.account.as_deref(), &query.cursor, query.limit)
+    let found = directory
+        .get(&id, query.min_revision)
         .await
-    {
-        Ok((records, cursor, revision)) => Json(serde_json::json!({
-            "namespaces": records.iter().map(|r| json(r, revision)).collect::<Vec<_>>(),
-            "cursor": cursor,
-        }))
-        .into_response(),
-        Err(error) => failure(error),
-    }
+        .and_then(|(record, revision)| {
+            if record.tenant == tenant && admit_open(&record).is_ok() {
+                Ok(namespace(&record, revision))
+            } else {
+                Err(Error::NotFound)
+            }
+        });
+    reply(found, None)
 }
 
-/// A record as the management API shows it, with the directory `revision` it was read or written at.
-fn json(record: &Record, revision: u64) -> serde_json::Value {
-    serde_json::json!({
-        "revision": revision,
+async fn rename(
+    State(directory): State<Arc<Directory>>,
+    Path((tenant, id)): Path<(String, String)>,
+    bytes: Bytes,
+) -> Response {
+    let renamed = match body::<RenameBody>(&bytes) {
+        Ok(request) => directory.rename(&tenant, &id, &request.title).await,
+        Err(error) => Err(error),
+    };
+    reply(
+        renamed.map(|(record, revision)| namespace(&record, revision)),
+        None,
+    )
+}
+
+/// Cloudflare answers an empty result; the revision lets a caller read its own deletion.
+async fn delete(
+    State(directory): State<Arc<Directory>>,
+    Path((tenant, id)): Path<(String, String)>,
+) -> Response {
+    let deleted = directory.delete(&tenant, &id).await;
+    reply(
+        deleted.map(|(_, revision)| json!({ "revision": revision })),
+        None,
+    )
+}
+
+async fn list(
+    State(directory): State<Arc<Directory>>,
+    Path(tenant): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> Response {
+    let page = query.page.unwrap_or(1);
+    let per_page = query.per_page.unwrap_or(20);
+    let invalid = |detail: &str| reply(Err(Error::Invalid(detail.into())), None);
+    let by_title = match query.order.as_deref() {
+        None | Some("id") => false,
+        Some("title") => true,
+        Some(_) => return invalid("order must be id or title"),
+    };
+    let descending = match query.direction.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(_) => return invalid("direction must be asc or desc"),
+    };
+    if page == 0 || !(1..=1000).contains(&per_page) {
+        return invalid("page starts at 1 and per_page is 1 to 1000");
+    }
+    let (mut records, revision) = match directory.list(&tenant).await {
+        Ok(listed) => listed,
+        Err(error) => return reply(Err(error), None),
+    };
+    if by_title {
+        records.sort_by(|a, b| a.title.cmp(&b.title));
+    }
+    if descending {
+        records.reverse();
+    }
+    let shown: Vec<_> = records
+        .iter()
+        .skip((page - 1).saturating_mul(per_page))
+        .take(per_page)
+        .map(|record| namespace(record, revision))
+        .collect();
+    let info = json!({
+        "page": page,
+        "per_page": per_page,
+        "count": shown.len(),
+        "total_count": records.len(),
+    });
+    reply(Ok(Value::Array(shown)), Some(info))
+}
+
+/// A namespace as Cloudflare shows it, with the directory `revision` it was read or written at.
+fn namespace(record: &Record, revision: u64) -> Value {
+    json!({
         "id": record.id,
-        "account": record.account,
         "title": record.title,
-        "home_region": record.home_region,
-        "storage": record.storage,
-        "storage_format": record.storage_format,
-        "storage_bytes": record.storage_bytes,
-        "permissions": record.permissions,
-        "cache_ttl_seconds": record.cache_ttl_seconds,
-        "state": match record.state() {
-            Lifecycle::Active => "active",
-            Lifecycle::Deleting => "deleting",
-        },
-        "created_at": record.created_at,
+        "jurisdiction": record.home_region,
+        "revision": revision,
     })
 }
 
-fn failure(error: Error) -> Response {
-    let status = match error {
-        Error::NotFound => StatusCode::NOT_FOUND,
-        Error::Invalid(_) => StatusCode::BAD_REQUEST,
-        Error::Rejected(_) | Error::Contended => StatusCode::CONFLICT,
-        Error::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
-        Error::Corrupt(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    };
-    (status, error.to_string()).into_response()
+/// Cloudflare's response envelope. ponytail: every error has code 10000; distinct codes when a client needs them.
+fn reply(result: Result<Value, Error>, result_info: Option<Value>) -> Response {
+    match result {
+        Ok(result) => {
+            let mut body =
+                json!({ "success": true, "errors": [], "messages": [], "result": result });
+            if let Some(info) = result_info {
+                body["result_info"] = info;
+            }
+            Json(body).into_response()
+        }
+        Err(error) => {
+            let status = match error {
+                Error::NotFound => StatusCode::NOT_FOUND,
+                Error::Invalid(_) | Error::Duplicate => StatusCode::BAD_REQUEST,
+                Error::Rejected(_) | Error::Contended => StatusCode::CONFLICT,
+                Error::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+                Error::Corrupt(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            let body = json!({
+                "success": false,
+                "errors": [{ "code": 10000, "message": error.to_string() }],
+                "messages": [],
+                "result": null,
+            });
+            (status, Json(body)).into_response()
+        }
+    }
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ replay_peers = ["relay-eu-1a-2:7300", "relay-eu-1a-3:7300"]
 
 [location]
 region = "eu"
-dc = "eu-1"
+dc = "arn1"
 cell = "eu-1a"
 # Optional rack/power domain; it may differ among relays in the same cell.
 # failure_domain = "rack-1"
