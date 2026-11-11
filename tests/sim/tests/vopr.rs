@@ -911,7 +911,9 @@ fn start_cluster(run: &Arc<Run>) -> Vec<Process> {
     for (i, ip) in KVS.iter().enumerate() {
         let name = format!("kv-{}", i + 1);
         let config = service(&name, ip, &[]);
-        let id = spawn(run, &name, ip, move || bedrock_kv::run(config.clone()));
+        let id = spawn(run, &name, ip, move || {
+            bedrock_kv::run(config.clone().into())
+        });
         add(name, ip, &[], true, id);
     }
     add("subscriber".into(), SUBSCRIBER, &[], false, subscriber(run));

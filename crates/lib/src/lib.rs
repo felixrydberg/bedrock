@@ -1,8 +1,10 @@
 //! Shared distributed core linked by every Bedrock binary.
 
 pub mod admin;
+pub mod client;
 pub mod datasets;
 pub mod health;
+pub mod http;
 pub mod membership;
 pub mod node;
 pub mod placement;

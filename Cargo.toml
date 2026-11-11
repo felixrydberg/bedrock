@@ -28,6 +28,8 @@ rocksdb = { version = "0.25", default-features = false, features = ["lz4", "bind
 tempfile = "3"
 tracing = "0.1"
 # B-03 admin endpoint: hyper runs over madsim-tokio sockets, so it is simulated too.
+# Served through hyper rather than `axum::serve`, which does not run under madsim (#9).
+axum = { version = "0.8", default-features = false, features = ["http1"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"

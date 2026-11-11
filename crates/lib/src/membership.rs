@@ -250,15 +250,26 @@ fn read_snapshot(
     snapshot: &dyn Snapshot,
     prefix: &[u8],
 ) -> Result<(BTreeMap<String, pb::Member>, Directories), Status> {
-    let mut members = BTreeMap::new();
-    let mut directories = Directories::new();
     let scan = snapshot
         .scan(&KeyRange::prefix(prefix.to_vec()))
         .map_err(|e| Status::internal(e.to_string()))?;
-    for entry in scan {
+    parse(scan.map(|entry| {
         let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
-        let key = String::from_utf8(key[prefix.len()..].to_vec())
-            .map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
+        Ok((key[prefix.len()..].to_vec(), value))
+    }))
+}
+
+/// Node ID → entry, and the placement directories, from a membership namespace's `(key, value)` rows, as a
+/// subscription stores them or as a relay's `Routes` returns them (#56 / B-25).
+pub fn parse(
+    entries: impl IntoIterator<Item = Result<(Vec<u8>, Vec<u8>), Status>>,
+) -> Result<(BTreeMap<String, pb::Member>, Directories), Status> {
+    let mut members = BTreeMap::new();
+    let mut directories = Directories::new();
+    for entry in entries {
+        let (key, value) = entry?;
+        let key =
+            String::from_utf8(key).map_err(|_| Status::data_loss("membership key is not UTF-8"))?;
         if key.starts_with(drain::PREFIX) {
             continue;
         }

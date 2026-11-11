@@ -6,10 +6,11 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+axum.workspace = true
 figment.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client"] }
-hyper-util.workspace = true
+hyper-util = { workspace = true, features = ["service"] }
 prometheus-client.workspace = true
 prost.workspace = true
 serde.workspace = true

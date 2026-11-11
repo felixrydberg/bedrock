@@ -48,8 +48,11 @@ pub struct Write {
 pub enum CommitError {
     Invalid(String),
     Busy,
-    /// The namespace moved past [`Write::expected`]; nothing was written.
-    Conflict,
+    /// The namespace moved past [`Write::expected`] to `head`; nothing was written. A caller that planned from a
+    /// lagging replica re-reads at `head` and plans again (#56 / B-25).
+    Conflict {
+        head: u64,
+    },
     Fenced,
     /// Persistence may have completed; retry with the same idempotency key.
     Unavailable(String),
@@ -60,7 +63,12 @@ impl fmt::Display for CommitError {
         match self {
             Self::Invalid(reason) => write!(f, "invalid write: {reason}"),
             Self::Busy => f.write_str("too many writes waiting in this namespace"),
-            Self::Conflict => f.write_str("the namespace moved past the expected revision"),
+            Self::Conflict { head } => {
+                write!(
+                    f,
+                    "the namespace moved past the expected revision to {head}"
+                )
+            }
             Self::Fenced => f.write_str("another writer owns this namespace"),
             Self::Unavailable(detail) => write!(f, "commit outcome unknown: {detail}"),
         }
@@ -554,11 +562,9 @@ impl Writer {
                 waiting.push((done, sequence));
                 continue;
             }
-            if write
-                .expected
-                .is_some_and(|expected| expected != state.head + entries.len() as u64)
-            {
-                let _ = done.send(Err(CommitError::Conflict));
+            let head = state.head + entries.len() as u64;
+            if write.expected.is_some_and(|expected| expected != head) {
+                let _ = done.send(Err(CommitError::Conflict { head }));
                 continue;
             }
             let Some(sequence) = state

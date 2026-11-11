@@ -314,7 +314,7 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
     let writer = open_writer().await;
     let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let api = http.local_addr().unwrap();
-    tokio::spawn(bedrock_api::serve(
+    tokio::spawn(bedrock_lib::http::serve(
         http,
         bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
         None,
@@ -374,7 +374,7 @@ async fn simulated() {
         .spawn(async move {
             let writer = open_writer().await;
             let http = TcpListener::bind(api).await.unwrap();
-            tokio::spawn(bedrock_api::serve(
+            tokio::spawn(bedrock_lib::http::serve(
                 http,
                 bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
                 None,

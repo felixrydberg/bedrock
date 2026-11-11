@@ -9,6 +9,10 @@ roles = ["l1", "l2"]
 relays = ["relay-eu-1a-1:7300", "relay-eu-1a-2:7300", "relay-eu-1a-3:7300"]
 api = "api.core:7002"
 s3_endpoint = "https://s3.example.internal"
+# Namespace management (POST/GET /v1/namespaces, GET/DELETE /v1/namespaces/{id}); unset serves none. Callers send
+# Authorization: Bearer <write_token>, the bedrock-api write credential this node also forwards directory writes with.
+# Set it via BEDROCK_WRITE_TOKEN.
+# manage_listen = "0.0.0.0:7103"
 
 [location]
 region = "eu"

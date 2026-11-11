@@ -646,6 +646,11 @@ Created: [#55](https://github.com/felixrydberg/bedrock/issues/55) — Feature �
 
 Created: [#56](https://github.com/felixrydberg/bedrock/issues/56) — Feature 🚀: Customer KV namespace directory, creation and quotas
 
+Amended 2026-11-11 (user decision): B-25 also builds Quicksilver reads (`Reads` on range owners) and the shared client's
+routing-table slice (§4 decision 15 amendment). Records live at `kv/namespaces/{id}` in `quicksilver/infrastructure`; IDs
+are 32 hex characters, so storage is `kv/{id}/`. Deletion marks the record `Deleting`; removing S3 objects waits for B-39.
+The dated scope amendment comment on #56 is pending; add its GitHub comment link here after it is posted.
+
 ---
 
 #### B-39 — Customer-KV readers and caches on B-11 materialized storage
@@ -691,6 +696,10 @@ inspecting engine state rather than through a served read.
 
 **Describe the solution you'd like**
 - Add to the fixed load: KV reads with minimum revisions, listing, and namespace create and delete.
+- Namespace create, get, list and delete go through `bedrock-kv`'s management endpoint. Give each operation an expected
+  result in `tests/sim/src/history.rs`: returned ID/record/list, the `Active` to `Deleting` transition, and rejection of
+  opens and writes after deletion. Include a deliberate bug for each request type so its expectation demonstrably fails.
+- Quicksilver `Get`/`List` reads may join the fixed load, with expected values, absence and minimum-revision outcomes.
 - Prove `MinRevisionReads` through served reads, including absence and listing as #25 requires.
 - Run real `bedrock-kv` readers under faults: reader loss, pressure and idle eviction, reopen, and publication lag.
 - Add real reads to the simulation. Damage is found today by those and by the scrubber (`health::scrub`, #25 / B-23).
@@ -1040,6 +1049,9 @@ keeps what arrived, but nothing yet guarantees coverage or rebuilds it after a n
 **Describe the solution you'd like**
 - `full_replica` placement so that every key of the namespace is held across the L2 nodes in each DC: every hash range in
   the placement directory has a ready owner (decision 13).
+- The Quicksilver read server answers only for ranges its node holds in `ready` or `leaving`; it checks that state and its
+  applied revision for each request. Completeness reporting must use the same held-range/readiness definition, not count
+  assigned or populating ranges as complete.
 - Eviction of covered keys is forbidden.
 - Completeness tracking, with degraded status until redundancy and completeness are restored.
 - This applies to pushed namespaces such as Quicksilver, not customer-KV cache readers. No customer-KV replica-completeness
@@ -1335,6 +1347,8 @@ Something has to own the order, so that every intermediate state is safe and a f
 
 **Describe the solution you'd like**
 - Every revision of a Worker or Pages site is its own deployment with its own `deployment_id`.
+- Read `deployment/{id}` and active-deployment records through the shared client and Quicksilver `Reads` API; do not add a
+  separate deployment-record read path.
 - Quicksilver schema, owned by this draft (typed accessors included): `deployment/{deployment_id} → {runtime settings, bindings,
   env/secret references, cdn_revision, bundle sha256 for Workers}` and `worker/{worker_id}/active → deployment_id`. A project
   name or host resolves to a `deployment_id` here; the CDN only ever sees the UUID.
@@ -1377,6 +1391,7 @@ point lookups; the CDN and Quicksilver only answer for keys and artifacts.
 **Describe the solution you'd like**
 - The Gateway resolves the host (or project name) to the active `deployment_id` in Quicksilver, then reads
   `deployment/{deployment_id}`, which says Worker or Pages.
+- Use the shared client and Quicksilver `Reads` API for both records.
 - Worker: route the request to a node that invokes it. A cold start fetches the bundle with `get_artifact(bundle sha256)` (B-35).
 - Pages: `get_path("pages", deployment_id, path, cdn_revision)` gives the sha256, then `get_artifact(sha256)` from its holders.
   Index files, SPA fallbacks, redirects and the 404 page are further path rows.
@@ -1693,8 +1708,11 @@ Services have no standard way to reach each other. Each binary wires up its own 
 cannot reach another cell, and public requests have no entry point.
 
 **Describe the solution you'd like**
-- A shared client in `lib` built from `membership::View`, `relays::sources`, `transport::Peers` and `SourceChain`. Services call
-  it by service and key and never touch member lists, addresses or breakers.
+- #56 / B-25 ships the shared client's first slice: callers fetch `Relay.Routes` from their cell relay on first use, cache
+  members and placement directory for that service, and drop the table after 10 idle minutes (`IDLE_TTL`). Reads go directly
+  to holders; owner/freshness rejection tries the next owner, then fetches a newer table, with bounded retries. Compute holds
+  tables only for services it calls. B-57 adds `bytes()`, Gateway/Compute wiring, tier fallback and customer-KV rendezvous
+  (`Sources::readers`).
 - `bedrock-gateway`, with its role taken from the tier of the relay it subscribes to (§4 decision 15): a cell tier authenticates
   and routes to nodes, a DC or region tier picks a cell. Separate public and internal listeners with separate limits.
 - A `gateway` service identity in `authorize`, including a way to read from upper-tier relays, which accept only `relay` today.
@@ -1828,6 +1846,8 @@ nodes in turn, with real binaries and writes running.
   - Cell drain: nothing moves across cells for quicksilver and cdn, and the cell gets no new assignments.
   - Scale out, then scale in: joins and rebalancing, then drains below the replica count, which must keep redundancy.
   - Rolling restart of every node, one at a time, with no write lost and no read going backwards.
+  - Keep clients reading during range handoffs, drains and rolling restarts. Exercise stale `Relay.Routes` tables, owner
+    rejection, bounded next-owner retry and table refresh while reads continue.
 - **Real binaries** (`tests/crash`, `scripts/crash.sh`): a dynamic cluster where the harness starts a new node, drains one
   through the operator path and removes it, and does a rolling restart. The existing invariants and disk checks apply.
 - Failing seeds go to OPEN, then REGRESSIONS, with a focused test.
@@ -1953,6 +1973,8 @@ and no test that every one failing costs only availability. Enroute states this 
   mechanism that keeps it safe (owner check, fence, term, freeze, fail-closed).
 - The rule: a stale or unreachable input may cause a retry, an error or a freeze. It never causes a second writer, a write
   accepted by a non-owner, a read below its minimum revision, or a revoked key accepted past its bound.
+- Relay-fetched routing tables are discovery inputs that may cost availability only. A holder's owner check, followed by
+  rejection handling and table refresh, preserves the safety rule.
 - Simulation scenarios in `tests/sim`, seeded and replayable, each checked against the writer:
   - the regional directory stale on callers during a handoff;
   - S3 unreachable on open and recent-state paths while relays are healthy;
@@ -2153,7 +2175,8 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
       `membership/{service}.{cell}` namespace, under `range/{start}` keys (node IDs cannot contain `/`). Membership,
       assignment and readiness therefore share one revision order. An entry holds the range bounds and its owners, each
       `populating`, `ready` or `leaving`. Every node subscribes to it, as it already does to membership; it stays small
-      (a few ranges per node). Nodes route locally from that view; relays are never on the read path.
+      (a few ranges per node). `Relay.Routes` looks up this already-published state; keys and bytes never pass through
+      relays. Nodes route locally from a table, and relays are never on the read path.
     - **Assignment (B-15):** a pure, deterministic function of the published directory and membership, run only by the
       majority publisher, which waits until its subscription applies each write before planning again. A joining member takes
       ranges, splitting the largest where needed, until its share matches its capacity weight. A member removed after the
@@ -2248,9 +2271,11 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
       subscribes to a relay like any other process. Its role follows that relay's tier: at the cell tier it authenticates and
       routes to nodes; at a DC or region tier it picks a cell, with no authentication and no Quicksilver. Public and internal
       (mTLS) traffic use separate listeners with separate limits, so a public flood cannot starve internal reads.
-    - **Reads inside a cell go direct.** The caller hashes the key against its own member list and connects to the node. One
-      shared client in `lib` hides member lists, hashing, connections, breakers and tier fallback, so a service only says what
-      it wants. A process holds lists only for the services it calls.
+    - **Reads inside a cell go direct.** The caller hashes the key against routing tables fetched from its cell relay on
+      first use, then connects directly to a node. The shared client in `lib` caches each service table and drops it after
+      10 idle minutes. Compute holds tables only for services it calls. Owner rejection and refresh protect correctness;
+      a stale/unavailable table can only cost availability. One shared client hides tables, hashing, connections, breakers
+      and tier fallback, so a service only says what it wants.
     - **Reads between cells go through a Gateway.** A node needs its own cell's list and the target's Gateway address, not
       another cell's members.
     - **Public entry.** Anycast reaches a DC; a connection-level layer that never sees keys spreads connections across Gateways.
@@ -2271,9 +2296,21 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
       briefly reuse answers, and each answer carries its age. The Gateway accepts while it has applied that sequence and the
       confirmation is under 30 seconds old. Starting values: a 5-second poll and up to 5 seconds of reuse per tier. A head that
       moves while the Gateway's stream does not also sends it to a sibling relay.
+    - **Amendment 2026-11-11: discover routing tables on demand.** Callers hash locally against service routing tables fetched
+      from their cell relay on first use, then drop each table after 10 idle minutes. They do not subscribe to every service
+      they call; Compute holds tables only for services it uses. Gateway entry routing for Worker and Pages traffic remains
+      as described above.
     - **Cost:** a writer outage over 30 seconds rejects API-key requests everywhere, until B-09b replicates the writer; losing
       every route through the relays does the same. Public Pages and Worker traffic needs no API key. The freshness request is a
       relay protocol change, so the TLA+ specification comes first, and like `Tick` it can never advance applied state.
+    - **Amendment 2026-11-11 (#56 / B-25): routing tables on demand.** A caller does not subscribe to the member lists of the
+      services it calls. The shared client (`lib/client`, the first slice of B-57's client) asks a cell relay for a service's
+      published membership namespace (`Relay.Routes`: members and placement directories at one revision), caches it, and
+      reads from the holder directly. A holder that does not serve the range or is behind turns the read away and the
+      client tries the next owner, then a newer table, a bounded number of times. A table unused for 10 minutes is dropped.
+      Relays answer only table fetches, never reads, so decision 13 still holds. `Routes` and the owners' `Reads` service are
+      read-only and change no replication state; no TLA+ change. B-25 wires Quicksilver `Get`/`List`; `bytes()`, customer-KV
+      rendezvous and Gateway/Compute use stay with B-27 and B-57.
 
 ### Still open
 
