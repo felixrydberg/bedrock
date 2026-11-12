@@ -78,3 +78,5 @@ Choose the cheapest available model that can reliably complete and verify the ta
 - Cap parallelism for every heavy run: use `cargo ... -j 4` or `CARGO_BUILD_JOBS=4`, and do not pass `-workers auto` to TLC. Use a fixed TLC worker count of at most 4, and bound the JVM heap (for example `JDK_JAVA_OPTIONS=-Xmx4g`).
 - Do not run seed sweeps or long TLC checks in a worker alongside the lead's own builds. Run them in sequence and report the cap used.
 - If a run is interrupted or the machine reboots, do not retry at the same parallelism. Lower the cap, record the cap in the report, and tell the user.
+
+The codebase is yours: What its for and how its built is your call, and you'll keep building on it.
