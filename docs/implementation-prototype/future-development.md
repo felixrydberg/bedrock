@@ -95,6 +95,9 @@ then cached until the writer publishes again. Namespaces nobody reads cost nothi
 
 ## Customer-KV namespace writer/reader colocation
 
+**Accepted 2026-11-12 for #58 / B-26** (writer and reads on the rendezvous owner in the home region; see the B-26
+amendment in `feature-drafts.md`). The text below is the original evaluation.
+
 Evaluate placing a namespace's writer and its active KV readers in the same cell, and where practical the same host
 or nearby hosts. This may reduce cross-region S3 traffic and read latency, especially for frequently read namespaces,
 but should be justified by measured request, latency and cache-residency data. The API writer and `bedrock-kv` remain

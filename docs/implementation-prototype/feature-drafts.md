@@ -669,6 +669,13 @@ Created: [#57](https://github.com/felixrydberg/bedrock/issues/57) — Feature �
 
 Created: [#58](https://github.com/felixrydberg/bedrock/issues/58) — Feature 🚀: Customer KV write path with home-region forwarding
 
+Amended 2026-11-12 (user decision): customer-KV writer/reader colocation (§4 decisions 11 and 12 amendments). Each
+namespace's writer runs on its owning `bedrock-kv` node in the home region: rendezvous over the region's healthy `kv`
+members by `hash_of("kv", id, "")`, without L2 ranges or a directory. Other nodes and regions forward to that owner. The
+owner serves reads from the same SlateDB handle (read-your-writes, no reader polling), so B-39's polling `DbReader` is
+removed. SlateDB's writer open fences a previous owner; a fenced node waits a hold-off before reopening. `bedrock-api`
+keeps the pushed datasets and rejects `kv`. `docs/spec/materialized.tla` models the ownership move.
+
 ---
 
 #### B-27 — KV reads through cache-affinity routing and S3 namespace readers
@@ -2126,6 +2133,10 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
       value, and the requesting cell may cache it for at most 60 seconds. Adding/removing a cache node needs no namespace
       move, replica rebuild or customer-KV relay subscription. Membership still comes from the Quicksilver/Auth connection.
       One logical writer remains a write-throughput limit even when readers scale out.
+      Amended 2026-11-12 (B-26): the customer-KV writer is no longer in `bedrock-api`. The namespace's owning `bedrock-kv`
+      node in the home region (rendezvous over that region's healthy `kv` members) embeds `lib`'s generic writer and
+      serves the namespace's reads from the same handle, replacing the read-only namespace reader. Writes scale across
+      the region's `kv` nodes; one namespace still has one ordered writer. Ownership moves rely on SlateDB writer fencing.
     - **Read semantics:** optional local L1 → preferred healthy cell value cache → on miss, Quicksilver home-region
       lookup → home-region SlateDB reader → its block cache/S3 ranges or coherent recent committed state. `LIST` runs against
       the home namespace's full ordered database view; pagination uses original keys and a logical cursor, not cache-node
