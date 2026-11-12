@@ -187,6 +187,18 @@ impl Readers {
             // Not kept: the database may be created any moment, and an empty view would never see it.
             return Ok(None);
         };
+        let (reader, evicted) = self.install(id, reader);
+        // Pressure closes what it evicted now, not at the next sweep. A reader a read still holds closes once released,
+        // so beyond `max_open` there are at most as many readers as reads in flight.
+        if evicted {
+            self.release().await;
+        }
+        Ok(Some(reader))
+    }
+
+    /// Keeps `reader` open for `id` unless another already is, evicting the least recently used readers beyond
+    /// `max_open`. Returns the reader to use and whether any was evicted.
+    fn install(&self, id: &str, reader: Arc<Reader>) -> (Arc<Reader>, bool) {
         let mut open = self.open.lock().unwrap();
         // A coalesced open hands every caller the same reader; the first to finish installs it.
         let installed = open.entry(id.to_owned()).or_insert_with(|| Open {
@@ -207,9 +219,11 @@ impl Readers {
             }
         }
         let reader = installed;
+        let mut evicted = false;
         // ponytail: least recently used is found by a scan over at most `max_open` readers; an ordered index if that
         // grows large.
         while open.len() > self.max_open {
+            evicted = true;
             let oldest = open
                 .iter()
                 .min_by_key(|(_, open)| open.used)
@@ -222,7 +236,7 @@ impl Readers {
                 .push((oldest, evicted.reader, "pressure"));
         }
         self.gauge.set(open.len() as i64);
-        Ok(Some(reader))
+        (reader, evicted)
     }
 
     /// Takes a reader that failed out of service, so the next read opens a fresh one.
@@ -353,6 +367,11 @@ impl Readers {
             }
             self.gauge.set(open.len() as i64);
         }
+        self.release().await;
+    }
+
+    /// Closes every retired reader no read still holds.
+    async fn release(&self) {
         let closable: Vec<_> = {
             let mut retired = self.retired.lock().unwrap();
             let (closable, held) = std::mem::take(&mut *retired)
@@ -373,9 +392,9 @@ impl Readers {
         self.closed.get_or_create(&ReasonLabels { reason }).inc();
     }
 
-    /// Deletes every stored object of namespace `id`, after closing each of its local readers, so none still running
-    /// can write a checkpoint back under the deleted prefix. They are closed at once, not when idle: the namespace is
-    /// deleted, so a read still holding one fails rather than being waited for.
+    /// Deletes every stored object of namespace `id`, after closing each of its local readers and fencing its writer, so
+    /// nothing still running writes a checkpoint or publication back under the deleted prefix. Readers are closed at
+    /// once, not when idle: the namespace is deleted, so a read still holding one fails rather than being waited for.
     pub async fn destroy(&self, id: &str) -> StorageResult<()> {
         let mut stopping = Vec::new();
         {
@@ -392,6 +411,9 @@ impl Readers {
         for reader in stopping {
             self.stop(&reader, "purge").await;
         }
+        // Opening a writer fences any `bedrock-api` writer still open on the namespace. Refusing it a new one is write
+        // admission's (B-26): a `Deleting` namespace takes no writes.
+        self.factory.open(DATASET, id).await?.close().await?;
         self.factory.destroy(DATASET, id).await
     }
 }

@@ -154,7 +154,8 @@ fn storage_is_purgeable_only_after_the_grace_since_deletion() {
     namespace.deleting_at = 1_000;
     assert!(!purgeable(&namespace, 1_000 + grace - 1));
     assert!(purgeable(&namespace, 1_000 + grace));
-    // Deleted before the time was recorded: the grace has long passed.
+    // No recorded deletion time, e.g. from a binary that predates it during an upgrade: never purged until deleting it
+    // again records one.
     namespace.deleting_at = 0;
-    assert!(purgeable(&namespace, grace));
+    assert!(!purgeable(&namespace, u64::MAX));
 }

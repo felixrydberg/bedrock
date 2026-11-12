@@ -135,7 +135,18 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         _ => None,
     };
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
-    let mut sweep = tokio::time::interval(SWEEP);
+    // Its own task, so a slow reader close never delays readiness or shutdown. Cancelled at shutdown: readers write no
+    // data, and an unclosed reader's checkpoint expires on its own.
+    let sweeping = tokio::spawn({
+        let readers = readers.clone();
+        async move {
+            let mut sweep = tokio::time::interval(SWEEP);
+            loop {
+                sweep.tick().await;
+                readers.sweep().await;
+            }
+        }
+    });
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
         tokio::select! {biased;
@@ -146,10 +157,10 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
                     tracing::warn!(%error,"membership view unreadable");
                 }
             },
-            _=sweep.tick()=>readers.sweep().await,
         }
     }
     admin.set_ready(false);
+    sweeping.abort();
     if let Some(manage) = manage {
         manage.abort();
     }

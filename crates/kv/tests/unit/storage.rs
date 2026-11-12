@@ -225,6 +225,49 @@ async fn cached_values_expire_and_never_answer_a_newer_minimum_revision() {
     assert_eq!(cache.inner.lock().unwrap().total, 0);
 }
 
+/// SlateDB, because the model removes a destroyed namespace's state and so fails its writer whether fenced or not.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn destroy_fences_a_writer_still_open_so_nothing_comes_back() {
+    use bedrock_lib::storage::slate::SlateFactory;
+    use object_store::ObjectStore;
+
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let factory = Arc::new(SlateFactory::new(store.clone()));
+    let writer = Materialized::open(factory.as_ref(), DATASET, &id(1))
+        .await
+        .unwrap();
+    let readers = Readers::new(&Admin::new(), factory, REGION.into(), "eu-1a".into(), 4);
+    readers.destroy(&id(1)).await.unwrap();
+    let event = Event {
+        dataset: DATASET.into(),
+        namespace: id(1),
+        stream: "kv-0".into(),
+        sequence: 1,
+        epoch: 1,
+        committed_at: 100,
+        key: b"k".to_vec(),
+        operation: Operation::Set(b"v".to_vec()),
+    };
+    let late = writer
+        .apply(&[Committed {
+            event,
+            retry_key: None,
+            retry_expires_at: 0,
+        }])
+        .await;
+    let late = match late {
+        Ok(()) => writer.publish().await.map(|_| ()),
+        Err(error) => Err(error),
+    };
+    assert!(matches!(late, Err(StorageError::Fenced(_))), "{late:?}");
+    let left = store.list_with_delimiter(None).await.unwrap();
+    assert!(
+        left.objects.is_empty() && left.common_prefixes.is_empty(),
+        "nothing was written back under the deleted prefix: {left:?}"
+    );
+}
+
 #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
 #[cfg_attr(madsim, tokio::test)]
 async fn a_list_cursor_outside_its_prefix_never_leaves_the_prefix() {

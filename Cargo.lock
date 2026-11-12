@@ -313,6 +313,7 @@ dependencies = [
  "hyper",
  "lru",
  "madsim-tokio",
+ "object_store",
  "prometheus-client",
  "prost",
  "serde",

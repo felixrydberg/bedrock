@@ -917,11 +917,17 @@ impl Reader {
 
     /// The revision the view currently represents.
     pub async fn position(&self) -> StorageResult<Position> {
-        let Some(metadata) = self.db.get(META_KEY).await? else {
+        let mut metadata = self.db.get(META_KEY).await?;
+        if metadata.is_none() {
             // A created database that no commit reached is empty; data without atomic metadata is corruption.
             if self.db.scan(b"", None, 1).await?.is_empty() {
                 return Ok(Position::default());
             }
+            // The first commit may have been published between the two reads. It wrote `m` in the same batch as its
+            // data, so any view that shows the data shows `m` too.
+            metadata = self.db.get(META_KEY).await?;
+        }
+        let Some(metadata) = metadata else {
             return Err(StorageError::Corruption(context(
                 &self.instance(),
                 "namespace data has no atomic revision metadata",

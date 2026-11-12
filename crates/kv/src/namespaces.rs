@@ -201,13 +201,20 @@ pub fn admit_write(record: &Record, current: u64, added: u64) -> Result<(), Reje
 }
 
 /// How long a `Deleting` namespace keeps its storage. It outlasts directory propagation and the writes and reads that
-/// were admitted before the deletion reached them, so a purge only removes what nothing still uses. A reader left open
-/// elsewhere fails once its objects are gone; it never serves a missing object as an absent key.
-pub const PURGE_GRACE: Duration = Duration::from_secs(10 * 60);
+/// were admitted before the deletion reached them, and the idle close of a reader another node still has open, so no
+/// such reader writes a checkpoint back after the purge. A reader still open fails once its objects are gone; it never
+/// serves a missing object as an absent key.
+pub const PURGE_GRACE: Duration = Duration::from_secs(20 * 60);
+const _: () = assert!(
+    PURGE_GRACE.as_secs() > crate::storage::IDLE.as_secs() + crate::SWEEP.as_secs() + 60,
+    "a purge must wait out every reader's idle close"
+);
 
-/// Whether `record`'s storage may be purged at wall-clock `now_ms`.
+/// Whether `record`'s storage may be purged at wall-clock `now_ms`. A deletion with no recorded time never is: deleting
+/// it again records one.
 pub fn purgeable(record: &Record, now_ms: u64) -> bool {
     record.state() == Lifecycle::Deleting
+        && record.deleting_at > 0
         && record
             .deleting_at
             .saturating_add(PURGE_GRACE.as_millis() as u64)
@@ -557,7 +564,8 @@ impl Directory {
             let mut record = record
                 .filter(|r| r.tenant == tenant)
                 .ok_or(Error::NotFound)?;
-            if record.state() == Lifecycle::Deleting {
+            // A deletion recorded before `deleting_at` existed is stamped now, so it can be purged after the grace.
+            if record.state() == Lifecycle::Deleting && record.deleting_at > 0 {
                 return Ok((record, revision));
             }
             record.set_state(Lifecycle::Deleting);

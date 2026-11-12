@@ -656,11 +656,16 @@ CDN artifact CacheStorage retain their existing contracts.
   finishes. Closing a reader never touches S3.
 - The value cache has one process-wide byte budget, entries live at most 60 s, and
   one namespace may fill at most an eighth of it. Absences are not cached.
-- A cold open replays the WAL since the writer's last L0 flush; afterwards a point
-  read fetches index and blocks, not the namespace.
-- Deleting a namespace keeps its storage. An explicit purge after a 10-minute grace
-  deletes `kv/{id}/` and then the directory record; there is no undelete. A reader
-  left open elsewhere then fails rather than reading the namespace as empty.
+- A cold open replays the WAL since the writer's last L0 flush and keeps it in
+  memory, so a reader's memory is bounded by the writer's L0 flush size, not by
+  the reader's memtable setting. Afterwards a point read fetches index and blocks,
+  not the namespace.
+- Deleting a namespace records `deleting_at` and keeps its storage. An explicit
+  purge after a 20-minute grace, longer than a reader's idle close, closes this
+  node's readers, fences the writer, deletes `kv/{id}/` and then the directory
+  record; there is no undelete. A namespace deleted without a recorded time is not
+  purgeable until it is deleted again. A reader left open elsewhere fails rather
+  than reading the namespace as empty.
 
 ### Future Raft Integration
 

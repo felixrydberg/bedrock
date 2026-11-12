@@ -255,18 +255,25 @@ impl NamespaceFactory for SlateFactory {
             Ok(reader) => return Ok(Some(Arc::new(SlateReader { reader, instance }))),
             Err(error) => error,
         };
-        // Only a failed open pays for telling "not created yet" apart from a broken database.
-        let manifests = Path::from(dataset)
-            .join(namespace)
-            .join("state")
-            .join("manifest");
-        match self.store.list(Some(&manifests)).next().await {
+        // Only a failed open pays for telling "not created yet" apart from a broken database. A writer's open writes the
+        // first manifest before any WAL or SST, so objects without one are damage, never a database being created.
+        let state = Path::from(dataset).join(namespace).join("state");
+        let listing_failed =
+            |_| StorageError::Unavailable(context(&instance, "manifest listing failed".into()));
+        let manifests = state.clone().join("manifest");
+        if let Some(found) = self.store.list(Some(&manifests)).next().await {
+            found.map_err(listing_failed)?;
+            return Err(engine_error(&instance, "open reader", error));
+        }
+        match self.store.list(Some(&state)).next().await {
             None => Ok(None),
-            Some(Err(_)) => Err(StorageError::Unavailable(context(
-                &instance,
-                "manifest listing failed".into(),
-            ))),
-            Some(Ok(_)) => Err(engine_error(&instance, "open reader", error)),
+            Some(found) => {
+                found.map_err(listing_failed)?;
+                Err(StorageError::Corruption(context(
+                    &instance,
+                    "database objects without a manifest".into(),
+                )))
+            }
         }
     }
 
