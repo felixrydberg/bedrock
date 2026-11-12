@@ -294,14 +294,14 @@ impl NamespaceReader for MemoryReader {
         limit: usize,
     ) -> StorageResult<Vec<Entry>> {
         let range = KeyRange::prefix(prefix);
-        let (start, end) = range.bounds().expect("prefix range is never empty");
-        let start = after.map_or(start, std::ops::Bound::Excluded);
         self.with_durable(|entries| {
-            entries
-                .range::<[u8], _>((start, end))
-                .take(limit)
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
+            range.bounds_after(after).map_or_else(Vec::new, |bounds| {
+                entries
+                    .range::<[u8], _>(bounds)
+                    .take(limit)
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
         })
     }
 

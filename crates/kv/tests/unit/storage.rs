@@ -194,8 +194,13 @@ async fn destroy_retires_the_reader_and_removes_only_that_namespace() {
     let readers = readers(&factory, 4);
     let first = record(&id(1), REGION);
     readers.get(&first, b"k", 0).await.unwrap();
+    let in_flight = readers.reader(&id(1)).await.unwrap().unwrap();
     readers.destroy(&id(1)).await.unwrap();
     assert!(readers.open.lock().unwrap().is_empty());
+    assert!(
+        in_flight.get(b"k", 0, Duration::ZERO).await.is_err(),
+        "a held reader is closed before its objects go, not left running"
+    );
     assert_eq!(
         readers.get(&first, b"k", 0).await.unwrap(),
         (None, Position::default())
@@ -218,6 +223,53 @@ async fn cached_values_expire_and_never_answer_a_newer_minimum_revision() {
     sleep(Duration::from_secs(CACHE_TTL_SECONDS.into())).await;
     assert_eq!(cache.get("a", b"k", 0), None);
     assert_eq!(cache.inner.lock().unwrap().total, 0);
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn a_list_cursor_outside_its_prefix_never_leaves_the_prefix() {
+    let factory = MemoryFactory::default();
+    publish(&factory, &id(1), 1, b"aa", b"1").await;
+    publish(&factory, &id(1), 2, b"ba", b"2").await;
+    publish(&factory, &id(1), 3, b"ca", b"3").await;
+    let readers = readers(&factory, 4);
+    let home = record(&id(1), REGION);
+    let page = |after: &'static [u8]| {
+        let (readers, home) = (readers.clone(), home.clone());
+        async move {
+            readers
+                .list(&home, b"b", Some(after), 10, 0)
+                .await
+                .unwrap()
+                .0
+                .len()
+        }
+    };
+    assert_eq!(
+        page(b"a").await,
+        1,
+        "a cursor before the prefix starts at it"
+    );
+    assert_eq!(page(b"b").await, 1);
+    assert_eq!(page(b"ba").await, 0);
+    assert_eq!(
+        page(b"c").await,
+        0,
+        "a cursor past the prefix leaves nothing"
+    );
+}
+
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn expired_values_free_their_namespace_share() {
+    let budget = 8 * 1024;
+    let cache = ValueCache::new(&Admin::new(), budget);
+    for n in 0..100u32 {
+        cache.fill("hot", &n.to_be_bytes(), &[0; 100], 1);
+    }
+    sleep(Duration::from_secs(CACHE_TTL_SECONDS.into())).await;
+    cache.fill("hot", b"new", &[0; 100], 2);
+    assert!(cache.get("hot", b"new", 0).is_some());
 }
 
 #[test]

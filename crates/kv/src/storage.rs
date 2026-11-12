@@ -74,8 +74,8 @@ pub struct Readers {
     cell: String,
     max_open: usize,
     open: Mutex<BTreeMap<String, Open>>,
-    /// Readers taken out of service; each closes once no read still holds it.
-    retired: Mutex<Vec<(Arc<Reader>, &'static str)>>,
+    /// Readers taken out of service, by namespace; each closes once no read still holds it.
+    retired: Mutex<Vec<(String, Arc<Reader>, &'static str)>>,
     opened: Family<OutcomeLabels, Counter>,
     closed: Family<ReasonLabels, Counter>,
     waits: Family<OutcomeLabels, Counter>,
@@ -195,7 +195,18 @@ impl Readers {
             position: Position::default(),
         });
         installed.used = Instant::now();
-        let reader = installed.reader.clone();
+        let installed = installed.reader.clone();
+        // An open that started after another finished loses the install; every caller it served retires it once.
+        if !Arc::ptr_eq(&installed, &reader) {
+            let mut retired = self.retired.lock().unwrap();
+            if !retired
+                .iter()
+                .any(|(_, held, _)| Arc::ptr_eq(held, &reader))
+            {
+                retired.push((id.to_owned(), reader, "duplicate"));
+            }
+        }
+        let reader = installed;
         // ponytail: least recently used is found by a scan over at most `max_open` readers; an ordered index if that
         // grows large.
         while open.len() > self.max_open {
@@ -208,7 +219,7 @@ impl Readers {
             self.retired
                 .lock()
                 .unwrap()
-                .push((evicted.reader, "pressure"));
+                .push((oldest, evicted.reader, "pressure"));
         }
         self.gauge.set(open.len() as i64);
         Ok(Some(reader))
@@ -229,7 +240,10 @@ impl Readers {
             .is_some_and(|open| Arc::ptr_eq(&open.reader, reader))
         {
             let removed = open.remove(id).expect("just checked");
-            self.retired.lock().unwrap().push((removed.reader, "error"));
+            self.retired
+                .lock()
+                .unwrap()
+                .push((id.to_owned(), removed.reader, "error"));
             self.gauge.set(open.len() as i64);
         }
     }
@@ -321,15 +335,6 @@ impl Readers {
         self.finish(id, &reader, min_revision, behind, read)
     }
 
-    /// Takes namespace `id`'s reader out of service, e.g. before its storage is purged.
-    pub fn close(&self, id: &str) {
-        let mut open = self.open.lock().unwrap();
-        if let Some(removed) = open.remove(id) {
-            self.retired.lock().unwrap().push((removed.reader, "purge"));
-        }
-        self.gauge.set(open.len() as i64);
-    }
-
     /// Retires readers idle for [`IDLE`] and closes every retired reader no read still holds. The caller runs this on
     /// a process-wide timer; it costs nothing per namespace.
     pub async fn sweep(&self) {
@@ -344,7 +349,7 @@ impl Readers {
             let mut retired = self.retired.lock().unwrap();
             for id in idle {
                 let removed = open.remove(&id).expect("just listed");
-                retired.push((removed.reader, "idle"));
+                retired.push((id, removed.reader, "idle"));
             }
             self.gauge.set(open.len() as i64);
         }
@@ -352,21 +357,41 @@ impl Readers {
             let mut retired = self.retired.lock().unwrap();
             let (closable, held) = std::mem::take(&mut *retired)
                 .into_iter()
-                .partition(|(reader, _)| Arc::strong_count(reader) == 1);
+                .partition(|(_, reader, _)| Arc::strong_count(reader) == 1);
             *retired = held;
             closable
         };
-        for (reader, reason) in closable {
-            if let Err(error) = reader.close().await {
-                tracing::debug!(%error, "closing a namespace reader failed");
-            }
-            self.closed.get_or_create(&ReasonLabels { reason }).inc();
+        for (_, reader, reason) in closable {
+            self.stop(&reader, reason).await;
         }
     }
 
-    /// Deletes every stored object of namespace `id`, after taking its local reader out of service.
+    async fn stop(&self, reader: &Reader, reason: &'static str) {
+        if let Err(error) = reader.close().await {
+            tracing::debug!(%error, "closing a namespace reader failed");
+        }
+        self.closed.get_or_create(&ReasonLabels { reason }).inc();
+    }
+
+    /// Deletes every stored object of namespace `id`, after closing each of its local readers, so none still running
+    /// can write a checkpoint back under the deleted prefix. They are closed at once, not when idle: the namespace is
+    /// deleted, so a read still holding one fails rather than being waited for.
     pub async fn destroy(&self, id: &str) -> StorageResult<()> {
-        self.close(id);
+        let mut stopping = Vec::new();
+        {
+            let mut open = self.open.lock().unwrap();
+            stopping.extend(open.remove(id).map(|open| open.reader));
+            self.gauge.set(open.len() as i64);
+            let mut retired = self.retired.lock().unwrap();
+            let (theirs, others) = std::mem::take(&mut *retired)
+                .into_iter()
+                .partition(|(namespace, _, _)| namespace == id);
+            *retired = others;
+            stopping.extend(theirs.into_iter().map(|(_, reader, _)| reader));
+        }
+        for reader in stopping {
+            self.stop(&reader, "purge").await;
+        }
         self.factory.destroy(DATASET, id).await
     }
 }
@@ -484,7 +509,24 @@ impl ValueCache {
             return;
         }
         state.remove(&id);
-        if state.by_namespace.get(namespace).copied().unwrap_or(0) + size > share {
+        let over = |state: &CacheState| {
+            state.by_namespace.get(namespace).copied().unwrap_or(0) + size > share
+        };
+        if over(&state) {
+            // Expired entries leave only when read or under budget pressure, so reclaim this namespace's before refusing.
+            // ponytail: a scan of the whole cache, only for a namespace at its share; a per-namespace index if it shows.
+            let now = Instant::now();
+            let expired: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|(key, cached)| key.0 == namespace && cached.expires <= now)
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in expired {
+                state.remove(&key);
+            }
+        }
+        if over(&state) {
             self.skipped.inc();
             self.bytes.set(state.total as i64);
             return;

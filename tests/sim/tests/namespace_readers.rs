@@ -276,8 +276,8 @@ fn in_child(seed: u64) -> u64 {
     );
     stdout
         .lines()
-        .find_map(|line| line.strip_prefix("READERS "))
-        .and_then(|hash| hash.parse().ok())
+        .find_map(|line| line.split_once("READERS "))
+        .and_then(|(_, hash)| hash.trim().parse().ok())
         .expect("the child prints its trace hash")
 }
 

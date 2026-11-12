@@ -309,11 +309,12 @@ impl NamespaceReader for SlateReader {
         limit: usize,
     ) -> StorageResult<Vec<Entry>> {
         let range = KeyRange::prefix(prefix);
-        let (start, end) = range.bounds().expect("prefix range is never empty");
-        let start = after.map_or(start, std::ops::Bound::Excluded);
+        let Some(bounds) = range.bounds_after(after) else {
+            return Ok(Vec::new());
+        };
         let mut iter = self
             .reader
-            .scan((start, end))
+            .scan(bounds)
             .await
             .map_err(|error| engine_error(&self.instance, "reader scan", error))?;
         let mut entries = Vec::new();
