@@ -23,7 +23,8 @@ use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::admin::Admin;
-use crate::storage::namespace::{NamespaceDatabase, NamespaceFactory};
+use crate::replication::materialized::Reader;
+use crate::storage::namespace::NamespaceFactory;
 use crate::storage::{ErrorContext, StorageError, StorageResult};
 
 /// Bounds for one source on one node.
@@ -290,9 +291,10 @@ impl Limiter {
 }
 
 /// A finished open: the cell that led it, and its result.
-type Opened = (String, StorageResult<Arc<dyn NamespaceDatabase>>);
+type Opened = (String, StorageResult<Option<Arc<Reader>>>);
 
-/// Coalesced, limited opens of namespace readers. Keeping readers open afterwards is B-28's residency.
+/// Coalesced, limited opens of read-only namespace readers (#57 / B-39), which never fence the writer. Keeping readers
+/// open afterwards is the caller's residency (`kv/storage`).
 pub struct NamespaceOpens {
     factory: Arc<dyn NamespaceFactory>,
     opens: Coalescer<(String, String), Opened>,
@@ -315,13 +317,15 @@ impl NamespaceOpens {
         cell: &str,
         dataset: &str,
         namespace: &str,
-    ) -> StorageResult<Arc<dyn NamespaceDatabase>> {
+    ) -> StorageResult<Option<Arc<Reader>>> {
         let accept = |(leader, opened): &Opened| {
             leader == cell || !matches!(opened, Err(StorageError::Overloaded(_)))
         };
         let open = || async {
             let opened = match self.limiter.acquire(cell).await {
-                Ok(_permit) => self.factory.open(dataset, namespace).await,
+                Ok(_permit) => Reader::open(self.factory.as_ref(), dataset, namespace)
+                    .await
+                    .map(|reader| reader.map(Arc::new)),
                 Err(overloaded) => Err(overloaded),
             };
             (cell.to_owned(), opened)

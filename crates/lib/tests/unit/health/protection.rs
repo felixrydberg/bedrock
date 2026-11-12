@@ -7,6 +7,7 @@ use super::*;
 use crate::health::fallback::{self, Found, Limited, Read, ReadKey, SourceChain, Tier};
 use crate::monotonic_now;
 use crate::reconciliation::{self, Reconcile, Reconciler};
+use crate::storage::namespace::{NamespaceDatabase, NamespaceReader};
 use crate::storage::sim::MemoryFactory;
 
 const OP: Duration = Duration::from_millis(80);
@@ -602,13 +603,22 @@ impl NamespaceFactory for Factory {
         }
         self.memory.open(dataset, namespace).await
     }
+
+    async fn open_reader(
+        &self,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
+        self.open(dataset, namespace).await?;
+        self.memory.open_reader(dataset, namespace).await
+    }
 }
 
 fn spawn_open(
     opens: &Arc<NamespaceOpens>,
     cell: &str,
     namespace: &str,
-) -> tokio::task::JoinHandle<StorageResult<Arc<dyn NamespaceDatabase>>> {
+) -> tokio::task::JoinHandle<StorageResult<Option<Arc<Reader>>>> {
     let (opens, cell, namespace) = (opens.clone(), cell.to_owned(), namespace.to_owned());
     tokio::spawn(async move { opens.open(&cell, "kv", &namespace).await })
 }
@@ -625,7 +635,7 @@ async fn concurrent_opens_of_one_namespace_share_one_initialization() {
         .collect();
     let mut readers = Vec::new();
     for handle in handles {
-        readers.push(handle.await.unwrap().unwrap());
+        readers.push(handle.await.unwrap().unwrap().unwrap());
     }
     assert_eq!(factory.opens.load(Ordering::Relaxed), 1);
     assert!(readers.iter().all(|r| Arc::ptr_eq(r, &readers[0])));

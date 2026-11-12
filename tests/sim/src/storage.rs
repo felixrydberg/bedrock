@@ -16,7 +16,7 @@ use async_trait::async_trait;
 
 use super::memory::MemoryEngine;
 use super::namespace::{
-    Changes, NamespaceDatabase, NamespaceFactory, NamespaceScan, valid_identity,
+    Changes, NamespaceDatabase, NamespaceFactory, NamespaceReader, NamespaceScan, valid_identity,
 };
 use super::{
     Entry, ErrorContext, KeyRange, Scan, Snapshot, StorageEngine, StorageError, StorageResult,
@@ -217,6 +217,97 @@ impl NamespaceFactory for MemoryFactory {
                 closed: false,
             }),
         }))
+    }
+
+    /// Follows the durable state at once: the model has no publication lag, and never sees a buffered write.
+    async fn open_reader(
+        &self,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
+        if !valid_identity(dataset) || !valid_identity(namespace) {
+            return Err(StorageError::Unsupported(context(
+                "namespace-memory",
+                "namespace",
+                "dataset and namespace must be nonempty single path components",
+            )));
+        }
+        let identity = (dataset.to_owned(), namespace.to_owned());
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable("namespace", "state lock poisoned"))?;
+        if !state.contains_key(&identity) {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(MemoryReader {
+            state: self.state.clone(),
+            identity,
+            instance: format!("{dataset}/{namespace}"),
+            closed: AtomicBool::new(false),
+        })))
+    }
+
+    async fn destroy(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
+        self.state
+            .lock()
+            .map_err(|_| unavailable("namespace", "state lock poisoned"))?
+            .remove(&(dataset.to_owned(), namespace.to_owned()));
+        Ok(())
+    }
+}
+
+struct MemoryReader {
+    state: Arc<Mutex<State>>,
+    identity: Identity,
+    instance: String,
+    closed: AtomicBool,
+}
+
+impl MemoryReader {
+    fn with_durable<T>(&self, read: impl FnOnce(&Entries) -> T) -> StorageResult<T> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(unavailable(&self.instance, "reader closed"));
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| unavailable(&self.instance, "state lock poisoned"))?;
+        // A destroyed database's objects are gone; a reader still holding it fails rather than reading nothing.
+        let namespace = state
+            .get(&self.identity)
+            .ok_or_else(|| unavailable(&self.instance, "namespace objects are missing"))?;
+        Ok(read(&namespace.entries))
+    }
+}
+
+#[async_trait]
+impl NamespaceReader for MemoryReader {
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.with_durable(|entries| entries.get(key).cloned())
+    }
+
+    async fn scan(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StorageResult<Vec<Entry>> {
+        let range = KeyRange::prefix(prefix);
+        let (start, end) = range.bounds().expect("prefix range is never empty");
+        let start = after.map_or(start, std::ops::Bound::Excluded);
+        self.with_durable(|entries| {
+            entries
+                .range::<[u8], _>((start, end))
+                .take(limit)
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+    }
+
+    async fn close(&self) -> StorageResult<()> {
+        self.closed.store(true, Ordering::Relaxed);
+        Ok(())
     }
 }
 
@@ -428,6 +519,59 @@ impl NamespaceFactory for SimFactory {
             observer: self.observer.clone(),
             unflushed: Mutex::default(),
         }))
+    }
+
+    async fn open_reader(
+        &self,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
+        inject(&self.faults, StoreAccess::Open, "namespace").await?;
+        let Some(inner) = self.inner.open_reader(dataset, namespace).await? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(SimReader {
+            inner,
+            faults: self.faults.clone(),
+            instance: format!("{dataset}/{namespace}"),
+        })))
+    }
+
+    async fn destroy(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
+        let instance = format!("{dataset}/{namespace}");
+        let fault = inject(&self.faults, StoreAccess::Write, &instance).await?;
+        let destroyed = self.inner.destroy(dataset, namespace).await;
+        finish(fault, &instance, destroyed)
+    }
+}
+
+/// A reader whose calls fail as the factory's faults decide. Its reads take the `Read` faults, like a writer's.
+struct SimReader {
+    inner: Arc<dyn NamespaceReader>,
+    faults: StoreFaults,
+    instance: String,
+}
+
+#[async_trait]
+impl NamespaceReader for SimReader {
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        inject(&self.faults, StoreAccess::Read, &self.instance).await?;
+        self.inner.get(key).await
+    }
+
+    async fn scan(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StorageResult<Vec<Entry>> {
+        inject(&self.faults, StoreAccess::Read, &self.instance).await?;
+        self.inner.scan(prefix, after, limit).await
+    }
+
+    async fn close(&self) -> StorageResult<()> {
+        inject(&self.faults, StoreAccess::Close, &self.instance).await?;
+        self.inner.close().await
     }
 }
 

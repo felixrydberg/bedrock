@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use super::pb;
 use super::{Event, Operation};
 use crate::storage::namespace::{
-    Changes, NamespaceDatabase, NamespaceFactory, NamespaceScan, valid_identity,
+    Changes, NamespaceDatabase, NamespaceFactory, NamespaceReader, NamespaceScan, valid_identity,
 };
 use crate::storage::{
     Entry, ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, WriteBatch,
@@ -324,6 +324,44 @@ pub(crate) fn validate_scope(dataset: &str, namespace: &str) -> StorageResult<()
     Ok(())
 }
 
+/// The validated `m` record: what a namespace's stored state represents.
+struct State {
+    sequence: u64,
+    committed_at: u64,
+    pruned_through: u64,
+    raft: Option<RaftPosition>,
+}
+
+fn decode_state(dataset: &str, namespace: &str, value: &[u8]) -> StorageResult<State> {
+    let corrupt =
+        |detail: &str| StorageError::Corruption(context(&format!("{dataset}/{namespace}"), detail));
+    let record = StateRecord::decode(value)
+        .map_err(|_| corrupt("namespace metadata is not valid protobuf"))?;
+    if record.version != FORMAT_VERSION
+        || record.dataset != dataset
+        || record.namespace != namespace
+        || record.sequence == 0
+    {
+        return Err(corrupt(
+            "invalid namespace metadata version, scope or revision",
+        ));
+    }
+    let raft = match (record.raft_index, record.raft_term) {
+        (None, None) => None,
+        (Some(index), Some(term)) if index > 0 => Some(RaftPosition { index, term }),
+        _ => return Err(corrupt("invalid represented Raft position")),
+    };
+    if record.pruned_through > record.sequence {
+        return Err(corrupt("retained-event boundary exceeds revision"));
+    }
+    Ok(State {
+        sequence: record.sequence,
+        committed_at: record.committed_at,
+        pruned_through: record.pruned_through,
+        raft,
+    })
+}
+
 fn key(prefix: u8, raw: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::with_capacity(raw.len() + 1);
     encoded.push(prefix);
@@ -405,10 +443,7 @@ impl Materialized {
                     if metadata.is_some() {
                         return Err(self.corrupt("duplicate namespace metadata"));
                     }
-                    metadata =
-                        Some(StateRecord::decode(value.as_slice()).map_err(|_| {
-                            self.corrupt("namespace metadata is not valid protobuf")
-                        })?);
+                    metadata = Some(decode_state(&self.dataset, &self.namespace, &value)?);
                 }
                 [b'v', raw @ ..] if !raw.is_empty() => {
                     if view.values.insert(raw.to_vec(), value).is_some() {
@@ -442,27 +477,11 @@ impl Materialized {
             }
         }
         match metadata {
-            Some(record) => {
-                if record.version != FORMAT_VERSION
-                    || record.dataset != self.dataset
-                    || record.namespace != self.namespace
-                    || record.sequence == 0
-                {
-                    return Err(
-                        self.corrupt("invalid namespace metadata version, scope or revision")
-                    );
-                }
-                view.sequence = record.sequence;
-                view.committed_at = record.committed_at;
-                view.pruned_through = record.pruned_through;
-                view.raft = match (record.raft_index, record.raft_term) {
-                    (None, None) => None,
-                    (Some(index), Some(term)) if index > 0 => Some(RaftPosition { index, term }),
-                    _ => return Err(self.corrupt("invalid represented Raft position")),
-                };
-                if view.pruned_through > view.sequence {
-                    return Err(self.corrupt("retained-event boundary exceeds revision"));
-                }
+            Some(state) => {
+                view.sequence = state.sequence;
+                view.committed_at = state.committed_at;
+                view.pruned_through = state.pruned_through;
+                view.raft = state.raft;
             }
             None if has_events || !view.values.is_empty() || !view.retries.is_empty() => {
                 return Err(self.corrupt("namespace data has no atomic revision metadata"));
@@ -844,6 +863,146 @@ impl Materialized {
 
     pub async fn close(&self) -> StorageResult<()> {
         let _guard = self.tracked.lock().await;
+        self.db.close().await
+    }
+}
+
+/// How often a minimum-revision read rechecks its reader's view, which follows publications on its own. A recheck reads
+/// one key the reader already holds.
+const RECHECK: Duration = Duration::from_millis(100);
+
+/// What a [`Reader`]'s view represents: the namespace revision and its writer's commit time. Revision 0 is a namespace no
+/// write has reached. Engine sequence numbers never appear here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Position {
+    pub sequence: u64,
+    pub committed_at: u64,
+}
+
+/// Read-only access to a namespace as its writer published it, for customer-KV readers (#57 / B-39). It never writes
+/// namespace data, so it never fences the writer, and it trails the writer by the engine's publication polling.
+pub struct Reader {
+    db: Arc<dyn NamespaceReader>,
+    dataset: String,
+    namespace: String,
+}
+
+impl Reader {
+    /// `None` while no writer has created the namespace's database: every key is absent at revision 0, and the caller
+    /// opens again later rather than keeping an empty view.
+    pub async fn open(
+        factory: &dyn NamespaceFactory,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<Option<Self>> {
+        validate_scope(dataset, namespace)?;
+        let Some(db) = factory.open_reader(dataset, namespace).await? else {
+            return Ok(None);
+        };
+        let reader = Reader {
+            db,
+            dataset: dataset.into(),
+            namespace: namespace.into(),
+        };
+        if let Err(error) = reader.position().await {
+            let _ = reader.db.close().await;
+            return Err(error);
+        }
+        Ok(Some(reader))
+    }
+
+    fn instance(&self) -> String {
+        format!("{}/{}", self.dataset, self.namespace)
+    }
+
+    /// The revision the view currently represents.
+    pub async fn position(&self) -> StorageResult<Position> {
+        let Some(metadata) = self.db.get(META_KEY).await? else {
+            // A created database that no commit reached is empty; data without atomic metadata is corruption.
+            if self.db.scan(b"", None, 1).await?.is_empty() {
+                return Ok(Position::default());
+            }
+            return Err(StorageError::Corruption(context(
+                &self.instance(),
+                "namespace data has no atomic revision metadata",
+            )));
+        };
+        let state = decode_state(&self.dataset, &self.namespace, &metadata)?;
+        Ok(Position {
+            sequence: state.sequence,
+            committed_at: state.committed_at,
+        })
+    }
+
+    /// The view's position once it reaches `min_revision`, rechecking for up to `wait` while publication catches up.
+    async fn reach(&self, min_revision: u64, wait: Duration) -> StorageResult<Position> {
+        let deadline = crate::monotonic_now() + wait;
+        loop {
+            let position = self.position().await?;
+            if position.sequence >= min_revision {
+                return Ok(position);
+            }
+            if crate::monotonic_now() >= deadline {
+                return Err(StorageError::Unavailable(context(
+                    &self.instance(),
+                    format!(
+                        "reader view at revision {} has not reached revision {min_revision}",
+                        position.sequence
+                    ),
+                )));
+            }
+            tokio::time::sleep(RECHECK.min(deadline - crate::monotonic_now())).await;
+        }
+    }
+
+    /// `key`'s value (or proven absence) and the position it was read at.
+    ///
+    // ponytail: the engine reader has no snapshot, so the position is read first and the value after it. The value comes
+    // from that view or a later one, so the position is a lower bound: safe for minimum revisions and cache fills. A
+    // pinned snapshot would give exact revisions if a caller ever needs them.
+    pub async fn get(
+        &self,
+        key: &[u8],
+        min_revision: u64,
+        wait: Duration,
+    ) -> StorageResult<(Option<Vec<u8>>, Position)> {
+        let position = self.reach(min_revision, wait).await?;
+        let value = self.db.get(&self::key(b'v', key)).await?;
+        Ok((value, position))
+    }
+
+    /// Up to `limit` live keys under `prefix` after `after`, in key order, and a lower bound on their position as for
+    /// [`Reader::get`]. Each page is one consistent engine view.
+    pub async fn list(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+        min_revision: u64,
+        wait: Duration,
+    ) -> StorageResult<(Vec<Entry>, Position)> {
+        let position = self.reach(min_revision, wait).await?;
+        let after = after.map(|after| key(b'v', after));
+        let entries = self
+            .db
+            .scan(&key(b'v', prefix), after.as_deref(), limit)
+            .await?;
+        let mut page = Vec::with_capacity(entries.len());
+        for (encoded, value) in entries {
+            match encoded.strip_prefix(b"v") {
+                Some(raw) if !raw.is_empty() => page.push((raw.to_vec(), value)),
+                _ => {
+                    return Err(StorageError::Corruption(context(
+                        &self.instance(),
+                        "invalid value key",
+                    )));
+                }
+            }
+        }
+        Ok((page, position))
+    }
+
+    pub async fn close(&self) -> StorageResult<()> {
         self.db.close().await
     }
 }

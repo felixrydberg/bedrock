@@ -1,8 +1,9 @@
 //! `bedrock-kv`: customer KV. It hosts no relay-fed datasets; it only joins the cell membership as service `kv`.
 //! It reads the namespace directory from Quicksilver through the shared client and, with `manage_listen` set, serves
-//! namespace management ([`namespaces::routes`]).
+//! namespace management ([`namespaces::routes`]). Home-region namespaces are read from S3 through [`storage::Readers`].
 
 pub mod namespaces;
+pub mod storage;
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -10,7 +11,11 @@ use std::sync::Arc;
 
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, ConfigError, NodeConfig, ServiceConfig};
+use bedrock_lib::s3::S3Config;
 use serde::Deserialize;
+
+/// How often idle readers are closed and retired ones released.
+const SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Deserialize)]
 pub struct KvConfig {
@@ -23,6 +28,10 @@ pub struct KvConfig {
     /// `bedrock-api`'s write credential, required with `manage_listen`.
     #[serde(default)]
     pub write_token: Option<String>,
+    /// The bucket `bedrock-api` writes namespace databases to; readers only read it, except for their managed
+    /// checkpoints and purges. Required outside simulation.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
 }
 
 impl From<ServiceConfig> for KvConfig {
@@ -31,6 +40,7 @@ impl From<ServiceConfig> for KvConfig {
             service,
             manage_listen: None,
             write_token: None,
+            s3: None,
         }
     }
 }
@@ -50,6 +60,7 @@ impl fmt::Debug for KvConfig {
                 "write_token",
                 &self.write_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("s3", &self.s3)
             .finish()
     }
 }
@@ -61,6 +72,7 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         service: config,
         manage_listen,
         write_token,
+        s3,
     } = config;
     config.validate()?;
     check_hosts_nothing_pushed(&config)?;
@@ -68,12 +80,20 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         return Err(ConfigError("manage_listen requires write_token".into()));
     }
     tracing::info!(node_id = %config.node.node_id, "starting bedrock-kv");
-    // ponytail: customer-KV readers (per-namespace S3 databases behind read-only caches) arrive with B-39; roles
-    // are only logged until then.
+    // ponytail: roles are only logged; the read path (B-27) decides what l1 and l2 serve.
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
+    let memory_mb = config.node.budget.memory_mb.unwrap_or(1024);
+    let factory = namespace_factory(s3.as_ref(), memory_mb)?;
     let admin = node::start_admin(&config.node).await?;
+    let readers = storage::Readers::new(
+        &admin,
+        factory,
+        config.node.location.region.clone(),
+        config.node.location.cell.clone(),
+        storage::max_open(memory_mb),
+    );
     let (members, target) = membership::View::new("kv", &config.node.location.cell);
     let tls = bedrock_lib::transport::tls::start(&config.node, "kv", &admin).await?;
     let peers = Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(tls.clone()));
@@ -103,6 +123,7 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
                     token: token.clone(),
                     tls: tls.clone(),
                 },
+                readers.clone(),
                 config.node.location.region.clone(),
             ));
             let app = bedrock_lib::http::bearer(namespaces::routes(directory), &token)?;
@@ -114,6 +135,7 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         _ => None,
     };
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut sweep = tokio::time::interval(SWEEP);
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
         tokio::select! {biased;
@@ -124,6 +146,7 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
                     tracing::warn!(%error,"membership view unreadable");
                 }
             },
+            _=sweep.tick()=>readers.sweep().await,
         }
     }
     admin.set_ready(false);
@@ -133,6 +156,29 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
     session.drain().await;
     tracing::info!("shutting down");
     Ok(())
+}
+
+/// The namespace databases `bedrock-api` writes, read through one block cache of a quarter of the memory budget.
+#[cfg(not(madsim))]
+fn namespace_factory(
+    s3: Option<&S3Config>,
+    memory_mb: u64,
+) -> Result<Arc<dyn bedrock_lib::storage::namespace::NamespaceFactory>, ConfigError> {
+    let s3 = s3.ok_or_else(|| ConfigError("bedrock-kv needs [s3] to read namespaces".into()))?;
+    let store =
+        bedrock_lib::s3::object_store(s3).map_err(|error| ConfigError(error.to_string()))?;
+    Ok(Arc::new(
+        bedrock_lib::storage::slate::SlateFactory::new(store)
+            .with_reader_cache_bytes(memory_mb * 1024 * 1024 / 4),
+    ))
+}
+
+#[cfg(madsim)]
+fn namespace_factory(
+    _: Option<&S3Config>,
+    _: u64,
+) -> Result<Arc<dyn bedrock_lib::storage::namespace::NamespaceFactory>, ConfigError> {
+    Ok(bedrock_lib::sim::namespaces())
 }
 
 /// Customer KV has no pushed data; Quicksilver and CDN have separate binaries.

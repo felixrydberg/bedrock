@@ -9,6 +9,8 @@ axum = { workspace = true, features = ["json", "query"] }
 bedrock-lib.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
+# The value cache's recency order (#57 / B-39).
+lru = { version = "0.18", default-features = false }
 prometheus-client.workspace = true
 prost.workspace = true
 serde.workspace = true
@@ -17,7 +19,9 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+bedrock-lib = { workspace = true, features = ["test-support"] }
 figment.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

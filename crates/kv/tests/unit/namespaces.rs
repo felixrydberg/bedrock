@@ -14,6 +14,7 @@ fn record(id: &str) -> Record {
         cache_ttl_seconds: CACHE_TTL_SECONDS,
         state: Lifecycle::Active as i32,
         created_at: 1,
+        deleting_at: 0,
     }
 }
 
@@ -22,8 +23,8 @@ fn id(n: u8) -> String {
     format!("{n:032x}")
 }
 
-#[test]
-fn generated_ids_are_valid_identities() {
+#[tokio::test]
+async fn generated_ids_are_valid_identities() {
     let generated = bedrock_lib::uuid();
     assert!(valid_id(&generated), "{generated}");
     for bad in [
@@ -139,4 +140,21 @@ fn a_tenant_cannot_reuse_an_active_title() {
     // A deleted namespace frees its title.
     records[0].set_state(Lifecycle::Deleting);
     assert!(!taken(&records, "customer-123", "store-A", ""));
+}
+
+#[test]
+fn storage_is_purgeable_only_after_the_grace_since_deletion() {
+    let grace = PURGE_GRACE.as_millis() as u64;
+    let mut namespace = record(&id(1));
+    assert!(
+        !purgeable(&namespace, u64::MAX),
+        "an active namespace keeps its storage"
+    );
+    namespace.set_state(Lifecycle::Deleting);
+    namespace.deleting_at = 1_000;
+    assert!(!purgeable(&namespace, 1_000 + grace - 1));
+    assert!(purgeable(&namespace, 1_000 + grace));
+    // Deleted before the time was recorded: the grace has long passed.
+    namespace.deleting_at = 0;
+    assert!(purgeable(&namespace, grace));
 }

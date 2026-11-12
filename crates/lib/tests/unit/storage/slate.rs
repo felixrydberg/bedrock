@@ -19,6 +19,8 @@ struct WalFaultStore {
     recursive_lists: AtomicUsize,
     listing_calls: std::sync::Mutex<Vec<String>>,
     listing_failure: std::sync::Mutex<Option<String>>,
+    /// Bytes every GET returned, ranged or whole.
+    read_bytes: AtomicUsize,
 }
 
 impl std::fmt::Display for WalFaultStore {
@@ -66,7 +68,10 @@ impl ObjectStore for WalFaultStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        self.inner.get_opts(location, options).await
+        let result = self.inner.get_opts(location, options).await?;
+        let length = result.range.end - result.range.start;
+        self.read_bytes.fetch_add(length as usize, Ordering::SeqCst);
+        Ok(result)
     }
 
     fn delete_stream(&self, locations: ObjectStream<Path>) -> ObjectStream<Path> {
@@ -402,4 +407,69 @@ async fn invalid_batch_returns_error_without_applying_valid_rows() {
     );
     assert_eq!(db.get(b"valid").await.unwrap(), None);
     db.close().await.unwrap();
+}
+
+/// A cold point read on a compacted namespace fetches its manifest, index and one block, not the namespace (#57 / B-39).
+#[tokio::test]
+async fn a_cold_point_read_fetches_bounded_blocks_not_the_namespace() {
+    let store = Arc::new(WalFaultStore::default());
+    let db = Db::builder("kv/big/state", store.clone() as Arc<dyn ObjectStore>)
+        .with_settings(Settings {
+            flush_interval: None,
+            ..Settings::default()
+        })
+        .build()
+        .await
+        .unwrap();
+    let value = vec![7u8; 4096];
+    for i in 0..2048u32 {
+        db.put(format!("v{i:05}"), &value).await.unwrap();
+    }
+    // Published as B-11 publishes, then in L0 SSTs rather than the WAL, as a namespace past its first memtable is.
+    db.flush().await.unwrap();
+    db.flush_with_options(slatedb::config::FlushOptions {
+        flush_type: slatedb::config::FlushType::MemTable,
+    })
+    .await
+    .unwrap();
+    db.close().await.unwrap();
+    let namespace_bytes = 2048 * value.len();
+
+    store.read_bytes.store(0, Ordering::SeqCst);
+    let reader = SlateFactory::new(store.clone())
+        .open_reader("kv", "big")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reader.get(b"v01024").await.unwrap(), Some(value));
+    let read = store.read_bytes.load(Ordering::SeqCst);
+    assert!(
+        read < namespace_bytes / 8,
+        "a cold read fetched {read} of the namespace's {namespace_bytes} bytes"
+    );
+    reader.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_reader_of_an_absent_database_is_none_and_destroy_stays_inside_its_prefix() {
+    let store = Arc::new(InMemory::new());
+    let factory = SlateFactory::new(store.clone());
+    assert!(factory.open_reader("kv", "ab").await.unwrap().is_none());
+    for namespace in ["ab", "abc"] {
+        let db = factory.open("kv", namespace).await.unwrap();
+        db.write(vec![(b"key".to_vec(), Some(b"value".to_vec()))])
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+        db.close().await.unwrap();
+    }
+    factory.destroy("kv", "ab").await.unwrap();
+    factory.destroy("kv", "ab").await.unwrap();
+    assert!(factory.open_reader("kv", "ab").await.unwrap().is_none());
+    let neighbour = factory.open_reader("kv", "abc").await.unwrap().unwrap();
+    assert_eq!(
+        neighbour.get(b"key").await.unwrap(),
+        Some(b"value".to_vec())
+    );
+    neighbour.close().await.unwrap();
 }

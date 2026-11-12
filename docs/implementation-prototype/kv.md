@@ -436,8 +436,10 @@ The earlier origin-cell and regional-tier design is superseded by `feature-draft
 - **Routing.** Hash `(namespace, key)` over healthy `bedrock-kv` nodes in the request's cell to select a preferred value
   cache. On a miss, resolve the home region through Quicksilver and forward to its namespace reader. There are no virtual
   buckets or durable cache ownership; another eligible local cache may serve.
-- **Freshness.** Minimum-revision reads need a sufficiently new namespace view, including for absence and `LIST`; a lagging
-  S3 view waits or uses the writer's recent committed state.
+- **Freshness.** Minimum-revision reads need a sufficiently new namespace view, including for absence and `LIST`. The
+  standalone writer acknowledges only after its S3 flush, so a lagging reader view is publication polling: the reader
+  polls every 1 s while open and a minimum-revision read waits up to 2 s, then fails as unavailable (B-39). A recent-state
+  path to the writer arrives with Raft (B-09b), whose committed tail precedes S3.
 - **Adding capacity** adds value-cache capacity to a cell. A home-region reader may be reopened after eviction; a drain
   releases local handles/cache state, never S3 data.
 
@@ -638,8 +640,27 @@ Startup never reconstructs current state by replaying a separate raw journal.
 Missing referenced objects, corruption and unavailability are explicit errors;
 only an absent application key is Ok(None). Native block checksums protect ranged
 SST reads. Single-key reads use indexed storage rather than a whole namespace scan.
-Later B-39 adds customer-KV readers and caches; local pushed StorageEngine and
+B-39 adds customer-KV readers and caches; local pushed StorageEngine and
 CDN artifact CacheStorage retain their existing contracts.
+
+### Customer-KV Readers (B-39)
+
+- A reader is a SlateDB `DbReader` with a managed checkpoint, which protects its
+  view's files from GC without writing namespace data, so it never fences the
+  writer. All readers in a process share one block cache.
+- A read takes the view's revision first and the value after it. The answer's
+  revision is therefore a lower bound on the value's: safe for minimum-revision
+  reads and cache fills.
+- One reader per active home namespace. Handle pressure closes the least recently
+  used one, 15 minutes idle closes any; an in-flight read keeps its reader until it
+  finishes. Closing a reader never touches S3.
+- The value cache has one process-wide byte budget, entries live at most 60 s, and
+  one namespace may fill at most an eighth of it. Absences are not cached.
+- A cold open replays the WAL since the writer's last L0 flush; afterwards a point
+  read fetches index and blocks, not the namespace.
+- Deleting a namespace keeps its storage. An explicit purge after a 10-minute grace
+  deletes `kv/{id}/` and then the directory record; there is no undelete. A reader
+  left open elsewhere then fails rather than reading the namespace as empty.
 
 ### Future Raft Integration
 

@@ -21,7 +21,8 @@ prost = "0.14"
 sha2 = "0.10"
 subtle = "2"
 madsim = "0.2.34"
-slatedb = { version = "=0.17.0", default-features = false }
+# `moka` is the shared reader block cache (#57 / B-39).
+slatedb = { version = "=0.17.0", default-features = false, features = ["moka"] }
 object_store = { version = "0.14.2", features = ["aws"] }
 # B-05; compiled out under madsim. Building it needs libclang (bindgen).
 rocksdb = { version = "0.25", default-features = false, features = ["lz4", "bindgen-runtime"] }

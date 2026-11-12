@@ -1,7 +1,7 @@
 use super::*;
 
-#[test]
-fn uuids_are_version_4_in_cloudflare_shape() {
+#[tokio::test]
+async fn uuids_are_version_4_in_cloudflare_shape() {
     let id = uuid();
     assert_eq!(id.len(), 32);
     assert!(

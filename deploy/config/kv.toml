@@ -15,6 +15,13 @@ s3_endpoint = "https://s3.example.internal"
 # Set it via BEDROCK_WRITE_TOKEN.
 # manage_listen = "0.0.0.0:7103"
 
+# The bucket bedrock-api writes namespace databases to; this node reads its home region's namespaces from it (B-39).
+# Credentials come from BEDROCK_S3__ACCESS_KEY_ID and BEDROCK_S3__SECRET_ACCESS_KEY. Readers need get and list,
+# plus conditional put and delete for their managed checkpoints and namespace purges.
+[s3]
+endpoint = "https://s3.example.internal"
+bucket = "bedrock"
+
 [location]
 region = "eu"
 dc = "arn1"

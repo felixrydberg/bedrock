@@ -12,22 +12,76 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use object_store::ObjectStore;
-use slatedb::{CloseReason, Db, ErrorKind, Settings, WriteBatch};
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt};
+use slatedb::config::DbReaderOptions;
+use slatedb::db_cache::DbCache;
+use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
+use slatedb::{CloseReason, Db, DbReader, DbReaderMode, ErrorKind, Settings, WriteBatch};
+use tokio_stream::StreamExt;
 
 use super::namespace::{
-    Changes, NamespaceDatabase, NamespaceFactory, NamespaceScan, valid_identity,
+    Changes, NamespaceDatabase, NamespaceFactory, NamespaceReader, NamespaceScan, valid_identity,
 };
 use super::{Entry, ErrorContext, KeyRange, StorageError, StorageResult};
 
+/// How often an open reader looks for newly published manifests and WAL objects. Each poll is a LIST and a GET, so this
+/// is the steady cost of an open reader (#57 / B-39).
+pub const READER_POLL: Duration = Duration::from_secs(1);
+/// How long a reader's managed checkpoint protects its view's files from GC; refreshed while the reader is open.
+pub const READER_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(5 * 60);
+/// WAL a reader buffers in memory before it waits for the writer's L0 flush.
+const READER_MEMTABLE_BYTES: u64 = 16 * 1024 * 1024;
+
 pub struct SlateFactory {
     store: Arc<dyn ObjectStore>,
+    /// Blocks, indexes and filters of every reader in the process, under one budget.
+    reader_cache: Arc<dyn DbCache>,
 }
+
+/// The shared reader block cache's default budget. Entries are allocated as they are filled.
+pub const DEFAULT_READER_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 impl SlateFactory {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            reader_cache: reader_cache(DEFAULT_READER_CACHE_BYTES),
+        }
     }
+
+    /// Bounds the block cache that all of this factory's readers share.
+    pub fn with_reader_cache_bytes(mut self, bytes: u64) -> Self {
+        self.reader_cache = reader_cache(bytes);
+        self
+    }
+}
+
+fn reader_cache(bytes: u64) -> Arc<dyn DbCache> {
+    Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
+        max_capacity: bytes,
+        ..MokaCacheOptions::default()
+    }))
+}
+
+/// One database's scope in the shared cache: stable across reopens, so a reopened reader finds its blocks again.
+fn cache_scope(instance: &str) -> u64 {
+    // FNV-1a. Cache keys also carry each SST's random ULID, so a scope collision cannot mix namespaces' blocks.
+    instance.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+fn invalid_scope() -> StorageError {
+    StorageError::Unsupported(context(
+        "namespace",
+        "dataset and namespace must be nonempty single path components".into(),
+    ))
+}
+
+struct SlateReader {
+    reader: DbReader,
+    instance: String,
 }
 
 struct SlateDatabase {
@@ -171,6 +225,114 @@ impl NamespaceFactory for SlateFactory {
             instance,
             snapshot_lifetime,
         }))
+    }
+
+    async fn open_reader(
+        &self,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
+        if !valid_identity(dataset) || !valid_identity(namespace) {
+            return Err(invalid_scope());
+        }
+        let instance = format!("{dataset}/{namespace}");
+        let options = DbReaderOptions {
+            manifest_poll_interval: READER_POLL,
+            checkpoint_lifetime: READER_CHECKPOINT_LIFETIME,
+            max_memtable_bytes: READER_MEMTABLE_BYTES,
+            // The object store client retries already; a second layer would hide outages from callers.
+            object_store_max_retries: Some(0),
+            ..DbReaderOptions::default()
+        };
+        // The managed checkpoint keeps GC away from the files this reader's view references.
+        let opened = DbReader::builder(format!("{instance}/state"), self.store.clone())
+            .with_reader_mode(DbReaderMode::ManagedCheckpoint)
+            .with_options(options)
+            .with_db_cache(self.reader_cache.clone(), cache_scope(&instance))
+            .build()
+            .await;
+        let error = match opened {
+            Ok(reader) => return Ok(Some(Arc::new(SlateReader { reader, instance }))),
+            Err(error) => error,
+        };
+        // Only a failed open pays for telling "not created yet" apart from a broken database.
+        let manifests = Path::from(dataset)
+            .join(namespace)
+            .join("state")
+            .join("manifest");
+        match self.store.list(Some(&manifests)).next().await {
+            None => Ok(None),
+            Some(Err(_)) => Err(StorageError::Unavailable(context(
+                &instance,
+                "manifest listing failed".into(),
+            ))),
+            Some(Ok(_)) => Err(engine_error(&instance, "open reader", error)),
+        }
+    }
+
+    async fn destroy(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
+        if !valid_identity(dataset) || !valid_identity(namespace) {
+            return Err(invalid_scope());
+        }
+        let instance = format!("{dataset}/{namespace}");
+        let failed = |operation: &str| {
+            StorageError::Unavailable(context(&instance, format!("destroy: {operation} failed")))
+        };
+        // A `Path` prefix matches whole segments, so `kv/ab` never lists `kv/abc/...`.
+        let prefix = Path::from(dataset).join(namespace);
+        let mut listing = self.store.list(Some(&prefix));
+        while let Some(object) = listing.next().await {
+            let object = object.map_err(|_| failed("listing"))?;
+            match self.store.delete(&object.location).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(_) => return Err(failed("delete")),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl NamespaceReader for SlateReader {
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.reader
+            .get(key)
+            .await
+            .map(|value| value.map(|value| value.to_vec()))
+            .map_err(|error| engine_error(&self.instance, "reader get", error))
+    }
+
+    async fn scan(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StorageResult<Vec<Entry>> {
+        let range = KeyRange::prefix(prefix);
+        let (start, end) = range.bounds().expect("prefix range is never empty");
+        let start = after.map_or(start, std::ops::Bound::Excluded);
+        let mut iter = self
+            .reader
+            .scan((start, end))
+            .await
+            .map_err(|error| engine_error(&self.instance, "reader scan", error))?;
+        let mut entries = Vec::new();
+        while entries.len() < limit
+            && let Some(entry) = iter
+                .next()
+                .await
+                .map_err(|error| engine_error(&self.instance, "reader scan next", error))?
+        {
+            entries.push((entry.key.to_vec(), entry.value.to_vec()));
+        }
+        Ok(entries)
+    }
+
+    async fn close(&self) -> StorageResult<()> {
+        self.reader
+            .close()
+            .await
+            .map_err(|error| engine_error(&self.instance, "reader close", error))
     }
 }
 
