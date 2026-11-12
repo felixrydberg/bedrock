@@ -675,6 +675,7 @@ members by `hash_of("kv", id, "")`, without L2 ranges or a directory. Other node
 owner serves reads from the same SlateDB handle (read-your-writes, no reader polling), so B-39's polling `DbReader` is
 removed. SlateDB's writer open fences a previous owner; a fenced node waits a hold-off before reopening. `bedrock-api`
 keeps the pushed datasets and rejects `kv`. `docs/spec/materialized.tla` models the ownership move.
+Amendment comments: [#58](https://github.com/felixrydberg/bedrock/issues/58#issuecomment-6836793779), [#57](https://github.com/felixrydberg/bedrock/issues/57#issuecomment-6836794214), [#59](https://github.com/felixrydberg/bedrock/issues/59#issuecomment-6836794654), [#60](https://github.com/felixrydberg/bedrock/issues/60#issuecomment-6836795115).
 
 ---
 
