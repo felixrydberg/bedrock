@@ -22,6 +22,7 @@
 ## Correctness and validation
 
 - Land #26 / B-23a before shared-core I/O work. Use runtime time/tasks, seeded randomness and simulation-compatible network/S3 seams. Keep direct filesystem, OS time and thread access inside adapters; avoid unordered map/set iteration when it affects messages or output.
+- Use `bedrock_lib::monotonic_now()` for the monotonic clock and `bedrock_lib::uuid()` for random IDs, rather than `Instant::now()` or a UUID crate. Both follow madsim's simulated clock and seeded RNG.
 - Simulation builds must exclude RocksDB and model buffered versus committed storage state. A seed must reproduce the same trace; keep failing seeds as regressions.
 - Persist data and applied revisions atomically. Preserve ordered, duplicate-safe application, checksums, minimum-revision reads and validation before readiness. Deletes are ordered `DELETE` events and full snapshots hold no tombstones; cache fills come only from sources at least as far along as the receiver, and local not-found records belong to the KV read path (B-27).
 - A missing key is `Ok(None)`; corruption, unavailability and unsupported operations are explicit errors. Preserve isolation between datasets and services.
