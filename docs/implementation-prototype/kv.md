@@ -657,8 +657,9 @@ CDN artifact CacheStorage retain their existing contracts.
 - The value cache has one process-wide byte budget, entries live at most 60 s, and
   one namespace may fill at most an eighth of it. Absences are not cached.
 - A cold open replays the WAL since the writer's last L0 flush and keeps it in
-  memory, so a reader's memory is bounded by the writer's L0 flush size, not by
-  the reader's memtable setting. Afterwards a point read fetches index and blocks,
+  memory, so a reader's memory is bounded by the writer, not by the reader's
+  memtable setting. The writer flushes to L0 at 8 MiB and pauses writes once
+  16 MiB is unflushed, so a reader holds at most about 16 MiB. Afterwards a point read fetches index and blocks,
   not the namespace.
 - Deleting a namespace records `deleting_at` and keeps its storage. An explicit
   purge after a 20-minute grace, longer than a reader's idle close, closes this

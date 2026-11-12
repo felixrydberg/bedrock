@@ -32,6 +32,8 @@ pub const READER_POLL: Duration = Duration::from_secs(1);
 pub const READER_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(5 * 60);
 /// WAL a reader buffers in memory before it waits for the writer's L0 flush.
 const READER_MEMTABLE_BYTES: u64 = 16 * 1024 * 1024;
+/// The writer's memtable size before it flushes to L0. Smaller than SlateDB's 64 MiB default so readers stay small.
+const WRITER_L0_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct SlateFactory {
     store: Arc<dyn ObjectStore>,
@@ -209,6 +211,10 @@ impl NamespaceFactory for SlateFactory {
         let settings = Settings {
             flush_interval: None,
             object_store_max_retries: Some(0),
+            // A reader holds the WAL not yet flushed to L0 in memory, so these bound every reader of this namespace:
+            // memtables flush at 8 MiB, and writes wait once 16 MiB is unflushed (#57 / B-39, kv `max_open`).
+            l0_sst_size_bytes: WRITER_L0_BYTES,
+            max_unflushed_bytes: 2 * WRITER_L0_BYTES,
             ..Settings::default()
         };
         let snapshot_lifetime = settings

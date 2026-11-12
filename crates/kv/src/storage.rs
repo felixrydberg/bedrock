@@ -577,8 +577,8 @@ impl ValueCache {
 
 /// How many readers a node with `memory_mb` of budget keeps open.
 pub fn max_open(memory_mb: u64) -> usize {
-    // ponytail: one reader per 8 MiB of the node's memory budget (a reader's WAL memtable is bounded at 16 MiB but
-    // rarely full); a measured bound once B-53's benchmarks exist.
+    // ponytail: one reader per 8 MiB of the node's memory budget (a reader's replayed WAL is bounded at 16 MiB by
+    // the writer's L0 settings but rarely full); a measured bound once B-53's benchmarks exist.
     (memory_mb / 8).max(1) as usize
 }
 
