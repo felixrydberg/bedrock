@@ -143,7 +143,7 @@ impl Readers {
 
     /// Open readers with what they last saw: namespace, revision, its commit time and idle time.
     fn introspect(&self) -> String {
-        let now = Instant::now();
+        let now = bedrock_lib::monotonic_now();
         let open = self.open.lock().unwrap();
         let rows: Vec<_> = open
             .iter()
@@ -172,7 +172,7 @@ impl Readers {
     /// The namespace's reader, opening it if needed; `None` while no writer has created its database.
     async fn reader(&self, id: &str) -> StorageResult<Option<Arc<Reader>>> {
         if let Some(open) = self.open.lock().unwrap().get_mut(id) {
-            open.used = Instant::now();
+            open.used = bedrock_lib::monotonic_now();
             return Ok(Some(open.reader.clone()));
         }
         let opened = self.opens.open(&self.cell, DATASET, id).await;
@@ -203,10 +203,10 @@ impl Readers {
         // A coalesced open hands every caller the same reader; the first to finish installs it.
         let installed = open.entry(id.to_owned()).or_insert_with(|| Open {
             reader: reader.clone(),
-            used: Instant::now(),
+            used: bedrock_lib::monotonic_now(),
             position: Position::default(),
         });
-        installed.used = Instant::now();
+        installed.used = bedrock_lib::monotonic_now();
         let installed = installed.reader.clone();
         // An open that started after another finished loses the install; every caller it served retires it once.
         if !Arc::ptr_eq(&installed, &reader) {
@@ -352,7 +352,7 @@ impl Readers {
     /// Retires readers idle for [`IDLE`] and closes every retired reader no read still holds. The caller runs this on
     /// a process-wide timer; it costs nothing per namespace.
     pub async fn sweep(&self) {
-        let now = Instant::now();
+        let now = bedrock_lib::monotonic_now();
         {
             let mut open = self.open.lock().unwrap();
             let idle: Vec<String> = open
@@ -508,7 +508,7 @@ impl ValueCache {
         let mut state = self.inner.lock().unwrap();
         let id = (namespace.to_owned(), key.to_vec());
         let cached = state.entries.get(&id)?;
-        if cached.expires <= Instant::now() {
+        if cached.expires <= bedrock_lib::monotonic_now() {
             state.remove(&id);
             self.bytes.set(state.total as i64);
             return None;
@@ -537,7 +537,7 @@ impl ValueCache {
         if over(&state) {
             // Expired entries leave only when read or under budget pressure, so reclaim this namespace's before refusing.
             // ponytail: a scan of the whole cache, only for a namespace at its share; a per-namespace index if it shows.
-            let now = Instant::now();
+            let now = bedrock_lib::monotonic_now();
             let expired: Vec<_> = state
                 .entries
                 .iter()
@@ -553,7 +553,7 @@ impl ValueCache {
             self.bytes.set(state.total as i64);
             return;
         }
-        let expires = Instant::now() + Duration::from_secs(CACHE_TTL_SECONDS.into());
+        let expires = bedrock_lib::monotonic_now() + Duration::from_secs(CACHE_TTL_SECONDS.into());
         state.total += size;
         *state.by_namespace.entry(namespace.to_owned()).or_default() += size;
         state.entries.put(
@@ -575,11 +575,12 @@ impl ValueCache {
     }
 }
 
-/// How many readers a node with `memory_mb` of budget keeps open.
+/// How many readers a node with `memory_mb` of budget keeps open. A quarter of the budget is the shared block cache
+/// and a quarter is headroom for the value cache and the process; the other half holds readers at their worst case,
+/// 16 MiB of replayed WAL each (the writer's L0 settings in `SlateFactory`).
 pub fn max_open(memory_mb: u64) -> usize {
-    // ponytail: one reader per 8 MiB of the node's memory budget (a reader's replayed WAL is bounded at 16 MiB by
-    // the writer's L0 settings but rarely full); a measured bound once B-53's benchmarks exist.
-    (memory_mb / 8).max(1) as usize
+    // ponytail: sized for every reader full at once; a measured bound once B-53's benchmarks exist.
+    (memory_mb / 2 / 16).max(1) as usize
 }
 
 #[cfg(test)]

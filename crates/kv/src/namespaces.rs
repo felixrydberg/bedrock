@@ -570,9 +570,11 @@ impl Directory {
             }
             record.set_state(Lifecycle::Deleting);
             record.deleting_at = wall_ms();
+            // Keyed by the revision planned from, so a retained result of an earlier delete, such as an older binary's
+            // `delete:{id}` that recorded no time, never stands in for this write.
             match self
                 .api
-                .put(&record, revision, &format!("delete:{id}"))
+                .put(&record, revision, &format!("delete:{id}:{revision}"))
                 .await?
             {
                 // Storage stays until a purge after `PURGE_GRACE`.

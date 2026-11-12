@@ -659,8 +659,11 @@ CDN artifact CacheStorage retain their existing contracts.
 - A cold open replays the WAL since the writer's last L0 flush and keeps it in
   memory, so a reader's memory is bounded by the writer, not by the reader's
   memtable setting. The writer flushes to L0 at 8 MiB and pauses writes once
-  16 MiB is unflushed, so a reader holds at most about 16 MiB. Afterwards a point read fetches index and blocks,
-  not the namespace.
+  16 MiB is unflushed, so a reader holds at most about 16 MiB. Afterwards a point
+  read fetches index and blocks, not the namespace.
+- A node's memory budget is split into quarters: one for the shared block cache,
+  one for headroom (value cache and process), and two for readers at their
+  16 MiB worst case. A 1 GiB node keeps at most 32 readers open.
 - Deleting a namespace records `deleting_at` and keeps its storage. An explicit
   purge after a 20-minute grace, longer than a reader's idle close, closes this
   node's readers, fences the writer, deletes `kv/{id}/` and then the directory

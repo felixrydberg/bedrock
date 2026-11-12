@@ -195,7 +195,8 @@ async fn scenario() -> u64 {
         Arc::new(factory.clone()),
         "eu".into(),
         "eu-1a".into(),
-        // One handle, so pressure closes and reopens it as other readers come and go.
+        // One namespace, so this never evicts: open races and idle closes are what it exercises. Eviction and reopen are
+        // the kv unit tests'.
         1,
     );
 
@@ -258,6 +259,7 @@ fn run(seed: u64) -> u64 {
 
 /// Runs `seed` in a child process and returns its trace hash. Replays are compared across processes: tokio seeds its
 /// `watch` waker shards from a process-wide counter, so a second run inside one process may wake waiters differently.
+#[allow(clippy::disallowed_types)] // This launcher isolates seeds before simulation starts.
 fn in_child(seed: u64) -> u64 {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
