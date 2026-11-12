@@ -156,6 +156,18 @@ impl KeyRange {
             )),
         }
     }
+
+    /// [`KeyRange::bounds`] for the keys after cursor `after`. A cursor before the range starts at its start; one at or
+    /// past its end leaves nothing.
+    pub fn bounds_after<'a>(&'a self, after: Option<&'a [u8]>) -> Option<Bounds<'a>> {
+        let (start, end) = self.bounds()?;
+        match after {
+            Some(after) if after >= self.start.as_slice() => self
+                .contains(after)
+                .then_some((Bound::Excluded(after), end)),
+            _ => Some((start, end)),
+        }
+    }
 }
 
 /// Pushed L2 data in the hash-first layout (#22 / B-21): `l2/{8-byte big-endian hash}/{namespace}\0{key}`. A hash

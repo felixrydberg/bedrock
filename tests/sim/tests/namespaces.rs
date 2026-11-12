@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bedrock_kv::KvConfig;
+use bedrock_kv::namespaces::{
+    CACHE_TTL_SECONDS, FORMAT_VERSION, Lifecycle, PURGE_GRACE, Record, storage as storage_of,
+};
 use bedrock_lib::node::{
     ApiConfig, Budget, Location, MembershipSettings, NodeConfig, RelayConfig, Role, ServiceConfig,
     Tier,
@@ -22,6 +25,7 @@ use bedrock_lib::storage::sim::{Disks, Fingerprint, MemoryFactory};
 use http_body_util::Full;
 use hyper::body::Bytes;
 use madsim::runtime::{Handle, NodeHandle, Runtime};
+use prost::Message;
 use serde_json::Value;
 use tokio::time::sleep;
 
@@ -378,6 +382,59 @@ async fn scenario() -> Vec<String> {
             })
             .await;
             assert_ne!(reused["result"]["id"], id.as_str());
+
+            // A deletion an older binary recorded with no time, under its `delete:{id}` key: deleting it again stamps
+            // the time even while that key's result is retained, so the purge after the grace goes through.
+            let legacy = create("store-legacy");
+            let legacy = until("legacy create", Duration::from_secs(60), 200, || {
+                call(kv_a, "POST", &mine, &legacy)
+            })
+            .await;
+            let legacy = legacy["result"]["id"].as_str().unwrap().to_owned();
+            let unstamped = Record {
+                format_version: FORMAT_VERSION,
+                id: legacy.clone(),
+                tenant: "customer-123".into(),
+                title: "store-legacy".into(),
+                home_region: "eu".into(),
+                storage: storage_of(&legacy),
+                storage_format: bedrock_lib::replication::materialized::FORMAT_VERSION,
+                storage_bytes: Some(1_000_000),
+                permissions: Vec::new(),
+                cache_ttl_seconds: CACHE_TTL_SECONDS,
+                state: Lifecycle::Deleting as i32,
+                created_at: 1,
+                deleting_at: 0,
+            };
+            let request = hyper::Request::put(format!(
+                "/v1/quicksilver/infrastructure/kv/namespaces/{legacy}"
+            ))
+            .header("host", "api")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("idempotency-key", format!("delete:{legacy}"))
+            .body(Full::new(Bytes::from(unstamped.encode_to_vec())))
+            .unwrap();
+            let (status, _) = bedrock_lib::http::send(
+                &format!("{API}:7002"),
+                None,
+                request,
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status.as_u16(), 200);
+            let legacy_path = format!("{mine}/{legacy}");
+            until("legacy delete", Duration::from_secs(60), 200, || {
+                call(kv_a, "DELETE", &legacy_path, "")
+            })
+            .await;
+            sleep(PURGE_GRACE + Duration::from_secs(60)).await;
+            let purge = format!("{legacy_path}/purge");
+            until("legacy purge", Duration::from_secs(60), 200, || {
+                call(kv_a, "POST", &purge, "")
+            })
+            .await;
+            trace.push("legacy deletion purged".into());
             let unknown = call(kv_a, "GET", &format!("{mine}/{}", "0".repeat(32)), "").await;
             assert_eq!(unknown.0, 404);
             // A wrong token never reaches the directory.

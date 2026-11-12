@@ -463,6 +463,13 @@ impl Cluster {
                     self.write_address(),
                     self.options.s3,
                 );
+                if node.kind == Kind::Kv {
+                    tables += &format!(
+                        "[s3]\nendpoint = {:?}\nbucket = {:?}\naccess_key_id = \"local\"\nsecret_access_key = \"local\"\n",
+                        format!("http://127.0.0.1:{}", self.s3.port),
+                        self.bucket,
+                    );
+                }
             }
         }
         top + &tables

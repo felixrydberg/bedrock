@@ -8,8 +8,9 @@
 //! - **Nothing locational** is recorded: no cell, origin or cache holder. Adding a cell changes no record.
 //! - **Create** writes only the record. The writer opens the namespace's database on its first data write, so an empty
 //!   namespace has no engine objects.
-//! - **Delete** marks the record `Deleting`, which closes it to new opens and writes at once. Removing its S3 objects
-//!   waits for B-39's reader lifecycle ([`retire_storage`]).
+//! - **Delete** marks the record `Deleting` and stamps `deleting_at`, which closes it to new opens and writes at once.
+//!   Its S3 objects stay until an explicit **purge** ([`Directory::purge`]) after [`PURGE_GRACE`]: purging is never
+//!   triggered by polling, and there is no undelete (#57 / B-39).
 //! - Writes are planned from a read and committed with `If-Match` on the `infrastructure` head. The answering range may
 //!   lag the head; a 412 carries the head, and the operation re-reads at it and plans again.
 //! - **The management API** is Cloudflare's namespace API (`/client/v4/accounts/{tenant}/storage/kv/namespaces`): the
@@ -25,10 +26,12 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use bedrock_lib::admin::Admin;
 use bedrock_lib::client::Client;
 use bedrock_lib::transport::tls::Tls;
+
+use crate::storage::Readers;
 use http_body_util::Full;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -58,7 +61,7 @@ const MAX_REGION: usize = 64;
 #[repr(i32)]
 pub enum Lifecycle {
     Active = 0,
-    /// Closed to new opens and writes; its storage is retired once B-39 accounts for readers and checkpoints.
+    /// Closed to new opens and writes; its storage stays until a purge after [`PURGE_GRACE`].
     Deleting = 1,
 }
 
@@ -95,6 +98,10 @@ pub struct Record {
     /// Wall-clock milliseconds since the Unix epoch.
     #[prost(uint64, tag = "12")]
     pub created_at: u64,
+    /// When the namespace became `Deleting`, in wall-clock milliseconds; 0 while active, and for namespaces deleted
+    /// before this was recorded.
+    #[prost(uint64, tag = "13")]
+    pub deleting_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,9 +200,25 @@ pub fn admit_write(record: &Record, current: u64, added: u64) -> Result<(), Reje
     }
 }
 
-/// Deletes namespace `id`'s S3 database under `kv/{id}/` once its record is `Deleting`.
-pub async fn retire_storage(_id: &str) {
-    todo!("#57 / B-39: account for open readers and checkpoints, then delete kv/{{id}}/ only")
+/// How long a `Deleting` namespace keeps its storage. It outlasts directory propagation and the writes and reads that
+/// were admitted before the deletion reached them, and the idle close of a reader another node still has open, so no
+/// such reader writes a checkpoint back after the purge. A reader still open fails once its objects are gone; it never
+/// serves a missing object as an absent key.
+pub const PURGE_GRACE: Duration = Duration::from_secs(20 * 60);
+const _: () = assert!(
+    PURGE_GRACE.as_secs() > crate::storage::IDLE.as_secs() + crate::SWEEP.as_secs() + 60,
+    "a purge must wait out every reader's idle close"
+);
+
+/// Whether `record`'s storage may be purged at wall-clock `now_ms`. A deletion with no recorded time never is: deleting
+/// it again records one.
+pub fn purgeable(record: &Record, now_ms: u64) -> bool {
+    record.state() == Lifecycle::Deleting
+        && record.deleting_at > 0
+        && record
+            .deleting_at
+            .saturating_add(PURGE_GRACE.as_millis() as u64)
+            <= now_ms
 }
 
 /// What a caller asks for when creating a namespace.
@@ -258,16 +281,38 @@ enum Put {
 
 impl Api {
     async fn put(&self, record: &Record, expected: u64, idempotency: &str) -> Result<Put, Error> {
+        let body = Some(record.encode_to_vec());
+        self.write(&record.id, body, expected, idempotency).await
+    }
+
+    /// Removes namespace `id`'s record.
+    async fn delete(&self, id: &str, expected: u64, idempotency: &str) -> Result<Put, Error> {
+        self.write(id, None, expected, idempotency).await
+    }
+
+    async fn write(
+        &self,
+        id: &str,
+        body: Option<Vec<u8>>,
+        expected: u64,
+        idempotency: &str,
+    ) -> Result<Put, Error> {
         let path = format!(
             "/v1/{DATASET}/{NAMESPACE}/{}",
-            String::from_utf8(key(&record.id)).expect("hex IDs are UTF-8")
+            String::from_utf8(key(id)).expect("hex IDs are UTF-8")
         );
-        let request = hyper::Request::put(path)
+        let method = match body {
+            Some(_) => hyper::Method::PUT,
+            None => hyper::Method::DELETE,
+        };
+        let request = hyper::Request::builder()
+            .method(method)
+            .uri(path)
             .header("host", bedrock_lib::transport::host_of(&self.address))
             .header("authorization", format!("Bearer {}", self.token))
             .header("if-match", expected.to_string())
             .header("idempotency-key", idempotency)
-            .body(Full::new(Bytes::from(record.encode_to_vec())))
+            .body(Full::new(Bytes::from(body.unwrap_or_default())))
             .map_err(|e| Error::Invalid(e.to_string()))?;
         let (status, body) =
             bedrock_lib::http::send(&self.address, self.tls.as_deref(), request, API_TIMEOUT)
@@ -293,6 +338,7 @@ impl Api {
 pub struct Directory {
     client: Arc<Client>,
     api: Api,
+    readers: Arc<Readers>,
     /// Home region of namespaces created without a jurisdiction: this node's region.
     region: String,
     operations: Family<OperationLabels, Counter>,
@@ -300,7 +346,13 @@ pub struct Directory {
 }
 
 impl Directory {
-    pub fn new(admin: &Admin, client: Arc<Client>, api: Api, region: String) -> Self {
+    pub fn new(
+        admin: &Admin,
+        client: Arc<Client>,
+        api: Api,
+        readers: Arc<Readers>,
+        region: String,
+    ) -> Self {
         let operations = Family::default();
         admin.register(
             "kv_namespace_operations",
@@ -316,6 +368,7 @@ impl Directory {
         Self {
             client,
             api,
+            readers,
             region,
             operations,
             quota_rejections,
@@ -459,6 +512,7 @@ impl Directory {
                         cache_ttl_seconds: CACHE_TTL_SECONDS,
                         state: Lifecycle::Active as i32,
                         created_at: wall_ms(),
+                        deleting_at: 0,
                     })
                 })
                 .await
@@ -510,17 +564,56 @@ impl Directory {
             let mut record = record
                 .filter(|r| r.tenant == tenant)
                 .ok_or(Error::NotFound)?;
-            if record.state() == Lifecycle::Deleting {
+            // A deletion recorded before `deleting_at` existed is stamped now, so it can be purged after the grace.
+            if record.state() == Lifecycle::Deleting && record.deleting_at > 0 {
                 return Ok((record, revision));
             }
             record.set_state(Lifecycle::Deleting);
+            record.deleting_at = wall_ms();
+            // Keyed by the revision planned from, so a retained result of an earlier delete, such as an older binary's
+            // `delete:{id}` that recorded no time, never stands in for this write.
             match self
                 .api
-                .put(&record, revision, &format!("delete:{id}"))
+                .put(&record, revision, &format!("delete:{id}:{revision}"))
                 .await?
             {
-                // Storage stays until B-39 can retire it safely (`retire_storage`).
+                // Storage stays until a purge after `PURGE_GRACE`.
                 Put::Committed { revision } => return Ok((record, revision)),
+                Put::Conflict { head } => floor = head,
+            }
+        }
+        Err(Error::Contended)
+    }
+
+    /// Deletes the tenant's `Deleting` namespace `id`'s storage under `kv/{id}/` once [`PURGE_GRACE`] has passed, then
+    /// its record, and returns the directory revision without it. Retrying after a failure repeats only what is left.
+    pub async fn purge(&self, tenant: &str, id: &str) -> Result<u64, Error> {
+        let purged = self.try_purge(tenant, id).await;
+        self.count("purge", purged)
+    }
+
+    async fn try_purge(&self, tenant: &str, id: &str) -> Result<u64, Error> {
+        let mut floor = 0;
+        for _ in 0..ATTEMPTS {
+            let (record, revision) = self.read(id, floor).await?;
+            let record = record
+                .filter(|r| r.tenant == tenant)
+                .ok_or(Error::NotFound)?;
+            if !purgeable(&record, wall_ms()) {
+                return Err(Error::Invalid(
+                    "only a namespace deleted at least PURGE_GRACE ago can be purged".into(),
+                ));
+            }
+            self.readers
+                .destroy(id)
+                .await
+                .map_err(|error| Error::Unavailable(error.to_string()))?;
+            match self
+                .api
+                .delete(id, revision, &format!("purge:{id}"))
+                .await?
+            {
+                Put::Committed { revision } => return Ok(revision),
                 Put::Conflict { head } => floor = head,
             }
         }
@@ -561,6 +654,11 @@ pub fn routes(directory: Arc<Directory>) -> Router {
         .route(
             "/client/v4/accounts/{tenant}/storage/kv/namespaces/{id}",
             get(read).put(rename).delete(delete),
+        )
+        // Not in Cloudflare's API, which purges on its own schedule.
+        .route(
+            "/client/v4/accounts/{tenant}/storage/kv/namespaces/{id}/purge",
+            post(purge),
         )
         .with_state(directory)
 }
@@ -672,6 +770,14 @@ async fn delete(
         deleted.map(|(_, revision)| json!({ "revision": revision })),
         None,
     )
+}
+
+async fn purge(
+    State(directory): State<Arc<Directory>>,
+    Path((tenant, id)): Path<(String, String)>,
+) -> Response {
+    let purged = directory.purge(&tenant, &id).await;
+    reply(purged.map(|revision| json!({ "revision": revision })), None)
 }
 
 async fn list(

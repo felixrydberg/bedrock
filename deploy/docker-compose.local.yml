@@ -94,6 +94,10 @@ services:
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   cdn-eu-1:
     <<: *cdn
@@ -126,6 +130,10 @@ services:
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   cdn-eu-2:
     <<: *cdn
@@ -157,6 +165,10 @@ services:
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   cdn-eu-3:
     <<: *cdn
@@ -214,6 +226,10 @@ services:
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   cdn-us-1:
     <<: *cdn
@@ -245,6 +261,10 @@ services:
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   cdn-us-2:
     <<: *cdn
@@ -276,6 +296,10 @@ services:
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   cdn-us-3:
     <<: *cdn

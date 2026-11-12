@@ -22,6 +22,7 @@
 ## Correctness and validation
 
 - Land #26 / B-23a before shared-core I/O work. Use runtime time/tasks, seeded randomness and simulation-compatible network/S3 seams. Keep direct filesystem, OS time and thread access inside adapters; avoid unordered map/set iteration when it affects messages or output.
+- Use `bedrock_lib::monotonic_now()` for the monotonic clock and `bedrock_lib::uuid()` for random IDs, rather than `Instant::now()` or a UUID crate. Both follow madsim's simulated clock and seeded RNG.
 - Simulation builds must exclude RocksDB and model buffered versus committed storage state. A seed must reproduce the same trace; keep failing seeds as regressions.
 - Persist data and applied revisions atomically. Preserve ordered, duplicate-safe application, checksums, minimum-revision reads and validation before readiness. Deletes are ordered `DELETE` events and full snapshots hold no tombstones; cache fills come only from sources at least as far along as the receiver, and local not-found records belong to the KV read path (B-27).
 - A missing key is `Ok(None)`; corruption, unavailability and unsupported operations are explicit errors. Preserve isolation between datasets and services.
@@ -78,3 +79,5 @@ Choose the cheapest available model that can reliably complete and verify the ta
 - Cap parallelism for every heavy run: use `cargo ... -j 4` or `CARGO_BUILD_JOBS=4`, and do not pass `-workers auto` to TLC. Use a fixed TLC worker count of at most 4, and bound the JVM heap (for example `JDK_JAVA_OPTIONS=-Xmx4g`).
 - Do not run seed sweeps or long TLC checks in a worker alongside the lead's own builds. Run them in sequence and report the cap used.
 - If a run is interrupted or the machine reboots, do not retry at the same parallelism. Lower the cap, record the cap in the report, and tell the user.
+
+The codebase is yours: What its for and how its built is your call, and you'll keep building on it.

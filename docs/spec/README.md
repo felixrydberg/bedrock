@@ -71,9 +71,9 @@ their nominal age. Current resolved state survives event-history deletion.
 
 Preserve native engine compaction, checkpoint/reference protection and GC; native
 LSM tombstones are implementation details. The Bedrock no-idle-polling rule does
-not remove SlateDB's internal timers while a handle is open. Later B-39 readers
-must protect native read/checkpoint views rather than infer protection from a
-namespace progress record. Upstream attribution remains in the dependency; these
+not remove SlateDB's internal timers while a handle is open. B-39 readers
+protect their views with SlateDB managed checkpoints rather than inferring
+protection from a namespace progress record. Upstream attribution remains in the dependency; these
 contracts do not claim a custom timer-free fork.
 
 ## Later Raft integration

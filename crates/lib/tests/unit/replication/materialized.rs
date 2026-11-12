@@ -635,3 +635,188 @@ async fn a_failed_write_is_read_back_from_storage() {
         .unwrap();
     assert_eq!(materialized.progress().await.unwrap().sequence, 2);
 }
+
+/// Long enough for a real reader to poll a publication in; a model reader sees one at once.
+const PUBLISHED: Duration = Duration::from_secs(5);
+
+/// What every factory's read-only readers must do (#57 / B-39).
+async fn reader_contract(factory: &dyn NamespaceFactory) {
+    assert!(
+        Reader::open(factory, "kv", "one").await.unwrap().is_none(),
+        "no writer has created the database"
+    );
+    let writer = Materialized::open(factory, "kv", "one").await.unwrap();
+    writer
+        .apply(&[
+            committed(1, 100, b"a", Some(b"1"), None),
+            committed(2, 200, b"b", Some(b"2"), None),
+        ])
+        .await
+        .unwrap();
+    // The batch is buffered, not published: a reader sees none of it.
+    let reader = Reader::open(factory, "kv", "one").await.unwrap().unwrap();
+    assert_eq!(reader.position().await.unwrap(), Position::default());
+    assert_eq!(
+        reader.get(b"a", 0, Duration::ZERO).await.unwrap(),
+        (None, Position::default())
+    );
+    assert!(matches!(
+        reader.get(b"a", 2, Duration::ZERO).await,
+        Err(StorageError::Unavailable(_))
+    ));
+
+    writer.publish().await.unwrap();
+    let (value, position) = reader.get(b"a", 2, PUBLISHED).await.unwrap();
+    assert_eq!(value, Some(b"1".to_vec()));
+    assert_eq!(
+        position,
+        Position {
+            sequence: 2,
+            committed_at: 200
+        }
+    );
+
+    // Opening the reader fenced nothing: the writer keeps committing, and its delete is proven at its revision.
+    writer
+        .apply(&[committed(3, 300, b"a", None, None)])
+        .await
+        .unwrap();
+    writer.publish().await.unwrap();
+    let (value, position) = reader.get(b"a", 3, PUBLISHED).await.unwrap();
+    assert_eq!((value, position.sequence), (None, 3));
+    let (page, _) = reader.list(b"", None, 10, 3, PUBLISHED).await.unwrap();
+    assert_eq!(page, vec![(b"b".to_vec(), b"2".to_vec())]);
+    let (page, _) = reader
+        .list(b"", Some(b"b"), 10, 3, PUBLISHED)
+        .await
+        .unwrap();
+    assert!(page.is_empty());
+    assert!(
+        Reader::open(factory, "kv", "two").await.unwrap().is_none(),
+        "another namespace is its own database"
+    );
+    reader.close().await.unwrap();
+    writer.close().await.unwrap();
+
+    // A reopened reader starts where the published state is.
+    let reopened = Reader::open(factory, "kv", "one").await.unwrap().unwrap();
+    assert_eq!(reopened.position().await.unwrap().sequence, 3);
+    reopened.close().await.unwrap();
+}
+
+/// Writes `m` as raw bytes, bypassing [`Materialized`].
+async fn publish_raw(factory: &dyn NamespaceFactory, namespace: &str, changes: Changes) {
+    let db = factory.open("kv", namespace).await.unwrap();
+    db.write(changes).await.unwrap();
+    db.flush().await.unwrap();
+    db.close().await.unwrap();
+}
+
+async fn reader_corruption_contract(factory: &dyn NamespaceFactory) {
+    publish_raw(
+        factory,
+        "garbled",
+        vec![(b"m".to_vec(), Some(b"\xff".to_vec()))],
+    )
+    .await;
+    assert!(matches!(
+        Reader::open(factory, "kv", "garbled").await,
+        Err(StorageError::Corruption(_))
+    ));
+    publish_raw(
+        factory,
+        "headless",
+        vec![(b"vkey".to_vec(), Some(b"value".to_vec()))],
+    )
+    .await;
+    assert!(matches!(
+        Reader::open(factory, "kv", "headless").await,
+        Err(StorageError::Corruption(_))
+    ));
+    let mut wrong_scope = StateRecord {
+        version: FORMAT_VERSION,
+        dataset: "kv".into(),
+        namespace: "elsewhere".into(),
+        sequence: 1,
+        committed_at: 1,
+        raft_index: None,
+        raft_term: None,
+        pruned_through: 0,
+    };
+    publish_raw(
+        factory,
+        "moved",
+        vec![(b"m".to_vec(), Some(wrong_scope.encode_to_vec()))],
+    )
+    .await;
+    assert!(matches!(
+        Reader::open(factory, "kv", "moved").await,
+        Err(StorageError::Corruption(_))
+    ));
+    wrong_scope.namespace = "fine".into();
+    publish_raw(
+        factory,
+        "fine",
+        vec![(b"m".to_vec(), Some(wrong_scope.encode_to_vec()))],
+    )
+    .await;
+    Reader::open(factory, "kv", "fine")
+        .await
+        .unwrap()
+        .unwrap()
+        .close()
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn model_reader_contract() {
+    reader_contract(&MemoryFactory::default()).await;
+    reader_corruption_contract(&MemoryFactory::default()).await;
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn actual_slatedb_reader_contract() {
+    let store = Arc::new(object_store::memory::InMemory::new());
+    reader_contract(&crate::storage::slate::SlateFactory::new(store)).await;
+    let store = Arc::new(object_store::memory::InMemory::new());
+    reader_corruption_contract(&crate::storage::slate::SlateFactory::new(store)).await;
+}
+
+#[tokio::test]
+async fn a_crash_never_shows_a_reader_an_unpublished_batch() {
+    let factory = MemoryFactory::default();
+    let writer = Materialized::open(&factory, "kv", "one").await.unwrap();
+    writer
+        .apply(&[committed(1, 100, b"a", Some(b"1"), None)])
+        .await
+        .unwrap();
+    writer.publish().await.unwrap();
+    writer
+        .apply(&[committed(2, 200, b"a", Some(b"lost"), None)])
+        .await
+        .unwrap();
+    let reader = Reader::open(&factory, "kv", "one").await.unwrap().unwrap();
+    factory.crash().unwrap();
+    let (value, position) = reader.get(b"a", 0, Duration::ZERO).await.unwrap();
+    assert_eq!((value, position.sequence), (Some(b"1".to_vec()), 1));
+}
+
+#[tokio::test]
+async fn a_destroyed_namespace_fails_its_open_reader_rather_than_reading_empty() {
+    let factory = MemoryFactory::default();
+    let writer = Materialized::open(&factory, "kv", "one").await.unwrap();
+    writer
+        .apply(&[committed(1, 100, b"a", Some(b"1"), None)])
+        .await
+        .unwrap();
+    writer.publish().await.unwrap();
+    let reader = Reader::open(&factory, "kv", "one").await.unwrap().unwrap();
+    factory.destroy("kv", "one").await.unwrap();
+    assert!(matches!(
+        reader.get(b"a", 0, Duration::ZERO).await,
+        Err(StorageError::Unavailable(_))
+    ));
+    assert!(Reader::open(&factory, "kv", "one").await.unwrap().is_none());
+}
