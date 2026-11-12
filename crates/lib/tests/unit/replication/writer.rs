@@ -102,6 +102,9 @@ impl NamespaceDatabase for Database {
     async fn close(&self) -> StorageResult<()> {
         self.inner.close().await
     }
+    fn durable(&self) -> Arc<dyn crate::storage::namespace::NamespaceReader> {
+        self.inner.durable()
+    }
 }
 
 fn clock() -> u64 {
@@ -442,4 +445,64 @@ async fn crashing_after_unknown_flush_outcome_recovers_only_remotely_durable_bat
         );
         assert_eq!(sequences(&events(&reopened, "a").await), [1]);
     }
+}
+
+/// Counts concurrent opens and makes each take a while, like a cold manifest read and fence.
+#[derive(Default)]
+struct SlowOpens {
+    inner: MemoryFactory,
+    running: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+#[async_trait]
+impl NamespaceFactory for SlowOpens {
+    async fn namespaces(&self) -> StorageResult<Vec<(String, String)>> {
+        self.inner.namespaces().await
+    }
+    async fn open(
+        &self,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<Arc<dyn NamespaceDatabase>> {
+        let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(running, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        self.running.fetch_sub(1, Ordering::SeqCst);
+        self.inner.open(dataset, namespace).await
+    }
+}
+
+/// A cold-open storm on an owner writer (#58 / B-26) runs at most `NAMESPACE_OPENS.total` opens at once, keeps at most
+/// `max_open` handles, and every write still lands.
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn an_owner_bounds_concurrent_opens_and_open_handles() {
+    let factory = Arc::new(SlowOpens::default());
+    let writer = Writer::owner(
+        clock,
+        Persistence {
+            factory: factory.clone(),
+            retention: Retention::default(),
+            metrics: PersistenceMetrics::default(),
+        },
+        4,
+    )
+    .unwrap();
+    let writes: Vec<_> = (0..32)
+        .map(|n| {
+            let writer = writer.clone();
+            tokio::spawn(async move { writer.commit(set(&format!("n{n}"), "k", "v", None)).await })
+        })
+        .collect();
+    for write in writes {
+        assert_eq!(write.await.unwrap(), Ok(1));
+    }
+    let limit = crate::health::protection::NAMESPACE_OPENS.total;
+    assert!(factory.peak.load(Ordering::SeqCst) <= limit);
+    assert!(writer.open_namespaces().len() <= 4);
+    assert!(
+        writer.log().namespaces("kv").is_empty(),
+        "an owner writer feeds no relay log"
+    );
 }

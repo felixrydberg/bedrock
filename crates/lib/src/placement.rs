@@ -7,7 +7,8 @@
 //!   owners `ready` as their relays report them so and removes `leaving` ones (#22 / B-21). [`merges`] joins neighbours
 //!   whose owners are the same again (#66 / B-61).
 //! - [`owners`] and [`serves`] read the published directory (#19 / B-16, `docs/spec/membership.md`).
-//! - [`rank`] orders customer-KV readers by rendezvous hash. Customer KV has no ranges.
+//! - [`rank`] orders customer-KV owners by rendezvous hash, and [`pick`] chooses a namespace's home cell. Customer KV
+//!   has no ranges.
 //! - [`hash_of`] places a key in the hash space; relay range streams select keys with [`in_span`] (#22 / B-21).
 //! - [`namespaces`] is the fixed namespace set of each ranged dataset, so relays know every namespace a range covers.
 
@@ -587,6 +588,13 @@ pub fn rank<'a>(
         .collect();
     scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.node_id.cmp(&b.1.node_id)));
     scored.into_iter().map(|(_, m)| m).collect()
+}
+
+/// The highest-ranked of `ids` for `hash`, by the same rendezvous score as [`rank`]: e.g. a customer-KV namespace's home
+/// cell among its region's cells (#58 / B-26).
+pub fn pick<'a>(hash: u64, ids: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    ids.into_iter()
+        .max_by(|a, b| score(hash, a).cmp(&score(hash, b)).then_with(|| b.cmp(a)))
 }
 
 /// FNV-1a over the node ID, then the SplitMix64 finalizer: stable across builds and platforms, unlike `DefaultHasher`.

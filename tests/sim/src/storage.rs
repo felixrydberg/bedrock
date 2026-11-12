@@ -219,35 +219,6 @@ impl NamespaceFactory for MemoryFactory {
         }))
     }
 
-    /// Follows the durable state at once: the model has no publication lag, and never sees a buffered write.
-    async fn open_reader(
-        &self,
-        dataset: &str,
-        namespace: &str,
-    ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
-        if !valid_identity(dataset) || !valid_identity(namespace) {
-            return Err(StorageError::Unsupported(context(
-                "namespace-memory",
-                "namespace",
-                "dataset and namespace must be nonempty single path components",
-            )));
-        }
-        let identity = (dataset.to_owned(), namespace.to_owned());
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| unavailable("namespace", "state lock poisoned"))?;
-        if !state.contains_key(&identity) {
-            return Ok(None);
-        }
-        Ok(Some(Arc::new(MemoryReader {
-            state: self.state.clone(),
-            identity,
-            instance: format!("{dataset}/{namespace}"),
-            closed: AtomicBool::new(false),
-        })))
-    }
-
     async fn destroy(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
         self.state
             .lock()
@@ -257,26 +228,28 @@ impl NamespaceFactory for MemoryFactory {
     }
 }
 
+/// A handle's durable reads. The model shows the store's durable state, never a buffered write, and a handle that a newer
+/// writer or a crash superseded reads nothing: it is fenced at once, where SlateDB notices at its next manifest poll.
 struct MemoryReader {
     state: Arc<Mutex<State>>,
     identity: Identity,
     instance: String,
-    closed: AtomicBool,
+    generation: Arc<()>,
 }
 
 impl MemoryReader {
     fn with_durable<T>(&self, read: impl FnOnce(&Entries) -> T) -> StorageResult<T> {
-        if self.closed.load(Ordering::Relaxed) {
-            return Err(unavailable(&self.instance, "reader closed"));
-        }
         let state = self
             .state
             .lock()
             .map_err(|_| unavailable(&self.instance, "state lock poisoned"))?;
-        // A destroyed database's objects are gone; a reader still holding it fails rather than reading nothing.
+        // A destroyed database's objects are gone; a handle still holding it fails rather than reading nothing.
         let namespace = state
             .get(&self.identity)
             .ok_or_else(|| unavailable(&self.instance, "namespace objects are missing"))?;
+        if !Arc::ptr_eq(&namespace.generation, &self.generation) {
+            return Err(fenced(&self.instance));
+        }
         Ok(read(&namespace.entries))
     }
 }
@@ -303,11 +276,6 @@ impl NamespaceReader for MemoryReader {
                     .collect()
             })
         })
-    }
-
-    async fn close(&self) -> StorageResult<()> {
-        self.closed.store(true, Ordering::Relaxed);
-        Ok(())
     }
 }
 
@@ -371,6 +339,15 @@ impl NamespaceDatabase for MemoryDatabase {
             Ok(())
         })
     }
+
+    fn durable(&self) -> Arc<dyn NamespaceReader> {
+        Arc::new(MemoryReader {
+            state: self.state.clone(),
+            identity: self.identity.clone(),
+            instance: self.instance.clone(),
+            generation: self.generation.clone(),
+        })
+    }
 }
 
 /// What a call into a namespace database does, as a fault hook sees it.
@@ -428,7 +405,7 @@ struct SimDatabase {
 }
 
 impl SimDatabase {
-    fn durable(&self) {
+    fn observe(&self) {
         if let Some(observer) = &self.observer {
             for changes in self.unflushed.lock().unwrap().drain(..) {
                 observer(&self.instance, &changes);
@@ -521,22 +498,6 @@ impl NamespaceFactory for SimFactory {
         }))
     }
 
-    async fn open_reader(
-        &self,
-        dataset: &str,
-        namespace: &str,
-    ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
-        inject(&self.faults, StoreAccess::Open, "namespace").await?;
-        let Some(inner) = self.inner.open_reader(dataset, namespace).await? else {
-            return Ok(None);
-        };
-        Ok(Some(Arc::new(SimReader {
-            inner,
-            faults: self.faults.clone(),
-            instance: format!("{dataset}/{namespace}"),
-        })))
-    }
-
     async fn destroy(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
         let instance = format!("{dataset}/{namespace}");
         let fault = inject(&self.faults, StoreAccess::Write, &instance).await?;
@@ -545,7 +506,7 @@ impl NamespaceFactory for SimFactory {
     }
 }
 
-/// A reader whose calls fail as the factory's faults decide. Its reads take the `Read` faults, like a writer's.
+/// Durable reads whose calls fail as the factory's faults decide, taking the `Read` faults like the handle's own reads.
 struct SimReader {
     inner: Arc<dyn NamespaceReader>,
     faults: StoreFaults,
@@ -567,11 +528,6 @@ impl NamespaceReader for SimReader {
     ) -> StorageResult<Vec<Entry>> {
         inject(&self.faults, StoreAccess::Read, &self.instance).await?;
         self.inner.scan(prefix, after, limit).await
-    }
-
-    async fn close(&self) -> StorageResult<()> {
-        inject(&self.faults, StoreAccess::Close, &self.instance).await?;
-        self.inner.close().await
     }
 }
 
@@ -622,7 +578,7 @@ impl NamespaceDatabase for SimDatabase {
         }
         let flushed = self.inner.flush().await;
         if flushed.is_ok() {
-            self.durable();
+            self.observe();
         }
         finish(fault, &self.instance, flushed)
     }
@@ -631,9 +587,16 @@ impl NamespaceDatabase for SimDatabase {
         let fault = inject(&self.faults, StoreAccess::Close, &self.instance).await?;
         let closed = self.inner.close().await;
         if closed.is_ok() {
-            self.durable();
+            self.observe();
         }
         finish(fault, &self.instance, closed)
+    }
+    fn durable(&self) -> Arc<dyn NamespaceReader> {
+        Arc::new(SimReader {
+            inner: self.inner.durable(),
+            faults: self.faults.clone(),
+            instance: self.instance.clone(),
+        })
     }
 }
 

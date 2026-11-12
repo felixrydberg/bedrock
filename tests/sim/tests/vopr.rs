@@ -912,7 +912,10 @@ fn start_cluster(run: &Arc<Run>) -> Vec<Process> {
         let name = format!("kv-{}", i + 1);
         let config = service(&name, ip, &[]);
         let id = spawn(run, &name, ip, move || {
-            bedrock_kv::run(config.clone().into())
+            bedrock_kv::run(bedrock_kv::KvConfig {
+                write_token: Some(TOKEN.into()),
+                ..config.clone().into()
+            })
         });
         add(name, ip, &[], true, id);
     }

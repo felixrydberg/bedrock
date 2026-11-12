@@ -42,6 +42,20 @@ acknowledgements bounded by durable progress, ordered revisions, young retained
 events, live retry protection, and retention of a pending event until flush.
 A namespace revision is a Bedrock revision, independent of engine sequence IDs.
 
+## Ownership moves (#58 / B-26, 2026-11-12)
+
+Customer-KV namespaces are written by their rendezvous owner `bedrock-kv` node, so ownership moves between live nodes.
+`Move` opens a new writer handle at the next epoch from durable state, like `Crash`, but the old handle survives in
+`stale` with its unflushed batch and a caller waiting for it. `StaleFlush` publishes that batch only while its epoch is
+current: SlateDB fences a superseded writer. `StaleAck` acknowledges only after the stale handle's own flush succeeded;
+otherwise the caller gets an error and retries with its idempotency key against the new owner, where `Retry` finds the
+durable record. A batch flushed before the move is acknowledged normally. Bug `fence` lets the stale handle publish
+after the move; TLC breaks `NoLostAck` (the new owner's acknowledged revision is overwritten). The model still trusts
+SlateDB's fencing rather than proving it, and covers one stale handle per run (`MaxEpoch=2`).
+
+`scripts/tlc.sh materialized` on 2026-11-12: the protocol passed (10,529 generated / 4,353 distinct states, two
+workers, `-Xmx4g`) and all eight bugs broke their invariants.
+
 ## Checks run on 2026-10-30
 
 TLC 2.19 with explicit Java 17, two workers, `MemFPSet` and breadth-first search

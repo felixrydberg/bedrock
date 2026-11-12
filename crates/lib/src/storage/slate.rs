@@ -14,10 +14,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt};
-use slatedb::config::DbReaderOptions;
+use slatedb::config::{DurabilityLevel, ReadOptions, ScanOptions};
 use slatedb::db_cache::DbCache;
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
-use slatedb::{CloseReason, Db, DbReader, DbReaderMode, ErrorKind, Settings, WriteBatch};
+use slatedb::{CloseReason, Db, ErrorKind, Settings, WriteBatch};
 use tokio_stream::StreamExt;
 
 use super::namespace::{
@@ -25,48 +25,47 @@ use super::namespace::{
 };
 use super::{Entry, ErrorContext, KeyRange, StorageError, StorageResult};
 
-/// How often an open reader looks for newly published manifests and WAL objects. Each poll is a LIST and a GET, so this
-/// is the steady cost of an open reader (#57 / B-39).
-pub const READER_POLL: Duration = Duration::from_secs(1);
-/// How long a reader's managed checkpoint protects its view's files from GC; refreshed while the reader is open.
-pub const READER_CHECKPOINT_LIFETIME: Duration = Duration::from_secs(5 * 60);
-/// WAL a reader buffers in memory before it waits for the writer's L0 flush.
-const READER_MEMTABLE_BYTES: u64 = 16 * 1024 * 1024;
-/// The writer's memtable size before it flushes to L0. Smaller than SlateDB's 64 MiB default so readers stay small.
+/// How often an open writer reads the manifest for compaction results and for a newer writer that fenced it. The handle
+/// sees its own writes without polling and learns of fencing on its next write, so this only bounds how long a node that
+/// lost a customer-KV namespace keeps serving its last view (#58 / B-26). SlateDB's default is 1 s.
+// ponytail: fixed; tune from the stale-read and S3 request metrics.
+pub const MANIFEST_POLL: Duration = Duration::from_secs(10);
+/// The writer's memtable size before it flushes to L0, bounding each open handle's memory (`kv` `max_open`).
 const WRITER_L0_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct SlateFactory {
     store: Arc<dyn ObjectStore>,
-    /// Blocks, indexes and filters of every reader in the process, under one budget.
-    reader_cache: Arc<dyn DbCache>,
+    /// Blocks, indexes and filters of every database the process opens, under one budget.
+    cache: Arc<dyn DbCache>,
 }
 
-/// The shared reader block cache's default budget. Entries are allocated as they are filled.
-pub const DEFAULT_READER_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+/// The shared block cache's default budget. Entries are allocated as they are filled.
+pub const DEFAULT_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
 impl SlateFactory {
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
         Self {
             store,
-            reader_cache: reader_cache(DEFAULT_READER_CACHE_BYTES),
+            cache: cache(DEFAULT_CACHE_BYTES),
         }
     }
 
-    /// Bounds the block cache that all of this factory's readers share.
-    pub fn with_reader_cache_bytes(mut self, bytes: u64) -> Self {
-        self.reader_cache = reader_cache(bytes);
+    /// Bounds the block cache that all of this factory's databases share. Without one, each database would get
+    /// SlateDB's own 512 MiB default.
+    pub fn with_cache_bytes(mut self, bytes: u64) -> Self {
+        self.cache = cache(bytes);
         self
     }
 }
 
-fn reader_cache(bytes: u64) -> Arc<dyn DbCache> {
+fn cache(bytes: u64) -> Arc<dyn DbCache> {
     Arc::new(MokaCache::new_with_opts(MokaCacheOptions {
         max_capacity: bytes,
         ..MokaCacheOptions::default()
     }))
 }
 
-/// One database's scope in the shared cache: stable across reopens, so a reopened reader finds its blocks again.
+/// One database's scope in the shared cache: stable across reopens, so a reopened handle finds its blocks again.
 fn cache_scope(instance: &str) -> u64 {
     // FNV-1a. Cache keys also carry each SST's random ULID, so a scope collision cannot mix namespaces' blocks.
     instance.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -81,8 +80,9 @@ fn invalid_scope() -> StorageError {
     ))
 }
 
-struct SlateReader {
-    reader: DbReader,
+/// Reads of a writer's handle, filtered to what is durable in the store.
+struct SlateDurable {
+    db: Db,
     instance: String,
 }
 
@@ -211,10 +211,10 @@ impl NamespaceFactory for SlateFactory {
         let settings = Settings {
             flush_interval: None,
             object_store_max_retries: Some(0),
-            // A reader holds the WAL not yet flushed to L0 in memory, so these bound every reader of this namespace:
-            // memtables flush at 8 MiB, and writes wait once 16 MiB is unflushed (#57 / B-39, kv `max_open`).
+            // Memtables flush at 8 MiB, and writes wait once 16 MiB is unflushed, bounding each open handle.
             l0_sst_size_bytes: WRITER_L0_BYTES,
             max_unflushed_bytes: 2 * WRITER_L0_BYTES,
+            manifest_poll_interval: MANIFEST_POLL,
             ..Settings::default()
         };
         let snapshot_lifetime = settings
@@ -223,6 +223,7 @@ impl NamespaceFactory for SlateFactory {
             .map_or(Duration::MAX, |options| options.checkpoint_lifetime);
         let db = Db::builder(format!("{instance}/state"), self.store.clone())
             .with_settings(settings)
+            .with_db_cache(self.cache.clone(), cache_scope(&instance))
             .build()
             .await
             .map_err(|error| engine_error(&instance, "open", error))?;
@@ -231,56 +232,6 @@ impl NamespaceFactory for SlateFactory {
             instance,
             snapshot_lifetime,
         }))
-    }
-
-    async fn open_reader(
-        &self,
-        dataset: &str,
-        namespace: &str,
-    ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
-        if !valid_identity(dataset) || !valid_identity(namespace) {
-            return Err(invalid_scope());
-        }
-        let instance = format!("{dataset}/{namespace}");
-        let options = DbReaderOptions {
-            manifest_poll_interval: READER_POLL,
-            checkpoint_lifetime: READER_CHECKPOINT_LIFETIME,
-            max_memtable_bytes: READER_MEMTABLE_BYTES,
-            // The object store client retries already; a second layer would hide outages from callers.
-            object_store_max_retries: Some(0),
-            ..DbReaderOptions::default()
-        };
-        // The managed checkpoint keeps GC away from the files this reader's view references.
-        let opened = DbReader::builder(format!("{instance}/state"), self.store.clone())
-            .with_reader_mode(DbReaderMode::ManagedCheckpoint)
-            .with_options(options)
-            .with_db_cache(self.reader_cache.clone(), cache_scope(&instance))
-            .build()
-            .await;
-        let error = match opened {
-            Ok(reader) => return Ok(Some(Arc::new(SlateReader { reader, instance }))),
-            Err(error) => error,
-        };
-        // Only a failed open pays for telling "not created yet" apart from a broken database. A writer's open writes the
-        // first manifest before any WAL or SST, so objects without one are damage, never a database being created.
-        let state = Path::from(dataset).join(namespace).join("state");
-        let listing_failed =
-            |_| StorageError::Unavailable(context(&instance, "manifest listing failed".into()));
-        let manifests = state.clone().join("manifest");
-        if let Some(found) = self.store.list(Some(&manifests)).next().await {
-            found.map_err(listing_failed)?;
-            return Err(engine_error(&instance, "open reader", error));
-        }
-        match self.store.list(Some(&state)).next().await {
-            None => Ok(None),
-            Some(found) => {
-                found.map_err(listing_failed)?;
-                Err(StorageError::Corruption(context(
-                    &instance,
-                    "database objects without a manifest".into(),
-                )))
-            }
-        }
     }
 
     async fn destroy(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
@@ -305,14 +256,21 @@ impl NamespaceFactory for SlateFactory {
     }
 }
 
+fn durable_reads() -> ReadOptions {
+    ReadOptions {
+        durability_filter: DurabilityLevel::Remote,
+        ..ReadOptions::default()
+    }
+}
+
 #[async_trait]
-impl NamespaceReader for SlateReader {
+impl NamespaceReader for SlateDurable {
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
-        self.reader
-            .get(key)
+        self.db
+            .get_with_options(key, &durable_reads())
             .await
             .map(|value| value.map(|value| value.to_vec()))
-            .map_err(|error| engine_error(&self.instance, "reader get", error))
+            .map_err(|error| engine_error(&self.instance, "durable get", error))
     }
 
     async fn scan(
@@ -325,28 +283,25 @@ impl NamespaceReader for SlateReader {
         let Some(bounds) = range.bounds_after(after) else {
             return Ok(Vec::new());
         };
+        let options = ScanOptions {
+            durability_filter: DurabilityLevel::Remote,
+            ..ScanOptions::default()
+        };
         let mut iter = self
-            .reader
-            .scan(bounds)
+            .db
+            .scan_with_options(bounds, &options)
             .await
-            .map_err(|error| engine_error(&self.instance, "reader scan", error))?;
+            .map_err(|error| engine_error(&self.instance, "durable scan", error))?;
         let mut entries = Vec::new();
         while entries.len() < limit
             && let Some(entry) = iter
                 .next()
                 .await
-                .map_err(|error| engine_error(&self.instance, "reader scan next", error))?
+                .map_err(|error| engine_error(&self.instance, "durable scan next", error))?
         {
             entries.push((entry.key.to_vec(), entry.value.to_vec()));
         }
         Ok(entries)
-    }
-
-    async fn close(&self) -> StorageResult<()> {
-        self.reader
-            .close()
-            .await
-            .map_err(|error| engine_error(&self.instance, "reader close", error))
     }
 }
 
@@ -449,6 +404,13 @@ impl NamespaceDatabase for SlateDatabase {
             .close()
             .await
             .map_err(|error| engine_error(&self.instance, "close", error))
+    }
+
+    fn durable(&self) -> Arc<dyn NamespaceReader> {
+        Arc::new(SlateDurable {
+            db: self.db.clone(),
+            instance: self.instance.clone(),
+        })
     }
 }
 

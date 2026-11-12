@@ -58,7 +58,10 @@ async fn every_binary_boots_and_stops_on_ctrl_c() {
         .map(|&(name, ip)| {
             let node = node_config(name, ip);
             let fut: std::pin::Pin<Box<dyn Future<Output = _> + Send>> = match name {
-                "kv" => Box::pin(bedrock_kv::run(service_config(node, &[]).into())),
+                "kv" => Box::pin(bedrock_kv::run(bedrock_kv::KvConfig {
+                    write_token: Some("simulation-writer-token".into()),
+                    ..service_config(node, &[]).into()
+                })),
                 "quicksilver" => Box::pin(bedrock_quicksilver::run(service_config(
                     node,
                     bedrock_quicksilver::DATASETS,

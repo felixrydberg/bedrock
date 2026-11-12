@@ -9,7 +9,8 @@
 //!   bound fails at once with a retryable [`StorageError::Overloaded`], and the caller backs off.
 //!
 //! [`crate::health::fallback::SourceChain`] coalesces reads and [`crate::health::fallback::Limited`] puts a limiter in
-//! front of one tier; [`NamespaceOpens`] does both for namespace readers. Customer request-rate policy is separate (B-56).
+//! front of one tier. Customer-KV owners bound namespace opens with [`NAMESPACE_OPENS`] (`replication::writer`).
+//! Customer request-rate policy is separate (B-56).
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -23,8 +24,6 @@ use prometheus_client::metrics::gauge::Gauge;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::admin::Admin;
-use crate::replication::materialized::Reader;
-use crate::storage::namespace::NamespaceFactory;
 use crate::storage::{ErrorContext, StorageError, StorageResult};
 
 /// Bounds for one source on one node.
@@ -50,7 +49,7 @@ pub const S3_FETCHES: Limits = Limits {
     queue: 64,
 };
 
-/// Namespace reader opens. Far fewer than fetches: each one reads a manifest and starts engine tasks.
+/// Namespace handle opens. Far fewer than fetches: each one reads a manifest, writes a fence and starts engine tasks.
 pub const NAMESPACE_OPENS: Limits = Limits {
     total: 8,
     per_cell: 2,
@@ -287,51 +286,6 @@ impl Limiter {
                 total.expect("limiter semaphores are never closed"),
             ],
         })
-    }
-}
-
-/// A finished open: the cell that led it, and its result.
-type Opened = (String, StorageResult<Option<Arc<Reader>>>);
-
-/// Coalesced, limited opens of read-only namespace readers (#57 / B-39), which never fence the writer. Keeping readers
-/// open afterwards is the caller's residency (`kv/storage`).
-pub struct NamespaceOpens {
-    factory: Arc<dyn NamespaceFactory>,
-    opens: Coalescer<(String, String), Opened>,
-    limiter: Limiter,
-}
-
-impl NamespaceOpens {
-    pub fn new(factory: Arc<dyn NamespaceFactory>, metrics: &Metrics) -> Self {
-        NamespaceOpens {
-            factory,
-            opens: Coalescer::new("namespace_open", metrics),
-            limiter: Limiter::new("namespace_open", NAMESPACE_OPENS, metrics),
-        }
-    }
-
-    /// Concurrent opens of one namespace share one initialization, and its failure. Only a leader from `cell` can pass
-    /// on an overload, because it is `cell`'s own queue that is full.
-    pub async fn open(
-        &self,
-        cell: &str,
-        dataset: &str,
-        namespace: &str,
-    ) -> StorageResult<Option<Arc<Reader>>> {
-        let accept = |(leader, opened): &Opened| {
-            leader == cell || !matches!(opened, Err(StorageError::Overloaded(_)))
-        };
-        let open = || async {
-            let opened = match self.limiter.acquire(cell).await {
-                Ok(_permit) => Reader::open(self.factory.as_ref(), dataset, namespace)
-                    .await
-                    .map(|reader| reader.map(Arc::new)),
-                Err(overloaded) => Err(overloaded),
-            };
-            (cell.to_owned(), opened)
-        };
-        let key = (dataset.to_owned(), namespace.to_owned());
-        self.opens.run(key, accept, open).await.1
     }
 }
 

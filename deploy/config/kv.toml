@@ -9,15 +9,16 @@ roles = ["l1", "l2"]
 relays = ["relay-eu-1a-1:7300", "relay-eu-1a-2:7300", "relay-eu-1a-3:7300"]
 api = "api.core:7002"
 s3_endpoint = "https://s3.example.internal"
-# Namespace management, Cloudflare's API at /client/v4/accounts/{tenant}/storage/kv/namespaces; unset serves none.
-# Callers send
-# Authorization: Bearer <write_token>, the bedrock-api write credential this node also forwards directory writes with.
-# Set it via BEDROCK_WRITE_TOKEN.
+# Required: Authorization: Bearer <write_token> for value writes and forwards between kv nodes, and the bedrock-api
+# write credential this node forwards directory writes with. Set it via BEDROCK_WRITE_TOKEN. Value writes
+# (Cloudflare's /client/v4/accounts/{tenant}/storage/kv/namespaces/{id}/values/{key}, /bulk and /bulk/delete) are served
+# on `listen`, where other kv nodes forward them.
+# Namespace management and the value routes for clients; unset serves none.
 # manage_listen = "0.0.0.0:7103"
 
-# The bucket bedrock-api writes namespace databases to; this node reads its home region's namespaces from it (B-39).
-# Credentials come from BEDROCK_S3__ACCESS_KEY_ID and BEDROCK_S3__SECRET_ACCESS_KEY. Readers need get and list,
-# plus conditional put and delete for their managed checkpoints and namespace purges.
+# The bucket namespace databases live in. This node writes and reads the namespaces it owns (#58 / B-26).
+# Credentials come from BEDROCK_S3__ACCESS_KEY_ID and BEDROCK_S3__SECRET_ACCESS_KEY, with get, list, conditional put
+# and delete.
 [s3]
 endpoint = "https://s3.example.internal"
 bucket = "bedrock"
@@ -26,6 +27,12 @@ bucket = "bedrock"
 region = "eu"
 dc = "arn1"
 cell = "eu-1a"
+
+# Other cells: new namespaces are placed in a cell of their jurisdiction, and writes for another cell's namespaces are
+# forwarded to its entry address (a kv node's `listen`, or its Gateway once B-57 exists).
+# [cells.eu-1b]
+# region = "eu"
+# address = "eu-1b-m1:7100"
 
 [budget]
 cpus = 2.0

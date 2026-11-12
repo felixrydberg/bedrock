@@ -436,25 +436,23 @@ async fn a_cold_point_read_fetches_bounded_blocks_not_the_namespace() {
     let namespace_bytes = 2048 * value.len();
 
     store.read_bytes.store(0, Ordering::SeqCst);
-    let reader = SlateFactory::new(store.clone())
-        .open_reader("kv", "big")
+    let handle = SlateFactory::new(store.clone())
+        .open("kv", "big")
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(reader.get(b"v01024").await.unwrap(), Some(value));
+    assert_eq!(handle.durable().get(b"v01024").await.unwrap(), Some(value));
     let read = store.read_bytes.load(Ordering::SeqCst);
     assert!(
         read < namespace_bytes / 8,
         "a cold read fetched {read} of the namespace's {namespace_bytes} bytes"
     );
-    reader.close().await.unwrap();
+    handle.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn a_reader_of_an_absent_database_is_none_and_destroy_stays_inside_its_prefix() {
+async fn destroy_stays_inside_its_prefix() {
     let store = Arc::new(InMemory::new());
     let factory = SlateFactory::new(store.clone());
-    assert!(factory.open_reader("kv", "ab").await.unwrap().is_none());
     for namespace in ["ab", "abc"] {
         let db = factory.open("kv", namespace).await.unwrap();
         db.write(vec![(b"key".to_vec(), Some(b"value".to_vec()))])
@@ -465,11 +463,29 @@ async fn a_reader_of_an_absent_database_is_none_and_destroy_stays_inside_its_pre
     }
     factory.destroy("kv", "ab").await.unwrap();
     factory.destroy("kv", "ab").await.unwrap();
-    assert!(factory.open_reader("kv", "ab").await.unwrap().is_none());
-    let neighbour = factory.open_reader("kv", "abc").await.unwrap().unwrap();
+    let prefix = object_store::path::Path::from("kv").join("ab");
+    assert!(store.list(Some(&prefix)).next().await.is_none());
+    let neighbour = factory.open("kv", "abc").await.unwrap();
     assert_eq!(
-        neighbour.get(b"key").await.unwrap(),
+        neighbour.durable().get(b"key").await.unwrap(),
         Some(b"value".to_vec())
     );
     neighbour.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_reads_never_show_a_buffered_batch() {
+    let factory = SlateFactory::new(Arc::new(InMemory::new()));
+    let db = factory.open("kv", "one").await.unwrap();
+    let durable = db.durable();
+    db.write(vec![(b"key".to_vec(), Some(b"value".to_vec()))])
+        .await
+        .unwrap();
+    assert_eq!(db.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+    assert_eq!(durable.get(b"key").await.unwrap(), None);
+    assert!(durable.scan(b"", None, 10).await.unwrap().is_empty());
+    db.flush().await.unwrap();
+    assert_eq!(durable.get(b"key").await.unwrap(), Some(b"value".to_vec()));
+    assert_eq!(durable.scan(b"", None, 10).await.unwrap().len(), 1);
+    db.close().await.unwrap();
 }

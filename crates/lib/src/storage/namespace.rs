@@ -41,10 +41,13 @@ pub trait NamespaceDatabase: Send + Sync {
     async fn write(&self, changes: Changes) -> StorageResult<()>;
     async fn flush(&self) -> StorageResult<()>;
     async fn close(&self) -> StorageResult<()>;
+    /// Reads of this handle that see only what a flush made durable, never a buffered batch (#58 / B-26). Customer KV
+    /// serves reads from its writer's handle, so no separate reader polls the store. The view lives as long as the
+    /// handle: once the handle is closed or fenced, its reads fail.
+    fn durable(&self) -> Arc<dyn NamespaceReader>;
 }
 
-/// A read-only handle on a namespace database (#57 / B-39). It never writes namespace data, so opening one never fences
-/// the writer. It sees only what the writer made durable, and follows later publications on its own, a little behind.
+/// Reads of a namespace as its writer made it durable (#58 / B-26).
 #[async_trait]
 pub trait NamespaceReader: Send + Sync {
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
@@ -55,7 +58,6 @@ pub trait NamespaceReader: Send + Sync {
         after: Option<&[u8]>,
         limit: usize,
     ) -> StorageResult<Vec<Entry>>;
-    async fn close(&self) -> StorageResult<()>;
 }
 
 #[async_trait]
@@ -67,16 +69,6 @@ pub trait NamespaceFactory: Send + Sync {
         dataset: &str,
         namespace: &str,
     ) -> StorageResult<Arc<dyn NamespaceDatabase>>;
-
-    /// A read-only handle, or `None` while no writer has created the database.
-    async fn open_reader(
-        &self,
-        dataset: &str,
-        namespace: &str,
-    ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
-        let _ = (dataset, namespace);
-        Err(unsupported("read-only namespace handles"))
-    }
 
     /// Deletes every object of the database, and nothing outside `{dataset}/{namespace}/`. Open handles fail afterwards;
     /// the caller retires them first. Deleting an absent database succeeds.

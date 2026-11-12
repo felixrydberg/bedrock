@@ -37,6 +37,7 @@ materialized crash OrderedPositions
 materialized cleanup YoungEventsSurvive
 materialized retry RetryProtection
 materialized event PendingRetained
+materialized fence NoLostAck
 publisher unconditional NoLostUpdate
 publisher unconditional NoRegression
 publisher ahead ViewsLag

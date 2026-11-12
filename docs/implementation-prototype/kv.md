@@ -429,18 +429,24 @@ A cell is a self-contained cluster: its own membership, placement directory, L2 
 The earlier origin-cell and regional-tier design is superseded by `feature-drafts.md` §4 decisions 11 (2026-10-29) and
 12 (2026-10-31). In short:
 
-- **Storage.** Each namespace is its own database in S3, written by one logical `bedrock-api` writer. No cell or node owns it.
-- **Readers.** Only the namespace's home region runs its read-only SlateDB namespace reader. It keeps an engine handle and
-  may cache blocks locally. Other regions do not open SlateDB databases for that namespace; they cache returned values
-  for at most 60 seconds.
+- **Storage.** Each namespace is its own database in S3. Amended 2026-11-12 (#58 / B-26): its single writer is its
+  **owner**, a `bedrock-kv` node of its home cell, not `bedrock-api`. The record names the home region and home cell
+  (picked at creation by rendezvous over the region's known cells); within the cell the owner is the first ready member
+  by rendezvous hash of the namespace ID. Ownership is routing only: no data lives on the node.
+- **Owner reads.** The owner serves reads from its writer handle, filtered to what is durable. There is no polling
+  reader: the handle sees its own writes, and an idle handle reads the manifest every 10 s only to learn of compaction
+  or a newer writer. Other regions do not open the database; they cache returned values for at most 60 seconds.
 - **Routing.** Hash `(namespace, key)` over healthy `bedrock-kv` nodes in the request's cell to select a preferred value
-  cache. On a miss, resolve the home region through Quicksilver and forward to its namespace reader. There are no virtual
-  buckets or durable cache ownership; another eligible local cache may serve.
+  cache. On a miss, resolve the home region and cell through Quicksilver and forward to the owner. A write goes to the
+  owner the same way, from any node.
+- **Ownership moves.** When membership changes, the new owner's open fences the old handle (SlateDB writer epoch) and
+  recovers every acknowledged write; the old owner's unflushed batch fails and its caller retries with its idempotency
+  key. A fenced node leaves the namespace alone for 5 s, so two nodes whose views disagree for a moment do not keep
+  taking it from each other. `docs/spec/materialized.tla` models the move.
 - **Freshness.** Minimum-revision reads need a sufficiently new namespace view, including for absence and `LIST`. The
-  standalone writer acknowledges only after its S3 flush, so a lagging reader view is publication polling: the reader
-  polls every 1 s while open and a minimum-revision read waits up to 2 s, then fails as unavailable (B-39). A recent-state
-  path to the writer arrives with Raft (B-09b), whose committed tail precedes S3.
-- **Adding capacity** adds value-cache capacity to a cell. A home-region reader may be reopened after eviction; a drain
+  owner acknowledges only after its S3 flush, and that flush makes the write visible to its reads, so a read at an
+  acknowledged revision never waits. A node whose view is behind it has lost the namespace and fails at once.
+- **Adding capacity** spreads owners and value caches over more nodes; about 1/n of a cell's namespaces move. A drain
   releases local handles/cache state, never S3 data.
 
 The L1/L2 bucket model in the rest of this document applies to Quicksilver and CDN; Auth serving awaits Gateway.
@@ -578,12 +584,12 @@ services. Current size/storage quotas, bounded queues, coalescing and backpressu
 
 Example: a namespace homed in Europe is cached in America.
 
-1. The request reaches any API node.
-2. The namespace directory identifies its home writer.
-3. The request is forwarded to the authoritative region.
-4. The writer assigns a namespace revision and commits the operation to the namespace's S3 database (B-11).
-5. Readers see it once they refresh to a namespace view that includes it, or immediately for a minimum-revision read,
-   which waits for that view or uses the writer's recent committed state.
+1. The request reaches any `bedrock-kv` node (Cloudflare's value API, #58 / B-26).
+2. The namespace directory names its home region and cell.
+3. The request is forwarded to that cell, then to the namespace's owner there, at most two hops.
+4. The owner assigns a namespace revision and commits the operation to the namespace's S3 database (B-11), then
+   answers with the revision.
+5. The owner's reads see it as soon as it is acknowledged; other cells' value caches within their 60-second bound.
 
 No relay carries customer-KV events.
 
@@ -593,11 +599,11 @@ Example: a Frankfurt node requests a key whose namespace is homed in Paris.
 
 1. The Gateway or Compute host has already checked the caller. Check namespace deletion state, then the optional L1, and route a miss to the
    preferred healthy value-cache node in the Frankfurt cell, selected by rendezvous hash of `(namespace, key)`.
-2. On a cell cache miss, resolve the home region through Quicksilver and forward the request to the Paris namespace
-   reader. Only that home-region reader opens the namespace's SlateDB database; it serves cached blocks or fetches needed
-   ranges from S3.
-3. Return the value to Frankfurt, cache it there for at most 60 seconds, and return it to the requester. If the home
-   reader was evicted, reopen it on demand.
+2. On a cell cache miss, resolve the home region and cell through Quicksilver and forward the request to the
+   namespace's owner in Paris. Only the owner opens the namespace's SlateDB database; it serves cached blocks or fetches
+   needed ranges from S3.
+3. Return the value to Frankfurt, cache it there for at most 60 seconds, and return it to the requester. If the
+   owner's handle was evicted, reopen it on demand.
 4. Validate expiration and the namespace-view revision. A minimum-revision read must bypass cached values that cannot
    prove the requested revision.
 
@@ -643,33 +649,34 @@ SST reads. Single-key reads use indexed storage rather than a whole namespace sc
 B-39 adds customer-KV readers and caches; local pushed StorageEngine and
 CDN artifact CacheStorage retain their existing contracts.
 
-### Customer-KV Readers (B-39)
+### Customer-KV Owners (B-39, amended by B-26)
 
-- A reader is a SlateDB `DbReader` with a managed checkpoint, which protects its
-  view's files from GC without writing namespace data, so it never fences the
-  writer. All readers in a process share one block cache.
+- The owner's handle is its writer `Db`; reads use SlateDB's `Remote` durability
+  filter, so an unacknowledged batch is never visible. All handles in a process
+  share one block cache.
 - A read takes the view's revision first and the value after it. The answer's
   revision is therefore a lower bound on the value's: safe for minimum-revision
   reads and cache fills.
-- One reader per active home namespace. Handle pressure closes the least recently
-  used one, 15 minutes idle closes any; an in-flight read keeps its reader until it
-  finishes. Closing a reader never touches S3.
+- Handles open on first use. Pressure closes the least recently used one, 15
+  minutes idle closes any, and a membership change closes the namespaces that
+  moved away. Closing never touches S3. At most 8 handles open at once, so a cold
+  storm is bounded.
+- Each value is stored with its Cloudflare metadata and absolute expiration; an
+  expired key reads as absent. The namespace's live key and value bytes are kept
+  in its metadata record and checked against `storage_bytes` before a write.
 - The value cache has one process-wide byte budget, entries live at most 60 s, and
   one namespace may fill at most an eighth of it. Absences are not cached.
-- A cold open replays the WAL since the writer's last L0 flush and keeps it in
-  memory, so a reader's memory is bounded by the writer, not by the reader's
-  memtable setting. The writer flushes to L0 at 8 MiB and pauses writes once
-  16 MiB is unflushed, so a reader holds at most about 16 MiB. Afterwards a point
-  read fetches index and blocks, not the namespace.
+- The writer flushes to L0 at 8 MiB and pauses writes once 16 MiB is unflushed,
+  so a handle holds at most about 16 MiB of memtable.
 - A node's memory budget is split into quarters: one for the shared block cache,
-  one for headroom (value cache and process), and two for readers at their
-  16 MiB worst case. A 1 GiB node keeps at most 32 readers open.
+  one for headroom (value cache and process), and two for handles at their
+  16 MiB worst case. A 1 GiB node keeps at most 32 handles open.
 - Deleting a namespace records `deleting_at` and keeps its storage. An explicit
-  purge after a 20-minute grace, longer than a reader's idle close, closes this
-  node's readers, fences the writer, deletes `kv/{id}/` and then the directory
-  record; there is no undelete. A namespace deleted without a recorded time is not
-  purgeable until it is deleted again. A reader left open elsewhere fails rather
-  than reading the namespace as empty.
+  purge after a 20-minute grace closes this node's handle, fences the owner by
+  opening the database, deletes `kv/{id}/` and then the directory record; there is
+  no undelete. A namespace deleted without a recorded time is not purgeable until
+  it is deleted again. A handle left open elsewhere fails rather than reading the
+  namespace as empty.
 
 ### Future Raft Integration
 

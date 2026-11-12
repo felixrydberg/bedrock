@@ -5,7 +5,9 @@
 //! - **IDs** are random version 4 UUIDs as 32 lowercase hex characters (Cloudflare's namespace ID shape), never
 //!   reused. They are valid writer and storage identities, so a namespace's database lives at `kv/{id}/` (the writer's
 //!   `{dataset}/{namespace}` layout). Bindings reference the ID; `tenant` and `title` are descriptive only.
-//! - **Nothing locational** is recorded: no cell, origin or cache holder. Adding a cell changes no record.
+//! - **The home cell** is the only locational field (#58 / B-26): chosen at creation by rendezvous over the home region's
+//!   known cells, it pins the namespace's single writer to one cell, whose members pick the owner by rendezvous. Adding
+//!   a cell changes no record; moving a namespace to another cell is a record change (not built).
 //! - **Create** writes only the record. The writer opens the namespace's database on its first data write, so an empty
 //!   namespace has no engine objects.
 //! - **Delete** marks the record `Deleting` and stamps `deleting_at`, which closes it to new opens and writes at once.
@@ -31,7 +33,7 @@ use bedrock_lib::admin::Admin;
 use bedrock_lib::client::Client;
 use bedrock_lib::transport::tls::Tls;
 
-use crate::storage::Readers;
+use crate::storage::Owners;
 use http_body_util::Full;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -45,8 +47,8 @@ pub const SERVICE: &str = "quicksilver";
 pub const DATASET: &str = bedrock_lib::datasets::capabilities::QUICKSILVER;
 pub const NAMESPACE: &str = "infrastructure";
 pub const PREFIX: &str = "kv/namespaces/";
-/// Records this code writes; any other version is refused rather than misread.
-pub const FORMAT_VERSION: u32 = 1;
+/// Records this code writes; any other version is refused rather than misread. Version 2 adds the home cell.
+pub const FORMAT_VERSION: u32 = 2;
 /// Remote regions cache values returned by the home reader for this long (fixed, B-27).
 pub const CACHE_TTL_SECONDS: u32 = 60;
 /// Reads, writes and conflicts one operation may go through before giving up.
@@ -75,8 +77,7 @@ pub struct Record {
     pub tenant: String,
     #[prost(string, tag = "4")]
     pub title: String,
-    /// The only region that opens the namespace's database; its writer is that region's API writer. Cloudflare's
-    /// `jurisdiction`.
+    /// The only region that opens the namespace's database. Cloudflare's `jurisdiction`.
     #[prost(string, tag = "5")]
     pub home_region: String,
     /// The namespace's S3 database prefix, `kv/{id}`.
@@ -102,6 +103,9 @@ pub struct Record {
     /// before this was recorded.
     #[prost(uint64, tag = "13")]
     pub deleting_at: u64,
+    /// The cell of `home_region` whose owner writes and reads the namespace (#58 / B-26).
+    #[prost(string, tag = "14")]
+    pub home_cell: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +118,10 @@ pub enum Error {
     Rejected(Rejected),
     /// The directory kept moving under this operation; retry later.
     Contended,
+    /// Too many writes are waiting for the namespace; retry later.
+    Busy,
+    /// A key, value or request exceeds Cloudflare's size limits.
+    TooLarge(String),
     Unavailable(String),
     /// A stored record could not be decoded or failed validation.
     Corrupt(String),
@@ -136,6 +144,8 @@ impl std::fmt::Display for Error {
                 f.write_str("namespace storage quota exceeded")
             }
             Self::Contended => f.write_str("the directory changed during the operation; retry"),
+            Self::Busy => f.write_str("too many writes are waiting for this namespace; retry"),
+            Self::TooLarge(detail) => write!(f, "too large: {detail}"),
             Self::Unavailable(detail) => write!(f, "directory unavailable: {detail}"),
             Self::Corrupt(detail) => write!(f, "directory record is corrupt: {detail}"),
         }
@@ -173,6 +183,8 @@ pub fn decode(id: &str, bytes: &[u8]) -> Result<Record, Error> {
         Some("unsupported cache policy")
     } else if Lifecycle::try_from(record.state).is_err() {
         Some("unknown lifecycle state")
+    } else if record.home_cell.is_empty() {
+        Some("no home cell")
     } else {
         None
     };
@@ -201,14 +213,9 @@ pub fn admit_write(record: &Record, current: u64, added: u64) -> Result<(), Reje
 }
 
 /// How long a `Deleting` namespace keeps its storage. It outlasts directory propagation and the writes and reads that
-/// were admitted before the deletion reached them, and the idle close of a reader another node still has open, so no
-/// such reader writes a checkpoint back after the purge. A reader still open fails once its objects are gone; it never
-/// serves a missing object as an absent key.
+/// were admitted before the deletion reached them. The purge then fences the owner's handle, which fails afterwards; it
+/// never serves a missing object as an absent key.
 pub const PURGE_GRACE: Duration = Duration::from_secs(20 * 60);
-const _: () = assert!(
-    PURGE_GRACE.as_secs() > crate::storage::IDLE.as_secs() + crate::SWEEP.as_secs() + 60,
-    "a purge must wait out every reader's idle close"
-);
 
 /// Whether `record`'s storage may be purged at wall-clock `now_ms`. A deletion with no recorded time never is: deleting
 /// it again records one.
@@ -227,6 +234,8 @@ pub struct Create {
     pub tenant: String,
     pub title: String,
     pub home_region: String,
+    /// The cells of `home_region` this node knows; the namespace's home cell is picked among them.
+    pub cells: Vec<String>,
     pub storage_bytes: Option<u64>,
     pub permissions: Vec<String>,
 }
@@ -235,7 +244,14 @@ impl Create {
     fn validate(&self) -> Result<(), Error> {
         label("tenant", &self.tenant, MAX_TENANT)?;
         label("title", &self.title, MAX_TITLE)?;
-        label("home_region", &self.home_region, MAX_REGION)
+        label("home_region", &self.home_region, MAX_REGION)?;
+        if self.cells.is_empty() {
+            return Err(Error::Invalid(format!(
+                "no cell of jurisdiction {} is configured",
+                self.home_region
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -260,11 +276,6 @@ fn taken(records: &[Record], tenant: &str, title: &str, id: &str) -> bool {
 struct OperationLabels {
     operation: &'static str,
     outcome: &'static str,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct QuotaLabels {
-    quota: &'static str,
 }
 
 /// `bedrock-api`'s write endpoint.
@@ -338,11 +349,12 @@ impl Api {
 pub struct Directory {
     client: Arc<Client>,
     api: Api,
-    readers: Arc<Readers>,
+    owners: Arc<Owners>,
     /// Home region of namespaces created without a jurisdiction: this node's region.
     region: String,
+    /// Every cell this node knows, as (region, cell): its own and the configured ones.
+    cells: Vec<(String, String)>,
     operations: Family<OperationLabels, Counter>,
-    quota_rejections: Family<QuotaLabels, Counter>,
 }
 
 impl Directory {
@@ -350,8 +362,9 @@ impl Directory {
         admin: &Admin,
         client: Arc<Client>,
         api: Api,
-        readers: Arc<Readers>,
+        owners: Arc<Owners>,
         region: String,
+        cells: Vec<(String, String)>,
     ) -> Self {
         let operations = Family::default();
         admin.register(
@@ -359,19 +372,13 @@ impl Directory {
             "Namespace directory operations by outcome",
             operations.clone(),
         );
-        let quota_rejections = Family::default();
-        admin.register(
-            "kv_quota_rejections",
-            "Writes refused by a namespace quota or deletion",
-            quota_rejections.clone(),
-        );
         Self {
             client,
             api,
-            readers,
+            owners,
             region,
+            cells,
             operations,
-            quota_rejections,
         }
     }
 
@@ -383,6 +390,8 @@ impl Directory {
             Err(Error::Invalid(_)) => "invalid",
             Err(Error::Rejected(_)) => "rejected",
             Err(Error::Contended) => "contended",
+            Err(Error::Busy) => "busy",
+            Err(Error::TooLarge(_)) => "too_large",
             Err(Error::Unavailable(_)) => "unavailable",
             Err(Error::Corrupt(_)) => "corrupt",
         };
@@ -392,19 +401,17 @@ impl Directory {
         result
     }
 
-    /// [`admit_write`], counted for the quota metrics. Only B-26's write path calls it.
-    pub fn admit_write(&self, record: &Record, current: u64, added: u64) -> Result<(), Rejected> {
-        let admitted = admit_write(record, current, added);
-        if let Err(rejected) = admitted {
-            let quota = match rejected {
-                Rejected::Deleted => "deleted",
-                Rejected::StorageQuota => "storage_bytes",
-            };
-            self.quota_rejections
-                .get_or_create(&QuotaLabels { quota })
-                .inc();
-        }
-        admitted
+    /// The cells of `region` this node knows, in name order.
+    pub fn cells_of(&self, region: &str) -> Vec<String> {
+        let mut cells: Vec<String> = self
+            .cells
+            .iter()
+            .filter(|(r, _)| r == region)
+            .map(|(_, cell)| cell.clone())
+            .collect();
+        cells.sort();
+        cells.dedup();
+        cells
     }
 
     /// Namespace `id` in any state and the directory revision that proves it, from a holder at least at
@@ -499,6 +506,12 @@ impl Directory {
                     if records.iter().any(|r| r.id == id) {
                         return Err(Error::Contended);
                     }
+                    let home_cell = bedrock_lib::placement::pick(
+                        bedrock_lib::placement::hash_of(crate::storage::DATASET, &id, b""),
+                        request.cells.iter().map(String::as_str),
+                    )
+                    .expect("validated: at least one cell")
+                    .to_owned();
                     Ok(Record {
                         format_version: FORMAT_VERSION,
                         storage: storage(&id),
@@ -513,6 +526,7 @@ impl Directory {
                         state: Lifecycle::Active as i32,
                         created_at: wall_ms(),
                         deleting_at: 0,
+                        home_cell,
                     })
                 })
                 .await
@@ -604,7 +618,7 @@ impl Directory {
                     "only a namespace deleted at least PURGE_GRACE ago can be purged".into(),
                 ));
             }
-            self.readers
+            self.owners
                 .destroy(id)
                 .await
                 .map_err(|error| Error::Unavailable(error.to_string()))?;
@@ -634,9 +648,10 @@ impl Directory {
     }
 }
 
-/// Wall time is the point here (`created_at`); madsim simulates it.
+/// Wall-clock milliseconds since the Unix epoch: `created_at` and customer expirations are wall time. Madsim simulates
+/// it.
 #[allow(clippy::disallowed_methods)]
-fn wall_ms() -> u64 {
+pub fn wall_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -708,12 +723,14 @@ async fn create(
     let created = match body::<CreateBody>(&bytes) {
         Ok(CreateBody { mode: Some(_), .. }) => Err(Error::Invalid("mode is not supported".into())),
         Ok(request) => {
+            let home_region = request
+                .jurisdiction
+                .unwrap_or_else(|| directory.region.clone());
             let request = Create {
                 tenant,
                 title: request.title,
-                home_region: request
-                    .jurisdiction
-                    .unwrap_or_else(|| directory.region.clone()),
+                cells: directory.cells_of(&home_region),
+                home_region,
                 storage_bytes: request.storage_bytes,
                 permissions: request.permissions,
             };
@@ -838,7 +855,7 @@ fn namespace(record: &Record, revision: u64) -> Value {
 }
 
 /// Cloudflare's response envelope. ponytail: every error has code 10000; distinct codes when a client needs them.
-fn reply(result: Result<Value, Error>, result_info: Option<Value>) -> Response {
+pub(crate) fn reply(result: Result<Value, Error>, result_info: Option<Value>) -> Response {
     match result {
         Ok(result) => {
             let mut body =
@@ -853,6 +870,8 @@ fn reply(result: Result<Value, Error>, result_info: Option<Value>) -> Response {
                 Error::NotFound => StatusCode::NOT_FOUND,
                 Error::Invalid(_) | Error::Duplicate => StatusCode::BAD_REQUEST,
                 Error::Rejected(_) | Error::Contended => StatusCode::CONFLICT,
+                Error::Busy => StatusCode::TOO_MANY_REQUESTS,
+                Error::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
                 Error::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
                 Error::Corrupt(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };

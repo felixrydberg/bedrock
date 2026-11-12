@@ -116,6 +116,8 @@ pub struct Progress {
     pub retries: BTreeMap<String, RetryRecord>,
     pub pruned_through: u64,
     pub raft: Option<RaftPosition>,
+    /// Bytes of live keys and values, for storage quotas (#58 / B-26).
+    pub live_bytes: u64,
 }
 
 /// What [`Materialized::persist`] made durable. It leaves out the retries, because copying them costs a commit as much as
@@ -126,6 +128,7 @@ pub struct Persisted {
     pub committed_at: u64,
     pub pruned_through: u64,
     pub raft: Option<RaftPosition>,
+    pub live_bytes: u64,
 }
 
 /// The namespace's progress as this handle last wrote or read it. Taken out while a change is under way and put back only
@@ -136,18 +139,25 @@ struct Tracked {
     retries: Retries,
     pruned_through: u64,
     raft: Option<RaftPosition>,
+    live_bytes: u64,
 }
 
-impl From<View> for Tracked {
-    fn from(view: View) -> Self {
+impl Tracked {
+    fn new(view: View, live_bytes: u64) -> Self {
         Tracked {
             sequence: view.sequence,
             committed_at: view.committed_at,
             retries: view.retries.into(),
             pruned_through: view.pruned_through,
             raft: view.raft,
+            live_bytes,
         }
     }
+}
+
+/// What a live key costs against a storage quota: its key and value bytes.
+fn live_size(key: &[u8], value: &[u8]) -> u64 {
+    (key.len() + value.len()) as u64
 }
 
 /// Covered committed Raft log position, independent of namespace/engine sequences.
@@ -230,6 +240,9 @@ struct StateRecord {
     raft_term: Option<u64>,
     #[prost(uint64, tag = "8")]
     pruned_through: u64,
+    /// Bytes of live keys and values (#58 / B-26). Absent in databases written before it was kept; counted once on open.
+    #[prost(uint64, optional, tag = "9")]
+    live_bytes: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -330,6 +343,7 @@ struct State {
     committed_at: u64,
     pruned_through: u64,
     raft: Option<RaftPosition>,
+    live_bytes: Option<u64>,
 }
 
 fn decode_state(dataset: &str, namespace: &str, value: &[u8]) -> StorageResult<State> {
@@ -359,6 +373,7 @@ fn decode_state(dataset: &str, namespace: &str, value: &[u8]) -> StorageResult<S
         committed_at: record.committed_at,
         pruned_through: record.pruned_through,
         raft,
+        live_bytes: record.live_bytes,
     })
 }
 
@@ -381,8 +396,8 @@ impl Materialized {
             namespace: namespace.into(),
             tracked: Mutex::new(None),
         };
-        match materialized.read_progress().await {
-            Ok(view) => *materialized.tracked.lock().await = Some(view.into()),
+        match materialized.read_tracked().await {
+            Ok(tracked) => *materialized.tracked.lock().await = Some(tracked),
             Err(error) => {
                 let _ = materialized.db.close().await;
                 return Err(error);
@@ -395,8 +410,24 @@ impl Materialized {
     async fn take_tracked(&self, tracked: &mut Option<Tracked>) -> StorageResult<Tracked> {
         match tracked.take() {
             Some(tracked) => Ok(tracked),
-            None => Ok(self.read_progress().await?.into()),
+            None => self.read_tracked().await,
         }
+    }
+
+    /// Progress and live bytes as stored, counting the live bytes once if the database predates them.
+    async fn read_tracked(&self) -> StorageResult<Tracked> {
+        let (view, live_bytes) = self.read_progress().await?;
+        let live_bytes = match live_bytes {
+            Some(bytes) => bytes,
+            None => self
+                .db
+                .scan(b"v")
+                .await?
+                .iter()
+                .map(|(key, value)| live_size(&key[1..], value))
+                .sum(),
+        };
+        Ok(Tracked::new(view, live_bytes))
     }
 
     fn corrupt(&self, detail: impl Into<String>) -> StorageError {
@@ -408,23 +439,23 @@ impl Materialized {
 
     async fn read_view(&self) -> StorageResult<View> {
         let entries = self.db.scan(b"").await?;
-        let view = self.decode_view(entries)?;
+        let (view, _) = self.decode_view(entries)?;
         self.events_locked(&view).await?;
         Ok(view)
     }
 
-    // Applying/publishing need revision and retry metadata, not all namespace values.
-    async fn read_progress(&self) -> StorageResult<View> {
+    // Applying/publishing need revision and retry metadata, not all namespace values. Also returns the stored live bytes.
+    async fn read_progress(&self) -> StorageResult<(View, Option<u64>)> {
         let Some(metadata) = self.db.get(META_KEY).await? else {
             // A genuinely new database is empty; data without atomic metadata is corruption.
-            return self.read_view().await;
+            return Ok((self.read_view().await?, Some(0)));
         };
         let mut entries = self.db.scan(b"r").await?;
         entries.push((META_KEY.to_vec(), metadata));
         self.decode_view(entries)
     }
 
-    fn decode_view(&self, entries: Vec<Entry>) -> StorageResult<View> {
+    fn decode_view(&self, entries: Vec<Entry>) -> StorageResult<(View, Option<u64>)> {
         let mut has_events = false;
         let mut view = View {
             dataset: self.dataset.clone(),
@@ -436,7 +467,7 @@ impl Materialized {
             pruned_through: 0,
             raft: None,
         };
-        let mut metadata = None;
+        let mut metadata: Option<State> = None;
         for (encoded, value) in entries {
             match encoded.as_slice() {
                 [b'm'] => {
@@ -476,6 +507,7 @@ impl Materialized {
                 _ => return Err(self.corrupt("invalid materialized record key")),
             }
         }
+        let live_bytes = metadata.as_ref().and_then(|state| state.live_bytes);
         match metadata {
             Some(state) => {
                 view.sequence = state.sequence;
@@ -497,7 +529,7 @@ impl Materialized {
         {
             return Err(self.corrupt("invalid retry revision/expiry or zero-revision data"));
         }
-        Ok(view)
+        Ok((view, live_bytes))
     }
 
     pub async fn view(&self) -> StorageResult<View> {
@@ -530,9 +562,19 @@ impl Materialized {
             retries: view.retries.records.clone(),
             pruned_through: view.pruned_through,
             raft: view.raft,
+            live_bytes: view.live_bytes,
         };
         *slot = Some(view);
         Ok(progress)
+    }
+
+    /// Bytes of live keys and values as of the tracked revision (#58 / B-26).
+    pub async fn live_bytes(&self) -> StorageResult<u64> {
+        let mut slot = self.tracked.lock().await;
+        let tracked = self.take_tracked(&mut slot).await?;
+        let bytes = tracked.live_bytes;
+        *slot = Some(tracked);
+        Ok(bytes)
     }
 
     pub async fn apply(&self, entries: &[Committed]) -> StorageResult<()> {
@@ -557,6 +599,7 @@ impl Materialized {
             committed_at: view.committed_at,
             pruned_through: view.pruned_through,
             raft: view.raft,
+            live_bytes: view.live_bytes,
         };
         *slot = Some(view);
         Ok(persisted)
@@ -595,6 +638,8 @@ impl Materialized {
         let mut retries: BTreeMap<String, Option<RetryRecord>> = BTreeMap::new();
         let original_sequence = view.sequence;
         let mut changes: Changes = Vec::new();
+        // Live size of each key this batch writes, as of the batch so far.
+        let mut sizes: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         for entry in entries {
             let event = &entry.event;
             if event.dataset != self.dataset
@@ -635,7 +680,21 @@ impl Materialized {
                 Operation::Set(value) => Some(value.clone()),
                 Operation::Delete => None,
             };
-            changes.push((key(b'v', &event.key), value));
+            let encoded = key(b'v', &event.key);
+            let old = match sizes.get(&encoded) {
+                Some(&size) => size,
+                None => self
+                    .db
+                    .get(&encoded)
+                    .await?
+                    .map_or(0, |old| live_size(&event.key, &old)),
+            };
+            let new = value
+                .as_ref()
+                .map_or(0, |value| live_size(&event.key, value));
+            view.live_bytes = view.live_bytes.saturating_sub(old).saturating_add(new);
+            sizes.insert(encoded.clone(), new);
+            changes.push((encoded, value));
             changes.push((
                 key(b'e', &event.sequence.to_be_bytes()),
                 Some(
@@ -688,6 +747,7 @@ impl Materialized {
                     raft_index: view.raft.map(|position| position.index),
                     raft_term: view.raft.map(|position| position.term),
                     pruned_through: view.pruned_through,
+                    live_bytes: Some(view.live_bytes),
                 }
                 .encode_to_vec(),
             ),
@@ -751,7 +811,7 @@ impl Materialized {
 
     pub async fn events(&self) -> StorageResult<Vec<Committed>> {
         let _guard = self.tracked.lock().await;
-        self.events_locked(&self.read_progress().await?).await
+        self.events_locked(&self.read_progress().await?.0).await
     }
 
     /// Reads at most `limit` retained events from `from` by sequence key, never the whole history.
@@ -841,6 +901,7 @@ impl Materialized {
                     raft_index: view.raft.map(|p| p.index),
                     raft_term: view.raft.map(|p| p.term),
                     pruned_through: view.pruned_through,
+                    live_bytes: Some(view.live_bytes),
                 }
                 .encode_to_vec(),
             ),
@@ -865,10 +926,19 @@ impl Materialized {
         let _guard = self.tracked.lock().await;
         self.db.close().await
     }
+
+    /// Reads of this handle that see only what was made durable (#58 / B-26). It fails once the handle is closed.
+    pub fn reader(&self) -> Reader {
+        Reader {
+            db: self.db.durable(),
+            dataset: self.dataset.clone(),
+            namespace: self.namespace.clone(),
+        }
+    }
 }
 
-/// How often a minimum-revision read rechecks its reader's view, which follows publications on its own. A recheck reads
-/// one key the reader already holds.
+/// How often a minimum-revision read rechecks the durable view, which moves when an in-flight batch's flush completes. A
+/// recheck reads one key.
 const RECHECK: Duration = Duration::from_millis(100);
 
 /// What a [`Reader`]'s view represents: the namespace revision and its writer's commit time. Revision 0 is a namespace no
@@ -879,8 +949,8 @@ pub struct Position {
     pub committed_at: u64,
 }
 
-/// Read-only access to a namespace as its writer published it, for customer-KV readers (#57 / B-39). It never writes
-/// namespace data, so it never fences the writer, and it trails the writer by the engine's publication polling.
+/// Customer-KV reads of a namespace from its owner's writer handle, as that writer made it durable (#58 / B-26). A batch
+/// is visible once its flush completed, before its caller is answered.
 pub struct Reader {
     db: Arc<dyn NamespaceReader>,
     dataset: String,
@@ -888,29 +958,6 @@ pub struct Reader {
 }
 
 impl Reader {
-    /// `None` while no writer has created the namespace's database: every key is absent at revision 0, and the caller
-    /// opens again later rather than keeping an empty view.
-    pub async fn open(
-        factory: &dyn NamespaceFactory,
-        dataset: &str,
-        namespace: &str,
-    ) -> StorageResult<Option<Self>> {
-        validate_scope(dataset, namespace)?;
-        let Some(db) = factory.open_reader(dataset, namespace).await? else {
-            return Ok(None);
-        };
-        let reader = Reader {
-            db,
-            dataset: dataset.into(),
-            namespace: namespace.into(),
-        };
-        if let Err(error) = reader.position().await {
-            let _ = reader.db.close().await;
-            return Err(error);
-        }
-        Ok(Some(reader))
-    }
-
     fn instance(&self) -> String {
         format!("{}/{}", self.dataset, self.namespace)
     }
@@ -963,7 +1010,7 @@ impl Reader {
 
     /// `key`'s value (or proven absence) and the position it was read at.
     ///
-    // ponytail: the engine reader has no snapshot, so the position is read first and the value after it. The value comes
+    // ponytail: the durable view has no snapshot, so the position is read first and the value after it. The value comes
     // from that view or a later one, so the position is a lower bound: safe for minimum revisions and cache fills. A
     // pinned snapshot would give exact revisions if a caller ever needs them.
     pub async fn get(
@@ -1006,10 +1053,6 @@ impl Reader {
             }
         }
         Ok((page, position))
-    }
-
-    pub async fn close(&self) -> StorageResult<()> {
-        self.db.close().await
     }
 }
 

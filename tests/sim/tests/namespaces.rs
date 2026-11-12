@@ -224,9 +224,22 @@ async fn scenario() -> Vec<String> {
                 bedrock_quicksilver::run(config.clone())
             }));
         }
+        // Each kv node knows the other cell, so namespaces spread over both and writes are forwarded between them.
+        let cells = CELLS
+            .iter()
+            .filter(|(other, ..)| *other != cell)
+            .map(|(other, _, _, other_kv)| {
+                let entry = bedrock_kv::CellConfig {
+                    region: "eu".into(),
+                    address: format!("{other_kv}:7000"),
+                };
+                (other.to_string(), entry)
+            })
+            .collect();
         let config = KvConfig {
             manage_listen: Some(format!("{kv}:7003").parse().unwrap()),
             write_token: Some(TOKEN.into()),
+            cells,
             ..KvConfig::from(service(&format!("kv-{cell}"), kv, cell, &relays, &[]))
         };
         spawn(&format!("kv-{cell}"), kv, move || {
@@ -278,6 +291,38 @@ async fn scenario() -> Vec<String> {
             .await;
             assert_eq!(record(&in_a), record(&created));
             assert_eq!(record(&in_b), record(&created));
+
+            // Values are written through either cell (#58 / B-26). The namespace's home cell is one of the two, so one
+            // of these forwards; its owner commits, and each answer carries a newer namespace revision.
+            let values = format!("{mine}/{id}");
+            let greeting = format!("{values}/values/greeting?expiration_ttl=3600");
+            let first = until("value write", Duration::from_secs(60), 200, || {
+                call(kv_a, "PUT", &greeting, "hello")
+            })
+            .await;
+            let first = first["result"]["revision"].as_u64().unwrap();
+            let (status, again) = call(kv_b, "PUT", &format!("{values}/values/greeting"), "again").await;
+            assert_eq!(status, 200, "{again}");
+            let again = again["result"]["revision"].as_u64().unwrap();
+            assert!(again > first, "{again} after {first}");
+            let bulk = r#"[{"key":"a","value":"1"},{"key":"b","value":"Mg==","base64":true,"metadata":{"m":1}}]"#;
+            let (status, put) = call(kv_b, "PUT", &format!("{values}/bulk"), bulk).await;
+            assert_eq!(status, 200, "{put}");
+            assert_eq!(put["result"]["successful_key_count"], 2);
+            assert_eq!(put["result"]["revision"].as_u64().unwrap(), again + 2);
+            let (status, deleted) =
+                call(kv_a, "POST", &format!("{values}/bulk/delete"), r#"["a"]"#).await;
+            assert_eq!(status, 200, "{deleted}");
+            let (status, refused) =
+                call(kv_a, "PUT", &format!("{values}/values/x?expiration_ttl=1"), "v").await;
+            assert_eq!(status, 400, "{refused}");
+            let (status, unknown) =
+                call(kv_a, "PUT", &format!("{theirs}/{id}/values/x"), "v").await;
+            assert_eq!(status, 404, "another tenant's namespace: {unknown}");
+            // The owner wrote the namespace's database; the API writer took none of it.
+            let stored = databases.namespaces().await.unwrap();
+            assert!(stored.contains(&("kv".to_owned(), id.clone())), "{stored:?}");
+            trace.push(format!("values written through {}", again + 3));
             // Another tenant does not see it, and a tenant's titles are unique.
             let foreign = call(kv_a, "GET", &format!("{theirs}/{id}"), "").await;
             assert_eq!(foreign.0, 404, "{}", foreign.1);
@@ -405,6 +450,7 @@ async fn scenario() -> Vec<String> {
                 state: Lifecycle::Deleting as i32,
                 created_at: 1,
                 deleting_at: 0,
+                home_cell: CELLS[0].0.into(),
             };
             let request = hyper::Request::put(format!(
                 "/v1/quicksilver/infrastructure/kv/namespaces/{legacy}"

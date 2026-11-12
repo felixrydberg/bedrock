@@ -1,53 +1,102 @@
-//! Customer-KV reader residency and value caching (#57 / B-39).
+//! Customer-KV namespace ownership, owner reads and writes, and value caching (#57 / B-39, #58 / B-26).
 //!
-//! [`Readers`] keeps one read-only reader per active namespace whose home region is this node's, opened on demand and
-//! closed under handle pressure or after [`IDLE`] unused. Closing a reader never touches S3 data. [`ValueCache`] holds
-//! values a home reader returned, for at most [`CACHE_TTL_SECONDS`], under one process-wide byte budget that no single
-//! namespace can take over. Neither keeps anything for a dormant namespace, and neither polls one.
-//!
-//! Which node holds a namespace's reader, and which serves a key from its cache, is routing (B-27).
+//! Each namespace has one owner: the first of its home cell's ready `kv` members by rendezvous hash of the namespace ID
+//! ([`Owners::route`]). The owner holds the namespace's only writer handle, embedded here as an owner
+//! [`Writer`], and serves reads from that same handle, so no reader polls S3 and a read sees every acknowledged write.
+//! Handles open on first use, close under pressure or after [`IDLE`], and close when membership moves the namespace to
+//! another member. Closing never touches S3 data. A node that disagrees about ownership for a moment is fenced by the
+//! other's open and leaves the namespace alone for `FENCE_HOLD`. [`ValueCache`] holds values an owner returned, for at
+//! most [`CACHE_TTL_SECONDS`], under one process-wide byte budget that no single namespace can take over.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bedrock_lib::admin::Admin;
-use bedrock_lib::health::protection::{self, NamespaceOpens};
-use bedrock_lib::replication::materialized::{Position, Reader};
-use bedrock_lib::storage::namespace::NamespaceFactory;
-use bedrock_lib::storage::{Entry, ErrorContext, StorageError, StorageResult};
+use bedrock_lib::placement;
+use bedrock_lib::replication::Operation;
+use bedrock_lib::replication::materialized::Position;
+use bedrock_lib::replication::pb;
+use bedrock_lib::replication::writer::{CommitError, Write, Writer};
+use bedrock_lib::storage::{StorageError, StorageResult};
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::Histogram;
+use prost::Message;
 use tokio::time::Instant;
 
 use crate::namespaces::{self, CACHE_TTL_SECONDS, Record};
 
 /// The dataset customer namespaces are stored under (`kv/{id}/`).
 pub const DATASET: &str = "kv";
-/// A reader unused this long is closed; the next read reopens it.
+/// A handle unused this long is closed; the next request reopens it.
 pub const IDLE: Duration = Duration::from_secs(15 * 60);
-/// How long a minimum-revision read waits for the reader to see a revision its writer already acknowledged.
-pub const MIN_REVISION_WAIT: Duration = Duration::from_secs(2);
 /// A namespace may fill at most this fraction of the value cache, so one hot namespace cannot evict the rest.
 const SHARE: u64 = 8;
 
-/// Why a read was refused before reaching storage.
+/// A stored customer value: Cloudflare's value, metadata and absolute expiration together, so they change atomically.
+#[derive(Clone, PartialEq, Message)]
+pub struct Stored {
+    #[prost(bytes = "vec", tag = "1")]
+    pub value: Vec<u8>,
+    /// The caller's metadata, as the JSON text it sent.
+    #[prost(string, optional, tag = "2")]
+    pub metadata: Option<String>,
+    /// Seconds since the Unix epoch after which the key reads as absent; 0 never expires.
+    #[prost(uint64, tag = "3")]
+    pub expiration: u64,
+}
+
+impl Stored {
+    /// Whether the key reads as absent at wall-clock `now_s`.
+    pub fn expired(&self, now_s: u64) -> bool {
+        self.expiration != 0 && self.expiration <= now_s
+    }
+}
+
+/// One key's change in a write: a value to store, or `None` to delete it.
+pub type Change = (Vec<u8>, Option<Stored>);
+
+/// Where a namespace's requests go from this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReadError {
-    /// Only the namespace's home region opens its database; other regions ask the home.
-    NotHome,
-    /// The namespace is being deleted: it has no data to read.
+pub enum Route {
+    /// This node owns it.
+    Local,
+    /// Another member of this cell owns it; its address.
+    Peer(String),
+    /// Another cell is its home: (region, cell).
+    Cell(String, String),
+}
+
+/// Why a read or write was refused before reaching storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerError {
+    /// This node does not own the namespace; send the request where [`Owners::route`] says.
+    NotOwner(Route),
+    /// The namespace is being deleted: it has no data and takes no writes.
     Deleted,
+    /// A write would exceed the namespace's storage quota.
+    Quota,
+    Commit(CommitError),
     Storage(StorageError),
 }
 
-impl From<StorageError> for ReadError {
+impl From<StorageError> for OwnerError {
     fn from(error: StorageError) -> Self {
-        ReadError::Storage(error)
+        OwnerError::Storage(error)
     }
 }
+
+impl From<CommitError> for OwnerError {
+    fn from(error: CommitError) -> Self {
+        OwnerError::Commit(error)
+    }
+}
+
+/// This cell's members of service `kv`, as the node's membership view holds them.
+pub type Members = Arc<dyn Fn() -> BTreeMap<String, pb::Member> + Send + Sync>;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct OutcomeLabels {
@@ -55,280 +104,175 @@ struct OutcomeLabels {
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct ReasonLabels {
-    reason: &'static str,
+struct RouteLabels {
+    route: &'static str,
 }
 
-struct Open {
-    reader: Arc<Reader>,
-    used: Instant,
-    /// What the last read through this reader saw, for introspection.
-    position: Position,
-}
-
-/// One logical reader per active home namespace, bounded in number.
-pub struct Readers {
-    factory: Arc<dyn NamespaceFactory>,
-    opens: NamespaceOpens,
+/// The namespaces this node owns, and where the others' requests go.
+pub struct Owners {
+    writer: Arc<Writer>,
+    node_id: String,
     region: String,
     cell: String,
-    max_open: usize,
-    open: Mutex<BTreeMap<String, Open>>,
-    /// Readers taken out of service, by namespace; each closes once no read still holds it.
-    retired: Mutex<Vec<(String, Arc<Reader>, &'static str)>>,
-    opened: Family<OutcomeLabels, Counter>,
-    closed: Family<ReasonLabels, Counter>,
-    waits: Family<OutcomeLabels, Counter>,
-    gauge: Gauge,
+    members: Members,
+    routes: Family<RouteLabels, Counter>,
+    writes: Family<OutcomeLabels, Counter>,
+    released: Counter,
+    commit_seconds: Histogram,
+    pending_bytes: Gauge,
+    open: Gauge,
 }
 
-fn storage_error(id: &str, detail: &str) -> StorageError {
-    StorageError::Unavailable(ErrorContext {
-        engine: "kv",
-        instance: format!("{DATASET}/{id}"),
-        file: None,
-        partition: None,
-        detail: detail.into(),
-    })
-}
-
-impl Readers {
+impl Owners {
     pub fn new(
         admin: &Admin,
-        factory: Arc<dyn NamespaceFactory>,
+        writer: Arc<Writer>,
+        node_id: String,
         region: String,
         cell: String,
-        max_open: usize,
+        members: Members,
     ) -> Arc<Self> {
-        let opened = Family::default();
+        let routes = Family::default();
         admin.register(
-            "kv_reader_opens",
-            "Namespace reader opens by outcome",
-            opened.clone(),
+            "kv_routes",
+            "Customer-KV requests by where they were sent: local, a peer in this cell, or another cell",
+            routes.clone(),
         );
-        let closed = Family::default();
+        let writes = Family::default();
         admin.register(
-            "kv_reader_closes",
-            "Namespace reader closes by reason",
-            closed.clone(),
+            "kv_writes",
+            "Customer-KV write requests by outcome",
+            writes.clone(),
         );
-        let waits = Family::default();
+        let released = Counter::default();
         admin.register(
-            "kv_reader_min_revision",
-            "Minimum-revision reads: met at once, met after waiting for publication, or still behind",
-            waits.clone(),
+            "kv_owner_released",
+            "Namespace handles closed because membership moved the namespace to another member",
+            released.clone(),
         );
-        let gauge = Gauge::default();
-        admin.register("kv_readers_open", "Open namespace readers", gauge.clone());
-        let readers = Arc::new(Readers {
-            opens: NamespaceOpens::new(factory.clone(), &protection::Metrics::new(admin)),
-            factory,
+        let commit_seconds = Histogram::new([0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]);
+        admin.register(
+            "kv_commit_seconds",
+            "Customer-KV write latency from admission to durable acknowledgement",
+            commit_seconds.clone(),
+        );
+        let pending_bytes = Gauge::default();
+        admin.register(
+            "kv_pending_bytes",
+            "Customer-KV bytes admitted and not yet durable",
+            pending_bytes.clone(),
+        );
+        let open = Gauge::default();
+        admin.register("kv_owner_open", "Open namespace handles", open.clone());
+        let owners = Arc::new(Owners {
+            writer,
+            node_id,
             region,
             cell,
-            max_open,
-            open: Mutex::default(),
-            retired: Mutex::default(),
-            opened,
-            closed,
-            waits,
-            gauge,
+            members,
+            routes,
+            writes,
+            released,
+            commit_seconds,
+            pending_bytes,
+            open,
         });
-        let weak = Arc::downgrade(&readers);
+        let weak = Arc::downgrade(&owners);
         admin.introspect(move |view, _| match (view, weak.upgrade()) {
-            ("readers", Some(readers)) => Some(readers.introspect()),
+            ("owners", Some(owners)) => Some(owners.introspect()),
             _ => None,
         });
-        readers
+        owners
     }
 
-    /// Open readers with what they last saw: namespace, revision, its commit time and idle time.
+    /// Open handles: namespace and idle time. The durable head is in each read's answer.
     fn introspect(&self) -> String {
-        let now = bedrock_lib::monotonic_now();
-        let open = self.open.lock().unwrap();
-        let rows: Vec<_> = open
-            .iter()
-            .map(|(id, open)| {
-                serde_json::json!({
-                    "namespace": id,
-                    "revision": open.position.sequence,
-                    "committed_at": open.position.committed_at,
-                    "idle_ms": now.duration_since(open.used).as_millis() as u64,
-                })
+        let rows: Vec<_> = self
+            .writer
+            .open_namespaces()
+            .into_iter()
+            .map(|(_, namespace, idle)| {
+                serde_json::json!({ "namespace": namespace, "idle_ms": idle.as_millis() as u64 })
             })
             .collect();
-        serde_json::json!({ "readers": rows }).to_string()
+        serde_json::json!({ "owners": rows }).to_string()
     }
 
-    fn admit(&self, record: &Record) -> Result<(), ReadError> {
+    /// The owner of namespace `id` among this cell's ready, healthy members, if any.
+    fn owner(&self, id: &str) -> Option<pb::Member> {
+        let members = (self.members)();
+        let eligible = members
+            .values()
+            .filter(|m| m.status == pb::member::Status::Ready as i32 && m.unhealthy.is_empty());
+        placement::rank(placement::hash_of(DATASET, id, b""), eligible)
+            .first()
+            .map(|m| (*m).clone())
+    }
+
+    /// Where `record`'s requests go. Only its home cell's owner serves them; with no ready member known in this cell,
+    /// this node serves them, since it is a member itself.
+    pub fn route(&self, record: &Record) -> Route {
+        if record.home_region != self.region || record.home_cell != self.cell {
+            return Route::Cell(record.home_region.clone(), record.home_cell.clone());
+        }
+        match self.owner(&record.id) {
+            Some(owner) if owner.node_id != self.node_id => Route::Peer(owner.address),
+            _ => Route::Local,
+        }
+    }
+
+    /// Counts where a request was sent.
+    pub fn count_route(&self, route: &Route) {
+        let route = match route {
+            Route::Local => "local",
+            Route::Peer(_) => "peer",
+            Route::Cell(..) => "cell",
+        };
+        self.routes.get_or_create(&RouteLabels { route }).inc();
+    }
+
+    /// Refuses `record` unless it is active and owned here. The caller passes a fresh directory read, so a deleted
+    /// namespace is never served from a handle left open.
+    fn admit(&self, record: &Record) -> Result<(), OwnerError> {
         if namespaces::admit_open(record).is_err() {
-            return Err(ReadError::Deleted);
+            return Err(OwnerError::Deleted);
         }
-        if record.home_region != self.region {
-            return Err(ReadError::NotHome);
-        }
-        Ok(())
-    }
-
-    /// The namespace's reader, opening it if needed; `None` while no writer has created its database.
-    async fn reader(&self, id: &str) -> StorageResult<Option<Arc<Reader>>> {
-        if let Some(open) = self.open.lock().unwrap().get_mut(id) {
-            open.used = bedrock_lib::monotonic_now();
-            return Ok(Some(open.reader.clone()));
-        }
-        let opened = self.opens.open(&self.cell, DATASET, id).await;
-        let outcome = match &opened {
-            Ok(Some(_)) => "opened",
-            Ok(None) => "not_created",
-            Err(StorageError::Overloaded(_)) => "overloaded",
-            Err(_) => "error",
-        };
-        self.opened.get_or_create(&OutcomeLabels { outcome }).inc();
-        let Some(reader) = opened? else {
-            // Not kept: the database may be created any moment, and an empty view would never see it.
-            return Ok(None);
-        };
-        let (reader, evicted) = self.install(id, reader);
-        // Pressure closes what it evicted now, not at the next sweep. A reader a read still holds closes once released,
-        // so beyond `max_open` there are at most as many readers as reads in flight.
-        if evicted {
-            self.release().await;
-        }
-        Ok(Some(reader))
-    }
-
-    /// Keeps `reader` open for `id` unless another already is, evicting the least recently used readers beyond
-    /// `max_open`. Returns the reader to use and whether any was evicted.
-    fn install(&self, id: &str, reader: Arc<Reader>) -> (Arc<Reader>, bool) {
-        let mut open = self.open.lock().unwrap();
-        // A coalesced open hands every caller the same reader; the first to finish installs it.
-        let installed = open.entry(id.to_owned()).or_insert_with(|| Open {
-            reader: reader.clone(),
-            used: bedrock_lib::monotonic_now(),
-            position: Position::default(),
-        });
-        installed.used = bedrock_lib::monotonic_now();
-        let installed = installed.reader.clone();
-        // An open that started after another finished loses the install; every caller it served retires it once.
-        if !Arc::ptr_eq(&installed, &reader) {
-            let mut retired = self.retired.lock().unwrap();
-            if !retired
-                .iter()
-                .any(|(_, held, _)| Arc::ptr_eq(held, &reader))
-            {
-                retired.push((id.to_owned(), reader, "duplicate"));
-            }
-        }
-        let reader = installed;
-        let mut evicted = false;
-        // ponytail: least recently used is found by a scan over at most `max_open` readers; an ordered index if that
-        // grows large.
-        while open.len() > self.max_open {
-            evicted = true;
-            let oldest = open
-                .iter()
-                .min_by_key(|(_, open)| open.used)
-                .map(|(id, _)| id.clone())
-                .expect("over the bound means not empty");
-            let evicted = open.remove(&oldest).expect("just found");
-            self.retired
-                .lock()
-                .unwrap()
-                .push((oldest, evicted.reader, "pressure"));
-        }
-        self.gauge.set(open.len() as i64);
-        (reader, evicted)
-    }
-
-    /// Takes a reader that failed out of service, so the next read opens a fresh one.
-    fn discard(&self, id: &str, reader: &Arc<Reader>, error: &StorageError) {
-        let broken = matches!(
-            error,
-            StorageError::Corruption(_) | StorageError::IoError(_) | StorageError::Fenced(_)
-        );
-        if !broken {
-            return;
-        }
-        let mut open = self.open.lock().unwrap();
-        if open
-            .get(id)
-            .is_some_and(|open| Arc::ptr_eq(&open.reader, reader))
-        {
-            let removed = open.remove(id).expect("just checked");
-            self.retired
-                .lock()
-                .unwrap()
-                .push((id.to_owned(), removed.reader, "error"));
-            self.gauge.set(open.len() as i64);
+        match self.route(record) {
+            Route::Local => Ok(()),
+            route => Err(OwnerError::NotOwner(route)),
         }
     }
 
-    fn record(&self, id: &str, reader: &Arc<Reader>, position: Position) {
-        if let Some(open) = self.open.lock().unwrap().get_mut(id)
-            && Arc::ptr_eq(&open.reader, reader)
-            && position.sequence >= open.position.sequence
-        {
-            open.position = position;
-        }
-    }
-
-    /// Whether the reader's view is behind `min_revision`, so the read waits for publication.
-    async fn behind(&self, reader: &Reader, min_revision: u64) -> bool {
-        min_revision > 0
-            && !reader
-                .position()
-                .await
-                .is_ok_and(|position| position.sequence >= min_revision)
-    }
-
-    /// Counts a minimum-revision read and takes a broken reader out of service.
-    fn finish<T>(
-        &self,
-        id: &str,
-        reader: &Arc<Reader>,
-        min_revision: u64,
-        behind: bool,
-        result: StorageResult<(T, Position)>,
-    ) -> Result<(T, Position), ReadError> {
-        if min_revision > 0 {
-            let outcome = match (&result, behind) {
-                (Ok(_), false) => "met",
-                (Ok(_), true) => "waited",
-                (Err(_), true) => "behind",
-                (Err(_), false) => "failed",
-            };
-            self.waits.get_or_create(&OutcomeLabels { outcome }).inc();
-        }
-        match result {
-            Ok((found, position)) => {
-                self.record(id, reader, position);
-                Ok((found, position))
-            }
-            Err(error) => {
-                self.discard(id, reader, &error);
-                Err(ReadError::Storage(error))
-            }
-        }
-    }
-
-    /// `key`'s value or proven absence in the home namespace `record`, at a position at least `min_revision`. The
-    /// caller passes a fresh directory read, so a deleted namespace is never served from a reader left open.
+    /// `key`'s live value, or its proven absence, at a position at least `min_revision`. An acknowledged revision is
+    /// durable on its owner before the answer, so a view behind `min_revision` is a node that lost the namespace: the
+    /// read fails at once and the caller routes again.
     pub async fn get(
         &self,
         record: &Record,
         key: &[u8],
         min_revision: u64,
-    ) -> Result<(Option<Vec<u8>>, Position), ReadError> {
+    ) -> Result<(Option<Stored>, Position), OwnerError> {
         self.admit(record)?;
-        let id = &record.id;
-        let Some(reader) = self.reader(id).await? else {
-            return absent(id, min_revision).map(|position| (None, position));
-        };
-        let behind = self.behind(&reader, min_revision).await;
-        let read = reader.get(key, min_revision, MIN_REVISION_WAIT).await;
-        self.finish(id, &reader, min_revision, behind, read)
+        let reader = self.writer.reader(DATASET, &record.id).await?;
+        let read = reader.get(key, min_revision, Duration::ZERO).await;
+        let (raw, position) = self.checked(&record.id, read).await?;
+        Ok((live(raw, &record.id)?, position))
     }
 
-    /// Up to `limit` keys under `prefix` after `after`, as [`Readers::get`] reads one.
+    /// Passes a failed read to the writer, so a fenced or broken handle is not used again.
+    async fn checked<T>(&self, id: &str, read: StorageResult<T>) -> StorageResult<T> {
+        if let Err(error) = &read {
+            // A view behind the caller's revision is not a broken handle.
+            let behind = matches!(error, StorageError::Unavailable(context) if context.engine == "namespace");
+            if !behind {
+                self.writer.report(DATASET, id, error).await;
+            }
+        }
+        read
+    }
+
+    /// Up to `limit` live keys under `prefix` after `after`, as [`Owners::get`] reads one. Expired keys are left out, so
+    /// a page may hold fewer than `limit` while more follow.
     pub async fn list(
         &self,
         record: &Record,
@@ -336,97 +280,145 @@ impl Readers {
         after: Option<&[u8]>,
         limit: usize,
         min_revision: u64,
-    ) -> Result<(Vec<Entry>, Position), ReadError> {
+    ) -> Result<(Vec<(Vec<u8>, Stored)>, Position), OwnerError> {
         self.admit(record)?;
-        let id = &record.id;
-        let Some(reader) = self.reader(id).await? else {
-            return absent(id, min_revision).map(|position| (Vec::new(), position));
-        };
-        let behind = self.behind(&reader, min_revision).await;
+        let reader = self.writer.reader(DATASET, &record.id).await?;
         let read = reader
-            .list(prefix, after, limit, min_revision, MIN_REVISION_WAIT)
+            .list(prefix, after, limit, min_revision, Duration::ZERO)
             .await;
-        self.finish(id, &reader, min_revision, behind, read)
-    }
-
-    /// Retires readers idle for [`IDLE`] and closes every retired reader no read still holds. The caller runs this on
-    /// a process-wide timer; it costs nothing per namespace.
-    pub async fn sweep(&self) {
-        let now = bedrock_lib::monotonic_now();
-        {
-            let mut open = self.open.lock().unwrap();
-            let idle: Vec<String> = open
-                .iter()
-                .filter(|(_, open)| now.duration_since(open.used) >= IDLE)
-                .map(|(id, _)| id.clone())
-                .collect();
-            let mut retired = self.retired.lock().unwrap();
-            for id in idle {
-                let removed = open.remove(&id).expect("just listed");
-                retired.push((id, removed.reader, "idle"));
+        let (entries, position) = self.checked(&record.id, read).await?;
+        let mut page = Vec::with_capacity(entries.len());
+        for (key, raw) in entries {
+            if let Some(stored) = live(Some(raw), &record.id)? {
+                page.push((key, stored));
             }
-            self.gauge.set(open.len() as i64);
         }
-        self.release().await;
+        Ok((page, position))
     }
 
-    /// Closes every retired reader no read still holds.
-    async fn release(&self) {
-        let closable: Vec<_> = {
-            let mut retired = self.retired.lock().unwrap();
-            let (closable, held) = std::mem::take(&mut *retired)
-                .into_iter()
-                .partition(|(_, reader, _)| Arc::strong_count(reader) == 1);
-            *retired = held;
-            closable
+    /// Commits `changes` to `record` in order and in one atomic batch, after its quota admits them, and returns the
+    /// revision of the last. With `idempotency`, a retry returns the original revision without writing again.
+    pub async fn write(
+        &self,
+        record: &Record,
+        changes: Vec<Change>,
+        idempotency: Option<&str>,
+    ) -> Result<u64, OwnerError> {
+        let written = self.try_write(record, changes, idempotency).await;
+        let outcome = match &written {
+            Ok(_) => "committed",
+            Err(OwnerError::NotOwner(_)) => "not_owner",
+            Err(OwnerError::Deleted) => "deleted",
+            Err(OwnerError::Quota) => "quota",
+            Err(OwnerError::Commit(CommitError::Busy)) => "busy",
+            Err(OwnerError::Commit(CommitError::Fenced)) => "fenced",
+            Err(_) => "failed",
         };
-        for (_, reader, reason) in closable {
-            self.stop(&reader, reason).await;
-        }
+        self.writes.get_or_create(&OutcomeLabels { outcome }).inc();
+        written
     }
 
-    async fn stop(&self, reader: &Reader, reason: &'static str) {
-        if let Err(error) = reader.close().await {
-            tracing::debug!(%error, "closing a namespace reader failed");
+    async fn try_write(
+        &self,
+        record: &Record,
+        changes: Vec<Change>,
+        idempotency: Option<&str>,
+    ) -> Result<u64, OwnerError> {
+        self.admit(record)?;
+        // ponytail: counts each stored value in full, ignoring what it replaces, so an overwrite at the limit is refused;
+        // concurrent requests can overshoot by one batch. Exact accounting needs the old sizes before admission.
+        let added: u64 = changes
+            .iter()
+            .filter_map(|(key, stored)| {
+                stored
+                    .as_ref()
+                    .map(|s| (key.len() + s.encoded_len()) as u64)
+            })
+            .sum();
+        if record.storage_bytes.is_some() {
+            let current = self.writer.live_bytes(DATASET, &record.id).await?;
+            if namespaces::admit_write(record, current, added).is_err() {
+                return Err(OwnerError::Quota);
+            }
         }
-        self.closed.get_or_create(&ReasonLabels { reason }).inc();
+        let single = changes.len() == 1;
+        let writes = changes
+            .into_iter()
+            .enumerate()
+            .map(|(index, (key, stored))| Write {
+                dataset: DATASET.into(),
+                namespace: record.id.clone(),
+                key,
+                operation: match stored {
+                    Some(stored) => Operation::Set(stored.encode_to_vec()),
+                    None => Operation::Delete,
+                },
+                idempotency_key: idempotency.map(|key| {
+                    if single {
+                        key.to_owned()
+                    } else {
+                        format!("{key}#{index}")
+                    }
+                }),
+                expected: None,
+            })
+            .collect();
+        let started = bedrock_lib::monotonic_now();
+        self.pending_bytes.inc_by(added as i64);
+        let committed = self.writer.commit_all(writes).await;
+        self.pending_bytes.dec_by(added as i64);
+        self.commit_seconds.observe(
+            bedrock_lib::monotonic_now()
+                .duration_since(started)
+                .as_secs_f64(),
+        );
+        let revisions = committed?;
+        Ok(*revisions.last().expect("a write has at least one change"))
     }
 
-    /// Deletes every stored object of namespace `id`, after closing each of its local readers and fencing its writer, so
-    /// nothing still running writes a checkpoint or publication back under the deleted prefix. Readers are closed at
-    /// once, not when idle: the namespace is deleted, so a read still holding one fails rather than being waited for.
+    /// Closes the handles of namespaces membership has moved to another member, so this node stops serving them.
+    /// The caller runs it whenever its membership view advances.
+    pub async fn release_moved(&self) {
+        for (_, id, _) in self.writer.open_namespaces() {
+            let moved = self
+                .owner(&id)
+                .is_some_and(|owner| owner.node_id != self.node_id);
+            if moved {
+                self.writer.release(DATASET, &id).await;
+                self.released.inc();
+            }
+        }
+        self.open.set(self.writer.open_namespaces().len() as i64);
+    }
+
+    /// Closes handles idle for [`IDLE`]. The caller runs this on a process-wide timer; it costs nothing per namespace.
+    pub async fn sweep(&self) {
+        self.writer.sweep(IDLE).await;
+        self.open.set(self.writer.open_namespaces().len() as i64);
+    }
+
+    /// Deletes every stored object of namespace `id`, after closing this node's handle and fencing any other writer, so
+    /// nothing still running writes back under the deleted prefix.
     pub async fn destroy(&self, id: &str) -> StorageResult<()> {
-        let mut stopping = Vec::new();
-        {
-            let mut open = self.open.lock().unwrap();
-            stopping.extend(open.remove(id).map(|open| open.reader));
-            self.gauge.set(open.len() as i64);
-            let mut retired = self.retired.lock().unwrap();
-            let (theirs, others) = std::mem::take(&mut *retired)
-                .into_iter()
-                .partition(|(namespace, _, _)| namespace == id);
-            *retired = others;
-            stopping.extend(theirs.into_iter().map(|(_, reader, _)| reader));
-        }
-        for reader in stopping {
-            self.stop(&reader, "purge").await;
-        }
-        // Opening a writer fences any `bedrock-api` writer still open on the namespace. Refusing it a new one is write
-        // admission's (B-26): a `Deleting` namespace takes no writes.
-        self.factory.open(DATASET, id).await?.close().await?;
-        self.factory.destroy(DATASET, id).await
+        self.writer.destroy(DATASET, id).await
     }
 }
 
-/// A namespace no write has reached holds nothing, at revision 0; a later revision has not been published yet.
-fn absent(id: &str, min_revision: u64) -> Result<Position, ReadError> {
-    if min_revision > 0 {
-        return Err(ReadError::Storage(storage_error(
-            id,
-            "namespace database not created yet",
-        )));
-    }
-    Ok(Position::default())
+/// A stored value as the caller sees it: absent once expired, and corruption if it does not decode.
+fn live(raw: Option<Vec<u8>>, id: &str) -> StorageResult<Option<Stored>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let stored = Stored::decode(raw.as_slice()).map_err(|_| {
+        StorageError::Corruption(bedrock_lib::storage::ErrorContext {
+            engine: "kv",
+            instance: format!("{DATASET}/{id}"),
+            file: None,
+            partition: None,
+            detail: "stored value is not a valid envelope".into(),
+        })
+    })?;
+    Ok((!stored.expired(namespaces::wall_ms() / 1000)).then_some(stored))
 }
 
 struct Cached {
@@ -441,7 +433,7 @@ impl Cached {
     }
 }
 
-/// Values a home reader returned, by namespace and key, under one byte budget for the process.
+/// Values an owner returned, by namespace and key, under one byte budget for the process.
 pub struct ValueCache {
     budget: u64,
     inner: Mutex<CacheState>,
@@ -575,9 +567,9 @@ impl ValueCache {
     }
 }
 
-/// How many readers a node with `memory_mb` of budget keeps open. A quarter of the budget is the shared block cache
-/// and a quarter is headroom for the value cache and the process; the other half holds readers at their worst case,
-/// 16 MiB of replayed WAL each (the writer's L0 settings in `SlateFactory`).
+/// How many namespace handles a node with `memory_mb` of budget keeps open. A quarter of the budget is the shared block
+/// cache and a quarter is headroom for the value cache and the process; the other half holds handles at their worst
+/// case, 16 MiB of unflushed memtable each (the writer's L0 settings in `SlateFactory`).
 pub fn max_open(memory_mb: u64) -> usize {
     // ponytail: sized for every reader full at once; a measured bound once B-53's benchmarks exist.
     (memory_mb / 2 / 16).max(1) as usize

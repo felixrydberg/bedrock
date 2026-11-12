@@ -134,5 +134,6 @@ The I/O rules in `clippy.toml` apply to every crate; adapters opt out with an ex
 | `s3`             | Namespace-engine object I/O and checksummed CDN artifact storage     |
 | `transport`      | Node-to-node transport and mutual TLS                     |
 | `quicksilver/storage` | Quicksilver L1/L2 hash-range keyspace and eviction, on top of `lib/storage`; Auth awaits Gateway |
-| `kv/storage`     | Customer-KV reader residency and cache eviction (B-28, B-39)          |
+| `kv/storage`     | Customer-KV namespace ownership, owner handle residency and value cache (B-26, B-28, B-39) |
+| `kv/operations`  | Customer-KV writes: Cloudflare's value API and forwarding to the owner (B-26) |
 

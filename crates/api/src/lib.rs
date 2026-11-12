@@ -9,22 +9,28 @@
 //! holding a revision commits only if that is still the namespace's head, otherwise it answers 412 with the head
 //! as the body and writes nothing.
 //! Every write requires `Authorization: Bearer <write_token>`; the configured token grants access to all writes.
+//! Only pushed datasets are written here. Customer KV (`kv`) is written by each namespace's owning `bedrock-kv` node
+//! (#58 / B-26): this writer neither takes its writes nor opens its databases, which would fence that owner.
 //! With `tls` configured, both listeners use TLS (B-55): relays need a node certificate, while write callers may
 //! present one but still authenticate with the token.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::routing::put;
+use bedrock_lib::datasets::capabilities;
 use bedrock_lib::node::{self, ApiConfig, ConfigError};
 use bedrock_lib::replication::Operation;
 use bedrock_lib::replication::writer::{
     CommitError, Persistence, PersistenceMetrics, Write, Writer,
 };
+use bedrock_lib::storage::StorageResult;
+use bedrock_lib::storage::namespace::{NamespaceDatabase, NamespaceFactory};
 use bedrock_lib::transport;
 use tokio::net::TcpListener;
 
@@ -47,7 +53,7 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     let writer = Writer::open(
         now,
         Persistence {
-            factory,
+            factory: Arc::new(Pushed(factory)),
             retention: config.retention,
             metrics: PersistenceMetrics::new(&admin),
         },
@@ -116,6 +122,12 @@ async fn write(
         Some(Some(revision)) => Some(revision),
         Some(None) => return (StatusCode::BAD_REQUEST, "invalid If-Match".into()),
     };
+    if !capabilities::pushed(&dataset) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{dataset} is not written here; its own service writes it"),
+        );
+    }
     let operation = match method {
         Method::DELETE => Operation::Delete,
         _ => Operation::Set(value.to_vec()),
@@ -144,6 +156,27 @@ async fn write(
             };
             (status, error.to_string())
         }
+    }
+}
+
+/// The bucket as this writer sees it: startup recovery lists only pushed datasets' databases. Opening another service's
+/// database would take it from that service's writer.
+struct Pushed(Arc<dyn NamespaceFactory>);
+
+#[async_trait]
+impl NamespaceFactory for Pushed {
+    async fn namespaces(&self) -> StorageResult<Vec<(String, String)>> {
+        let mut scopes = self.0.namespaces().await?;
+        scopes.retain(|(dataset, _)| capabilities::pushed(dataset));
+        Ok(scopes)
+    }
+
+    async fn open(
+        &self,
+        dataset: &str,
+        namespace: &str,
+    ) -> StorageResult<Arc<dyn NamespaceDatabase>> {
+        self.0.open(dataset, namespace).await
     }
 }
 

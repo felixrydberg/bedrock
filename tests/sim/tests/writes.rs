@@ -331,7 +331,8 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc)),
     );
     scenario(api, replication).await;
-    let (status, sequence) = send(
+    // Customer KV is written by its owning `bedrock-kv` node (#58 / B-26), never through the API writer.
+    let (status, _) = send(
         api,
         "PUT",
         "/v1/kv/customer/key",
@@ -340,16 +341,7 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
         &[AUTHORIZATION],
     )
     .await;
-    assert_eq!((status, sequence), (StatusCode::OK, "1".into()));
-    assert_eq!(
-        writer
-            .bootstrap("kv", "customer")
-            .await
-            .unwrap()
-            .values
-            .get(b"key".as_slice()),
-        Some(&b"value".to_vec())
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     writer.close().await.unwrap();
 }
 

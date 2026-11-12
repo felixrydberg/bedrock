@@ -5,7 +5,9 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
-axum = { workspace = true, features = ["json", "query"] }
+axum = { workspace = true, features = ["json", "multipart", "query"] }
+# Bulk writes' base64 values (#58 / B-26); already in the tree through object_store.
+base64 = "0.22"
 bedrock-lib.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true

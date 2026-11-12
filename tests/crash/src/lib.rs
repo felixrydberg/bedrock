@@ -464,6 +464,10 @@ impl Cluster {
                     self.options.s3,
                 );
                 if node.kind == Kind::Kv {
+                    top += &format!(
+                        "write_token = {TOKEN:?}
+"
+                    );
                     tables += &format!(
                         "[s3]\nendpoint = {:?}\nbucket = {:?}\naccess_key_id = \"local\"\nsecret_access_key = \"local\"\n",
                         format!("http://127.0.0.1:{}", self.s3.port),

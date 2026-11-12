@@ -2,6 +2,11 @@
 //! Each SlateDB batch atomically stores original events, resolved values, retry results
 //! and progress. Only remote durability allows a response or subscription publication.
 //! Future B-09b commits through Raft first and uses the same persistence operation.
+//!
+//! [`Writer::open`] is `bedrock-api`'s writer for pushed datasets: it recovers every namespace at startup and feeds the
+//! relay log. [`Writer::owner`] is a customer-KV node's writer for the namespaces it owns (#58 / B-26): it opens each on
+//! first use, keeps at most `max_open` open, publishes no relay log, serves reads from the same handle
+//! ([`Writer::reader`]) and, after another node fenced it, waits [`FENCE_HOLD`] before taking a namespace back.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,7 +21,7 @@ use tokio::sync::oneshot;
 
 use super::log::{Log, MemoryLog};
 use super::materialized::{
-    Committed, Materialized, Persisted, Retention, Retries, RetryRecord, Snapshot, View,
+    Committed, Materialized, Persisted, Reader, Retention, Retries, RetryRecord, Snapshot, View,
     validate_scope,
 };
 use super::{Event, Operation, stream};
@@ -31,6 +36,9 @@ const RECOVERY_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 const RECOVERY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
 /// Maximum writes waiting for the next namespace batch.
 pub const MAX_QUEUED: usize = 1024;
+/// How long an owner writer leaves a namespace alone after another writer fenced it. Membership views converge within
+/// this, so two nodes that both think they own a namespace stop taking it from each other.
+pub const FENCE_HOLD: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Write {
@@ -120,6 +128,15 @@ pub struct Writer {
     persistence: Persistence,
     slots: tokio::sync::Semaphore,
     closed: AtomicBool,
+    /// Set for an owner writer ([`Writer::owner`]).
+    owner: Option<Owner>,
+}
+
+struct Owner {
+    max_open: usize,
+    /// Bounds concurrent cold opens, which read a manifest, write a fence and start engine tasks.
+    // ponytail: one process-wide bound; per-cell fairness (`health::protection::Limiter`) if cross-cell surges show.
+    opening: tokio::sync::Semaphore,
 }
 
 #[derive(Default)]
@@ -127,6 +144,9 @@ struct Namespace {
     queue: Mutex<Vec<Queued>>,
     state: tokio::sync::Mutex<State>,
     flow: Mutex<CleanupFlow>,
+    /// Whether the namespace has an open handle, and when it was last used: what an owner writer evicts by.
+    open: AtomicBool,
+    used: Mutex<Option<tokio::time::Instant>>,
 }
 
 #[derive(Default)]
@@ -148,6 +168,8 @@ struct State {
     retries: Retries,
     unresolved: Option<Vec<Committed>>,
     fenced: bool,
+    /// When this handle was fenced; an owner writer may take the namespace back [`FENCE_HOLD`] later.
+    fenced_at: Option<tokio::time::Instant>,
     recovery: Vec<std::sync::Weak<RecoveryLease>>,
 }
 
@@ -190,20 +212,49 @@ impl Writer {
         self.log.clone()
     }
 
-    pub async fn open(clock: fn() -> u64, config: Persistence) -> StorageResult<Arc<Self>> {
+    fn new(
+        clock: fn() -> u64,
+        config: Persistence,
+        owner: Option<Owner>,
+    ) -> StorageResult<Arc<Self>> {
         config.retention.validate()?;
         let log = Arc::new(MemoryLog::with_retention(
             clock,
             config.retention.event_retention_ms,
         ));
-        let writer = Arc::new(Self {
+        Ok(Arc::new(Self {
             clock,
             log,
             namespaces: Mutex::default(),
             persistence: config,
             slots: tokio::sync::Semaphore::new(4),
             closed: AtomicBool::new(false),
-        });
+            owner,
+        }))
+    }
+
+    /// A customer-KV owner's writer (#58 / B-26): nothing is opened until used, at most `max_open` namespaces stay open,
+    /// the least recently used closing first, and no relay log is kept. The caller routes each namespace to one owner;
+    /// a second writer opening it fences this one, as SlateDB guarantees and `docs/spec/materialized.tla` models.
+    pub fn owner(
+        clock: fn() -> u64,
+        config: Persistence,
+        max_open: usize,
+    ) -> StorageResult<Arc<Self>> {
+        Self::new(
+            clock,
+            config,
+            Some(Owner {
+                max_open: max_open.max(1),
+                opening: tokio::sync::Semaphore::new(
+                    crate::health::protection::NAMESPACE_OPENS.total,
+                ),
+            }),
+        )
+    }
+
+    pub async fn open(clock: fn() -> u64, config: Persistence) -> StorageResult<Arc<Self>> {
+        let writer = Self::new(clock, config, None)?;
         let result = async {
             for (dataset, namespace) in writer.persistence.factory.namespaces().await? {
                 validate_scope(&dataset, &namespace)?;
@@ -233,6 +284,16 @@ impl Writer {
         if let Some(source) = &state.source {
             return Ok(source.clone());
         }
+        let _permit = match &self.owner {
+            Some(owner) => Some(
+                owner
+                    .opening
+                    .acquire()
+                    .await
+                    .map_err(|_| unavailable("writer closed"))?,
+            ),
+            None => None,
+        };
         let source = Arc::new(
             Materialized::open(self.persistence.factory.as_ref(), dataset, namespace).await?,
         );
@@ -242,6 +303,32 @@ impl Writer {
                 return Err(unavailable(
                     "Raft-backed namespace requires the Raft writer",
                 ));
+            }
+            if self.owner.is_some() {
+                // No relay log; a reopen may only find what this handle already made durable, or more that a writer
+                // that took the namespace meanwhile added.
+                if progress.sequence < state.head {
+                    return Err(StorageError::Corruption(ErrorContext {
+                        engine: "writer",
+                        instance: format!("{dataset}/{namespace}"),
+                        file: None,
+                        partition: None,
+                        detail: format!(
+                            "reopened store is at {} behind durable head {}",
+                            progress.sequence, state.head
+                        ),
+                    }));
+                }
+                // The store moved past this handle's head: a failed batch either landed or another owner took its
+                // revisions meanwhile. Its callers were told the outcome is unknown and retry with their idempotency keys,
+                // which find a batch that landed; replaying it now would collide with the other owner's revisions.
+                if progress.sequence > state.head {
+                    state.unresolved = None;
+                }
+                state.head = progress.sequence;
+                state.committed_at = progress.committed_at;
+                state.retries = progress.retries.into();
+                return Ok(());
             }
             // A reopen after `discard` keeps the log, which holds what was durable. It gains what became durable since,
             // such as a batch whose flush landed but reported failure, and may lack nothing.
@@ -286,7 +373,79 @@ impl Writer {
             return Err(error);
         }
         state.source = Some(source.clone());
+        if self.owner.is_some() {
+            let ns = self.namespace(dataset, namespace);
+            ns.open.store(true, Ordering::SeqCst);
+            *ns.used.lock().unwrap() = Some(crate::monotonic_now());
+            self.evict(Some(&ns)).await;
+        }
         Ok(source)
+    }
+
+    /// Closes the least recently used idle handles while more than `max_open` are open, never `keep`'s. A namespace
+    /// in use, or with a batch whose flush failed, stays open until a later pass: the next open or finished batch.
+    async fn evict(&self, keep: Option<&Arc<Namespace>>) {
+        let Some(owner) = &self.owner else {
+            return;
+        };
+        let mut open: Vec<(Option<tokio::time::Instant>, Arc<Namespace>)> = self
+            .namespaces
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|ns| ns.open.load(Ordering::SeqCst))
+            .map(|ns| (*ns.used.lock().unwrap(), ns.clone()))
+            .collect();
+        let mut count = open.len();
+        // ponytail: sorts every open namespace on each cold open; an ordered index if `max_open` grows large.
+        open.sort_by_key(|(used, _)| *used);
+        for (_, ns) in open {
+            if count <= owner.max_open {
+                return;
+            }
+            if keep.is_some_and(|keep| Arc::ptr_eq(&ns, keep))
+                || !ns.queue.lock().unwrap().is_empty()
+            {
+                continue;
+            }
+            let Ok(mut state) = ns.state.try_lock() else {
+                continue;
+            };
+            if state.unresolved.is_some() {
+                continue;
+            }
+            Self::shut(&ns, &mut state).await;
+            count -= 1;
+        }
+    }
+
+    /// Closes the namespace's handle and forgets its state; the next use reopens it from the store.
+    async fn shut(ns: &Namespace, state: &mut State) {
+        if let Some(source) = state.source.take()
+            && let Err(error) = source.close().await
+        {
+            tracing::debug!(%error, "closing a namespace handle failed");
+        }
+        *state = State::default();
+        ns.open.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this handle is fenced. An owner writer takes the namespace back after [`FENCE_HOLD`]: a fresh open
+    /// recovers the store and fences whoever had it.
+    fn held(&self, state: &mut State) -> bool {
+        if !state.fenced {
+            return false;
+        }
+        let expired = state
+            .fenced_at
+            .is_some_and(|at| crate::monotonic_now().duration_since(at) >= FENCE_HOLD);
+        if self.owner.is_some() && expired {
+            state.fenced = false;
+            state.fenced_at = None;
+            state.source = None;
+            return false;
+        }
+        true
     }
 
     /// SlateDB closes a database for good when one of its background tasks fails, which a single failed S3 request can
@@ -295,6 +454,9 @@ impl Writer {
     /// writer owns the namespace.
     fn discard(state: &mut State, error: &StorageError) {
         if matches!(error, StorageError::Fenced(_)) {
+            if !state.fenced {
+                state.fenced_at = Some(crate::monotonic_now());
+            }
             state.fenced = true;
         } else {
             state.source = None;
@@ -327,7 +489,7 @@ impl Writer {
     /// Settles a failed flush before a read that needs a coherent view. Waiting for a later commit could wait forever: a
     /// membership publisher writes only once its own bootstrap succeeded.
     async fn settle(&self, state: &mut State, dataset: &str, namespace: &str) -> StorageResult<()> {
-        if state.fenced {
+        if self.held(state) {
             return Err(unavailable("another writer owns this namespace"));
         }
         self.source(state, dataset, namespace).await?;
@@ -417,7 +579,7 @@ impl Writer {
         validate_scope(dataset, namespace)?;
         let ns = self.namespace(dataset, namespace);
         let mut state = ns.state.lock().await;
-        if state.fenced || state.unresolved.is_some() {
+        if self.held(&mut state) || state.unresolved.is_some() {
             return Ok(());
         }
         let source = self.source(&mut state, dataset, namespace).await?;
@@ -451,9 +613,11 @@ impl Writer {
             removed <= through,
             "cleanup removed through {removed}, past recovery boundary {through}"
         );
-        self.log
-            .prune(dataset, namespace, removed)
-            .map_err(|detail| unavailable(&detail))?;
+        if self.owner.is_none() {
+            self.log
+                .prune(dataset, namespace, removed)
+                .map_err(|detail| unavailable(&detail))?;
+        }
         state.retries.expire(now);
         Ok(())
     }
@@ -474,24 +638,177 @@ impl Writer {
     }
 
     pub async fn commit(self: &Arc<Self>, write: Write) -> Result<u64, CommitError> {
-        validate(&write)?;
+        let mut committed = self.commit_all(vec![write]).await?;
+        Ok(committed.pop().expect("one write, one revision"))
+    }
+
+    /// Commits writes to one namespace in order and in one atomic batch: they enter the queue together, and a drain
+    /// takes the whole queue. Returns each write's revision, or the first error, which then applies to all of them.
+    pub async fn commit_all(self: &Arc<Self>, writes: Vec<Write>) -> Result<Vec<u64>, CommitError> {
+        let Some(first) = writes.first() else {
+            return Ok(Vec::new());
+        };
+        for write in &writes {
+            validate(write)?;
+            if write.dataset != first.dataset || write.namespace != first.namespace {
+                return Err(CommitError::Invalid(
+                    "one batch writes one namespace".into(),
+                ));
+            }
+        }
         if self.closed.load(Ordering::SeqCst) {
             return Err(CommitError::Unavailable("writer closed".into()));
         }
-        let ns = self.namespace(&write.dataset, &write.namespace);
-        let (done, committed) = oneshot::channel();
+        let ns = self.namespace(&first.dataset, &first.namespace);
+        let mut waiting = Vec::with_capacity(writes.len());
         {
             let mut queue = ns.queue.lock().unwrap();
-            if queue.len() >= MAX_QUEUED {
+            // A batch larger than the bound is admitted into an empty queue, so it is bounded by its caller's request size.
+            if queue.len() >= MAX_QUEUED
+                || (!queue.is_empty() && queue.len() + writes.len() > MAX_QUEUED)
+            {
                 return Err(CommitError::Busy);
             }
-            queue.push(Queued { write, done });
+            for write in writes {
+                let (done, committed) = oneshot::channel();
+                queue.push(Queued { write, done });
+                waiting.push(committed);
+            }
         }
         // Caller cancellation cannot interrupt persistence between buffering and durability.
         tokio::spawn(self.clone().drain(ns));
-        committed
-            .await
-            .unwrap_or_else(|_| Err(CommitError::Unavailable("writer stopped".into())))
+        let mut revisions = Vec::with_capacity(waiting.len());
+        let mut failure = None;
+        for committed in waiting {
+            match committed.await {
+                Ok(Ok(revision)) => revisions.push(revision),
+                Ok(Err(error)) => {
+                    failure.get_or_insert(error);
+                }
+                Err(_) => {
+                    failure.get_or_insert(CommitError::Unavailable("writer stopped".into()));
+                }
+            }
+        }
+        failure.map_or(Ok(revisions), Err)
+    }
+
+    /// Reads of namespace `dataset/namespace` from this owner's handle, opening it if needed (#58 / B-26). Only what
+    /// a flush made durable is visible. The reader fails once the handle closes; ask again for a fresh one.
+    // ponytail: takes the namespace gate, so a read waits out a flush in progress; a lock-free handle if that shows.
+    pub async fn reader(&self, dataset: &str, namespace: &str) -> StorageResult<Reader> {
+        validate_scope(dataset, namespace)?;
+        let ns = self.namespace(dataset, namespace);
+        let mut state = ns.state.lock().await;
+        self.settle(&mut state, dataset, namespace).await?;
+        let source = self.source(&mut state, dataset, namespace).await?;
+        *ns.used.lock().unwrap() = Some(crate::monotonic_now());
+        Ok(source.reader())
+    }
+
+    /// Takes a failure seen by a [`Writer::reader`] into account, as a failed write would be: a fenced handle waits
+    /// out [`FENCE_HOLD`], any other failed one is reopened by the next use.
+    pub async fn report(&self, dataset: &str, namespace: &str, error: &StorageError) {
+        if !matches!(
+            error,
+            StorageError::Fenced(_)
+                | StorageError::Corruption(_)
+                | StorageError::IoError(_)
+                | StorageError::Unavailable(_)
+        ) {
+            return;
+        }
+        let Some(ns) = self
+            .namespaces
+            .lock()
+            .unwrap()
+            .get(&(dataset.into(), namespace.into()))
+            .cloned()
+        else {
+            return;
+        };
+        let mut state = ns.state.lock().await;
+        if state.source.is_some() && state.unresolved.is_none() {
+            Self::discard(&mut state, error);
+        }
+    }
+
+    /// The namespace's live key and value bytes as of its durable head, for storage quotas.
+    pub async fn live_bytes(&self, dataset: &str, namespace: &str) -> StorageResult<u64> {
+        validate_scope(dataset, namespace)?;
+        let ns = self.namespace(dataset, namespace);
+        let mut state = ns.state.lock().await;
+        self.settle(&mut state, dataset, namespace).await?;
+        let source = self.source(&mut state, dataset, namespace).await?;
+        source.live_bytes().await
+    }
+
+    /// Closes the namespace's handle, e.g. once this node no longer owns it. A batch whose flush failed keeps it open,
+    /// so it is retried rather than lost; the next owner's open recovers whatever did land.
+    pub async fn release(&self, dataset: &str, namespace: &str) {
+        let Some(ns) = self
+            .namespaces
+            .lock()
+            .unwrap()
+            .get(&(dataset.into(), namespace.into()))
+            .cloned()
+        else {
+            return;
+        };
+        let mut state = ns.state.lock().await;
+        if state.unresolved.is_none() {
+            Self::shut(&ns, &mut state).await;
+        }
+    }
+
+    /// Closes the handles idle for at least `idle`, with what [`Writer::release`] keeps open.
+    pub async fn sweep(&self, idle: std::time::Duration) {
+        let now = crate::monotonic_now();
+        let idle: Vec<(String, String)> = self
+            .namespaces
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, ns)| {
+                ns.open.load(Ordering::SeqCst)
+                    && ns
+                        .used
+                        .lock()
+                        .unwrap()
+                        .is_none_or(|used| now.duration_since(used) >= idle)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for (dataset, namespace) in idle {
+            self.release(&dataset, &namespace).await;
+        }
+    }
+
+    /// Open handles with their durable head and idle time, for introspection.
+    pub fn open_namespaces(&self) -> Vec<(String, String, std::time::Duration)> {
+        let now = crate::monotonic_now();
+        self.namespaces
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, ns)| ns.open.load(Ordering::SeqCst))
+            .map(|((dataset, namespace), ns)| {
+                let used = ns.used.lock().unwrap().unwrap_or(now);
+                (dataset.clone(), namespace.clone(), now.duration_since(used))
+            })
+            .collect()
+    }
+
+    /// Deletes every stored object of the namespace after closing this writer's handle and fencing any other: the open
+    /// here takes the namespace from whichever writer still had it, so nothing writes back under the deleted prefix.
+    pub async fn destroy(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
+        validate_scope(dataset, namespace)?;
+        let ns = self.namespace(dataset, namespace);
+        let mut state = ns.state.lock().await;
+        Self::shut(&ns, &mut state).await;
+        let factory = self.persistence.factory.as_ref();
+        factory.open(dataset, namespace).await?.close().await?;
+        factory.destroy(dataset, namespace).await
     }
 
     fn namespace(&self, dataset: &str, namespace: &str) -> Arc<Namespace> {
@@ -511,7 +828,10 @@ impl Writer {
         }
         let dataset = queued[0].write.dataset.clone();
         let name = queued[0].write.namespace.clone();
-        let setup = if state.fenced {
+        if self.owner.is_some() {
+            *ns.used.lock().unwrap() = Some(crate::monotonic_now());
+        }
+        let setup = if self.held(&mut state) {
             Err(CommitError::Fenced)
         } else {
             self.source(&mut state, &dataset, &name)
@@ -613,6 +933,8 @@ impl Writer {
         if result.is_ok() {
             self.schedule_cleanup(ns, dataset, name);
         }
+        // Opens that happened while this batch held its namespace could not close it.
+        self.evict(None).await;
     }
 
     async fn persist(&self, state: &mut State, entries: Vec<Committed>) -> Result<(), CommitError> {
@@ -642,12 +964,14 @@ impl Writer {
                             };
                             state.retries.insert(key, retry);
                         }
-                        self.log
-                            .append(entry.event)
-                            .expect("batch continues durable log");
+                        if self.owner.is_none() {
+                            self.log
+                                .append(entry.event)
+                                .expect("batch continues durable log");
+                        }
                     }
                 }
-                if let Some(last) = last {
+                if let Some(last) = last.filter(|_| self.owner.is_none()) {
                     assert_eq!(sequence, last.sequence, "persisted a different head");
                     let log = self.log.head(&last.dataset, &last.namespace).get();
                     assert_eq!(log, sequence, "the log and the durable head disagree");

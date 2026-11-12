@@ -15,6 +15,7 @@ fn record(id: &str) -> Record {
         state: Lifecycle::Active as i32,
         created_at: 1,
         deleting_at: 0,
+        home_cell: "eu-1a".into(),
     }
 }
 
@@ -52,8 +53,9 @@ fn every_region_decodes_the_same_identity_from_the_same_bytes() {
 fn records_that_do_not_match_their_key_or_contract_are_corrupt() {
     // Not id(0): one mutation swaps in the all-zero ID.
     let (id, other) = (id(1), id(2));
-    let mutations: [fn(&mut Record); 5] = [
-        |r| r.format_version = 2,
+    let mutations: [fn(&mut Record); 6] = [
+        |r| r.format_version = 1,
+        |r| r.home_cell = String::new(),
         |r| r.storage = "kv/elsewhere".into(),
         |r| r.cache_ttl_seconds = 300,
         |r| r.state = 7,
@@ -108,10 +110,15 @@ fn create_requests_need_bounded_printable_labels_within_cloudflares_limits() {
         tenant: "customer-123".into(),
         title: "store-A".into(),
         home_region: "eu".into(),
+        cells: vec!["eu-1a".into()],
         ..Create::default()
     };
     assert_eq!(ok.validate(), Ok(()));
     for bad in [
+        Create {
+            cells: Vec::new(),
+            ..ok.clone()
+        },
         Create {
             tenant: String::new(),
             ..ok.clone()
