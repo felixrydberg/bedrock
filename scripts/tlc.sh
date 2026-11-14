@@ -2,9 +2,11 @@
 # Checks the TLA+ models in docs/spec with TLC (#25 / B-23 Layer 1): every model's config must pass, and every
 # deliberate bug must break the invariant it names, checked alone so no other invariant fires first.
 #
-#   scripts/tlc.sh          Every model, then every bug: about 10 minutes, mostly handoff.
-#   scripts/tlc.sh bugs     Only the bugs: under a minute.
+#   scripts/tlc.sh          Every model, then every bug: about 15 minutes, mostly handoff.
+#   scripts/tlc.sh bugs     Only the bugs: about 2 minutes.
 #   scripts/tlc.sh relays   One model and its bugs.
+#
+# A model with several configs names each one model-variant.cfg (volume-handoff.cfg checks volume.tla).
 #
 # Needs Java 11 or later. The TLA+ tools jar (v1.8.0 from https://github.com/tlaplus/tlaplus/releases, sha256
 # e1f11b75c4b5bc4478ba0ac5cb6ae28e40a01b0016bc33e0aa97da22dfdbcd7f) is checked in beside this script; set TLA2TOOLS to use another. Paths stay relative, so Windows Java works
@@ -69,10 +71,18 @@ follows ahead HeldBeforeNext
 merge lower GapFreeApply
 merge higher GapFreeApply
 merge drift OneCursor
+volume-base appoint NoLostAck
+volume-base previous NoLostAck
+volume-base flush S3Committed
+volume-handoff populating NoLostAck
+volume-handoff unsealed NoLostAck
+volume-topology new-only NoLostAck
+volume-topology new-only OneWriter
+volume-topology new-only NoStaleAppend
 '
 
 tlc() {
-    local name="$1" config="$2" model="$3"
+    local name="$1" config="$2" model="${3%%-*}"
     java -Xmx4g -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 2 -noGenerateSpecTE -metadir "$work/$name" \
         -config "$config" "$model.tla" 2>&1
 }
@@ -106,7 +116,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership service_isolation handoff cell"
+models="relays follows merge materialized publisher membership service_isolation handoff cell volume-base volume-handoff volume-wipe volume-topology"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;
