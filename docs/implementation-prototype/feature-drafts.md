@@ -49,7 +49,8 @@ does not imply a simulation pass. Amend #25's older CI wording accordingly while
 seven-night evidence. This document does not enable a simulation CI job or claim an unrun gate passed.
 
 B-11 adds an asynchronous, SlateDB-based atomic S3 persistence contract in `lib/storage` for the generic API writer across datasets.
-Track O reuses it for each actor's S3 database: a volume slot flushes to it and other slots read it through B-39's `Reader`.
+Track O reuses it for one S3 database per `volume` range, shared by many actors (amended 2026-11-14): the range's
+maintainer flushes to it and other slots read it through B-39's `Reader`.
 Quicksilver, Auth, relay replay and CDN retention continue using the local `StorageEngine` and pushed replication.
 `full_replica` completeness and CDN phase 3/4 items remain later work. Sequence compression is out of scope.
 
@@ -214,7 +215,7 @@ Rules this implies:
 | [S-02](https://github.com/felixrydberg/bedrock/issues/110) | Volume protocol in TLA+: claim, append, lease, release, repair, topology change | Actors | `docs/spec/volume.tla` | decision 16 |
 | [S-03](https://github.com/felixrydberg/bedrock/issues/111) | `bedrock-volume` binary: records, gRPC service, membership, ranges, owner checks | Actors | `volume` bin | S-01, S-02, B-21, B-68 |
 | [S-04](https://github.com/felixrydberg/bedrock/issues/112) | Volume client in Compute: claim, recovery, append window, reads | Actors | `compute/actors` | S-03 |
-| [S-05](https://github.com/felixrydberg/bedrock/issues/113) | Cold tier: maintainer, SlateDB flush, truncation, SSD cache, S3 reader handles | Actors | `volume/cold` | S-03, B-11, B-39 |
+| [S-05](https://github.com/felixrydberg/bedrock/issues/113) | Cold tier: one SlateDB per range, maintainer flush, truncation, split and merge by clone, SSD cache, S3 reader handles | Actors | `volume/cold` | S-03, B-11, B-39 |
 | [S-06](https://github.com/felixrydberg/bedrock/issues/114) | Slot repair and node-reported range readiness | Actors | `volume/repair`, `lib/relays` | S-02, S-03, B-68 |
 | [S-07](https://github.com/felixrydberg/bedrock/issues/115) | `bedrock-compute` actor host: acquire, wake, sleep, leases, SQLite VFS, gates | Actors | `compute` bin | S-04 |
 | [S-08](https://github.com/felixrydberg/bedrock/issues/116) | Gateway actor routing and location cache | Actors | `gateway/actors` | B-57, S-07 |
@@ -228,7 +229,7 @@ Rules this implies:
 | [S-16](https://github.com/felixrydberg/bedrock/issues/124) | Simulation and crash load: actor workload, kills mid-append, slot loss, cell loss | Actors | `tests/sim`, `tests/crash` | S-07, B-23 |
 | [S-17](https://github.com/felixrydberg/bedrock/issues/125) | Planned DC changes and manual DC-loss restore | Actors | `lib/actors`, operator tooling | S-05 |
 | [S-18](https://github.com/felixrydberg/bedrock/issues/126) | Customer-KV writers as `kv` actors, with reads through the value cache to the holder (replaces B-26, B-27) | KV | `compute/builtin`, `kv` | S-05, S-08, B-25 |
-| [S-19](https://github.com/felixrydberg/bedrock/issues/127) | Load-based range splitting for `volume` ranges (later, gated on measurements) | Actors | `lib/placement`, `volume` | S-03, S-16 |
+| [S-19](https://github.com/felixrydberg/bedrock/issues/127) | Load- and flush-lag-based range splitting for `volume` ranges (later, gated on measurements; bytes balancing is in S-03) | Actors | `lib/placement`, `volume` | S-03, S-16 |
 
 ### Parallel work inside the shared core
 
@@ -758,8 +759,8 @@ Created: [#90](https://github.com/felixrydberg/bedrock/issues/90) — Feature �
 #### B-53 — Namespace residency fairness and cold-open tuning at scale
 
 Replaced (decision 16). Customer-KV writes and reads now go through `kv` actors, so the cost of many small S3 databases
-is measured once, for all actors, in S-05 (`statefull/v2.md` §12 question 2). The fallback named there is a chunk store
-with a conditional-PUT manifest.
+was handled once, for all actors, in S-05. Amendment 2026-11-14: actors now share one S3 database per `volume` range
+(`statefull/v2.md` §5 Cold tier), so there are no per-actor databases to tune.
 
 ---
 
@@ -981,7 +982,8 @@ issue, its body is written from those sections in the usual template. All are cr
   the sandbox runtime decision (leaning towards sandboxed workerd).
 - **Hardening and operations.** S-16 adds the actor workload to the simulation and crash tests; S-17 covers planned DC
   changes and DC-loss restore.
-- **Later.** S-19 (load-based splitting) starts only once measurements show hot volume nodes with similar range sizes.
+- **Later.** S-19's load-based splitting starts only once measurements show hot volume nodes with similar range sizes.
+  Balancing on stored bytes moved into S-03 (amended 2026-11-14).
 
 ---
 
@@ -1249,6 +1251,11 @@ issue, its body is written from those sections in the usual template. All are cr
     - **Storage:** `bedrock-volume` keeps each actor's claim, quorum log and key/value overlay on three slots in different
       cells of one DC. A commit is acknowledged at 2 of 3 fsyncs; S3 is never on the write path. A maintainer flushes to
       the actor's SlateDB database every second or 4 MiB. Epochs fence writers, and a host lease protects in-memory state.
+    - **Amendment 2026-11-14: one SlateDB per range.** Actors share one S3 database per `volume` range, written by the
+      owner of each actor's first slot. A range flushes every second or 4 MiB, so S3 requests grow with ranges and
+      bytes, not with the number of actors. SlateDB's own WAL is off. Splits and merges use SlateDB clones. Balancing
+      on stored bytes moves into S-03; S-19 adds load and flush-lag signals. Details in `statefull/v2.md` §5 Cold tier
+      and §11.
     - **Hosting:** `bedrock-compute` holds awake actors, sleeps idle ones and wakes them on request or alarm. Gateways
       route region → DC → cell → host with a location cache.
     - **Failure model:** losing a cell loses no acknowledged write. Losing a whole DC means downtime for its actors, and
@@ -1264,7 +1271,8 @@ issue, its body is written from those sections in the usual template. All are cr
 2. **SlateDB fork and patch set (B-11, S-05).** Pin the source/format baseline and upstream-update policy; prove
    Bedrock's I/O, simulation, range-integrity, checkpoint and recovery contracts before selecting engine features to
    remove. Which of Rivet's vendored SlateDB patches to carry is not decided.
-3. **Stateful actor questions.** Sandbox runtime, per-actor SlateDB cost, page or chunk granularity, DC choice, a KV
+3. **Stateful actor questions.** Sandbox runtime, range-database details (clone API, prefix delete, naming, KV),
+   page or chunk granularity, DC choice, a KV
    durability option, large KV values and heartbeat volume: see `statefull/v2.md` §12. An unavailable source is an
    error, never proof that a key is missing.
 
