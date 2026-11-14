@@ -107,7 +107,7 @@ pub fn rank<'a>(
 }
 
 /// FNV-1a over the node ID, then the SplitMix64 finalizer: stable across builds and platforms, unlike `DefaultHasher`.
-fn score(hash: u64, node: &str) -> u64 {
+pub(crate) fn score(hash: u64, node: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325_u64;
     for byte in node.bytes() {
         h = (h ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
