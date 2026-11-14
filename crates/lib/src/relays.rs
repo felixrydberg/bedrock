@@ -460,6 +460,9 @@ impl Hub {
             .unwrap()
             .values()
             .flat_map(|sub| sub.pushed.keys().cloned())
+            // An unpushed ranged dataset (`volume`) has no stream to finish. Its owners report readiness themselves
+            // (S-06); until then they stay populating and never vote.
+            .filter(|dataset| pushed(dataset))
             .collect();
         let heads: BTreeMap<String, Vec<(String, u64)>> = datasets
             .into_iter()

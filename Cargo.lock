@@ -340,9 +340,7 @@ dependencies = [
  "percent-encoding",
  "prometheus-client",
  "prost",
- "protobuf",
  "protoc-bin-vendored",
- "raft",
  "rcgen",
  "rocksdb",
  "rustls",
@@ -350,7 +348,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "slatedb",
- "slog",
  "subtle",
  "tempfile",
  "tokio-rustls",
@@ -379,6 +376,16 @@ version = "0.1.0"
 dependencies = [
  "bedrock-lib",
  "madsim-tokio",
+ "madsim-tonic",
+ "prost",
+ "protobuf",
+ "raft",
+ "rcgen",
+ "sha2",
+ "slog",
+ "subtle",
+ "tempfile",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -392,6 +399,7 @@ dependencies = [
  "bedrock-lib",
  "bedrock-quicksilver",
  "bedrock-relay",
+ "bedrock-volume",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -405,6 +413,18 @@ dependencies = [
  "serde_json",
  "tokio-stream",
  "tonic-prost",
+]
+
+[[package]]
+name = "bedrock-volume"
+version = "0.1.0"
+dependencies = [
+ "bedrock-lib",
+ "madsim-tokio",
+ "madsim-tonic",
+ "prometheus-client",
+ "prost",
+ "tracing",
 ]
 
 [[package]]

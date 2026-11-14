@@ -13,7 +13,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bedrock_lib::datasets::capabilities::ranged_datasets;
+use bedrock_lib::datasets::capabilities::{VOLUME, ranged_datasets};
 use bedrock_lib::membership::{
     DATASET, Directories, Published, Publisher, RANGE, SERVICES, encode, key, namespace,
 };
@@ -37,6 +37,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-plans at least this often, which is what expires grace periods.
 const RECONCILE: Duration = Duration::from_secs(1);
 // ponytail: fixed until B-34 makes them per-service settings read at relay startup (CDN artifacts want 2 replicas).
+// `volume` has its own setting, `volume_replicas`.
 const REPLICAS: usize = 3;
 const MAX_MOVING: usize = 16;
 
@@ -223,6 +224,7 @@ pub fn place(
     directories: &Directories,
     ready: &siblings::Ready,
     drains: &[Drain],
+    replicas: usize,
 ) -> Vec<Change> {
     let mut changes = Vec::new();
     for dataset in ranged_datasets(service) {
@@ -257,7 +259,7 @@ pub fn place(
             // A drain's members are `draining`, and its rate bounds the handoffs (#68 / B-21b).
             let drained = drain::apply(&members, drains, dataset);
             let moving = drain::moving(drains, MAX_MOVING);
-            entries = placement::assign(directory, &drained, &unhealthy, REPLICAS, moving);
+            entries = placement::assign(directory, &drained, &unhealthy, replicas, moving);
         }
         // Merges wait for a pass with nothing else to write, so they never share a plan with a split.
         let merges = if entries.is_empty() {
@@ -324,6 +326,7 @@ pub struct Cell {
     relays: Vec<String>,
     cell: String,
     grace: Duration,
+    volume_replicas: usize,
     control: Arc<control::Control>,
     drain_hooks: BTreeMap<String, Vec<Arc<dyn drain::Hook>>>,
 }
@@ -369,6 +372,7 @@ impl Cell {
             relays,
             cell,
             grace: Duration::from_millis(settings.grace_ms),
+            volume_replicas: settings.volume_replicas,
             control,
             drain_hooks,
         };
@@ -480,6 +484,11 @@ impl Cell {
                         &snapshot.directories,
                         &ready,
                         drains,
+                        if *service == VOLUME {
+                            self.volume_replicas
+                        } else {
+                            REPLICAS
+                        },
                     ));
                 }
             }
