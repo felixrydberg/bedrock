@@ -7,9 +7,9 @@ which module it lives in, which doc section it comes from, what it depends on, a
 
 Sources: `docs/implementation-prototype/kv.md`, `cdn.md`, `code-structure.md`, `notes.md`.
 
-> Status: B-01 to B-29 (including B-12b, B-18b, B-22b and B-23a, but not B-09b), plus B-21b, B-39 and B-61, are created as
-> GitHub issues (linked below; the issue is the source of truth). B-26, B-27, B-28 and B-53 are replaced by track O.
-> Track O (S-01 … S-19) and the other later drafts are still drafts.
+> Status: every draft is a GitHub issue (linked below; the issue is the source of truth). B-26, B-27 and B-28
+> (#58–#60) and B-53 are replaced by track O; B-37 is dropped; B-54 and B-55 shipped in #44. Track O is #109–#127,
+> the remaining B-drafts #75–#108, and B-68 is #70 (created 2026-11-14 unless noted).
 
 > Architecture updates, newest first:
 > - **2026-11-14: stateful actor platform (decision 16, track O).** Durable Objects, D1, Queues, Cron, Workflows and
@@ -135,8 +135,8 @@ Rules this implies:
 | [B-09](https://github.com/felixrydberg/bedrock/issues/9) | Dev write API (Axum, single node) batching writes to S3 | Shared core | `lib/replication` + `api` bin | B-08, B-02, B-07 |
 | [B-10](https://github.com/felixrydberg/bedrock/issues/10) | Stream subscriptions with consistent revision boundary | Shared core | `lib/replication` | B-09, B-03 |
 | [B-11](https://github.com/felixrydberg/bedrock/issues/11) | Generic API atomic materialized state, retained events and recovery | Shared core | `lib/storage`, `lib/replication`, `lib/s3`, `api` wiring | B-09, B-07, B-04, B-06, B-23a |
-| B-09b | Raft write quorum for the API (later) | Shared core | `lib/replication` + `api` bin | B-09, B-10, B-11, B-13 |
-| B-09c | Bulk writes: many keys of one namespace in one revision | Shared core | `lib/replication`, `lib/relays` + `api` bin | B-11, B-23 |
+| [B-09b](https://github.com/felixrydberg/bedrock/issues/75) | Raft write quorum for the API (later) | Shared core | `lib/replication` + `api` bin | B-09, B-10, B-11, B-13 |
+| [B-09c](https://github.com/felixrydberg/bedrock/issues/76) | Bulk writes: many keys of one namespace in one revision | Shared core | `lib/replication`, `lib/relays` + `api` bin | B-11, B-23 |
 | **D — Shared core: cluster** |||||
 | [B-13](https://github.com/felixrydberg/bedrock/issues/12) | Peer reachability from real traffic | Shared core | `lib/health` | B-03 |
 | [B-14](https://github.com/felixrydberg/bedrock/issues/13) | Storage-health manager and failure isolation | Shared core | `lib/health` | B-04, B-13 |
@@ -165,69 +165,70 @@ Rules this implies:
 | ~~[B-27](https://github.com/felixrydberg/bedrock/issues/59)~~ | ~~KV reads through home-region S3 readers~~ (replaced by S-18, decision 16) | — | — | — |
 | ~~[B-28](https://github.com/felixrydberg/bedrock/issues/60)~~ | ~~Namespace reader residency~~ (value-cache budgets landed in B-39; reader handles move to S-05) | — | — | — |
 | [B-29](https://github.com/felixrydberg/bedrock/issues/61) | KV end-to-end acceptance | KV | `kv`, `compute`, `volume`, integration tests | B-24, B-25, B-39, S-18 |
-| B-58 | Simulation load: KV reads, listing and namespaces | KV | `tests/sim` | B-23, B-29 |
+| [B-58](https://github.com/felixrydberg/bedrock/issues/77) | Simulation load: KV reads, listing and namespaces | KV | `tests/sim` | B-23, B-29 |
 | **I — First CDN** (parallel with H; no dependency on KV drafts) |||||
-| B-30 | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
-| B-31 | Artifact transfer | CDN | `cdn/artifact_transfer` | B-30 |
-| B-32 | `cdn` path rows and ref keys (§4 decision 14) | CDN | `cdn/retention`, `cdn/paths` | B-23, B-30, B-09c |
-| B-33 | Publish client writing path rows and ref keys in bulk | CDN | `cdn/paths` | B-30, B-32 |
-| B-34 | Regional L2 with two-replica artifact placement | CDN | `cdn/retention`, `cdn/artifact_storage` | B-31, B-32 |
-| B-35 | Artifact retrieval interface | CDN | `cdn/artifact_transfer` | B-33, B-34 |
-| B-36 | CDN end-to-end acceptance | CDN | `cdn` | B-30 … B-35 |
-| B-59 | Simulation load: publishing and artifact retrieval | CDN | `tests/sim` | B-23, B-36 |
+| [B-30](https://github.com/felixrydberg/bedrock/issues/78) | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
+| [B-31](https://github.com/felixrydberg/bedrock/issues/79) | Artifact transfer | CDN | `cdn/artifact_transfer` | B-30 |
+| [B-32](https://github.com/felixrydberg/bedrock/issues/80) | `cdn` path rows and ref keys (§4 decision 14) | CDN | `cdn/retention`, `cdn/paths` | B-23, B-30, B-09c |
+| [B-33](https://github.com/felixrydberg/bedrock/issues/81) | Publish client writing path rows and ref keys in bulk | CDN | `cdn/paths` | B-30, B-32 |
+| [B-34](https://github.com/felixrydberg/bedrock/issues/82) | Regional L2 with two-replica artifact placement | CDN | `cdn/retention`, `cdn/artifact_storage` | B-31, B-32 |
+| [B-35](https://github.com/felixrydberg/bedrock/issues/83) | Artifact retrieval interface | CDN | `cdn/artifact_transfer` | B-33, B-34 |
+| [B-36](https://github.com/felixrydberg/bedrock/issues/84) | CDN end-to-end acceptance | CDN | `cdn` | B-30 … B-35 |
+| [B-59](https://github.com/felixrydberg/bedrock/issues/85) | Simulation load: publishing and artifact retrieval | CDN | `tests/sim` | B-23, B-36 |
 | **J — KV refinements** |||||
 | ~~B-37~~ | ~~Cache-fill broadcast queue~~ (dropped, decision 11) | — | — | — |
-| B-38 | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
-| B-40 | `full_replica` placement and completeness | KV | `quicksilver/storage`, `lib/buckets` | B-24, B-21 |
-| B-41 | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
-| B-42 | Auth dataset | Shared infrastructure | `gateway` | B-57 |
+| [B-38](https://github.com/felixrydberg/bedrock/issues/86) | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
+| [B-40](https://github.com/felixrydberg/bedrock/issues/87) | `full_replica` placement and completeness | KV | `quicksilver/storage`, `lib/buckets` | B-24, B-21 |
+| [B-41](https://github.com/felixrydberg/bedrock/issues/88) | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
+| [B-42](https://github.com/felixrydberg/bedrock/issues/90) | Auth dataset | Shared infrastructure | `gateway` | B-57 |
 | ~~B-53~~ | ~~Namespace residency fairness and cold-open tuning~~ (replaced by S-05's per-actor database measurements) | — | — | — |
 | **K — CDN refinements** (parallel with J) |||||
-| B-43 | Artifact replica repair and range migration | CDN | `cdn/retention` | B-36 |
-| B-44 | Coordinated eviction, GC and failure recovery | CDN | `cdn/retention` | B-43 |
-| B-45 | Prewarming and artifact-set readiness | CDN | `cdn/retention` | B-36 |
-| B-46 | Optional unreplicated L1 and popularity-based retention | CDN | `cdn/artifact_storage`, `cdn/retention` | B-44 |
-| B-47 | Filesystem `CacheStorage` adapter | CDN | `cdn/artifact_storage` | B-36 |
-| B-49 | Large-object and range transfers | CDN | `cdn/artifact_transfer` | B-36 |
+| [B-43](https://github.com/felixrydberg/bedrock/issues/91) | Artifact replica repair and range migration | CDN | `cdn/retention` | B-36 |
+| [B-44](https://github.com/felixrydberg/bedrock/issues/92) | Coordinated eviction, GC and failure recovery | CDN | `cdn/retention` | B-43 |
+| [B-45](https://github.com/felixrydberg/bedrock/issues/93) | Prewarming and artifact-set readiness | CDN | `cdn/retention` | B-36 |
+| [B-46](https://github.com/felixrydberg/bedrock/issues/94) | Optional unreplicated L1 and popularity-based retention | CDN | `cdn/artifact_storage`, `cdn/retention` | B-44 |
+| [B-47](https://github.com/felixrydberg/bedrock/issues/95) | Filesystem `CacheStorage` adapter | CDN | `cdn/artifact_storage` | B-36 |
+| [B-49](https://github.com/felixrydberg/bedrock/issues/96) | Large-object and range transfers | CDN | `cdn/artifact_transfer` | B-36 |
 | **L — Compute and deploy control plane (future)** |||||
-| B-50 | Deploy control plane: publish, activate, roll back, delete | Compute | not decided | B-24, B-33, B-45 |
-| B-51 | Gateway: Worker and Pages request routing | Compute | `gateway` | B-35, B-50, B-57 |
-| B-48 | Compiled Worker artifact caching | Compute | not decided | B-51 |
-| B-52 | Deploy end-to-end acceptance | Compute | not decided | B-29, B-36, B-50, B-51 |
-| B-60 | Simulation load: Workers, Pages and deploys | Compute | `tests/sim` | B-23, B-52 |
+| [B-50](https://github.com/felixrydberg/bedrock/issues/97) | Deploy control plane: publish, activate, roll back, delete | Compute | not decided | B-24, B-33, B-45 |
+| [B-51](https://github.com/felixrydberg/bedrock/issues/98) | Gateway: Worker and Pages request routing | Compute | `gateway` | B-35, B-50, B-57 |
+| [B-48](https://github.com/felixrydberg/bedrock/issues/99) | Compiled Worker artifact caching | Compute | not decided | B-51 |
+| [B-52](https://github.com/felixrydberg/bedrock/issues/100) | Deploy end-to-end acceptance | Compute | not decided | B-29, B-36, B-50, B-51 |
+| [B-60](https://github.com/felixrydberg/bedrock/issues/101) | Simulation load: Workers, Pages and deploys | Compute | `tests/sim` | B-23, B-52 |
 | **M — Node security** (parent [#44](https://github.com/felixrydberg/bedrock/issues/44); scope amended 2026-11-03, drafts not yet issues) |||||
-| B-55 | Mutual TLS and caller identity for node-to-node traffic, enabled by config | Shared core | `lib/transport` + every bin | B-03, B-12, B-17 |
-| B-54 | Deployment guide: private networking and node certificates (Kubernetes, Docker, bare metal) | Foundation (docs) | `docs/deployment/` + `deploy/` | B-02, B-55 |
+| [B-55](https://github.com/felixrydberg/bedrock/issues/44) | Mutual TLS and caller identity for node-to-node traffic, enabled by config | Shared core | `lib/transport` + every bin | B-03, B-12, B-17 |
+| [B-54](https://github.com/felixrydberg/bedrock/issues/44) | Deployment guide: private networking and node certificates (Kubernetes, Docker, bare metal) | Foundation (docs) | `docs/deployment/` + `deploy/` | B-02, B-55 |
 | **N — Shared platform infrastructure (future)** |||||
-| B-56 | Shared API rate-limit infrastructure | Shared infrastructure | shared contracts in `lib`; API integration | To be agreed; does not gate initial KV |
-| B-57 | Gateway binary and shared cluster client | Shared infrastructure | `gateway`, `lib` client, `lib/relays` | B-19, B-22, B-55 |
+| [B-56](https://github.com/felixrydberg/bedrock/issues/102) | Shared API rate-limit infrastructure | Shared infrastructure | shared contracts in `lib`; API integration | To be agreed; does not gate initial KV |
+| [B-57](https://github.com/felixrydberg/bedrock/issues/89) | Gateway binary and shared cluster client | Shared infrastructure | `gateway`, `lib` client, `lib/relays` | B-19, B-22, B-55 |
 | [B-61](https://github.com/felixrydberg/bedrock/issues/66) | Simulation speed: more simulated seconds per real second | Shared infrastructure | `tests/sim`, `scripts/vopr.sh` | B-23 |
-| B-62 | Partial quarantine: rebuild only the damaged range | Shared core | `lib/health` + `lib/reconciliation` + `lib/relays` | B-14, B-21, B-22, B-23 |
-| B-63 | Operational scenarios: scale out, drain, cancel and rolling restart under load | Shared core | `tests/sim`, `tests/crash` | B-23, B-21b |
-| B-64 | Appointed writer per namespace group, with a small controller log (design and model first) | Shared core | `docs/spec/`, later `lib/replication` | B-09b, B-11, B-23 |
-| B-65 | Shared durable log store with one group-committed fsync for every writer group on a node | Shared core | `lib/replication` log store | B-09b; B-64 for more than one group |
-| B-66 | Safety versus discovery: stale or unreachable discovery inputs may only cost availability | Shared core | `docs/spec/`, `tests/sim`, `tests/crash` | B-23; B-09b and B-57 for their parts |
-| B-67 | Explicit operator-controlled membership changes for the API Raft group | Shared core | `lib/replication` + `api` bin | B-09b |
+| [B-62](https://github.com/felixrydberg/bedrock/issues/103) | Partial quarantine: rebuild only the damaged range | Shared core | `lib/health` + `lib/reconciliation` + `lib/relays` | B-14, B-21, B-22, B-23 |
+| [B-63](https://github.com/felixrydberg/bedrock/issues/104) | Operational scenarios: scale out, drain, cancel and rolling restart under load | Shared core | `tests/sim`, `tests/crash` | B-23, B-21b |
+| [B-64](https://github.com/felixrydberg/bedrock/issues/105) | Appointed writer per namespace group, with a small controller log (design and model first) | Shared core | `docs/spec/`, later `lib/replication` | B-09b, B-11, B-23 |
+| [B-65](https://github.com/felixrydberg/bedrock/issues/106) | Shared durable log store with one group-committed fsync for every writer group on a node | Shared core | `lib/replication` log store | B-09b; B-64 for more than one group |
+| [B-66](https://github.com/felixrydberg/bedrock/issues/107) | Safety versus discovery: stale or unreachable discovery inputs may only cost availability | Shared core | `docs/spec/`, `tests/sim`, `tests/crash` | B-23; B-09b and B-57 for their parts |
+| [B-67](https://github.com/felixrydberg/bedrock/issues/108) | Explicit operator-controlled membership changes for the API Raft group | Shared core | `lib/replication` + `api` bin | B-09b |
+| [B-68](https://github.com/felixrydberg/bedrock/issues/70) | Move relay-only placement and membership publisher code from `crates/lib` into `crates/relay` | Shared core | `lib` → `relay` bin | B-21b |
 | **O — Stateful actors** (decision 16; scope and acceptance in [`statefull/v2.md`](statefull/v2.md) §11) |||||
-| S-01 | Actor IDs, topology record and placement functions | Actors | `lib/actors`, Quicksilver schema | B-24 |
-| S-02 | Volume protocol in TLA+: claim, append, lease, release, repair, topology change | Actors | `docs/spec/volume.tla` | decision 16 |
-| S-03 | `bedrock-volume` binary: records, gRPC service, membership, ranges, owner checks | Actors | `volume` bin | S-01, S-02, B-21 |
-| S-04 | Volume client in Compute: claim, recovery, append window, reads | Actors | `compute/actors` | S-03 |
-| S-05 | Cold tier: maintainer, SlateDB flush, truncation, SSD cache, S3 reader handles | Actors | `volume/cold` | S-03, B-11, B-39 |
-| S-06 | Slot repair and node-reported range readiness | Actors | `volume/repair`, `lib/relays` | S-02, S-03 |
-| S-07 | `bedrock-compute` actor host: acquire, wake, sleep, leases, SQLite VFS, gates | Actors | `compute` bin | S-04 |
-| S-08 | Gateway actor routing and location cache | Actors | `gateway/actors` | B-57, S-07 |
-| S-09 | Alarms: holder timers and volume index wake | Actors | `compute/actors`, `volume/alarms` | S-07, S-08 |
-| S-10 | Durable Objects API | Compute | `compute` | S-07 … S-09, sandbox decision |
-| S-11 | D1 | Compute | `compute/builtin` | S-10 |
-| S-12 | Queues | Compute | `compute/builtin` | S-09, S-10 |
-| S-13 | Cron Triggers | Compute | `compute/builtin` | S-09, B-50 |
-| S-14 | Workflows | Compute | `compute` (runtime library) | S-10 |
-| S-15 | Hibernatable WebSockets held at the Gateway | Compute | `gateway/actors` | S-08 |
-| S-16 | Simulation and crash load: actor workload, kills mid-append, slot loss, cell loss | Actors | `tests/sim`, `tests/crash` | S-07, B-23 |
-| S-17 | Planned DC changes and manual DC-loss restore | Actors | `lib/actors`, operator tooling | S-05 |
-| S-18 | Customer-KV writers as `kv` actors, with reads through the value cache to the holder (replaces B-26, B-27) | KV | `compute/builtin`, `kv` | S-05, S-08, B-25 |
-| S-19 | Load-based range splitting for `volume` ranges (later, gated on measurements) | Actors | `lib/placement`, `volume` | S-03, S-16 |
+| [S-01](https://github.com/felixrydberg/bedrock/issues/109) | Actor IDs, topology record and placement functions | Actors | `lib/actors`, Quicksilver schema | B-24 |
+| [S-02](https://github.com/felixrydberg/bedrock/issues/110) | Volume protocol in TLA+: claim, append, lease, release, repair, topology change | Actors | `docs/spec/volume.tla` | decision 16 |
+| [S-03](https://github.com/felixrydberg/bedrock/issues/111) | `bedrock-volume` binary: records, gRPC service, membership, ranges, owner checks | Actors | `volume` bin | S-01, S-02, B-21, B-68 |
+| [S-04](https://github.com/felixrydberg/bedrock/issues/112) | Volume client in Compute: claim, recovery, append window, reads | Actors | `compute/actors` | S-03 |
+| [S-05](https://github.com/felixrydberg/bedrock/issues/113) | Cold tier: maintainer, SlateDB flush, truncation, SSD cache, S3 reader handles | Actors | `volume/cold` | S-03, B-11, B-39 |
+| [S-06](https://github.com/felixrydberg/bedrock/issues/114) | Slot repair and node-reported range readiness | Actors | `volume/repair`, `lib/relays` | S-02, S-03, B-68 |
+| [S-07](https://github.com/felixrydberg/bedrock/issues/115) | `bedrock-compute` actor host: acquire, wake, sleep, leases, SQLite VFS, gates | Actors | `compute` bin | S-04 |
+| [S-08](https://github.com/felixrydberg/bedrock/issues/116) | Gateway actor routing and location cache | Actors | `gateway/actors` | B-57, S-07 |
+| [S-09](https://github.com/felixrydberg/bedrock/issues/117) | Alarms: holder timers and volume index wake | Actors | `compute/actors`, `volume/alarms` | S-07, S-08 |
+| [S-10](https://github.com/felixrydberg/bedrock/issues/118) | Durable Objects API | Compute | `compute` | S-07 … S-09, sandbox decision |
+| [S-11](https://github.com/felixrydberg/bedrock/issues/119) | D1 | Compute | `compute/builtin` | S-10 |
+| [S-12](https://github.com/felixrydberg/bedrock/issues/120) | Queues | Compute | `compute/builtin` | S-09, S-10 |
+| [S-13](https://github.com/felixrydberg/bedrock/issues/121) | Cron Triggers | Compute | `compute/builtin` | S-09, B-50 |
+| [S-14](https://github.com/felixrydberg/bedrock/issues/122) | Workflows | Compute | `compute` (runtime library) | S-10 |
+| [S-15](https://github.com/felixrydberg/bedrock/issues/123) | Hibernatable WebSockets held at the Gateway | Compute | `gateway/actors` | S-08 |
+| [S-16](https://github.com/felixrydberg/bedrock/issues/124) | Simulation and crash load: actor workload, kills mid-append, slot loss, cell loss | Actors | `tests/sim`, `tests/crash` | S-07, B-23 |
+| [S-17](https://github.com/felixrydberg/bedrock/issues/125) | Planned DC changes and manual DC-loss restore | Actors | `lib/actors`, operator tooling | S-05 |
+| [S-18](https://github.com/felixrydberg/bedrock/issues/126) | Customer-KV writers as `kv` actors, with reads through the value cache to the holder (replaces B-26, B-27) | KV | `compute/builtin`, `kv` | S-05, S-08, B-25 |
+| [S-19](https://github.com/felixrydberg/bedrock/issues/127) | Load-based range splitting for `volume` ranges (later, gated on measurements) | Actors | `lib/placement`, `volume` | S-03, S-16 |
 
 ### Parallel work inside the shared core
 
@@ -332,80 +333,13 @@ Created: [#9](https://github.com/felixrydberg/bedrock/issues/9) — Feature 🚀
 
 #### B-09b — Replicated write quorum (Raft) for the write API
 
-```
-Title:  Feature 🚀: Raft quorum for the write API with SlateDB persistence and automatic failover
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-The dev API (B-09) is a single point of failure and waits on S3 for every acknowledgement.
-At scale the write path needs automatic failover, fencing of old leaders and low commit latency.
-
-**Describe the solution you'd like**
-- Run `bedrock-api` as a 3 or 5 node Raft group (`openraft`) in the core region. One leader is the only writer, the rest are followers.
-- Acknowledge a write once a majority has fsynced it. The state machine assigns per-namespace revisions when entries are applied. The Raft term fences old leaders.
-- Reuse B-11's existing `Materialized::persist(entries, Some(raft_position))` operation for batched database
-  persistence. B-11 owns its atomic records, remote flush and engine format; do not implement another backend,
-  persistence protocol or parallel raw S3 event journal. Retain the majority-committed but not yet SlateDB-durable
-  Raft tail for recovery and retry lookup, preserving original retry expiry.
-- Keep Raft-committed, applied, SlateDB-durable and reader-visible positions separate. Truncate only after a verified
-  recoverable native checkpoint covers every namespace affected by the global prefix, including closed/lazy namespaces.
-  Store the cutoff's index, term and membership. A namespace progress record is not a native checkpoint.
-- Materialize all datasets through B-11; publish pushed datasets through the existing `Relay.Session`. Customer `kv` uses B-39 readers and is
-  never sent through relays. The generic writer selects a storage/delivery contract, not product-specific KV/CDN logic.
-- Only one leader publishes each namespace database. Fence stale S3 publishers as well as stale Raft proposals; a term
-  change alone must not let an old process publish an older manifest. Integrate existing B-11 fencing with leadership;
-  do not create a second storage-publisher implementation.
-- Own the buffered/durable API consolidation when this first Raft caller lands: identify which `apply`/`publish`
-  entry points are actually needed beside `persist`, migrate their callers and remove superseded wrappers in the
-  same change. `apply` buffers; `persist` applies and flushes; `publish` flushes prior buffered work. Preserve the
-  adapter's buffered-versus-durable model and crash/flush/acknowledgement tests; test-only use alone is not proof of dead code.
-- Start with one group for the whole core region. Assigning namespaces across multiple groups is later work; see
-  [future API writer scaling](future-development.md#horizontally-scaled-api-writers) for the proposed direction.
-- Metrics: quorum commit latency, failover/recovery duration, persistence lag and retained tail/backpressure,
-  with namespace detail in introspection rather than metric labels.
-
-**Additional context**
-- **Implementation:** Shared core.
-- **Module:** `lib/replication` plus the `api` crate.
-- **Doc reference:** `kv.md` §8, §11, §12, §15.9.
-- **Depends on:** B-09, B-10, B-11, B-13.
-- **Known limits:** writes stop without a majority. Committed entries not yet SlateDB-durable can be lost if a majority of nodes is lost at once; separate failure domains and persist frequently.
-- **Acceptance criteria:** Killing the leader loses no acknowledged write, including a write committed before S3 publication.
-  A new leader accepts writes within the election timeout plus documented recovery time. An old-term leader cannot commit
-  or publish stale storage state. Persistence/replay retries do not double-apply data or skip revisions. Raft truncation cannot
-  strand a closed namespace. Update TLA+ before this protocol change, then rerun the applicable B-23 gates and nightly history.
+Created: [#75](https://github.com/felixrydberg/bedrock/issues/75) — Feature 🚀: Raft quorum for the write API with SlateDB persistence and automatic failover
 
 ---
 
 #### B-09c — Bulk writes: many keys of one namespace in one revision
 
-```
-Title:  Feature 🚀: Bulk writes that commit many keys of one namespace in one revision and fan out per range
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-A Pages deployment with 10,000 files writes 20,000 CDN keys (§4 decision 14). The write API takes one key per request, and a
-deployment must become visible all at once, never half written.
-
-**Describe the solution you'd like**
-- A generic bulk route in `bedrock-api`: many `SET`/`DELETE` operations for one dataset and namespace, committed atomically as
-  one revision, so every key of a bulk is visible or none is.
-- One replication event carries the operations. Relays filter it per key for range streams: each range receives the operations
-  it owns, and a range with none notes coverage for that revision only, as for any filtered event today.
-- Nodes apply their share and the revision atomically, duplicate-safe, like a single-key event.
-- A configured size cap per bulk; larger writes are split by the caller, which records the last revision.
-- Reuse the existing event format, sequencing, applier and B-11 materialization; the write API stays free of product code.
-
-**Additional context**
-- **Implementation:** Shared core.
-- **Module:** `lib/replication`, `lib/relays`, plus the `api` crate.
-- **Doc reference:** §4 decision 14; `kv.md` §8.
-- **Depends on:** B-11, B-23. Update the TLA+ specification first: one revision covering many keys, and per-range filtering.
-- **Acceptance criteria:** A crash mid-bulk never exposes part of it after recovery. A range stream receives exactly its own
-  keys of a bulk and coverage for the rest. Replaying a bulk is duplicate-safe. A bulk over the cap is rejected explicitly.
-  Normal and `cfg(madsim)` builds pass the applicable B-23 checks.
+Created: [#76](https://github.com/felixrydberg/bedrock/issues/76) — Feature 🚀: Bulk writes that commit many keys of one namespace in one revision and fan out per range
 
 ---
 
@@ -706,7 +640,7 @@ Created: [#59](https://github.com/felixrydberg/bedrock/issues/59) — Feature �
 
 Replaced by S-18 (decision 16). Reads still go L1 → the cell value cache by HRW over `(namespace, key)` with a 60-second
 TTL, but a miss goes to the namespace's `kv` actor instead of a home-region S3 reader. The holder answers
-minimum-revision reads and `LIST`. The issue amendment is pending.
+minimum-revision reads and `LIST`. Amendment: [#59 comment](https://github.com/felixrydberg/bedrock/issues/59#issuecomment-6876204015).
 
 ---
 
@@ -715,7 +649,7 @@ minimum-revision reads and `LIST`. The issue amendment is pending.
 Created: [#60](https://github.com/felixrydberg/bedrock/issues/60) — Feature 🚀: Per-node namespace reader retention and bounded customer-KV caching
 
 Replaced (decision 16). The value cache budget and per-namespace share landed in B-39 (#73). Reader handle residency
-moves to `volume/cold` in S-05, keyed by actor database. The issue amendment is pending.
+moves to `volume/cold` in S-05, keyed by actor database. Amendment: [#60 comment](https://github.com/felixrydberg/bedrock/issues/60#issuecomment-6876205788).
 
 ---
 
@@ -724,42 +658,13 @@ moves to `volume/cold` in S-05, keyed by actor database. The issue amendment is 
 Created: [#61](https://github.com/felixrydberg/bedrock/issues/61) — Feature 🚀: KV end-to-end acceptance suite on the multi-region deployment
 
 Depends on S-18 now (decision 16). Writer-crash scenarios become holder and slot kills; "home-region reader" scenarios
-become value-cache misses to the holder. The issue amendment is pending.
+become value-cache misses to the holder. Amendment: [#61 comment](https://github.com/felixrydberg/bedrock/issues/61#issuecomment-6876208017).
 
 ---
 
 #### B-58 — Simulation load: KV reads, listing and namespaces
 
-```
-Title:  Feature 🚀: Add customer KV traffic to the simulation's load
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-The simulation (#25 / B-23) only sends `PUT` and `DELETE`, because reads do not exist yet, so it proves `MinRevisionReads` by
-inspecting engine state rather than through a served read.
-
-**Describe the solution you'd like**
-- Add to the fixed load: KV reads with minimum revisions, listing, and namespace create and delete.
-- Namespace create, get, list and delete go through `bedrock-kv`'s management endpoint. Give each operation an expected
-  result in `tests/sim/src/history.rs`: returned ID/record/list, the `Active` to `Deleting` transition, and rejection of
-  opens and writes after deletion. Include a deliberate bug for each request type so its expectation demonstrably fails.
-- Quicksilver `Get`/`List` reads may join the fixed load, with expected values, absence and minimum-revision outcomes.
-- Prove `MinRevisionReads` through served reads, including absence and listing as #25 requires.
-- Run real `bedrock-kv` value caches and `kv` actors under faults: cache loss and pressure, holder sleep and wake, and
-  slot loss.
-- Add real reads to the simulation. Damage is found today by those and by the scrubber (`health::scrub`, #25 / B-23).
-
-**Additional context**
-The simulation sends the same load for every seed, and the seed decides only how it arrives: timing, bursts at the same
-average rate, which keys are hot, and value sizes. That keeps the load realistic, so long runs (`scripts/vopr.sh soak`) can
-find what only appears under real traffic over time. It keeps working without this task, but cannot reach what the load
-does not include. Add to the fixed load, never as a per-seed option, and give each request type its own expected result in
-`tests/sim/src/history.rs`: a request nothing checks only creates load.
-- **Implementation:** KV.
-- **Depends on:** B-23, B-29.
-- **Acceptance criteria:** Every new request type has an expected result and a deliberate bug that breaks it. The sweep and a
-  long soak pass with the new load.
+Created: [#77](https://github.com/felixrydberg/bedrock/issues/77) — Feature 🚀: Add customer KV traffic to the simulation's load
 
 ---
 
@@ -769,277 +674,49 @@ does not include. Add to the fixed load, never as a per-seed option, and give ea
 
 #### B-30 — Artifact storage: S3 content addressing, `CacheStorage`, Foyer
 
-```
-Title:  Feature 🚀: Content-addressed artifact storage with pluggable CacheStorage and Foyer backend
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-CDN artifacts are immutable and identified by SHA-256.
-They need authoritative storage in S3 plus a local cache backend that is separate from KV's storage engines.
-
-**Describe the solution you'd like**
-- Store and fetch artifacts in S3 by SHA-256, using `lib/s3`.
-- A `CacheStorage` trait: put/get (streaming), contains, delete, list inventory, usage. Separate from `StorageEngine`.
-- A Foyer adapter as the first backend.
-- A local artifact inventory. Checksums are verified on write and on read.
-- Corrupted artifacts are reported to the storage-health manager (B-14).
-
-**Additional context**
-- **Implementation:** CDN.
-- **Module:** `cdn/artifact_storage`.
-- **Doc reference:** `cdn.md` §3 Artifact Storage, §4 Phase 1, Core Principles 2 and 7.
-- **Depends on:** B-23.
-- **Acceptance criteria:** Upload, then fetch by hash, round-trips. A corrupted local artifact is detected and refetched from S3. The inventory survives a restart.
+Created: [#78](https://github.com/felixrydberg/bedrock/issues/78) — Feature 🚀: Content-addressed artifact storage with pluggable CacheStorage and Foyer backend
 
 ---
 
 #### B-31 — Artifact transfer
 
-```
-Title:  Feature 🚀: Streaming peer-to-peer artifact transfer with S3 fallback and request coalescing
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Artifacts need to move between storage nodes directly, with S3 as the fallback.
-This must not swamp relay traffic and must not duplicate fetches when many requests ask for the same hash.
-
-**Describe the solution you'd like**
-- Streaming transfers between nodes over the B-03 bulk channel.
-- Fetch from S3 when no peer has the artifact.
-- Coalesce concurrent requests for the same hash on each node, including local prewarming and incoming peer requests.
-  A peer request can start a missing artifact's fetch or join an existing fetch, even before local prewarming starts.
-- Retries, timeouts and backpressure.
-- Checksum verified before an artifact is stored or served.
-
-**Additional context**
-- **Implementation:** CDN.
-- **Module:** `cdn/artifact_transfer`.
-- **Doc reference:** `cdn.md` §3 Artifact Transfer, Core Principle 6.
-- **Depends on:** B-30.
-- **Acceptance criteria:** 100 concurrent requests for one missing hash on one node, mixing local prewarming and peer requests,
-  cause exactly one upstream fetch. A peer request arriving before local prewarming starts also shares that fetch.
-  Bulk transfers do not push relay or control latency past its SLO. Truncated transfers are rejected.
+Created: [#79](https://github.com/felixrydberg/bedrock/issues/79) — Feature 🚀: Streaming peer-to-peer artifact transfer with S3 fallback and request coalescing
 
 ---
 
 #### B-32 — `cdn` path rows and ref keys
 
-```
-Title:  Feature 🚀: CDN path rows and ref keys in the `cdn` dataset
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Which artifacts the CDN keeps, and which artifact a URL path serves, is declared through replicated keys, not by tracking
-artifact locations globally (§4 decision 14). This reuses the shared replication and sequencing infrastructure
-(`bedrock-api`, `bedrock-relay`), not KV itself. The `cdn` dataset belongs to the CDN: `bedrock-quicksilver` and `bedrock-kv`
-never host or subscribe to it, just as `bedrock-cdn` never subscribes to a KV dataset.
-
-**Describe the solution you'd like**
-- A `cdn` dataset (B-06) with global namespaces, replicated to every region. The deploy control plane (B-50) uses `workers` and
-  `pages`; the CDN treats namespace names and deployment IDs as opaque. It holds metadata only, never artifact bytes, and its
-  records are never evicted.
-- Two key kinds, written in bulk through `bedrock-api` (B-09c). The write API and relays are generic over datasets:
-
-  | Key | Value | Placed by |
-  |---|---|---|
-  | `path/{deployment_id}/{path}` | `{sha256, content type, size}` | the normal `(dataset, namespace, key)` hash |
-  | `ref/{sha256}/{deployment_id}` | empty | the sha256's first 8 bytes, ignoring the namespace |
-
-- The one shared-core change: `placement::hash_of` places `cdn` keys of the form `ref/{64 hex}/…` by that hash, so relays route
-  them, and nodes store them in the hash-first L2 layout, by content. Every other key, including a malformed `cdn` key, keeps the
-  normal hash.
-- One canonical codec for path-row values in `cdn/paths`, shared with B-33 and B-35. A malformed value is an explicit error.
-- `bedrock-cdn` follows the `cdn` ranges its relay pushes (#22 / B-21) and keeps both key kinds as ordinary L2 range data in
-  `lib/storage`. An artifact is retained while any `ref/{sha256}/…` key exists in any namespace: one prefix scan, no counts.
-- No derived state: range bootstrap (B-18, B-21) rebuilds everything a holder needs, with its existing validation,
-  exact-boundary resumption and readiness. No manifest expansion, reference-count table or second recovery path.
-  No artifact locations are stored globally.
-
-**Additional context**
-- **Implementation:** CDN, plus the `hash_of` rule in the shared core. Writes, ordering and fan-out come from the shared infrastructure.
-- **Module:** `cdn/retention`, row codec in `cdn/paths`, `lib/placement`.
-- **Doc reference:** `cdn.md` §3 Declarative Retention, §4 Phase 2, Core Principle 5; §4 decision 14 in this file.
-- **Depends on:** B-23, B-30 and B-09c; reuse created B-08/B-11/B-17/B-18/B-21 contracts.
-- **Acceptance criteria:**
-  - A `ref/` key reaches exactly the owners of its sha256's range in every cell, whatever its namespace.
-  - Two deployments sharing an artifact keep it retained; releasing one keeps the shared artifact.
-  - Wiping `bedrock-cdn`'s local state rebuilds identical rows and ref keys through range bootstrap under concurrent writes;
-    corruption, interruption and lease expiry cannot establish readiness.
-  - `bedrock-quicksilver` and `bedrock-kv` receive no `cdn` events, and the `quicksilver`, `kv` and `cdn` crates have no dependency on each other.
+Created: [#80](https://github.com/felixrydberg/bedrock/issues/80) — Feature 🚀: CDN path rows and ref keys in the `cdn` dataset
 
 ---
 
 #### B-33 — Publish client writing path rows and ref keys in bulk
 
-```
-Title:  Feature 🚀: Idempotent publish and release client for path rows and ref keys
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-A set of related artifacts (for example a Pages site with thousands of files) is published under one deployment ID.
-Publishing must guarantee that once it returns, every path row points at stored, retained content.
-The CDN is a backing service: it knows keys and artifacts, never deployments, Workers or which version is live.
-
-**Describe the solution you'd like**
-- Reuse B-32's row codec and B-30's content-addressed storage. This draft owns publish orchestration only.
-- `publish(namespace, deployment_id, files)` in `cdn/paths`:
-  1. Upload every artifact to S3 by sha256. Uploads are idempotent; never skip one because another tenant stored it.
-  2. Bulk-write (B-09c) every `path/{deployment_id}/{path}` row and one `ref/{sha256}/{deployment_id}` per distinct sha256,
-     split into bulks under the size cap. A Worker writes only the ref key of its bundle.
-  3. Return the revision of the last bulk once steps 1-2 have succeeded.
-- `release(namespace, deployment_id, files)` deletes the same keys in bulks under the size cap; a failed bulk is retried.
-- **Contract for callers:** after `publish` returns, the deployment's rows are readable at that revision and their artifacts are
-  retained until `release`. Callers write their own references to the deployment (for example in Quicksilver) only after
-  publishing, and remove them before releasing. The deploy control plane (B-50) is the first such caller.
-- Publishing is idempotent: rerunning it with the same files writes the same keys.
-- `bedrock-cdn` follows only `cdn` ranges, never `quicksilver` or any other KV dataset.
-
-**Additional context**
-- **Implementation:** CDN.
-- **Module:** `cdn/paths`.
-- **Doc reference:** `cdn.md` §3 Deployment Integration; §4 decision 14.
-- **Depends on:** B-30, B-32.
-- **Acceptance criteria:** `publish` never returns while a row's artifact is missing from S3 or unretained. Killing the client
-  between any two steps and rerunning it produces the same end state. A crash never makes part of one bulk visible.
-  `bedrock-cdn` receives no events from any KV dataset.
+Created: [#81](https://github.com/felixrydberg/bedrock/issues/81) — Feature 🚀: Idempotent publish and release client for path rows and ref keys
 
 ---
 
 #### B-34 — Regional L2 with two-replica artifact placement
 
-```
-Title:  Feature 🚀: Regional L2 artifact placement with two verified replicas per retained artifact
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Retained artifacts must be held by two verified nodes per cell, chosen with the shared range placement (decision 13).
-Local availability must be tracked separately from range ownership.
-A publish must not make both cold holders independently download the same artifact from S3.
-
-**Describe the solution you'd like**
-- The artifact hash falls in one `cdn` hash range (B-16); that range's two owners in the placement directory (B-15) are the
-  holders. Relays deliver its `ref/` keys only to them (§4 decision 14).
-- Only the selected holders initiate prewarming for an artifact, when its first `ref/` key arrives.
-- Reuse verified local or peer copies first. On a completely cold miss, the first holder fetches from S3.
-  The second requests the artifact from the first through B-31, starting or joining its coalesced fetch.
-- If the first holder fails or times out, the second falls back to S3 using B-31's retries and timeouts.
-  Artifact bytes use the existing bulk channel; relays continue carrying metadata.
-- A reconciler (B-20):
-  - desired = retained artifacts in my ranges only when read within the idle window (B-44); initial retention prewarming remains separate
-  - actual = local inventory
-  - repair = fetch via B-31
-- Track artifact availability separately from ownership and filter `relays::sources::Sources::select` by it (deferred from #20 / B-19, which returns range owners only).
-- Range repopulation hook for B-21.
-- Per-service owner count: B-16 made the owners per range (`REPLICAS = 3`) and the ranges moving at once
-  (`MAX_MOVING = 16`) constants in `crates/relay/src/membership.rs`. Make them per-service settings that the relay reads
-  at startup, from an environment variable or `[membership]`, with `cdn` set to 2.
-
-**Additional context**
-- **Implementation:** CDN.
-- **Module:** `cdn/retention`, `cdn/artifact_storage`.
-- **Doc reference:** `cdn.md` §3 Regional L2, §4 Phase 2, Core Principle 3.
-- **Depends on:** B-31, B-32.
-- **Known limits:** Download suppression is per cell and best-effort. Separate cells fetch independently; failover or
-  differing membership views can cause duplicate S3 downloads.
-- **Acceptance criteria:**
-  - After a publish, every artifact has two verified holders in each cell. Availability lookups return only holders that really have the bytes.
-  - With stable placement and healthy nodes, concurrent prewarming on both cold holders causes one S3 download and produces two verified copies.
-  - The second holder can request the first before it starts prewarming; concurrent requests on the first share one fetch.
-  - Failure or timeout of the first holder lets the second complete from S3 without waiting indefinitely.
+Created: [#82](https://github.com/felixrydberg/bedrock/issues/82) — Feature 🚀: Regional L2 artifact placement with two verified replicas per retained artifact
 
 ---
 
 #### B-35 — Artifact retrieval interface
 
-```
-Title:  Feature 🚀: Key- and hash-addressed CDN retrieval interface (streaming API and HTTP)
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Callers need a path row and then the artifact from the nearest healthy copy, both by point lookup.
-
-**Describe the solution you'd like**
-- `get_path(namespace, deployment_id, path, min_revision)` returns the row; `get_artifact(sha256)` streams the bytes. The CDN
-  never knows what a deployment is; callers (the Gateway, B-51) resolve which deployment they want themselves.
-- A path row is read from its key's owners at `min_revision` or later; an owner that is behind waits or the caller retries the next.
-- Artifacts use the B-22 `SourceChain` with CDN tiers: local cache → L2 holders of the sha256 → peers → S3.
-- One HTTP surface (`/paths/{namespace}/{deployment_id}/{path}`, `/artifacts/{sha256}`) and the same calls as an internal API.
-- Correct content type and caching headers for immutable content.
-
-**Additional context**
-- **Implementation:** CDN.
-- **Module:** `cdn/artifact_transfer` (retrieval), served by the `bedrock-cdn` binary.
-- **Doc reference:** `cdn.md` §3 Deployment Integration, §4 Phase 1 ("Basic Worker and Pages artifact retrieval"; the
-  Gateway is B-51).
-- **Depends on:** B-33, B-34.
-- **Acceptance criteria:** Requests are served from L2 in steady state. Artifact requests still succeed when both L2 holders are
-  down (via S3). The returned bytes always match the row's sha256. A missing row returns not found; a row behind `min_revision`
-  is never returned.
+Created: [#83](https://github.com/felixrydberg/bedrock/issues/83) — Feature 🚀: Key- and hash-addressed CDN retrieval interface (streaming API and HTTP)
 
 ---
 
 #### B-36 — CDN end-to-end acceptance
 
-```
-Title:  Feature 🚀: CDN end-to-end acceptance suite on the multi-region deployment
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-"CDN works" has to be shown on the real deployment, including failures.
-
-**Describe the solution you'd like**
-- Scenarios:
-  - publish a deployment, then fetch its path rows and artifacts from every region
-  - kill one L2 holder
-  - kill a relay during publish
-  - corrupt a cached artifact
-  - many concurrent cold requests for the same artifact
-  - kill `bedrock-cdn` on a machine: `bedrock-quicksilver` and `bedrock-kv` on that machine are unaffected
-  - kill `bedrock-quicksilver` or `bedrock-kv` on a machine: `bedrock-cdn` there is unaffected, since it depends on no KV process or dataset
-- Basic CDN dashboards: hit rates, S3 fallback rate, replica counts, transfer throughput.
-
-**Additional context**
-- **Implementation:** CDN.
-- **Doc reference:** `cdn.md` §3, §4 Phases 1–2.
-- **Depends on:** B-30 … B-35.
-- **Acceptance criteria:** Every scenario passes in CI or in a nightly job.
+Created: [#84](https://github.com/felixrydberg/bedrock/issues/84) — Feature 🚀: CDN end-to-end acceptance suite on the multi-region deployment
 
 ---
 
 #### B-59 — Simulation load: publishing and artifact retrieval
 
-```
-Title:  Feature 🚀: Add CDN traffic to the simulation's load
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-The simulation (#25 / B-23) writes keys to the `pages` and `workers` namespaces of the `cdn` dataset. Those are plain key
-writes, so nothing exercises publishing, path rows or artifact bytes.
-
-**Describe the solution you'd like**
-- Add to the fixed load: bulk publishes writing path rows and ref keys, and artifact retrieval, including many concurrent cold
-  requests for one artifact.
-- Add `CacheStorage` and S3 artifact faults to `tests/sim/src/storage.rs`.
-- Check that a retrieved artifact matches what was published, and that retention never removes a referenced artifact.
-
-**Additional context**
-The simulation sends the same load for every seed, and the seed decides only how it arrives: timing, bursts at the same
-average rate, which keys are hot, and value sizes. That keeps the load realistic, so long runs (`scripts/vopr.sh soak`) can
-find what only appears under real traffic over time. It keeps working without this task, but cannot reach what the load
-does not include. Add to the fixed load, never as a per-seed option, and give each request type its own expected result in
-`tests/sim/src/history.rs`: a request nothing checks only creates load.
-- **Implementation:** CDN.
-- **Depends on:** B-23, B-36.
-- **Acceptance criteria:** Every new request type has an expected result and a deliberate bug that breaks it. The sweep and a
-  long soak pass with the new load.
+Created: [#85](https://github.com/felixrydberg/bedrock/issues/85) — Feature 🚀: Add CDN traffic to the simulation's load
 
 ---
 
@@ -1056,112 +733,25 @@ and neither a customer-KV relay subscription nor a separate fill-broadcast chann
 
 #### B-38 — Full cache lifecycle and eviction
 
-```
-Title:  Feature 🚀: Adaptive KV cache admission and lifecycle across memory and disk
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-The bounded value cache from B-39 needs workload-driven admission and eviction tuning. Pushed datasets still
-need their own recent-update behavior; customer KV receives no push stream.
-
-**Describe the solution you'd like**
-- Tune hot/warm/cold admission and pressure behavior using measured cache reuse.
-- Preserve the L1 recent-update window for pushed datasets only. Customer KV admission follows reads and freshness checks.
-- Score by frequency, age, pressure and policy, respecting B-39's byte budget and per-namespace share.
-- Metrics: hit rate, admission/eviction reasons, cache churn and p99 read latency; namespace details remain introspection/top-N.
-
-**Additional context**
-- **Implementation:** KV refinement.
-- **Module:** `kv/storage`; the pushed-data L1 recent-update window lives in `quicksilver/storage`.
-- **Doc reference:** `kv.md` §9 L1, §16.
-- **Depends on:** B-29.
-- **Acceptance criteria:** Hit rate improves on a benchmark workload compared with B-39's cache. State transitions are observable in metrics.
+Created: [#86](https://github.com/felixrydberg/bedrock/issues/86) — Feature 🚀: Adaptive KV cache admission and lifecycle across memory and disk
 
 ---
 
 #### B-40 — `full_replica` placement and completeness
 
-```
-Title:  Feature 🚀: full_replica policy with complete regional coverage and completeness reporting
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Some namespaces, starting with Quicksilver (B-24), must be retained in full in every eligible datacenter. Disabling L2 eviction
-keeps what arrived, but nothing yet guarantees coverage or rebuilds it after a node is lost.
-
-**Describe the solution you'd like**
-- `full_replica` placement so that every key of the namespace is held across the L2 nodes in each DC: every hash range in
-  the placement directory has a ready owner (decision 13).
-- The Quicksilver read server answers only for ranges its node holds in `ready` or `leaving`; it checks that state and its
-  applied revision for each request. Completeness reporting must use the same held-range/readiness definition, not count
-  assigned or populating ranges as complete.
-- Eviction of covered keys is forbidden.
-- Completeness tracking, with degraded status until redundancy and completeness are restored.
-- This applies to pushed namespaces such as Quicksilver, not customer-KV cache readers. No customer-KV replica-completeness
-  or range-rebuild requirement is reintroduced. Metrics cover retained-data coverage/degradation with low-cardinality labels.
-
-**Additional context**
-- **Implementation:** KV refinement (KV Phase 6).
-- **Module:** `quicksilver/storage`, `lib/buckets`.
-- **Doc reference:** `kv.md` §3, §9, §15.5, §16.
-- **Depends on:** B-24, B-21.
-- **Acceptance criteria:** Killing a node reports degraded until it is rebuilt. Coverage reaches 100% again afterwards.
+Created: [#87](https://github.com/felixrydberg/bedrock/issues/87) — Feature 🚀: full_replica policy with complete regional coverage and completeness reporting
 
 ---
 
 #### B-41 — Adaptive cache promotion and regional load balancing
 
-```
-Title:  Feature 🚀: Adaptive cache promotion and regional load balancing
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Many hot keys can be spread by cache affinity, but a single hot key can still overload its preferred reader.
-
-**Describe the solution you'd like**
-- Promote hot customer-KV keys to additional cache readers or L1s using measured load; no durable shard movement or push feed.
-- Load-aware selection among eligible readers, with misses coalesced and S3/recent-state requests bounded.
-- Measure metadata duplication and cache reuse as readers spread; do not imply read-side scaling increases one writer's capacity.
-- Metrics: source load, promotions, cache-hit distribution and p99 latency; hot-key/namespace details use top-N/introspection.
-
-**Additional context**
-- **Implementation:** KV refinement (KV Phase 6).
-- **Module:** `kv/operations`, `lib/relays`.
-- **Doc reference:** `kv.md` §19 Phase 6.
-- **Depends on:** B-38.
-- **Acceptance criteria:** A skewed benchmark shows lower p99 latency and more even node load.
+Created: [#88](https://github.com/felixrydberg/bedrock/issues/88) — Feature 🚀: Adaptive cache promotion and regional load balancing
 
 ---
 
 #### B-42 — Auth dataset
 
-```
-Title:  Feature 🚀: Auth dataset for API key hashes, permissions and status
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-`notes.md` lists an Auth dataset (API key hashes, permissions, status). §4 decision 15 places it on the Gateways.
-
-**Describe the solution you'd like**
-- An `auth` dataset with a `keys` namespace (§4 decision 13, fixed namespaces). Every cell-tier Gateway follows the whole
-  namespace into local durable storage and is not ready until it has caught up. It never uses the `cached` TTL model: a
-  revocation must not wait for a TTL.
-- Fail-closed behaviour for revocations: a Gateway rejects keys once it has gone 30 seconds without proof that its copy is
-  current (decision 15).
-- Each key record holds its permissions, status, allowed IP ranges and expiry, evaluated locally on the Gateway.
-- Proposed key format, to settle before the first key is issued: a recognizable prefix and a checksum, so secret scanners can
-  find leaked keys and malformed ones are rejected without a lookup.
-
-**Additional context**
-- **Implementation:** Shared infrastructure (new dataset).
-- **Module:** `crates/gateway` (binary `bedrock-gateway`, decision 15).
-- **Doc reference:** `notes.md`; `kv.md` §17 Freshness Guarantees ("access revocations require fencing… or fail-closed").
-- **Depends on:** B-57.
-- **Acceptance criteria:** A revoked key is rejected in every region within 30 seconds, or the check fails closed.
+Created: [#90](https://github.com/felixrydberg/bedrock/issues/90) — Feature 🚀: Auth dataset for API key hashes, permissions and status
 
 ---
 
@@ -1179,164 +769,37 @@ with a conditional-PUT manifest.
 
 #### B-43 — Artifact replica repair and range migration
 
-```
-Title:  Feature 🚀: Automatic artifact replica repair and range migration
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-The first CDN keeps two replicas, but repair and rebalancing after failures or membership changes only use the generic paths.
-CDN-specific repair is needed: verified copies, peer-first sourcing, throttling.
-
-**Describe the solution you'd like**
-- Replica repair: restore 2 verified holders after a holder is lost, sourcing from peers first and S3 second.
-- Range migration during rebalance through the relay-driven handoff (B-21), with no gap in availability.
-- Repair throttling that respects transfer backpressure.
-- Drain hook (B-21b): a node drain moves its artifact holders within the cell; a cell drain has nothing to move, and the cells
-  taking its traffic can prewarm (B-45).
-
-**Additional context**
-- **Implementation:** CDN refinement (CDN Phase 3). **Do this first among the CDN refinements.**
-- **Module:** `cdn/retention`.
-- **Doc reference:** `cdn.md` §3 Regional L2, §4 Phase 3.
-- **Depends on:** B-36.
-- **Acceptance criteria:** Killing a holder restores two replicas automatically. Rebalancing never drops an artifact below one available replica.
+Created: [#91](https://github.com/felixrydberg/bedrock/issues/91) — Feature 🚀: Automatic artifact replica repair and range migration
 
 ---
 
 #### B-44 — Coordinated eviction, GC and failure recovery
 
-```
-Title:  Feature 🚀: Coordinated artifact eviction, garbage collection and node/relay failure recovery
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Released artifacts need to be removed safely across replicas and from S3.
-Retention state must also recover cleanly after node and relay failures, without any per-artifact global metadata.
-
-**Describe the solution you'd like**
-- Coordinated eviction when an artifact's last `ref/` key is deleted, across both holders.
-- Idle eviction: both L2 holders evict a retained artifact that has not been read within a configurable idle window, and
-  under storage pressure the least recently read first. S3 keeps it, it stays retained, and the next miss fetches it again.
-- S3 garbage collection with a grace period. GC deletes an S3 object only when:
-  - it was released (its last `ref/` key was deleted), not merely never retained. Objects uploaded by a publish that has not
-    written its ref keys yet (B-33 step 1) are never candidates, and
-  - it is older than the grace period, and no `ref/` key for it exists at deletion time (re-checked by the holders, since a
-    new deploy can retain the same content hash again).
-- Deletion is version-protected: the bucket is versioned, and GC deletes only the object version it found released and past
-  the grace period. A publish always uploads (B-33 step 1), creating a newer version that a concurrent GC never deletes, so
-  re-checking ref keys is not the only guard.
-- S3 GC runs in one designated cell: its holders of a range see every ref key of the artifacts in it.
-- Orphans from failed publishes (uploaded, never retained) are swept separately, only after a much longer grace period than any publish takes.
-- Recovery of ref keys after relay and node loss through range bootstrap (B-21), using B-11's consistent materialized-state view and subsequent retained database events, resuming the stream boundary.
-- Reconciliation without per-artifact global location tracking.
-
-**Additional context**
-- **Implementation:** CDN refinement (CDN Phase 3).
-- **Module:** `cdn/retention`.
-- **Doc reference:** `cdn.md` §3 Declarative Retention, §4 Phase 3.
-- **Depends on:** B-43.
-- **Acceptance criteria:** An artifact that is still referenced is never deleted from S3. An idle retained artifact leaves L2
-  after the idle window and is served from S3 on the next request. Released artifacts are reclaimed within the grace window. State converges after a relay failure. An artifact uploaded by an in-progress publish is never deleted before its ref keys arrive. An artifact released by one deployment and retained by another during GC is kept.
+Created: [#92](https://github.com/felixrydberg/bedrock/issues/92) — Feature 🚀: Coordinated artifact eviction, garbage collection and node/relay failure recovery
 
 ---
 
 #### B-45 — Prewarming and artifact-set readiness
 
-```
-Title:  Feature 🚀: Regional prewarming on publish and readiness reporting for a set of artifacts
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Newly published content should not start cold in every region, and callers need to know when it is warm.
-
-**Describe the solution you'd like**
-- Prewarm: when a holder applies an artifact's first `ref/` key, it fetches the artifact (B-34).
-- Readiness: given a set of sha256s (for example a deployment's files, which the caller published), each cell groups them by
-  owner from its placement directory, asks each owner which it holds verified, and reports whether both holders have every
-  artifact, through the retrieval API (B-35). Callers can wait for all cells, or a threshold with a timeout, before they
-  start sending traffic.
-- Waiting is optional: using a deployment early is still correct, since misses fall back to S3, just cold.
-
-**Additional context**
-- **Implementation:** CDN refinement (CDN Phase 4).
-- **Module:** `cdn/retention`.
-- **Doc reference:** `cdn.md` §3 Deployment Integration, §4 Phase 4; §4 decision 14.
-- **Depends on:** B-36.
-- **Acceptance criteria:** A set reported ready in a cell gets close to 100% L2 hits there on its first requests.
-  Readiness turns false when a holder is lost and true again after repair (B-43).
+Created: [#93](https://github.com/felixrydberg/bedrock/issues/93) — Feature 🚀: Regional prewarming on publish and readiness reporting for a set of artifacts
 
 ---
 
 #### B-46 — Optional unreplicated L1 and popularity-based retention
 
-```
-Title:  Feature 🚀: Optional unreplicated L1 artifact cache and popularity-based retention
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Hot artifacts gain from per-node caching. Retention driven only by ref keys ignores real demand.
-
-**Describe the solution you'd like**
-- An optional per-node L1 that caches path rows and artifact bytes by sha256 in memory, evicts automatically and is never replicated.
-- Separate L2 and L1 storage areas; L1 evicts on its own, independently of L2 idle eviction (B-44).
-- Popularity signals feed into retention decisions.
-
-**Additional context**
-- **Implementation:** CDN refinement (CDN Phase 4).
-- **Module:** `cdn/artifact_storage`, `cdn/retention`.
-- **Doc reference:** `cdn.md` §3 Artifact Storage and Regional L2, §4 Phase 4, Core Principle 4.
-- **Depends on:** B-44.
-- **Acceptance criteria:** L1 eviction never touches L2 data. The hit rate for popular assets improves.
+Created: [#94](https://github.com/felixrydberg/bedrock/issues/94) — Feature 🚀: Optional unreplicated L1 artifact cache and popularity-based retention
 
 ---
 
 #### B-47 — Filesystem `CacheStorage` adapter
 
-```
-Title:  Feature 🚀: Filesystem CacheStorage adapter
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Some deployments want plain files instead of Foyer.
-
-**Describe the solution you'd like**
-- A filesystem adapter implementing `CacheStorage`: atomic writes, checksum verification, inventory scan on startup.
-- Shares the `CacheStorage` contract tests with Foyer.
-
-**Additional context**
-- **Implementation:** CDN refinement (CDN Phase 4).
-- **Module:** `cdn/artifact_storage`.
-- **Doc reference:** `cdn.md` §3 Artifact Storage, §4 Phase 4.
-- **Depends on:** B-36.
-- **Acceptance criteria:** Passes the same `CacheStorage` tests as Foyer. Can be selected by config.
+Created: [#95](https://github.com/felixrydberg/bedrock/issues/95) — Feature 🚀: Filesystem CacheStorage adapter
 
 ---
 
 #### B-49 — Large-object and range transfers
 
-```
-Title:  Feature 🚀: Large-object and HTTP range transfer support
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Large assets and partial (range) requests should not need the whole object transferred or buffered.
-
-**Describe the solution you'd like**
-- Range reads through the retrieval interface and the peer/S3 transfers.
-- Chunked verification for large objects.
-
-**Additional context**
-- **Implementation:** CDN refinement (CDN Phase 4).
-- **Module:** `cdn/artifact_transfer`.
-- **Doc reference:** `cdn.md` §4 Phase 4.
-- **Depends on:** B-36.
-- **Acceptance criteria:** Range requests return the correct bytes without fetching the full object. Large uploads and downloads stay within the memory budget.
+Created: [#96](https://github.com/felixrydberg/bedrock/issues/96) — Feature 🚀: Large-object and HTTP range transfer support
 
 ---
 
@@ -1350,153 +813,31 @@ as a client of those services. Nothing in tracks A-K depends on this track. Work
 
 #### B-50 — Deploy control plane: publish, activate, roll back, delete
 
-```
-Title:  Feature 🚀: Deploy control plane orchestrating S3, CDN and Quicksilver for Worker and Pages deployments
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-A Worker or Pages deployment touches three backing services (S3, the `cdn` dataset, Quicksilver) that cannot be written atomically together.
-Something has to own the order, so that every intermediate state is safe and a failed deploy can simply be rerun.
-
-**Describe the solution you'd like**
-- Every revision of a Worker or Pages site is its own deployment with its own `deployment_id`.
-- Read `deployment/{id}` and active-deployment records through the shared client and Quicksilver `Reads` API; do not add a
-  separate deployment-record read path.
-- Quicksilver schema, owned by this draft (typed accessors included): `deployment/{deployment_id} → {runtime settings, bindings,
-  env/secret references, cdn_revision, bundle sha256 for Workers}` and `worker/{worker_id}/active → deployment_id`. A project
-  name or host resolves to a `deployment_id` here; the CDN only ever sees the UUID.
-- **Publish and activate**, in this order:
-  1. Publish the artifacts with the CDN publish client (B-33) under the new `deployment_id`, into the `workers` or `pages`
-     namespace. It returns `cdn_revision` once the bytes are uploaded and the path rows and ref keys are written.
-  2. *(Optional)* wait for readiness of the deployment's artifacts (B-45).
-  3. Write `deployment/{deployment_id}` to Quicksilver.
-  4. Write `worker/{worker_id}/active` to make it live. Can be batched with step 3, or written later.
-  5. Send the deployment's cron schedules to the Worker's cron actor (S-13). Rerunning sends the same schedules again.
-- **Why this order:** Quicksilver only ever names deployments whose rows exist and whose artifacts are retained, so CDN GC
-  (B-44) cannot delete artifacts a deployment points at. A deploy that fails after step 1
-  leaves retained rows that nothing uses (harmless, cleaned up by a retry or a release).
-- **Rollback:** write a previous `deployment_id` to `worker/{worker_id}/active`. Keep the N previous deployments' rows and ref keys.
-  Only requested artifacts that remain warm within the idle window (B-44) are guaranteed to be served from L2; cold artifacts may
-  fetch from S3 unless the deployment was prewarmed (B-45). Reading the deployment record does not warm its artifacts.
-- **Delete** runs in reverse: remove `deployment/{deployment_id}` (it must not be active), then `release` (B-33).
-- Every step is idempotent, keyed by `deployment_id`.
-
-**Additional context**
-- **Implementation:** Compute / deploy control plane.
-- **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §3 Deployment Integration.
-- **Depends on:** B-24, B-33, B-45.
-- **Acceptance criteria:** Killing the control plane between any two steps and rerunning the deploy produces the same end state.
-  No Quicksilver deployment ever references unretained artifacts. Rollback requests for artifacts that remain warm within the
-  idle window need no S3 fallback; cold artifacts may require S3 unless the deployment is prewarmed.
+Created: [#97](https://github.com/felixrydberg/bedrock/issues/97) — Feature 🚀: Deploy control plane orchestrating S3, CDN and Quicksilver for Worker and Pages deployments
 
 ---
 
 #### B-51 — Gateway: Worker and Pages request routing
 
-```
-Title:  Feature 🚀: Gateway routing Worker and Pages requests through Quicksilver and the CDN
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-A request arrives with a host and a path. Something must decide whether it is a Worker or a Pages deployment and turn it into
-point lookups; the CDN and Quicksilver only answer for keys and artifacts.
-
-**Describe the solution you'd like**
-- The Gateway resolves the host (or project name) to the active `deployment_id` in Quicksilver, then reads
-  `deployment/{deployment_id}`, which says Worker or Pages.
-- Use the shared client and Quicksilver `Reads` API for both records.
-- Worker: route the request to a node that invokes it. A cold start fetches the bundle with `get_artifact(bundle sha256)` (B-35).
-- Pages: `get_path("pages", deployment_id, path, cdn_revision)` gives the sha256, then `get_artifact(sha256)` from its holders.
-  Index files, SPA fallbacks, redirects and the 404 page are further path rows.
-- Path rows and artifacts are immutable, so the Gateway caches both in memory without invalidation; a warm request makes no
-  CDN lookup.
-- Content type, caching headers and not-found handling for deployments.
-
-**Additional context**
-- **Implementation:** Compute / deploy control plane, running in `bedrock-gateway` (B-57).
-- **Doc reference:** `notes.md` (Worker Execution); `cdn.md` §4 Phase 1 ("Basic Worker and Pages artifact retrieval"); §4 decisions 14, 15.
-- **Depends on:** B-35, B-50, B-57.
-- **Acceptance criteria:** A Pages request resolves to the active deployment's file. Switching `active` changes the served
-  version in every region once Quicksilver has propagated. A Pages request never sees a row behind its deployment's
-  `cdn_revision`.
+Created: [#98](https://github.com/felixrydberg/bedrock/issues/98) — Feature 🚀: Gateway routing Worker and Pages requests through Quicksilver and the CDN
 
 ---
 
 #### B-48 — Compiled Worker artifact caching
 
-```
-Title:  Feature 🚀: Cache compiled Worker artifacts
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Recompiling Worker bundles on each cold VM start wastes time against the < 100 ms startup target.
-
-**Describe the solution you'd like**
-- Store compiled outputs as ordinary CDN artifacts, keyed by `(bundle hash, runtime version, target)`. The CDN needs no
-  Worker-specific code: Compute publishes and fetches them through B-33 and B-35.
-
-**Additional context**
-- **Implementation:** Compute (moved from the CDN refinements).
-- **Doc reference:** `cdn.md` §4 Phase 4; `notes.md` (Worker Execution).
-- **Depends on:** B-51.
-- **Acceptance criteria:** A warm compiled-cache hit skips compilation. Changing the runtime version invalidates the entry.
+Created: [#99](https://github.com/felixrydberg/bedrock/issues/99) — Feature 🚀: Cache compiled Worker artifacts
 
 ---
 
 #### B-52 — Deploy end-to-end acceptance
 
-```
-Title:  Feature 🚀: End-to-end deploy suite across KV, CDN and the control plane
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-"Deploys work" spans three services and has to be shown on the real multi-region deployment, including failures.
-
-**Describe the solution you'd like**
-- Scenarios:
-  - deploy, activate and serve a Worker and a Pages site from every region
-  - roll back and delete a deployment
-  - kill the control plane mid-deploy and rerun it
-  - kill a relay during a deploy
-  - kill `bedrock-quicksilver` on a machine: served deployments keep working from the CDN and other Quicksilver nodes
-
-**Additional context**
-- **Implementation:** Compute / deploy control plane.
-- **Depends on:** B-29, B-36, B-50, B-51.
-- **Acceptance criteria:** Every scenario passes in CI or in a nightly job.
+Created: [#100](https://github.com/felixrydberg/bedrock/issues/100) — Feature 🚀: End-to-end deploy suite across KV, CDN and the control plane
 
 ---
 
 #### B-60 — Simulation load: Workers, Pages and deploys
 
-```
-Title:  Feature 🚀: Add Worker, Pages and deploy traffic to the simulation's load
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Deploys span KV, CDN and the control plane, and a Worker or Pages site is made of several writes. Random key writes cannot
-show that a deployment is ever half-visible.
-
-**Describe the solution you'd like**
-- Add to the fixed load: create, activate, roll back and delete for Workers and Pages sites, alongside the KV and CDN traffic.
-- Run the Gateway and control plane binaries in the simulation with the others.
-- Check that a request is served by exactly one complete deployment, and that a rollback restores the previous one.
-
-**Additional context**
-The simulation sends the same load for every seed, and the seed decides only how it arrives: timing, bursts at the same
-average rate, which keys are hot, and value sizes. That keeps the load realistic, so long runs (`scripts/vopr.sh soak`) can
-find what only appears under real traffic over time. It keeps working without this task, but cannot reach what the load
-does not include. Add to the fixed load, never as a per-seed option, and give each request type its own expected result in
-`tests/sim/src/history.rs`: a request nothing checks only creates load.
-- **Implementation:** Compute / deploy control plane.
-- **Depends on:** B-23, B-52.
-- **Acceptance criteria:** Every new request type has an expected result and a deliberate bug that breaks it. The sweep and a
-  long soak pass with the new load.
+Created: [#101](https://github.com/felixrydberg/bedrock/issues/101) — Feature 🚀: Add Worker, Pages and deploy traffic to the simulation's load
 
 ---
 
@@ -1526,138 +867,13 @@ any `Member` (`node_id`, `service`, `cell`, `address`, budgets), which places it
 
 #### B-55 — Mutual TLS and caller identity between nodes
 
-```
-Title:  Feature 🚀: Mutual TLS and caller identity for node-to-node traffic
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Node-to-node gRPC and the write API are plaintext. A relay accepts any leaf session and trusts the `Member` it
-announces, so a host that reaches a relay can join membership under another node's `node_id` and receive L2 ranges.
-
-**Describe the solution you'd like**
-- **Enabled by configuration, fail closed.** `NodeConfig` gains an optional `tls = { cert, key, ca }` (file paths).
-  - Absent: plaintext with a startup warning and the gauge `transport_tls_enabled 0`, except production cell relays
-    with membership enabled, which require TLS and fail startup without it.
-  - Present: mTLS is required on every node-to-node listener and connection. Until the files load, `/ready` stays false;
-    if they do not load within a fixed startup timeout, the process exits with an error. A configured node never falls
-    back to plaintext. A file appearing at a path does not by itself enable TLS.
-  - A TLS server rejects plaintext clients and the reverse, so a cell runs one mode. Moving an existing cell to TLS is a
-    cutover; there is no mixed mode.
-- **Certificate contract** (what any issuer must produce, documented in B-54): a PEM private key, a PEM certificate chain
-  and a PEM CA bundle. The leaf certificate has extended key usages `serverAuth` and `clientAuth`, a URI SAN
-  `bedrock://{service}/{cell}/{node_id}` (`service` ∈ `quicksilver`, `kv`, `cdn`, `relay`, `api`; `node_id` and `cell`
-  already exclude `/`), and a DNS or IP SAN for the host in `advertise`. Startup rejects a certificate whose URI SAN
-  does not match the node's own `service`, `cell` and `node_id`.
-- **Identity.** One parser in `lib/transport` turns a verified peer chain into `Caller { service, cell, node_id }`.
-- **Transport.** `Peers::channel` dials `https://` with the client certificate and verifies the server chain against the
-  CA bundle and the dialed host against the server's SANs. Every server requires a client certificate from that bundle.
-  TLS 1.3 only, through rustls/tokio-rustls (already in the lockfile) on tonic's `serve_with_incoming` and
-  `connect_with_connector_lazy`, so certificates can be swapped (see Rotation).
-- **Authorization** in the RPC handlers, from `Caller`, never from fields in the request:
-
-  | Server | Accepts |
-  |---|---|
-  | api `Relay.Session` | `relay` |
-  | relay `Relay.Session`, leaf (`tier` 0) | `quicksilver`, `kv`, `cdn` in the relay's own cell |
-  | relay `Relay.Session`, lower relay tier | `relay` |
-  | relay `Siblings.Watch` | `relay` in the same cell |
-  | api write HTTP (HTTPS when `tls` is set) | Any caller; a client certificate is optional and every caller keeps the bearer token (open question 1) |
-
-  Clients check the server too: a leaf or relay session only accepts frames from a `relay` or `api` peer.
-- **Membership binding.** A leaf `Hello`'s `Member` must match the caller: same `service`, `cell` and `node_id`, and
-  the host in `address` must be one of the caller certificate's SANs. Otherwise the relay rejects the session with
-  `PERMISSION_DENIED`, which is a caller error and does not trip the caller's breaker for the relay (B-13). Budgets and
-  roles stay self-reported.
-- **Rotation without restart.** Every handshake uses the current rustls configs, on the server through the TLS
-  acceptor and on the client through the custom connector, so new handshakes pick up renewed files. Files are polled
-  every 10 seconds and compared by content, which also catches Kubernetes' atomic symlink swap of mounted Secrets. A
-  renewal that fails to parse, has expired or does not match the node keeps the previous certificate and raises an
-  error metric. Existing connections keep their handshake identity: gRPC servers begin a graceful close after 24
-  hours (`max_connection_age`, no grace limit), so long-lived relay sessions keep running, and the write listener has
-  no age limit.
-- **Admin endpoint** stays plain HTTP without client certificates. Deployments bind it to loopback or a private
-  interface (B-54).
-- **Metrics.** `transport_tls_enabled`, inbound handshake failures, reload failures and seconds until the local
-  certificate expires, all without labels. Rejected sessions are logged with the caller's identity.
-- **Simulation.** madsim-tonic ignores TLS and has no `serve_with_incoming`, so the TLS adapter is compiled out under
-  `cfg(madsim)`, as RocksDB is: simulated nodes run plaintext, and configuring `tls` there fails at startup.
-  Authorization is a pure function of the `Caller` (unit-tested in both builds); real-socket tests with a generated CA
-  cover the wiring.
-- **Specification.** Authorization only removes callers the protocol already treats as failed peers, and adds no
-  messages or states; `relays.tla` and `membership.tla` stay unchanged. Revisit if review shows otherwise.
-
-**Additional context**
-- **Implementation:** Shared core (`lib/transport`) plus wiring in every binary.
-- **Module:** `lib/transport`, `lib/node` (config), `lib/relays` (session authorization and membership binding), `api`.
-- **Depends on:** B-03 (transport), B-12 (membership entries), B-17 (relay sessions).
-- **Doc reference:** #44; `kv.md` §17 (security-sensitive actions fail closed).
-- **Acceptance criteria:**
-  - Real-binary test with a CA generated in the test: a session without a client certificate, with a certificate from
-    another CA, with an expired certificate, or as the wrong service is rejected; a valid one succeeds.
-  - A leaf announcing another `node_id`, another cell or an address outside its SANs is rejected before it joins
-    membership.
-  - With `tls` set and the files missing, the node stays unready and then exits; it never serves plaintext. Without
-    `tls`, non-membership nodes serve plaintext and report `transport_tls_enabled 0`; production cell membership
-    rejects startup without TLS.
-  - Replacing the files in place and by symlink swap changes the certificate on new handshakes without dropping
-    sessions; a corrupt or mismatched renewal keeps the old certificate and is reported.
-  - Normal and `cfg(madsim)` builds pass the existing seeds; bulk-transfer throughput with TLS is measured against
-    plaintext and recorded.
+Shipped in [#44](https://github.com/felixrydberg/bedrock/issues/44) (scope amendment 2026-11-03: B-55 binaries, B-54 deployment guide `docs/deployment/security.md`).
 
 ---
 
 #### B-54 — Deployment guide: private networking and certificate issuance
 
-```
-Title:  Feature 🚀: Deployment guide for private networking and node certificates
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-B-55 makes the binaries require certificates at configured paths but does not say where they come from. Bedrock runs on
-Kubernetes, customer Docker hosts and bare metal at several providers, and each has its own way to issue certificates and
-keep traffic private.
-
-**Describe the solution you'd like**
-- A guide under `docs/deployment/` with the B-55 certificate contract, and per deployment type how the files reach the
-  configured paths, how they renew before expiry, how the network is restricted, and where the admin endpoint binds:
-
-  | Deployment | Certificates | Private network |
-  |---|---|---|
-  | Kubernetes | cert-manager `Certificate` per pod → Secret mounted read-only. With OpenBao, cert-manager's Vault issuer (compatibility to be verified) | The cluster's CNI (for example WireGuard encryption) and NetworkPolicies limiting each port to the callers in B-55's table |
-  | Docker / compose | OpenBao Agent container writing into a volume shared with the services, or any script that writes the files | Host firewall; Nebula when hosts span networks |
-  | Bare metal across providers | OpenBao Agent as a systemd unit | Nebula, below |
-  | Local / tests | No `tls` section, or a test CA from a script | — |
-
-- **OpenBao reference setup**: a PKI intermediate with one role per service (`client_flag`,
-  `server_flag`, URI SANs limited by `allowed_uri_sans_template` to the machine's own `cell` and `node_id`, DNS SANs
-  by `allowed_domains_template` to its own host, IP SANs off, 7-day TTL, `generate_lease` set). One AppRole per
-  machine, whose response-wrapped `secret_id` is delivered before every agent start, with a policy allowing only `issue/{service}` for the services it
-  runs. Agent templates use `secret`: OpenBao's docs describe `pkiCert` re-fetching only at startup or after expiry,
-  and leased secrets at 85% of their TTL. The setup is run once against an OpenBao dev server to confirm this.
-- **Nebula**, for machines spanning several networks:
-  - Nebula 1.10+ with v2 certificates on a dedicated IPv4 /16, as a host service outside the Bedrock containers.
-  - At least three lighthouses at different providers; Nebula's own relay feature stays off for hosts with public addresses.
-  - Host firewall on the public interface: Nebula UDP 4242 and SSH from the operator network only.
-  - Nebula groups (`service`, `relay`, `api`, `monitoring`, `ops`) limit ports: relay `listen` ← `service`, `relay`;
-    api `listen` ← `relay`; api `write_listen` ← `relay`, `ops`; `admin_listen` ← `monitoring`, `ops`.
-  - Host keys are generated on the machine; only the public key is signed (open question 2 covers where the CA key lives).
-  - Removing a machine: its fingerprint goes into `pki.blocklist` on every host, with `pki.disconnect_invalid: true`.
-    Its TLS certificate then expires within its lifetime because the machine can no longer renew.
-- Non-membership examples may leave `[tls]` commented out. Production cell membership examples require TLS and
-  an explicit `membership.voter_ids` mapping; simulations retain their plaintext exception.
-
-**Additional context**
-- **Implementation:** Foundation (deployment). Documentation and example configuration; no Rust changes.
-- **Module:** `docs/deployment/security.md`, `deploy/config/`.
-- **Depends on:** B-02, B-55.
-- **Acceptance criteria:**
-  - The compose + OpenBao path is run end to end once: certificates are issued, a cell starts with TLS, renewal swaps the
-    certificate without dropping sessions. Recorded in the guide.
-  - The Nebula path is run once on machines in two networks: Bedrock ports answer only on overlay addresses and a
-    blocklisted machine loses its tunnels. Recorded in the guide.
-  - Steps not run end to end (for example the Kubernetes/cert-manager path) are marked untested in the guide.
+Shipped in [#44](https://github.com/felixrydberg/bedrock/issues/44) (scope amendment 2026-11-03: B-55 binaries, B-54 deployment guide `docs/deployment/security.md`).
 
 ---
 
@@ -1681,68 +897,13 @@ keep traffic private.
 
 #### B-56 — Shared API rate-limit infrastructure
 
-```
-Title:  Feature 🚀: Shared API rate-limit infrastructure across services
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Request-rate limits should use shared platform functionality that services can integrate, rather than separate product
-implementations. Customer KV request-rate limiting is deferred until this infrastructure is available; it does not block
-initial KV delivery.
-
-**Describe the solution you'd like**
-- Provide reusable rate-limit contracts and implementation in `lib`, with service API integration. KV consumes the shared
-  functionality later; it does not implement its own rate-limit system in B-25 through B-29 or B-39.
-- Agree policy configuration, caller/scope identity, accounting scope and behavior during failures before implementation.
-  The algorithm, deployment topology and distributed coordination remain design decisions for this draft.
-- Keep customer request-rate policies separate from storage/size quotas and existing overload protection such as bounded
-  queues, coalescing, source-capacity limits and backpressure.
-- Use low-cardinality metrics for allowed/rejected requests and limiter failures; expose caller/namespace details through
-  introspection rather than metric labels.
-
-**Additional context**
-- **Implementation:** Future shared infrastructure; draft only, no GitHub issue created.
-- **Module:** Shared contracts in `lib` and service API integration; final placement to be agreed.
-- **Depends on:** To be agreed before implementation. This draft is not a prerequisite for initial KV acceptance.
-- **Acceptance criteria:** The same limiter supports multiple service integrations with isolated scopes and consistent
-  decisions/errors. Validate policy enforcement, failure behavior and scope isolation through shared contract tests and
-  applicable normal/simulation checks when implemented. KV adoption follows this shared work.
+Created: [#102](https://github.com/felixrydberg/bedrock/issues/102) — Feature 🚀: Shared API rate-limit infrastructure across services
 
 ---
 
 #### B-57 — Gateway binary and shared cluster client
 
-```
-Title:  Feature 🚀: Gateway binary and shared client for routing between nodes and cells
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Services have no standard way to reach each other. Each binary wires up its own member view and source selection, a node
-cannot reach another cell, and public requests have no entry point.
-
-**Describe the solution you'd like**
-- #56 / B-25 ships the shared client's first slice: callers fetch `Relay.Routes` from their cell relay on first use, cache
-  members and placement directory for that service, and drop the table after 10 idle minutes (`IDLE_TTL`). Reads go directly
-  to holders; owner/freshness rejection tries the next owner, then fetches a newer table, with bounded retries. Compute holds
-  tables only for services it calls. B-57 adds `bytes()`, Gateway/Compute wiring, tier fallback and customer-KV rendezvous
-  (`Sources::readers`).
-- `bedrock-gateway`, with its role taken from the tier of the relay it subscribes to (§4 decision 15): a cell tier authenticates
-  and routes to nodes, a DC or region tier picks a cell. Separate public and internal listeners with separate limits.
-- A `gateway` service identity in `authorize`, including a way to read from upper-tier relays, which accept only `relay` today.
-- Reading other services' views: `{service}.{cell}` for each service the Gateway calls. This is untested.
-- The list of cells below an upper tier, which relays do not know today.
-- The freshness request of decision 15 on the relay session, with its reply's age accumulated at each tier.
-
-**Additional context**
-- **Implementation:** Shared infrastructure; draft only, no GitHub issue created.
-- **Module:** new `crates/gateway`; the client in `lib`; `lib/relays` and `replication.proto` for the freshness request.
-- **Doc reference:** §4 decision 15.
-- **Depends on:** B-19, B-22, B-55. The freshness request updates the TLA+ specification first and meets the B-23 checks.
-- **Acceptance criteria:** A read inside a cell takes no extra hop. A node reaches another cell with no member list for it. A
-  relay cut off from its parent cannot make a Gateway look fresh: simulation shows the Gateway failing closed within 30 seconds
-  and recovering afterwards, replayable per seed. Metric labels stay low-cardinality.
+Created: [#89](https://github.com/felixrydberg/bedrock/issues/89) — Feature 🚀: Gateway binary and shared client for routing between nodes and cells
 
 ---
 
@@ -1752,297 +913,37 @@ Created: [#66](https://github.com/felixrydberg/bedrock/issues/66) — Feature �
 
 #### B-62 — Partial quarantine: rebuild only the damaged range
 
-```
-Title:  Feature 🚀: Rebuild only the damaged range of a quarantined engine
-Labels: enhancement
-```
+Created: [#103](https://github.com/felixrydberg/bedrock/issues/103) — Feature 🚀: Rebuild only the damaged range of a quarantined engine
 
-**Is your feature request related to a problem? Please describe.**
-One bad record quarantines a whole engine instance, and rebuilding it re-bootstraps every scope of that dataset. Ranges only
-split, so that cost grows with a node's range count: `quicksilver-3` held 45 `keys` ranges at the end of a simulated day. While
-it rebuilds, the node serves nothing from that dataset and takes no new ranges for it, even though almost all of its data is
-good. `kv.md` §15.7 prefers the smallest practical recovery, and a failed L2 range is one of the levels it lists.
-
-**Describe the solution you'd like**
-Verify first, then narrow:
-1. Damage quarantines the whole instance, as it does today, so nothing is served while the extent is unknown.
-2. A verification pass checks the whole engine with its own verifier where it has one, then reads every record by range. It is
-   a local read, far cheaper than bootstrapping over the network.
-3. The adapter reports the span of storage it must discard. On RocksDB that is the damaged table file's key span, not the hash
-   range the failure hit. If it can name no span, the whole instance rebuilds.
-4. Every L2 range overlapping that span stays quarantined and the rest serve again.
-5. The adapter physically discards the span, and each of those ranges re-bootstraps through its own scope, then validates as a
-   bootstrap does today.
-
-The client already recovers one scope alone (`Intake::fail`), and the scrubber's walk already names the part of the engine it
-hit. New work:
-- Per-range health. `StorageHealth` tracks quarantine per range, and `Monitored` refuses calls by range. Whole-instance stays
-  the default state. `Member` names the damaged ranges, and `select`, `confirms` and `handoff` filter by range. The owner stays
-  `ready` in the directory, as a rebuilding owner does today, so this needs no directory write and no relay majority. This
-  changes the protocol, so `handoff.tla` and `membership.tla` come first, with `Sicken` per point.
-- The quarantine marker names its ranges, so a restart comes back with the same ranges refused. A marker that cannot be read as
-  ranges means the whole instance.
-- `StorageEngine` gains a way to report and discard a span, and an optional whole-engine verifier. `Reinitialise` gets a range
-  form that uses them and removes only those ranges' records and revisions.
-
-Falls back to the whole instance when:
-- a failure names no key or file, such as a manifest error;
-- the adapter cannot discard the span;
-- a failure is outside the L2 ranges, such as a revision or a namespace-prefixed record;
-- the verification pass fails or is interrupted;
-- more ranges are damaged than it is worth rebuilding one at a time.
-
-**RocksDB**
-Measured with throwaway probes against RocksDB 11.8 on 2026-11-06:
-- `delete_range` does not remove damage. After deleting the range around a bad block, scans are clean, but the next compaction
-  reads the block, sets a background error and stops all writes. Reopening does not help, because the next compaction fails the
-  same way. Only the block's file leaving the engine fixes it. Whole-instance `restore` therefore replaces both column families.
-- `delete_file_in_range` over the damaged file's span works: with 10 table files, one was dropped, the other 9 stayed, and after
-  refilling the span a full compaction and later writes succeeded. The corruption error names the file, and `live_files` gives
-  its key span. Keys are hash-first, so a file maps to a contiguous part of the hash space.
-  RocksDB's header says this leaves level 0 files, so damage in one means a whole-instance rebuild. Compacting it first cannot help, since compaction reads the bad block.
-- A scan cannot prove an engine clean: the same probe shows a clean scan over a block that still stops the engine. The proof
-  needs `VerifyChecksum`, which reads table files directly. It is in RocksDB's C API but not in the `rocksdb` crate, whose raw
-  handle is also private, so it needs an upstream change or a patched crate.
-
-**Open decisions**
-- Whether `VerifyChecksum` reads past the block cache, and what it reports with several bad files. It may stop at the first, so
-  the pass would repeat after each discard.
-- What SurrealKV needs when its adapter lands. Its `skv scrub` sweeps SSTable data blocks, but its README names no library API
-  for that and it skips the log and value log.
-
-**Acceptance**
-- A record damaged in one range rebuilds that range only, and every other range keeps serving throughout.
-- A range under rebuild serves nothing, and a restart during its rebuild does not serve it.
-- Each fallback above rebuilds the whole instance.
-- On a real RocksDB engine, a damaged table file discarded this way leaves compaction and writes working.
-- Deletes stay deleted and no older value replaces a newer one across a range rebuild.
-- `SimEngine` learns damage wider than one record, such as neighbouring keys and metadata. Damage is exactly one record today,
-  so the simulation would otherwise only ever take the narrow path and overstate the gain.
-- Compare rebuild time and time spent unhealthy before and after, using a soak of a seed with the corruption class.
-
-**Describe alternatives you've considered**
-- Trust the failing key's range without a verification pass: rejected. A bad RocksDB block can hold many keys, so neighbouring
-  ranges may be damaged too.
-- Demote the owner to `populating` instead of per-range health: rejected on 2026-11-06. It would reuse `select`, `confirms` and
-  the handoff, but a plain demotion breaks `NoEarlyDrop` and `ReadyHasData` in TLC. It passes a small model (two nodes, one start,
-  `MaxRev = 4`) only with three new rules: another healthy `ready` owner must remain, no promotion while sick, and the node wipes
-  only on proof the demotion is current. It would still need a member signal, a relay majority and a fallback for the last
-  holder, and it would count against the moving-range limit.
-- Repair engine blocks or pages: rejected by `kv.md` §15.7, since replication must not depend on engine internals.
-- Keep rebuilding whole instances and make them faster: helps, but the cost still grows with range count.
-
-**Additional context**
-This shortens rebuilds, not detection. Damage is found by the scrubber's walk, which starts over on every restart, so a durable
-walk position is separate work (`health::scrub`).
-
-Measured on seed 90003 over two simulated hours, with the seed's heavy fault load: 207 quarantines, and quicksilver nodes
-unhealthy for 28–49% of samples. One quicksilver rebuild took about 80 seconds. Seed 90004 reached 60–79%. The simulation's
-damage is one record, so these show the cost of whole-instance rebuilds, not what a real disk would produce.
+---
 
 #### B-63 — Operational scenarios: scale out, drain, cancel and rolling restart under load
 
-```
-Title:  Feature 🚀: End-to-end operational scenarios: scale out, drain, cancel and rolling restart under load
-Labels: enhancement
-```
+Created: [#104](https://github.com/felixrydberg/bedrock/issues/104) — Feature 🚀: End-to-end operational scenarios: scale out, drain, cancel and rolling restart under load
 
-**Is your feature request related to a problem? Please describe.**
-Simulation covers membership events on the shared core (join, relay failover, restart within grace, a cut-off node, a killed
-node, and a graceful `draining` leave, checked against the writer), and the crash harness covers kills and disk faults on a
-fixed cluster. Nothing exercises operating a live cluster: adding nodes, draining a node or cell, cancelling, and restarting
-nodes in turn, with real binaries and writes running.
-
-**Describe the solution you'd like**
-- **Simulation (madsim)**, extending `tests/sim/tests/membership.rs`, seeded, each seed replaying to the same trace:
-  - Held node drain (B-21b): a node stays `draining`, its ranges hand off within the drain rate, every `ready` owner holds the
-    committed data of its ranges, and nothing is revoked before the new owners are `ready`.
-  - Cancel: deleting the drain record mid-handoff makes the node eligible again and leaves no partial copies.
-  - Cell drain: nothing moves across cells for quicksilver and cdn, and the cell gets no new assignments.
-  - Scale out, then scale in: joins and rebalancing, then drains below the replica count, which must keep redundancy.
-  - Rolling restart of every node, one at a time, with no write lost and no read going backwards.
-  - Keep clients reading during range handoffs, drains and rolling restarts. Exercise stale `Relay.Routes` tables, owner
-    rejection, bounded next-owner retry and table refresh while reads continue.
-- **Real binaries** (`tests/crash`, `scripts/crash.sh`): a dynamic cluster where the harness starts a new node, drains one
-  through the operator path and removes it, and does a rolling restart. The existing invariants and disk checks apply.
-- Failing seeds go to OPEN, then REGRESSIONS, with a focused test.
-
-**Additional context**
-- **Implementation:** Test support only; no product code.
-- **Module:** `tests/sim`, `tests/crash`.
-- **Depends on:** B-23, B-21b. The drain record is `drain/{id}` in the cell's membership namespace (amendment on #68), so no
-  other dataset is needed. Amendment 2026-11-09: authenticated cell-local `CellControl.Write` now provides ordered drain
-  writes and cancellation; the operator CLI remains deferred. This draft still owns the proposed real-binary held-drain
-  scenario; the existing real-binary drain announces `draining` from the node.
-- **Acceptance criteria:**
-  - Every scenario above passes for the required seeds and replays to the same trace.
-  - A drain leaves the target holding nothing for any dataset, with no read going backwards.
-  - Cancelling a drain leaves no partial copies and makes the target eligible again.
-  - A drain never takes a range below its replica count.
-  - The real-binary run completes a scale-out, a drain and a rolling restart with every invariant intact.
+---
 
 #### B-64 — Appointed writer per namespace group, with a small controller log
 
-```
-Title:  Feature 🚀: Appointed writer per namespace group, controlled by a small root log (design and model first)
-Labels: enhancement
-```
+Created: [#105](https://github.com/felixrydberg/bedrock/issues/105) — Feature 🚀: Appointed writer per namespace group, controlled by a small root log (design and model first)
 
-**Is your feature request related to a problem? Please describe.**
-B-09b starts with one Raft group for the whole core region, so one leader orders every namespace. `future-development.md`
-proposes several Raft groups, each owning a set of namespaces. Independent election groups pay timers, heartbeats and
-elections per group, and moving a namespace between groups needs a single authority to decide it anyway. Enroute v0.4.0
-(`docs/internals/consensus.md`, `ledger-and-compute.md`) runs one log per repository without any of that: a small root
-Raft log is the controller and appoints each log's sequencer. This draft evaluates that shape against the plain
-multi-group design before anyone builds either. It is not needed until B-09b is implemented and hardened.
-
-**Describe the solution you'd like**
-Write and model-check the alternative, then decide:
-- **Controller.** The B-09b Raft group is the root. It records each writer group's replicas, sequencer and term, and the
-  namespace-to-group assignment. Only it changes them.
-- **Appointed sequencer.** A group's log has no timers, heartbeats or elections of its own; only its appointed sequencer
-  appends. Failure detection is per node, from real traffic (B-13), not per group.
-- **Failover.** The controller seals the group at term + 1 on its replicas; a seal raises the replica's fence and reports
-  where its log ends. After a majority answered, it appoints one of the most up-to-date answers with a compare-and-swap on the
-  root. A seal majority meets every commit majority, so the new sequencer holds every committed entry.
-- **Commit rule.** The commit point moves to the highest position a majority holds, only for a position of the
-  sequencer's own term. A new term starts with a no-op (Raft's rule against its Figure 8).
-- **Reads** that need the latest state check with a majority that the sequencer's term is still open.
-- **Fencing.** The B-11 publisher fence follows the appointed term, so a stale sequencer cannot publish an older manifest.
-- Output is a TLA+ specification and a written decision against N openraft groups (idle cost, failover time, what
-  `openraft` already gives, implementation risk). If appointed sequencers win, the implementation sits behind the write contract
-  B-09b defines. If not, record why and leave `future-development.md` as it is.
-
-**Describe alternatives you've considered**
-- Keep one group: simplest, and still the starting point.
-- N `openraft` groups as in `future-development.md`: reuses a library, but each group elects on its own.
-
-**Additional context**
-- **Implementation:** Design draft; no product code until the decision is accepted. Draft only, no GitHub issue created.
-  **Deferred:** this stays a draft and is not started until a GitHub issue is created for it. B-09b's single group comes
-  first, and B-65's multi-group support waits for this.
-- **Module:** `docs/spec/` first; later `lib/replication`.
-- **Reference:** Enroute v0.4.0 docs (reference only, no dependency). Namespace handoff between groups stays the separate
-  design in `future-development.md`.
-- **Depends on:** B-09b, B-11, B-23. A protocol change updates the TLA+ specification first.
-- **Acceptance criteria:**
-  - The specification checks failover, a stale sequencer, reads and fencing in TLC.
-  - Negative checks fail as stated: committing without a seal majority, appointing a replica that is not among the most up
-    to date, and counting a previous-term entry as committed each violate an invariant.
-  - A written decision exists. Nothing else is built before it.
+---
 
 #### B-65 — Shared durable log store with one group-committed fsync
 
-```
-Title:  Feature 🚀: One durable log store per API node with a group-committed fsync for all writer groups
-Labels: enhancement
-```
+Created: [#106](https://github.com/felixrydberg/bedrock/issues/106) — Feature 🚀: One durable log store per API node with a group-committed fsync for all writer groups
 
-**Is your feature request related to a problem? Please describe.**
-B-09b acknowledges a write once a majority has fsynced it, so fsync time is commit time and throughput depends on how
-many writes share one fsync. With one log file per group, many busy groups on a node would each sync on their own and
-destroy that batching. Enroute keeps one physical log store per node, with many logical logs, so one fsync covers every
-group written in a batch.
-
-**Describe the solution you'd like**
-- One log store per API node. Each writer group is a logical log under its group id: entries, hard state (term, fence,
-  vote, commit point) and where the log starts.
-- Concurrent writes from all groups join one batch and one fsync; a write is acknowledged only after the sync that covers it.
-- Recovery returns every group to its last durable position; a torn tail is discarded, never an acknowledged entry.
-- Truncation and purge per group follow B-09b's rule: only after a verified recoverable native checkpoint covers every affected
-  namespace.
-- Start with the single group of B-09b (concurrent writes of one group share an fsync). Support several group ids once
-  B-64 accepts them. If B-09b's log store already batches that way, this draft reduces to adding the group id.
-- Metrics: fsync batch size and fsync latency, with no group or namespace label.
-
-**Additional context**
-- **Implementation:** Shared core; draft only, no GitHub issue created.
-- **Module:** `lib/replication` log store, with direct filesystem access only in its adapter (B-23a). The simulation
-  adapter models buffered versus committed state.
-- **Depends on:** B-09b; B-64 for more than one group.
-- **Acceptance criteria:**
-  - Writes from several groups in one batch cost one fsync, measured.
-  - Crash tests kill during a batch and during a torn write; every acknowledged entry survives and each group recovers to a
-    consistent position.
-  - Deterministic simulation drives buffered-versus-committed loss with replayable seeds.
-  - Groups stay isolated: one group's truncation or damage does not alter another's log.
+---
 
 #### B-66 — Safety versus discovery: stale or unreachable inputs may only cost availability
 
-```
-Title:  Feature 🚀: Audit and test that stale or unreachable discovery never breaks safety
-Labels: enhancement
-```
+Created: [#107](https://github.com/felixrydberg/bedrock/issues/107) — Feature 🚀: Audit and test that stale or unreachable discovery never breaks safety
 
-**Is your feature request related to a problem? Please describe.**
-Several parts learn who owns something, or where to send it, from sources that can be stale or unreachable: the cell
-membership view and regional directory (published by the relay majority), the relay peer lists in config, S3 for namespace
-opens and recent state, the current-leader view that clients and relays hold after a B-09b failover, and the Gateway's auth
-copy. The specifications already freeze without a relay majority (`Freeze` in `membership.tla` and `handoff.tla`) and
-decision 15 makes the Gateway fail closed within 30 seconds. There is no one statement of which inputs are safety-critical,
-and no test that every one failing costs only availability. Enroute states this separation explicitly: its object-store
-`cluster/` listing is only discovery, and safety lives in the root log.
-
-**Describe the solution you'd like**
-- A table in `docs/spec/`: each discovery input, its source, who uses it, what stale or unreachable can cause, and the
-  mechanism that keeps it safe (owner check, fence, term, freeze, fail-closed).
-- The rule: a stale or unreachable input may cause a retry, an error or a freeze. It never causes a second writer, a write
-  accepted by a non-owner, a read below its minimum revision, or a revoked key accepted past its bound.
-- Relay-fetched routing tables are discovery inputs that may cost availability only. A holder's owner check, followed by
-  rejection handling and table refresh, preserves the safety rule.
-- Simulation scenarios in `tests/sim`, seeded and replayable, each checked against the writer:
-  - the regional directory stale on callers during a handoff;
-  - S3 unreachable on open and recent-state paths while relays are healthy;
-  - the old leader still addressed after a B-09b failover (its writes are rejected and never applied);
-  - a relay cut off from its parent while a Gateway depends on it.
-- Fix what this finds, each as a focused regression test. A protocol change updates the TLA+ specification first.
-
-**Additional context**
-- **Implementation:** Shared core audit plus tests; draft only, no GitHub issue created.
-- **Module:** `docs/spec/`, `tests/sim`, `tests/crash`.
-- **Depends on:** B-23. The leader scenario needs B-09b and the Gateway scenario needs B-57.
-- **Acceptance criteria:**
-  - Every input in the table has a mechanism, and a scenario or existing test that makes it fail.
-  - No scenario produces a second writer, a non-owner write, a read below its minimum revision or a stale key accepted.
-  - Failing seeds go to OPEN, then REGRESSIONS, with a focused test.
+---
 
 #### B-67 — Explicit operator-controlled membership changes for the API Raft group
 
-```
-Title:  Feature 🚀: API Raft membership changes only by explicit operator command, with safety checks
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-A node that is down looks the same as a node that is gone. Relay-derived membership removes a missing Quicksilver, KV or CDN
-node after a grace period, which is safe because their L2 and cache data is never the only copy. A B-09b voter is
-different: it may hold committed entries not yet SlateDB-durable (see B-09b's known limits), and removing a partitioned voter
-automatically would shrink the quorum. Enroute makes removal an explicit operator act for the same reason.
-
-**Describe the solution you'd like**
-- Voters are added, promoted and removed only by explicit commands on the API's authenticated control endpoint. No code path
-  changes voters because a node is unreachable or absent.
-- A new voter joins as a learner and is promoted only after it has caught up.
-- A removal is refused when it would leave fewer voters than the configured minimum, drop below distinct failure domains
-  (`node.location.failure_domain`, for example one availability zone per voter), or remove a voter that is still reachable
-  and has not been stopped or drained. A `force` flag overrides the last two for a lost node and is logged.
-- A removed voter that restarts cannot start an election, serve reads or publish.
-- A partitioned voter stays a voter: writes stop without a majority instead of the group shrinking itself.
-- The command-line front end is shared with the deferred operator CLI for drains; only the control endpoint is in scope here.
-
-**Describe alternatives you've considered**
-- Remove an absent voter after a grace period, as relay membership does: rejected for voters, as above.
-- Fixed voters in config only: simpler, but replacing a lost node would need a restart of the whole group.
-
-**Additional context**
-- **Implementation:** Shared core; draft only, no GitHub issue created.
-- **Module:** `lib/replication` plus the `api` crate.
-- **Depends on:** B-09b. Failure-domain checks reuse the placement helpers where they fit.
-- **Acceptance criteria:**
-  - No membership change happens without a command; simulation shows a long partition changes no voters.
-  - Each refusal above is tested, and `force` is logged.
-  - A learner is never promoted before it has caught up, and a removed voter cannot disturb the group after it restarts.
-  - A removal while the leader crashes leaves exactly one consistent membership, replayable per seed.
+Created: [#108](https://github.com/felixrydberg/bedrock/issues/108) — Feature 🚀: API Raft membership changes only by explicit operator command, with safety checks
 
 ---
 
@@ -2050,7 +951,27 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
 
 Decision 16. The drafts' scope, dependencies and acceptance live in [`statefull/v2.md`](statefull/v2.md): §4–§8 for the
 design, §11 for the drafts S-01 … S-19 and their acceptance highlights, §12 for open questions. When a draft becomes an
-issue, its body is written from those sections in the usual template, and its entry here becomes a `Created:` link.
+issue, its body is written from those sections in the usual template. All are created (2026-11-14):
+
+- S-01: [#109](https://github.com/felixrydberg/bedrock/issues/109) — Feature 🚀: Actor IDs, topology record and placement functions
+- S-02: [#110](https://github.com/felixrydberg/bedrock/issues/110) — Feature 🚀: Volume protocol in TLA+: claim, append, lease, release, repair and topology change
+- S-03: [#111](https://github.com/felixrydberg/bedrock/issues/111) — Feature 🚀: bedrock-volume binary: actor records, gRPC service, membership, ranges and owner checks
+- S-04: [#112](https://github.com/felixrydberg/bedrock/issues/112) — Feature 🚀: Volume client in Compute: claim, recovery, append window and reads
+- S-05: [#113](https://github.com/felixrydberg/bedrock/issues/113) — Feature 🚀: Volume cold tier: maintainer flush to SlateDB, truncation, SSD cache and S3 reader handles
+- S-06: [#114](https://github.com/felixrydberg/bedrock/issues/114) — Feature 🚀: Volume slot repair and node-reported range readiness
+- S-07: [#115](https://github.com/felixrydberg/bedrock/issues/115) — Feature 🚀: bedrock-compute actor host: acquire, wake, sleep, leases, SQLite VFS and gates
+- S-08: [#116](https://github.com/felixrydberg/bedrock/issues/116) — Feature 🚀: Gateway actor routing and location cache
+- S-09: [#117](https://github.com/felixrydberg/bedrock/issues/117) — Feature 🚀: Actor alarms: holder timers and volume index wake
+- S-10: [#118](https://github.com/felixrydberg/bedrock/issues/118) — Feature 🚀: Durable Objects API on the actor host
+- S-11: [#119](https://github.com/felixrydberg/bedrock/issues/119) — Feature 🚀: D1 on actors
+- S-12: [#120](https://github.com/felixrydberg/bedrock/issues/120) — Feature 🚀: Queues on actors
+- S-13: [#121](https://github.com/felixrydberg/bedrock/issues/121) — Feature 🚀: Cron Triggers on actors
+- S-14: [#122](https://github.com/felixrydberg/bedrock/issues/122) — Feature 🚀: Workflows on actors
+- S-15: [#123](https://github.com/felixrydberg/bedrock/issues/123) — Feature 🚀: Hibernatable WebSockets held at the Gateway
+- S-16: [#124](https://github.com/felixrydberg/bedrock/issues/124) — Feature 🚀: Actor workload in the simulation and crash tests
+- S-17: [#125](https://github.com/felixrydberg/bedrock/issues/125) — Feature 🚀: Planned DC changes and manual DC-loss restore for actors
+- S-18: [#126](https://github.com/felixrydberg/bedrock/issues/126) — Feature 🚀: Customer-KV namespace writers as kv actors, with reads through the value cache
+- S-19: [#127](https://github.com/felixrydberg/bedrock/issues/127) — Feature 🚀: Load-based range splitting for volume ranges
 
 - **Storage first.** S-01 … S-06 build actor storage. S-02 updates the specification before any protocol code, and
   S-03 waits for it.
