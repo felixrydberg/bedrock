@@ -2,8 +2,8 @@
 # Checks the TLA+ models in docs/spec with TLC (#25 / B-23 Layer 1): every model's config must pass, and every
 # deliberate bug must break the invariant it names, checked alone so no other invariant fires first.
 #
-#   scripts/tlc.sh          Every model, then every bug: about 15 minutes, mostly handoff.
-#   scripts/tlc.sh bugs     Only the bugs: about 2 minutes.
+#   scripts/tlc.sh          Every model, then every bug: about 2 hours, mostly the volume configs (2 workers).
+#   scripts/tlc.sh bugs     Only the bugs: about 40 minutes, mostly volume-base's previous.
 #   scripts/tlc.sh relays   One model and its bugs.
 #
 # A model with several configs names each one model-variant.cfg (volume-handoff.cfg checks volume.tla).
@@ -76,6 +76,8 @@ volume-base previous NoLostAck
 volume-base flush S3Committed
 volume-handoff populating NoLostAck
 volume-handoff unsealed NoLostAck
+volume-wipe self-epoch NoLostAck
+volume-wipe early NoLostAck
 volume-topology new-only NoLostAck
 volume-topology new-only OneWriter
 volume-topology new-only NoStaleAppend
@@ -92,7 +94,9 @@ pass() {
     local model="$1" started=$SECONDS out
     out="$(tlc "$model" "$model.cfg" "$model" || true)"
     if grep -q "No error has been found" <<< "$out"; then
-        echo "PASS $model: $(grep -m1 "0 states left on queue" <<< "$out") ($((SECONDS - started)) s)"
+        echo "PASS $model: $(grep -m1 "distinct states found, 0 states left on queue" <<< "$out")" \
+            "depth $(sed -n 's/.*depth of the complete state graph search is \([0-9]*\).*/\1/p' <<< "$out")" \
+            "($((SECONDS - started)) s)"
     else
         echo "FAIL $model"
         grep -E "Error|violated" <<< "$out" | head -5

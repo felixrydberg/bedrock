@@ -58,6 +58,20 @@ Choose the cheapest available model that can reliably complete and verify the ta
 - Workers return changed files or findings with locations, commands/check results, and unresolved risks. Return concise summaries instead of raw logs. Review workers report findings without silently editing the patch under review.
 - After integration, the lead checks the combined changes and runs the relevant validation. Individual worker success does not prove the combined result works.
 
+## Coordinate issue sessions
+
+The lead session plans, creates issues and starts issue sessions. Each issue is implemented in its own session.
+
+- Run each issue in its own worktree session on the issue's GitHub-linked branch. Create the branch with `gh issue develop <number> --repo felixrydberg/bedrock --base main`, start the session from it, and have the session `git switch` to it. The app's `claude/…` branch names are not issue branches.
+- Keep one issue per branch and one PR per issue, so each change gets its own review.
+- A session's job ends at implementing the issue, running its checks, committing and pushing the linked branch. Confirm each commit message with the user in chat before committing. The user opens the PRs and archives finished sessions, so never open a PR or archive a session.
+- Start at most two issue sessions at a time, and only for issues whose blockers are merged. Tell each session to check for a running heavy job before starting one (see "Power and host resources").
+- When starting sessions, give the user links to each issue and each session.
+- The user makes the design decisions a session raises, normally in that session. Do not answer a session's question for the user. If the user answers in the lead session, forward their words to the session, quoted.
+- Never edit an issue's body. Amend it with an "Amendment" comment. When creating issues, write dependencies as `#N / B-NN` and add a GitHub blocked-by link for each open dependency (`POST /repos/felixrydberg/bedrock/issues/{n}/dependencies/blocked_by` with the blocker's database `id`). In `feature-drafts.md`, replace a created draft's body with a `Created:` link and link its ID in the §2 table.
+- Leave the lead session's doc edits uncommitted until the user asks for a commit.
+- The shared `.git/config`, and once `AGENTS.md`, have been found overwritten with NUL bytes while sessions were running. If git reports "bad config line 1", restore the config from `.git/config.corrupt-backup` plus `[extensions] worktreeConfig = true`, then set the upstreams again. Check other recently written files for NUL bytes too.
+
 ## Keep changes small
 
 - Look for ways to simplify a component by moving predictable work into an existing library, platform capability or simpler data representation. A simple component paired with a well-understood transformation elsewhere can achieve the same result with less custom machinery. Compare the total code, operational cost and failure modes across both layers; preserve required guarantees and report specification changes before implementing them.
