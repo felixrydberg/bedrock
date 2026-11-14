@@ -1,11 +1,10 @@
 bedrock/crates/
 ├── lib/                  # bedrock-lib: shared distributed core (library only)
 │   ├── admin             # shared metrics registry and administrative HTTP endpoint
-│   ├── membership
+│   ├── membership        # shared half: the announced entry, the published namespace layout and the View
 │   ├── health
 │   ├── buckets
-│   ├── placement
-│   ├── raft_runtime      # durable Raft ready processing and state-machine contract
+│   ├── placement         # directory types and the read side; the write side lives in relay
 │   ├── replication
 │   ├── relays
 │   ├── reconciliation
@@ -17,6 +16,10 @@ bedrock/crates/
 │
 ├── api/                  # bedrock-api: write API
 ├── relay/                # bedrock-relay: relay process, built on lib
+│   ├── membership        # the cell membership publisher
+│   │   └── control       # each cell's embedded Raft control authority
+│   ├── placement         # assign, handoff and merges: the L2 directory's write side
+│   └── raft_runtime      # durable Raft ready processing and state-machine contract
 │
 ├── quicksilver/          # bedrock-quicksilver: quicksilver dataset; Auth awaits Gateway
 │   ├── storage
@@ -37,9 +40,9 @@ Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-quicksilver`, `bedrock-kv`
 `bedrock-lib` and never on another binary crate. Each binary crate is a library with a `run(config)` entry point
 (service-specific code) plus a `main.rs` that only initialises logging, loads config and calls `run`.
 
-`lib/membership/control` embeds each cell's fixed-voter Raft authority in its existing relays, backed by a separate durable
+`relay/membership/control` embeds each cell's fixed-voter Raft authority in its existing relays, backed by a separate durable
 local control store. Membership, placement and drain revisions originate there and are delivered only within that cell.
-`lib/raft_runtime` owns the reusable durable Raft storage and ready-processing lifecycle; membership owns the state machine,
+`relay/raft_runtime` owns the reusable durable Raft storage and ready-processing lifecycle; membership owns the state machine,
 admission and operator policy. `lib/datasets/capabilities` declares relay delivery, fixed namespaces and active range placement.
 They do not depend on the API, S3 or upstream relay services. Peer group identity must match region, DC, cell and voter
 addresses; failure domains may differ. Product-data replication retains the upstream relay tree.

@@ -6,8 +6,26 @@ rust-version.workspace = true
 
 [dependencies]
 bedrock-lib.workspace = true
+prost.workspace = true
+# Each cell's embedded Raft control authority (`membership::control`).
+raft.workspace = true
+protobuf.workspace = true
+sha2.workspace = true
+slog.workspace = true
+subtle.workspace = true
 tokio.workspace = true
+tonic.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+bedrock-lib = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-stream = "0.1"
+tempfile.workspace = true
+
+# Test CAs for the B-55 TLS tests, which do not run under madsim.
+[target.'cfg(not(madsim))'.dev-dependencies]
+rcgen = "0.14"
 
 [lints]
 workspace = true

@@ -10,7 +10,7 @@ use raft::eraftpb::{ConfState, Entry, HardState, Message, MessageType, Snapshot}
 use raft::{GetEntriesContext, RawNode, Storage};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::storage::StorageEngine;
+use bedrock_lib::storage::StorageEngine;
 
 /// Commands and admission policy belong to the owner; Raft traffic uses the same actor queue.
 pub(crate) enum Input<C> {

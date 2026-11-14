@@ -24,7 +24,6 @@ use super::{Hub, Key, MemberKey, StreamKey};
 use crate::admin::Admin;
 use crate::membership::Publisher;
 use crate::placement::State;
-use crate::replication::log::Log;
 use crate::replication::pb;
 
 /// Namespaces in each top-N gauge.

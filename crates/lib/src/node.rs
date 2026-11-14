@@ -251,7 +251,7 @@ impl RelayConfig {
                 return Err(ConfigError("replay_peers contains duplicate voters".into()));
             }
             voters.push(advertised.clone());
-            crate::membership::control::validate_voter_ids(&voters, &membership.voter_ids)
+            crate::membership::validate_voter_ids(&voters, &membership.voter_ids)
                 .map_err(ConfigError)?;
             if membership.voter_ids.get(&advertised) != Some(&self.node.node_id) {
                 return Err(ConfigError(

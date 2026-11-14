@@ -8,7 +8,6 @@ pub mod http;
 pub mod membership;
 pub mod node;
 pub mod placement;
-pub(crate) mod raft_runtime;
 pub mod reconciliation;
 pub mod relays;
 pub mod replication;

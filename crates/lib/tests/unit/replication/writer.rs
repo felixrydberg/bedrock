@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::*;
-use crate::replication::log::Log;
 use crate::storage::namespace::{Changes, NamespaceDatabase, NamespaceFactory};
 use crate::storage::sim::MemoryFactory;
 use crate::storage::{Entry, ErrorContext, StorageError, StorageResult};

@@ -17,13 +17,15 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 use tonic::{Request, Response, Status};
 
-use super::{DATASET, SERVICES, namespace};
-use crate::reconciliation::drain::{Drain, Scope};
-use crate::replication::log::Watched;
-use crate::replication::materialized::{RaftPosition, View};
-use crate::replication::{Event, Operation, pb};
-use crate::storage::{KeyRange, StorageEngine, WriteBatch};
-use crate::transport::{Caller, Class, Peers, host_of};
+use bedrock_lib::membership::{
+    DATASET, SERVICES, namespace, token, validate_drain, validate_voter_ids,
+};
+use bedrock_lib::reconciliation::drain::{Drain, Scope};
+use bedrock_lib::replication::log::Watched;
+use bedrock_lib::replication::materialized::{RaftPosition, View};
+use bedrock_lib::replication::{Event, Operation, pb};
+use bedrock_lib::storage::{KeyRange, StorageEngine, WriteBatch};
+use bedrock_lib::transport::{Caller, Class, Peers, host_of};
 
 use crate::raft_runtime::{self as raft_core, Machine, Store};
 type Saved = raft_core::Saved<Disk>;
@@ -54,13 +56,13 @@ pub struct Config {
     pub bootstrap: bool,
 }
 
-impl crate::relays::LocalControlSource for Control {
+impl bedrock_lib::relays::LocalControlSource for Control {
     fn validate_namespace(&self, cell: &str, namespace: &str) -> Result<(), Status> {
         if cell.is_empty()
             || cell != self.config.cell
             || !SERVICES
                 .iter()
-                .any(|service| namespace == super::namespace(service, cell))
+                .any(|service| namespace == bedrock_lib::membership::namespace(service, cell))
         {
             return Err(Status::invalid_argument(
                 "membership namespace is outside this cell",
@@ -298,25 +300,6 @@ fn conf(count: usize) -> ConfState {
     state
 }
 
-pub(crate) fn validate_voter_ids(
-    voters: &[String],
-    identities: &BTreeMap<String, String>,
-) -> Result<(), String> {
-    let unique: std::collections::BTreeSet<_> = identities.values().collect();
-    if identities.len() != voters.len()
-        || unique.len() != voters.len()
-        || identities.values().any(|id| !super::token(id))
-        || voters
-            .iter()
-            .any(|address| !identities.contains_key(address))
-    {
-        return Err(
-            "control voters require one distinct node identity per configured address".into(),
-        );
-    }
-    Ok(())
-}
-
 fn validate_state(state: &State, cell: &str) -> Result<(), String> {
     if state.namespaces.len() != SERVICES.len() || state.retries.len() > MAX_RETRIES {
         return Err("invalid control state cardinality".into());
@@ -392,9 +375,9 @@ impl Control {
     ) -> Result<(Arc<Self>, tokio::task::JoinHandle<()>), String> {
         config.voters.sort();
         validate_voter_ids(&config.voters, &config.voter_ids)?;
-        if !super::token(&config.region)
-            || !super::token(&config.dc)
-            || !super::token(&config.cell)
+        if !token(&config.region)
+            || !token(&config.dc)
+            || !token(&config.cell)
             || config.voters.len() < 3
             || config.voters.windows(2).any(|p| p[0] == p[1])
             || config.voters.iter().any(|v| v.is_empty())
@@ -1020,7 +1003,7 @@ fn apply_entry(
                 let event = Event {
                     dataset: DATASET.into(),
                     namespace: request.namespace.clone(),
-                    stream: crate::replication::stream(DATASET, 0),
+                    stream: bedrock_lib::replication::stream(DATASET, 0),
                     sequence: ns.head,
                     epoch: 0,
                     committed_at: command.at,
@@ -1157,40 +1140,19 @@ fn validate_operator(config: &Config, request: &pb::ControlWrite) -> Result<(), 
         .map_err(|_| Status::invalid_argument("drain key is not UTF-8"))?;
     let id = key
         .strip_prefix("drain/")
-        .filter(|id| super::token(id))
+        .filter(|id| token(id))
         .ok_or_else(|| Status::permission_denied("operator may write only drain/<id>"))?;
     if id.len() > 128 {
         return Err(Status::invalid_argument("drain identity too long"));
     }
     if let Some(bytes) = &request.value {
         let drain = Drain::decode(bytes).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        if drain.state != crate::reconciliation::drain::State::Draining {
+        if drain.state != bedrock_lib::reconciliation::drain::State::Draining {
             return Err(Status::invalid_argument(
                 "operators may create only draining records",
             ));
         }
         validate_drain(&config.cell, service, id, &drain)?;
-    }
-    Ok(())
-}
-
-pub(super) fn validate_drain(
-    cell: &str,
-    service: &str,
-    id: &str,
-    drain: &Drain,
-) -> Result<(), Status> {
-    if id.len() > 128 || !super::token(id) {
-        return Err(Status::invalid_argument("invalid drain identity"));
-    }
-    if match &drain.scope {
-        Scope::Node(node) => !super::token(node),
-        Scope::Cell(target) => target != cell,
-    } || crate::reconciliation::drain::validate_ranged_selection(service, drain).is_err()
-    {
-        return Err(Status::invalid_argument(
-            "unsupported drain scope, namespace, dataset, or state",
-        ));
     }
     Ok(())
 }

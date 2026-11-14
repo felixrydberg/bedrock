@@ -9,7 +9,7 @@
 //! Repairs should start or advance a step and return, leaving progress to show in `actual()`, as CDN artifact replica
 //! repair will (B-34: desired = retained artifacts in my ranges, actual = local inventory, repair = fetch). L2 range
 //! handoff (#22 / B-21) does not use it: its steps are directory writes that only the cell relays' majority publisher
-//! may make, so they run in that publisher's pass (`membership::Cell`), which already freezes without a majority.
+//! may make, so they run in that publisher's pass (`bedrock_relay::membership::Cell`), which already freezes without a majority.
 //! [`rebuild`] (#23 / B-22) plans "rebuild" for each quarantined storage source. [`drain`] (#68 / B-21b) is the drain
 //! record, the per-dataset drain hook and the placement it drives.
 

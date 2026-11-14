@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::tests::Factory;
-use crate::replication::log::Log;
 use crate::storage::StorageError;
 use crate::storage::sim::{MemoryFactory, SimFactory, StoreAccess, StoreFault};
 

@@ -1,7 +1,12 @@
-//! `bedrock-relay`: relay tree, fan-out, replay log and cell membership; product logic stays in `bedrock-lib` (B-17).
+//! `bedrock-relay`: relay tree, fan-out, replay log, and the cell membership publisher with its control authority and L2
+//! placement writes (B-17, B-68); the relay server core and everything other binaries read stay in `bedrock-lib`.
 
 use bedrock_lib::node::{self, ConfigError, RelayConfig};
 use std::sync::Arc;
+
+pub mod membership;
+pub mod placement;
+mod raft_runtime;
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
 pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
@@ -68,10 +73,10 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
         voters.push(config.node.advertised());
         let engine = storage(&config.node, "control")
             .map_err(|error| ConfigError(format!("cell control: {error}")))?;
-        let (control, running) = bedrock_lib::membership::control::Control::start(
+        let (control, running) = membership::control::Control::start(
             engine,
             peers.clone(),
-            bedrock_lib::membership::control::Config {
+            membership::control::Config {
                 region: config.node.location.region.clone(),
                 dc: config.node.location.dc.clone(),
                 cell: config.node.location.cell.clone(),
@@ -113,7 +118,7 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
     );
     tasks.push(watching);
     if let Some(settings) = &config.membership {
-        let (publishing, published) = bedrock_lib::membership::Cell::start(
+        let (publishing, published) = membership::Cell::start(
             hub.clone(),
             peers,
             siblings,
@@ -147,10 +152,10 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
         )
         .add_service(
             bedrock_lib::replication::pb::cell_control_server::CellControlServer::new(
-                bedrock_lib::membership::control::Server(control),
+                membership::control::Server(control),
             )
-            .max_decoding_message_size(bedrock_lib::membership::control::MAX_PACKET)
-            .max_encoding_message_size(bedrock_lib::membership::control::MAX_PACKET),
+            .max_decoding_message_size(membership::control::MAX_PACKET)
+            .max_encoding_message_size(membership::control::MAX_PACKET),
         );
     let server = bedrock_lib::transport::serve(router, config.node.listen, tls);
     admin.set_ready(true);

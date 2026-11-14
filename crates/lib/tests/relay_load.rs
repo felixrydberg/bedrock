@@ -12,7 +12,6 @@ use bedrock_lib::admin::Admin;
 use bedrock_lib::placement::hash_of;
 use bedrock_lib::relays::Hub;
 use bedrock_lib::relays::replay::{Replay, ReplayConfig};
-use bedrock_lib::replication::log::Log;
 use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::pb;
 use bedrock_lib::replication::writer::{Persistence, PersistenceMetrics, Write, Writer};
