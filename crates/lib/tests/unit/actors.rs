@@ -125,6 +125,40 @@ fn unknown_regions_are_rejected() {
 }
 
 #[test]
+fn a_topology_without_dcs_or_cells_is_rejected_not_a_panic() {
+    let id = named("alice");
+    for broken in [
+        topology(vec![]),
+        topology(vec![dc("a", &["a1"]), dc("b", &[])]),
+    ] {
+        let malformed = Err(Error::Malformed(
+            "a region needs at least one DC, and every DC at least one cell".into(),
+        ));
+        assert_eq!(dc_of(&id, &broken).map(|_| ()), malformed);
+        assert_eq!(cells_of(&id, &broken).map(|_| ()), malformed);
+        assert_eq!(slots(&id, &broken).map(|_| ()), malformed);
+        assert_eq!(
+            wake_host(&id, &broken, &[], |_| true).map(|_| ()),
+            malformed
+        );
+    }
+}
+
+#[test]
+fn read_errors_keep_the_status_code() {
+    for code in [
+        tonic::Code::Unavailable,
+        tonic::Code::DataLoss,
+        tonic::Code::FailedPrecondition,
+    ] {
+        assert_eq!(
+            Error::from(Status::new(code, "why")),
+            Error::Read(code, "why".into())
+        );
+    }
+}
+
+#[test]
 fn placement_has_fixed_vectors() {
     let topology = eu();
     // alice and bob rank the four-cell DC, carol the two-cell one.

@@ -40,7 +40,9 @@ pub enum Error {
     Malformed(String),
     /// The region has no topology record.
     UnknownRegion(String),
-    Unavailable(String),
+    /// A read failed with this status. The code says why: `Unavailable` and `DeadlineExceeded` are retryable, `DataLoss`
+    /// is corruption, and `Unimplemented`, `InvalidArgument` and `FailedPrecondition` are unsupported or refused.
+    Read(tonic::Code, String),
 }
 
 impl std::fmt::Display for Error {
@@ -48,12 +50,18 @@ impl std::fmt::Display for Error {
         match self {
             Self::Malformed(detail) => write!(f, "malformed: {detail}"),
             Self::UnknownRegion(region) => write!(f, "unknown region {region:?}"),
-            Self::Unavailable(detail) => write!(f, "topology unavailable: {detail}"),
+            Self::Read(code, detail) => write!(f, "read failed ({code}): {detail}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+impl From<Status> for Error {
+    fn from(status: Status) -> Self {
+        Self::Read(status.code(), status.message().to_owned())
+    }
+}
 
 fn malformed<T>(detail: impl Into<String>) -> Result<T, Error> {
     Err(Error::Malformed(detail.into()))
@@ -274,8 +282,7 @@ impl Topology {
                 &topology_key(code),
                 min_revision,
             )
-            .await
-            .map_err(unavailable)?;
+            .await?;
         match found.value {
             Some(bytes) => Ok((Self::decode_record(code, &bytes)?, found.revision)),
             None => Err(Error::UnknownRegion(code.to_owned())),
@@ -321,8 +328,7 @@ impl ActorNamespace {
     ) -> Result<(Option<Self>, u64), Error> {
         let found = client
             .get(SERVICE, DATASET, NAMESPACE, &actor_ns_key(id), min_revision)
-            .await
-            .map_err(unavailable)?;
+            .await?;
         let record = found
             .value
             .map(|bytes| Self::decode_record(&bytes))
@@ -331,22 +337,21 @@ impl ActorNamespace {
     }
 }
 
-fn unavailable(status: Status) -> Error {
-    Error::Unavailable(status.message().to_owned())
-}
-
 /// The ID's region: its prefix. Never changes.
 pub fn region_of(id: &ActorId) -> &str {
     id.region()
 }
 
-/// The topology of the ID's region; the caller must pass the record of [`region_of`].
+/// The topology of the ID's region; the caller must pass the record of [`region_of`]. Its fields are public, so one built
+/// without [`Topology::decode_record`] may have no DC or a DC without cells, which would leave nothing to rank.
 fn check<'a>(id: &ActorId, topology: &'a Topology) -> Result<&'a Topology, Error> {
-    if topology.region == id.region {
-        Ok(topology)
-    } else {
-        Err(Error::UnknownRegion(id.region.clone()))
+    if topology.region != id.region {
+        return Err(Error::UnknownRegion(id.region.clone()));
     }
+    if topology.dcs.is_empty() || topology.dcs.iter().any(|dc| dc.cells.is_empty()) {
+        return malformed("a region needs at least one DC, and every DC at least one cell");
+    }
+    Ok(topology)
 }
 
 /// Candidates by rendezvous hash of `id` with each name, most preferred first. Adding or removing a candidate moves only
