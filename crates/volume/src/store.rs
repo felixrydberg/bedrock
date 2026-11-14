@@ -60,6 +60,16 @@ fn corrupt(what: &str, error: prost::DecodeError) -> Error {
     }))
 }
 
+fn missing(seq: u64) -> Error {
+    Error::Storage(StorageError::Corruption(ErrorContext {
+        engine: "volume",
+        instance: "volume".into(),
+        file: None,
+        partition: Some(format!("log {seq}")),
+        detail: "an entry below the log end is missing".into(),
+    }))
+}
+
 /// An actor's key prefix, hash and metrics kind.
 pub struct Actor {
     hash: u64,
@@ -204,31 +214,35 @@ impl Store {
     }
 
     fn entry(&self, actor: &Actor, seq: u64) -> Result<pb::Entry, Error> {
-        let bytes = self.engine.get(&log_key(actor, seq))?.ok_or_else(|| {
-            Error::Storage(StorageError::Corruption(ErrorContext {
-                engine: "volume",
-                instance: "volume".into(),
-                file: None,
-                partition: Some(format!("log {seq}")),
-                detail: "an entry below the log end is missing".into(),
-            }))
-        })?;
+        let bytes = self
+            .engine
+            .get(&log_key(actor, seq))?
+            .ok_or_else(|| missing(seq))?;
         pb::Entry::decode(bytes.as_slice()).map_err(|e| corrupt("a log entry", e))
     }
 
-    /// The log after `flushed` through `through`, in order.
+    /// The log from `from` through `through`, in order. One scan, failing like [`Store::entry`] on a missing entry.
     fn entries(&self, actor: &Actor, from: u64, through: u64) -> Result<Vec<pb::Entry>, Error> {
         if through < from {
             return Ok(Vec::new());
         }
         let range = KeyRange::new(log_key(actor, from), log_key(actor, through + 1));
-        self.engine
-            .scan(&range)?
-            .map(|item| {
-                let (_, bytes) = item?;
-                pb::Entry::decode(bytes.as_slice()).map_err(|e| corrupt("a log entry", e))
-            })
-            .collect()
+        let mut log = Vec::new();
+        for item in self.engine.scan(&range)? {
+            let (_, bytes) = item?;
+            let entry =
+                pb::Entry::decode(bytes.as_slice()).map_err(|e| corrupt("a log entry", e))?;
+            let expected = from + log.len() as u64;
+            if entry.seq != expected {
+                return Err(missing(expected));
+            }
+            log.push(entry);
+        }
+        let next = from + log.len() as u64;
+        if next <= through {
+            return Err(missing(next));
+        }
+        Ok(log)
     }
 
     /// The epoch of entry `seq`, which lies between `claim.flushed` and the log end.
@@ -486,17 +500,20 @@ impl Store {
             log_key(actor, from),
             log_key(actor, end(claim).seq + 1),
         ));
+        // The last value the kept log wrote to each key, deletes included.
+        let mut last = BTreeMap::new();
+        for entry in kept {
+            for change in &entry.changes {
+                last.insert(change.key.as_slice(), (entry.seq, &change.value));
+            }
+        }
         for change in dropped.iter().flat_map(|e| &e.changes) {
-            let restored = kept.iter().rev().find_map(|e| {
-                e.changes
-                    .iter()
-                    .rev()
-                    .find(|c| c.key == change.key)
-                    .map(|c| pb::OverlayRecord {
-                        seq: e.seq,
-                        value: c.value.clone(),
-                    })
-            });
+            let restored = last
+                .get(change.key.as_slice())
+                .map(|(seq, value)| pb::OverlayRecord {
+                    seq: *seq,
+                    value: (*value).clone(),
+                });
             overlay.insert(data_key(actor, &change.key), restored);
         }
         if dropped.iter().any(|e| e.alarm.is_some()) {
@@ -641,6 +658,37 @@ impl Store {
             });
         }
         Ok((answer(Refusal::None, &claim, voting), values, false))
+    }
+
+    /// The claimant's recovery read: up to `limit` log entries from `from`, or from the first after the flushed point,
+    /// and whether more follow. Only the holder the slot promised at `epoch` may read; S3 holds the rest.
+    pub fn log(
+        &self,
+        actor: &Actor,
+        holder: &pb::Holder,
+        epoch: u64,
+        from: u64,
+        limit: u32,
+    ) -> Result<(pb::Answer, Vec<pb::Entry>, bool), Error> {
+        let _lock = self.lock(actor);
+        let claim = self.load(actor)?;
+        let voting = !claim.repaired;
+        if claim.epoch != epoch || claim.holder.as_ref() != Some(holder) {
+            return Ok((
+                answer(Refusal::NotPromised, &claim, voting),
+                Vec::new(),
+                false,
+            ));
+        }
+        let from = from.max(claim.flushed + 1);
+        let end = end(&claim).seq;
+        let through = end.min(from.saturating_add(u64::from(limit.clamp(1, MAX_LIMIT)) - 1));
+        let entries = self.entries(actor, from, through)?;
+        Ok((
+            answer(Refusal::None, &claim, voting),
+            entries,
+            through < end,
+        ))
     }
 
     /// Up to `limit` raw records of `[start, end)` after `after`, for a peer's repair copy (S-06), and whether more

@@ -1,6 +1,9 @@
-//! #111 / S-03: one actor's three slots on `bedrock-volume` services over the simulated network. A holder commits while
-//! seeded faults crash and restart one slot at a time, between appends or after a slot's fsync but before its answer.
-//! Every acknowledged commit survives into the next holder's recovered log, and a seed replays the same trace.
+//! #111 / S-03: one actor's three slots on `bedrock-volume` services over the simulated network and disks. A holder
+//! commits while seeded faults crash and restart one slot at a time: between appends, after a slot's fsync but before
+//! its answer, or with the append still in flight, so the disk loses it. Every acknowledged commit survives into the
+//! next holder's recovered log, and a seed replays the same trace.
+//!
+//! The simulated network has no TLS, so calls carry no `Caller`; `crates/volume/tests/unit/serve.rs` checks callers.
 #![cfg(madsim)]
 
 use std::collections::BTreeMap;
@@ -10,8 +13,7 @@ use std::time::Duration;
 use bedrock_lib::admin::Admin;
 use bedrock_lib::placement::{Owner, State};
 use bedrock_lib::storage::StorageEngine;
-use bedrock_lib::storage::memory::MemoryEngine;
-use bedrock_lib::storage::sim::Fingerprint;
+use bedrock_lib::storage::sim::{Fingerprint, SimEngine};
 use bedrock_lib::volume::volume_client::VolumeClient;
 use bedrock_lib::volume::volume_server::VolumeServer;
 use bedrock_lib::volume::{self as pb, Refusal};
@@ -33,7 +35,8 @@ fn actor() -> pb::Actor {
     }
 }
 
-/// A slot node whose engine outlives its restarts: the engine syncs every batch, so what it holds is what survives.
+/// A slot node whose simulated disk outlives its restarts. The store syncs every batch, so what the disk holds survives
+/// a restart; a crash with an append in flight takes that batch back ([`SimEngine::crash`]).
 fn slot(i: usize, engine: Arc<dyn StorageEngine>) -> NodeHandle {
     let name = format!("volume-{i}");
     Handle::current()
@@ -189,27 +192,23 @@ async fn open(name: &str, fingerprint: &Fingerprint) -> Holder {
         fingerprint.mix(("open", name, epoch, reserved, &granted));
         if granted.len() >= 2 {
             let (_, end, from) = granted.into_iter().max().unwrap();
-            let mut log = Vec::new();
-            // The test reads the recovered log back through the slot's records; S-04's client copies it the same way.
+            // The claimant reads the most advanced log through `Log`, which only the promised holder may read.
             let mut c = client(from).await.expect("a granting slot answers");
-            let records = c
-                .repair(pb::RepairRequest {
-                    start: 0,
-                    end: 0,
-                    after: Vec::new(),
+            let reply = c
+                .log(pb::LogRequest {
+                    actor: Some(actor()),
+                    holder: Some(holder.clone()),
+                    epoch,
+                    from: 1,
                     limit: 1000,
                 })
                 .await
                 .unwrap()
                 .into_inner();
-            for record in records.records {
-                if let Ok(entry) = <pb::Entry as prost::Message>::decode(record.value.as_slice())
-                    && record.key.windows(4).any(|w| w == b"log/")
-                    && entry.seq <= end
-                {
-                    log.push(entry);
-                }
-            }
+            assert_eq!(refused(&reply.answer.unwrap()), Refusal::None);
+            assert!(!reply.more);
+            let mut log = reply.entries;
+            assert_eq!(log.len() as u64, end, "the log ends where the claim said");
             let mut noop = pb::Entry {
                 seq: log.len() as u64 + 1,
                 epoch,
@@ -235,10 +234,16 @@ async fn open(name: &str, fingerprint: &Fingerprint) -> Holder {
 
 async fn scenario() -> u64 {
     let fingerprint = Fingerprint::new();
-    let engines: Vec<Arc<dyn StorageEngine>> = (0..3)
-        .map(|i| Arc::new(MemoryEngine::new(format!("volume-{i}"))) as Arc<dyn StorageEngine>)
+    // Fault-free disks that can lose their last batches in a crash.
+    let engines: Vec<Arc<SimEngine>> = (0..3)
+        .map(|i| {
+            let disk = SimEngine::new(&format!("volume-{i}"), Arc::new(|_| None), None, true);
+            Arc::new(disk.recorded(fingerprint.clone()))
+        })
         .collect();
-    let nodes: Vec<NodeHandle> = (0..3).map(|i| slot(i, engines[i].clone())).collect();
+    let nodes: Vec<NodeHandle> = (0..3)
+        .map(|i| slot(i, engines[i].clone() as Arc<dyn StorageEngine>))
+        .collect();
     let handle = Handle::current();
     let holder = handle
         .create_node()
@@ -281,10 +286,17 @@ async fn scenario() -> u64 {
                     }],
                     ..Default::default()
                 });
-                if down.is_none() && roll == 5 {
-                    // This slot fsyncs the append and dies before its answer counts.
+                if down.is_none() && roll >= 4 {
                     let i = thread_rng().gen_range(0..3);
-                    h1.send(i).await;
+                    let written = h1
+                        .send(i)
+                        .await
+                        .is_some_and(|answer| refused(&answer) == Refusal::None);
+                    // Roll 5: the slot fsyncs the append and dies before its answer counts. Roll 4: it dies with the
+                    // append still in flight, so the disk loses the batch and the answer never counts.
+                    if roll == 4 && written {
+                        engines[i].crash(1);
+                    }
                     handle.kill(ids[i]);
                     down = Some(i);
                 }

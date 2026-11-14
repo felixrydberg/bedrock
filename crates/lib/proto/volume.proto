@@ -18,6 +18,8 @@ service Volume {
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
   rpc Read(ReadRequest) returns (ReadReply);
   rpc Scan(ScanRequest) returns (ScanReply);
+  // The claimant's recovery read: the slot's log after its flushed point, only for the holder it promised.
+  rpc Log(LogRequest) returns (LogReply);
   // From the maintainer once S3 holds everything through `through` (S-05).
   rpc Truncate(TruncateRequest) returns (Answer);
   // Another slot copies one hash range's records (S-06).
@@ -112,6 +114,9 @@ message ReadReply { Answer answer = 1; repeated Value values = 2; }
 
 message ScanRequest { Actor actor = 1; bytes start = 2; uint32 limit = 3; uint64 min_seq = 4; }
 message ScanReply { Answer answer = 1; repeated Value values = 2; bool more = 3; }
+// Entries from `from` (or the first one after the flushed point), at most `limit`.
+message LogRequest { Actor actor = 1; Holder holder = 2; uint64 epoch = 3; uint64 from = 4; uint32 limit = 5; }
+message LogReply { Answer answer = 1; repeated Entry entries = 2; bool more = 3; }
 
 message TruncateRequest { Actor actor = 1; uint64 through = 2; }
 

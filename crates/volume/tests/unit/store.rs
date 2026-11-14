@@ -286,7 +286,7 @@ fn a_new_epoch_truncates_an_old_uncommitted_tail_and_its_overlay() {
     );
     assert_eq!(read(&store, "gone"), None);
     assert_eq!(read(&store, "new"), Some(b"b".to_vec()));
-    let log = store.entries(&actor(), 1, 3).unwrap();
+    let log = store.entries(&actor(), 1, 2).unwrap();
     assert_eq!(
         log.iter().map(|e| (e.seq, e.epoch)).collect::<Vec<_>>(),
         [(1, 1), (2, 2)]
@@ -334,6 +334,38 @@ fn a_repaired_slot_takes_claims_and_appends_without_voting_until_a_newer_claim_c
         refused(&store.reserve(&actor, 5, 0).unwrap()),
         Refusal::None
     );
+}
+
+#[test]
+fn the_promised_holder_reads_the_log_and_a_missing_entry_is_corruption() {
+    let store = store();
+    let (a, b) = (host("a"), host("b"));
+    claimed(&store, &a, 1);
+    let log: Vec<_> = (1..=3).map(|seq| entry(seq, 1, &[])).collect();
+    append(&store, &a, 1, 0, log.clone(), 0);
+    let (answer, entries, more) = store.log(&actor(), &a, 1, 1, 2).unwrap();
+    assert_eq!(
+        (refused(&answer), entries.as_slice(), more),
+        (Refusal::None, &log[..2], true)
+    );
+    let (_, entries, more) = store.log(&actor(), &a, 1, 3, 10).unwrap();
+    assert_eq!((entries.as_slice(), more), (&log[2..], false));
+    // Only the promise reads: another holder, or the right holder at another epoch, gets nothing.
+    for (holder, epoch) in [(&b, 1), (&a, 2)] {
+        let (answer, entries, _) = store.log(&actor(), holder, epoch, 1, 10).unwrap();
+        assert_eq!((refused(&answer), entries.len()), (Refusal::NotPromised, 0));
+    }
+    // A hole below the log end fails as a point read of it does.
+    store.engine.delete(&log_key(&actor(), 2)).unwrap();
+    for result in [
+        store.log(&actor(), &a, 1, 1, 10).map(|_| ()),
+        store.entry(&actor(), 2).map(|_| ()),
+    ] {
+        let Err(Error::Storage(StorageError::Corruption(context))) = result else {
+            panic!("a missing entry is corruption");
+        };
+        assert_eq!(context.partition.as_deref(), Some("log 2"));
+    }
 }
 
 #[test]
@@ -512,7 +544,8 @@ fn open(slots: &[Store; 3], name: &str, up: impl Fn(usize) -> bool + Copy) -> Ho
     }
     assert!(granted >= 2, "a quorum grants {epoch}");
     let (_, end, from) = best.unwrap();
-    let mut log = slots[from].entries(&actor(), 1, end).unwrap();
+    let (_, mut log, more) = slots[from].log(&actor(), &name, epoch, 1, 1000).unwrap();
+    assert!(!more && log.len() as u64 == end);
     let mut noop = entry(log.len() as u64 + 1, epoch, &[]);
     noop.kind = EntryKind::Noop as i32;
     log.push(noop);
@@ -533,30 +566,35 @@ fn open(slots: &[Store; 3], name: &str, up: impl Fn(usize) -> bool + Copy) -> Ho
 #[test]
 fn killing_one_slot_at_every_append_boundary_loses_no_acknowledged_commit() {
     const COMMITS: u64 = 4;
+    // The holder commits while the victim dies at the boundary; returns the slots after the crash and the acked log.
+    let crash = |victim: usize, boundary: u64, after_write: bool| {
+        let slots = [store(), store(), store()];
+        let mut holder = open(&slots, "h1", |_| true);
+        let mut acked = holder.log.clone();
+        for n in 0..COMMITS {
+            let seq = holder.log.len() as u64 + 1;
+            let key = format!("k{n}");
+            holder
+                .log
+                .push(entry(seq, holder.epoch, &[(&key, Some(&key))]));
+            let down = |i: usize| i == victim && n >= boundary;
+            if after_write && n == boundary {
+                // The victim fsyncs this append, then dies before answering.
+                send(&slots[victim], &mut holder, victim);
+            }
+            if replicate(&slots, &mut holder, |i| !down(i)) {
+                acked = holder.log.clone();
+            }
+        }
+        (slots, acked)
+    };
     for victim in 0..3 {
         for boundary in 0..=COMMITS {
             for after_write in [false, true] {
-                let slots = [store(), store(), store()];
-                let mut holder = open(&slots, "h1", |_| true);
-                let mut acked = holder.log.clone();
-                for n in 0..COMMITS {
-                    let seq = holder.log.len() as u64 + 1;
-                    let key = format!("k{n}");
-                    holder
-                        .log
-                        .push(entry(seq, holder.epoch, &[(&key, Some(&key))]));
-                    let down = |i: usize| i == victim && n >= boundary;
-                    if after_write && n == boundary {
-                        // The victim fsyncs this append, then dies before answering.
-                        send(&slots[victim], &mut holder, victim);
-                    }
-                    if replicate(&slots, &mut holder, |i| !down(i)) {
-                        acked = holder.log.clone();
-                    }
-                }
                 // The holder dies too. The victim restarts with what it synced; the next holder may use it and
-                // either survivor.
+                // either survivor. Each quorum recovers from the same post-crash slots, rebuilt for it.
                 for lost in 0..3 {
+                    let (slots, acked) = crash(victim, boundary, after_write);
                     let up = |i: usize| i != lost;
                     let next = open(&slots, &format!("h2-{lost}"), up);
                     for (i, entry) in acked.iter().enumerate() {

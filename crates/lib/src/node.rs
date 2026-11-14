@@ -224,6 +224,12 @@ impl RelayConfig {
             if self.tier != Tier::Cell {
                 return Err(ConfigError("membership requires a cell-tier relay".into()));
             }
+            // Placement would plan no owners and hand every volume range away.
+            if membership.volume_replicas == 0 {
+                return Err(ConfigError(
+                    "membership.volume_replicas must be at least 1".into(),
+                ));
+            }
             let advertised = self.node.advertised();
             // Siblings elect the publisher by address, so it must be the one they dial.
             if advertised
