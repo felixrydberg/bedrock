@@ -17,6 +17,10 @@ pub mod s3;
 pub mod sim;
 pub mod storage;
 pub mod transport;
+/// The `bedrock-volume` protocol (`proto/volume.proto`, #111 / S-03).
+pub mod volume {
+    tonic::include_proto!("bedrock.volume");
+}
 
 // madsim's Tokio clock uses `std::time::Instant`; scope the lint exception to this adapter.
 #[cfg_attr(madsim, allow(clippy::disallowed_methods))]

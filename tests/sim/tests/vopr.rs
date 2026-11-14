@@ -786,6 +786,7 @@ fn relay(name: &str, ip: &str, replay_max_bytes: Option<u64>) -> RelayConfig {
                 .collect(),
             bootstrap: true,
             grace_ms: GRACE.as_millis() as u64,
+            volume_replicas: 3,
         }),
         write_token: Some(TOKEN.into()),
     }

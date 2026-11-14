@@ -6,6 +6,11 @@
 //!   their capacity-weighted share take ranges from the most loaded, splitting where needed. [`handoff`] then marks
 //!   owners `ready` as their relays report them so and removes `leaving` ones (#22 / B-21). [`merges`] joins neighbours
 //!   whose owners are the same again (#66 / B-61).
+//! - A range weighs its share of the hash space, or, once members report range sizes (`volume`, #111 / S-03), its stored
+//!   bytes. A range no holder has reported yet weighs its hash span at the reported ranges' average bytes per hash. A
+//!   split cuts where the estimated bytes divide as wanted: half on each side of the reported middle, spread evenly. A
+//!   member is moved to within [`FILL`] of its target only once it is [`TRIGGER`] away, so sizes must drift by the
+//!   difference before a range moves again.
 //!
 //! The directory types and the read side ([`bedrock_lib::placement::owners`] and the rest) stay in `bedrock-lib`.
 
@@ -23,6 +28,72 @@ const FILL: f64 = 0.1;
 const TRIGGER: f64 = 0.15;
 /// Donors tried for an under-loaded member before it waits for the next plan.
 const TRIES: usize = 16;
+/// Bytes the whole hash space weighs on top of what it stores, so an empty or new cell still spreads ranges by hash.
+const EMPTY: u128 = 1 << 30;
+
+/// A member's report of one span it holds, from `start` (its key) to `end`.
+struct Report {
+    end: u128,
+    bytes: f64,
+    middle: Option<u128>,
+}
+
+impl Report {
+    /// Estimated bytes from `start` to `x`: half of them on each side of the middle, spread evenly.
+    fn below(&self, start: u128, x: u128) -> f64 {
+        let x = x.clamp(start, self.end);
+        let part =
+            |from: u128, to: u128, bytes: f64| bytes * (x - from) as f64 / (to - from) as f64;
+        match self.middle {
+            Some(m) if x <= m => part(start, m, self.bytes / 2.0),
+            Some(m) => self.bytes / 2.0 + part(m, self.end, self.bytes / 2.0),
+            None => part(start, self.end, self.bytes),
+        }
+    }
+}
+
+/// A member's reports by start.
+fn reports_of(member: &pb::Member) -> BTreeMap<u128, Report> {
+    member
+        .sizes
+        .iter()
+        .filter_map(|size| {
+            let span = size.span.as_ref()?;
+            let end = if span.end == 0 {
+                SPACE
+            } else {
+                u128::from(span.end)
+            };
+            let report = Report {
+                end,
+                bytes: size.bytes as f64,
+                middle: (size.middle != 0).then_some(u128::from(size.middle)),
+            };
+            Some((u128::from(span.start), report))
+        })
+        .collect()
+}
+
+/// The estimated bytes of `[start, end)` when `reports` cover all of it, with the middle of a report of exactly it.
+fn estimate(
+    reports: &BTreeMap<u128, Report>,
+    start: u128,
+    end: u128,
+) -> Option<(f64, Option<u128>)> {
+    let (mut bytes, mut covered, mut middle) = (0.0, 0, None);
+    for (&from, report) in reports
+        .range(..end)
+        .rev()
+        .take_while(|(_, r)| r.end > start)
+    {
+        bytes += report.below(from, end) - report.below(from, start);
+        covered += report.end.min(end) - from.max(start);
+        if (from, report.end) == (start, end) {
+            middle = report.middle;
+        }
+    }
+    (covered == end - start).then_some((bytes, middle))
+}
 
 /// The entries to write so every range has `replicas` owners, in distinct failure domains when possible, and members
 /// hold their capacity-weighted share. At most `max_moving` ranges are in handoff at once, counting those already moving.
@@ -61,6 +132,11 @@ struct Plan<'a> {
     order: BTreeSet<(u64, &'a str)>,
     /// Ranges with an owner not yet `ready`.
     moving: usize,
+    /// Each range's weight: its hash span, or its estimated bytes once members report sizes.
+    weights: BTreeMap<u64, u128>,
+    /// Reported byte middles of ranges as reported, which splits cut around.
+    middles: BTreeMap<u64, u128>,
+    bytes: bool,
 }
 
 impl<'a> Plan<'a> {
@@ -76,6 +152,11 @@ impl<'a> Plan<'a> {
         for owners in ranges.values_mut() {
             owners.retain(|o| members.contains_key(&o.node));
         }
+        let reports: BTreeMap<&str, _> = members
+            .iter()
+            .filter(|(_, m)| !m.sizes.is_empty())
+            .map(|(id, m)| (id.as_str(), reports_of(m)))
+            .collect();
         let mut plan = Plan {
             members,
             ranges,
@@ -84,7 +165,40 @@ impl<'a> Plan<'a> {
             target: BTreeMap::new(),
             order: BTreeSet::new(),
             moving: 0,
+            weights: BTreeMap::new(),
+            middles: BTreeMap::new(),
+            bytes: !reports.is_empty(),
         };
+        // The largest estimate of any owner holding the whole range.
+        let mut known = BTreeMap::new();
+        for (&start, owners) in &plan.ranges {
+            let (from, end) = (u128::from(start), plan.end(start));
+            let estimates = owners
+                .iter()
+                .filter(|o| o.state != State::Populating)
+                .filter_map(|o| estimate(reports.get(o.node.as_str())?, from, end));
+            if let Some(best) = estimates.reduce(|a, b| if b.0 > a.0 { b } else { a }) {
+                known.insert(start, best);
+            }
+        }
+        let (bytes, span): (f64, u128) = known.keys().fold((0.0, 0), |(b, s), start| {
+            (b + known[start].0, s + plan.span(*start))
+        });
+        let density = if span > 0 { bytes / span as f64 } else { 0.0 };
+        for start in plan.ranges.keys().copied().collect::<Vec<_>>() {
+            let span = plan.span(start);
+            let weight = match known.get(&start) {
+                _ if !plan.bytes => span,
+                Some((bytes, middle)) => {
+                    if let Some(middle) = middle {
+                        plan.middles.insert(start, *middle);
+                    }
+                    bytes.round() as u128 + span * EMPTY / SPACE
+                }
+                None => (span as f64 * density).round() as u128 + span * EMPTY / SPACE,
+            };
+            plan.weights.insert(start, weight);
+        }
         let starts: Vec<u64> = plan.ranges.keys().copied().collect();
         for start in starts {
             let size = plan.size(start);
@@ -114,7 +228,8 @@ impl<'a> Plan<'a> {
             .filter(|(n, _)| !eligible_ids.contains(*n))
             .map(|(_, l)| l)
             .sum();
-        let demand = replicas as f64 * SPACE as f64 - kept as f64;
+        let total: u128 = plan.weights.values().sum();
+        let demand = replicas as f64 * total as f64 - kept as f64;
         // Each member's share of its scarcest resource. A resource some member leaves unset (0) is ignored.
         let mut weight = vec![f64::INFINITY; eligible.len()];
         let resources: [fn(&pb::Member) -> f64; 2] = [|m| m.cpus, |m| m.disk_mb as f64];
@@ -323,9 +438,10 @@ impl<'a> Plan<'a> {
         let mut best: Option<((usize, u128), u64)> = None;
         for &start in self.held.get(d)? {
             let owners = &self.ranges[&start];
-            if owners
-                .iter()
-                .any(|o| o.state != State::Ready || o.node == u)
+            if self.size(start) == 0
+                || owners
+                    .iter()
+                    .any(|o| o.state != State::Ready || o.node == u)
             {
                 continue;
             }
@@ -365,17 +481,35 @@ impl<'a> Plan<'a> {
         self.set_load(node, self.load[node] - self.size(start));
     }
 
-    /// Splits off the last `piece` hashes of a range and returns where they start; the whole range if it is no larger.
+    /// Splits off the last `piece` of a range's weight and returns where it starts; the whole range if it is no larger,
+    /// or if the range is one hash wide.
     fn split(&mut self, start: u64, piece: u128) -> u64 {
         let size = self.size(start);
         if piece >= size {
             return start;
         }
-        let at = start + (size - piece) as u64;
+        let (from, end) = (u128::from(start), self.end(start));
+        let at = if !self.bytes {
+            start + (size - piece) as u64
+        } else if end - from < 2 {
+            return start;
+        } else {
+            let (w, p) = (size as f64, piece as f64);
+            let share = |part: f64, of: f64, hashes: u128| (hashes as f64 * part / of) as u128;
+            let at = match self.middles.get(&start) {
+                Some(&m) if p <= w / 2.0 => end - share(p, w / 2.0, end - m),
+                Some(&m) => m - share(p - w / 2.0, w / 2.0, m - from),
+                None => end - share(p, w, end - from),
+            };
+            at.clamp(from + 1, end - 1) as u64
+        };
         assert!(
             piece > 0 && at > start,
             "a split must fall inside the range"
         );
+        self.weights.insert(start, size - piece);
+        self.weights.insert(at, piece);
+        self.middles.remove(&start);
         let owners = self.ranges[&start].clone();
         for owner in owners.iter().filter(|o| holds(o)) {
             let node = self.members.get_key_value(&owner.node).unwrap().0.as_str();
@@ -407,13 +541,20 @@ impl<'a> Plan<'a> {
         ((1.0 + FILL) * self.target[node] - self.load[node] as f64).max(0.0) as u128
     }
 
+    /// A range's weight.
     fn size(&self, start: u64) -> u128 {
-        let end = self
-            .ranges
+        self.weights[&start]
+    }
+
+    fn end(&self, start: u64) -> u128 {
+        self.ranges
             .range((Excluded(start), Unbounded))
             .next()
-            .map_or(SPACE, |(next, _)| u128::from(*next));
-        end - u128::from(start)
+            .map_or(SPACE, |(next, _)| u128::from(*next))
+    }
+
+    fn span(&self, start: u64) -> u128 {
+        self.end(start) - u128::from(start)
     }
 
     /// An empty failure domain is the node's own.

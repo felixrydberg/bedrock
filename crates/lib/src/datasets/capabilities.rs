@@ -5,9 +5,10 @@ pub const AUTH: &str = "auth";
 pub const CDN: &str = "cdn";
 pub const KV: &str = "kv";
 pub const MEMBERSHIP: &str = "membership";
+pub const VOLUME: &str = "volume";
 
 /// Services with a membership namespace in each cell, including services without ranged datasets.
-pub const SERVICES: [&str; 3] = [QUICKSILVER, KV, CDN];
+pub const SERVICES: [&str; 4] = [QUICKSILVER, KV, CDN, VOLUME];
 
 struct Capability {
     dataset: &'static str,
@@ -41,6 +42,14 @@ const CAPABILITIES: &[Capability] = &[
         pushed: false,
         namespaces: &[],
         ranged_service: None,
+    },
+    // Actor slots (#111 / S-03): relay-assigned hash ranges with no relay data. The owner, not a relay stream, decides
+    // when it is ready (S-06).
+    Capability {
+        dataset: VOLUME,
+        pushed: false,
+        namespaces: &[],
+        ranged_service: Some(VOLUME),
     },
     Capability {
         dataset: MEMBERSHIP,

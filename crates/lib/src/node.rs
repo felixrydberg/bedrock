@@ -179,6 +179,14 @@ pub struct MembershipSettings {
     /// How long a disconnected node stays a member; it may reconnect to any cell relay meanwhile.
     #[serde(default = "default_grace_ms")]
     pub grace_ms: u64,
+    /// Owners of each `volume` range: `ceil(3 / cells in the DC)`, so an actor's three slots land on three nodes
+    /// (#111 / S-03). The default suits a DC with one cell.
+    #[serde(default = "default_volume_replicas")]
+    pub volume_replicas: usize,
+}
+
+fn default_volume_replicas() -> usize {
+    3
 }
 
 /// Longer than a silent relay's detection ([`crate::relays::IDLE`]) minus its progress interval, so failover fits.
@@ -215,6 +223,12 @@ impl RelayConfig {
             }
             if self.tier != Tier::Cell {
                 return Err(ConfigError("membership requires a cell-tier relay".into()));
+            }
+            // Placement would plan no owners and hand every volume range away.
+            if membership.volume_replicas == 0 {
+                return Err(ConfigError(
+                    "membership.volume_replicas must be at least 1".into(),
+                ));
             }
             let advertised = self.node.advertised();
             // Siblings elect the publisher by address, so it must be the one they dial.

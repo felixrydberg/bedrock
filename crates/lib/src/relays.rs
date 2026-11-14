@@ -460,6 +460,9 @@ impl Hub {
             .unwrap()
             .values()
             .flat_map(|sub| sub.pushed.keys().cloned())
+            // An unpushed ranged dataset (`volume`) has no stream to finish. Its owners report readiness themselves
+            // (S-06); until then they stay populating and never vote.
+            .filter(|dataset| pushed(dataset))
             .collect();
         let heads: BTreeMap<String, Vec<(String, u64)>> = datasets
             .into_iter()
@@ -634,7 +637,8 @@ impl Hub {
         }
         self.changed();
     }
-    /// The first member must arrive on a leaf Hello; later ones may change only its status and unhealthy datasets.
+    /// The first member must arrive on a leaf Hello; later ones may change only its status, unhealthy datasets and range
+    /// sizes.
     fn member(&self, id: u64, member: pb::Member) -> bool {
         if crate::membership::validate(&member).is_err() {
             return false;
@@ -654,6 +658,7 @@ impl Hub {
         };
         current.status = member.status;
         current.unhealthy = member.unhealthy;
+        current.sizes = member.sizes;
         drop(subscribers);
         self.members_changed();
         true

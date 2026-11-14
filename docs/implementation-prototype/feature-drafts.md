@@ -86,7 +86,7 @@ server runs every service, each service is its own process, and code is shared a
 | `bedrock-cdn` | Dataset `cdn` (path rows and ref keys) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
 | `bedrock-gateway` (planned, B-57) | Public entry point, internal routing between cells, API-key checks and the local `auth` copy (§4 decision 15); actor routing (S-08) | — (follows its relay's tier) |
 | `bedrock-compute` (planned, S-07) | Actor host: Workers sandbox, Durable Objects and the built-in `d1`, `kv`, `queue` and `cron` handlers (§4 decision 16) | — |
-| `bedrock-volume` (planned, S-03) | Actor storage: claims, leases, quorum log, overlay, flushes to S3, alarm index; `volume` hash ranges per cell (§4 decision 16) | — |
+| `bedrock-volume` (S-03; cold tier S-05) | Actor storage: claims, leases, quorum log, overlay, flushes to S3, alarm index; `volume` hash ranges per cell (§4 decision 16) | — |
 
 Rules this implies:
 
@@ -213,10 +213,11 @@ Rules this implies:
 | **O — Stateful actors** (decision 16; scope and acceptance in [`statefull/v2.md`](statefull/v2.md) §11) |||||
 | [S-01](https://github.com/felixrydberg/bedrock/issues/109) | Actor IDs, topology record and placement functions | Actors | `lib/actors`, Quicksilver schema | B-24 |
 | [S-02](https://github.com/felixrydberg/bedrock/issues/110) | Volume protocol in TLA+: claim, append, lease, release, repair, topology change | Actors | `docs/spec/volume.tla` | decision 16 |
-| [S-03](https://github.com/felixrydberg/bedrock/issues/111) | `bedrock-volume` binary: records, gRPC service, membership, ranges, owner checks | Actors | `volume` bin | S-01, S-02, B-21, B-68 |
+| [S-02b](https://github.com/felixrydberg/bedrock/issues/131) | Volume protocol fix in TLA+: epoch reservation and repair after a lost disk | Actors | `docs/spec/volume.tla` | S-02 |
+| [S-03](https://github.com/felixrydberg/bedrock/issues/111) | `bedrock-volume` binary: records, gRPC service, membership, ranges, owner checks | Actors | `volume` bin | S-01, S-02b, B-21, B-68 |
 | [S-04](https://github.com/felixrydberg/bedrock/issues/112) | Volume client in Compute: claim, recovery, append window, reads | Actors | `compute/actors` | S-03 |
 | [S-05](https://github.com/felixrydberg/bedrock/issues/113) | Cold tier: one SlateDB per range, maintainer flush, truncation, split and merge by clone, SSD cache, S3 reader handles | Actors | `volume/cold` | S-03, B-11, B-39 |
-| [S-06](https://github.com/felixrydberg/bedrock/issues/114) | Slot repair and node-reported range readiness | Actors | `volume/repair`, `lib/relays` | S-02, S-03, B-68 |
+| [S-06](https://github.com/felixrydberg/bedrock/issues/114) | Slot repair and node-reported range readiness | Actors | `volume/repair`, `lib/relays` | S-02b, S-03, B-68 |
 | [S-07](https://github.com/felixrydberg/bedrock/issues/115) | `bedrock-compute` actor host: acquire, wake, sleep, leases, SQLite VFS, gates | Actors | `compute` bin | S-04 |
 | [S-08](https://github.com/felixrydberg/bedrock/issues/116) | Gateway actor routing and location cache | Actors | `gateway/actors` | B-57, S-07 |
 | [S-09](https://github.com/felixrydberg/bedrock/issues/117) | Alarms: holder timers and volume index wake | Actors | `compute/actors`, `volume/alarms` | S-07, S-08 |

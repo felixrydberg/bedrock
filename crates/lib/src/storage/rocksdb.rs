@@ -432,6 +432,16 @@ impl StorageEngine for RocksDbAdapter {
         self.health()
     }
 
+    /// From the SST index: memtables are not counted, and compressed files count as stored.
+    fn approximate_size(&self, range: &KeyRange) -> StorageResult<u64> {
+        let start = data_key(&range.start);
+        let end = range.end.as_deref().map_or(KEY_END.to_vec(), data_key);
+        let sizes = self
+            .db
+            .get_approximate_sizes_cf(&self.data(), &[rocksdb::Range::new(&start, &end)]);
+        Ok(sizes[0])
+    }
+
     fn health(&self) -> StorageResult<()> {
         // RocksDB's counter never falls, so only errors since the last restore count. ponytail: one transient flush error
         // keeps the instance unhealthy until its rebuild; read the background error status if that rebuilds too much.

@@ -154,30 +154,41 @@ async fn distinct_voters_on_one_host_elect_and_forward_operator_writes_over_tls(
             peers(Some(tls(&ca, "relay", "c1", "operator").await)).with_identities(identities);
         let channel = operator.channel(&voters[follower], Class::Control).unwrap();
         let mut client = pb::cell_control_client::CellControlClient::new(channel);
-        let mut request = tonic::Request::new(pb::ControlWrite {
-            namespace: "cdn.c1".into(),
-            key: b"drain/cell".to_vec(),
-            value: Some(
-                Drain {
-                    scope: Scope::Cell("c1".into()),
-                    datasets: Vec::new(),
-                    namespace: None,
-                    state: State::Draining,
-                    rate: 1,
+        let request = || {
+            let mut request = tonic::Request::new(pb::ControlWrite {
+                namespace: "cdn.c1".into(),
+                key: b"drain/cell".to_vec(),
+                value: Some(
+                    Drain {
+                        scope: Scope::Cell("c1".into()),
+                        datasets: Vec::new(),
+                        namespace: None,
+                        state: State::Draining,
+                        rate: 1,
+                    }
+                    .encode(),
+                ),
+                expected: None,
+                expected_term: 0,
+                idempotency_key: "1000:operator".into(),
+            });
+            request
+                .metadata_mut()
+                .insert("authorization", "Bearer operator".parse().unwrap());
+            request
+        };
+        // A follower learns the leader from the leader's first message and answers `Unavailable` until then, so the
+        // operator retries; the idempotency key keeps a retry from writing twice.
+        let revision = loop {
+            match client.write(request()).await {
+                Ok(reply) => break reply.into_inner().revision,
+                Err(status) if status.code() == tonic::Code::Unavailable => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                .encode(),
-            ),
-            expected: None,
-            expected_term: 0,
-            idempotency_key: "1000:operator".into(),
-        });
-        request
-            .metadata_mut()
-            .insert("authorization", "Bearer operator".parse().unwrap());
-        assert_eq!(
-            client.write(request).await.unwrap().into_inner().revision,
-            1
-        );
+                Err(status) => panic!("operator write failed: {status}"),
+            }
+        };
+        assert_eq!(revision, 1);
         while controls
             .iter()
             .any(|control| control.head("cdn.c1").unwrap() != 1)

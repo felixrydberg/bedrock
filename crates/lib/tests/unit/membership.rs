@@ -82,6 +82,26 @@ fn announced_entries_are_validated() {
     assert!(health(&["quicksilver", "auth"]).is_err());
     assert!(health(&["auth", "auth"]).is_err());
     assert!(health(&["cdn"]).is_err());
+    // Range sizes are disjoint, non-empty spans in order, each with its middle inside or 0 (#111 / S-03).
+    let sizes = |spans: &[(u64, u64, u64)]| {
+        validate(&pb::Member {
+            sizes: spans
+                .iter()
+                .map(|&(start, end, middle)| pb::RangeSize {
+                    span: Some(pb::Span { start, end }),
+                    bytes: 1,
+                    middle,
+                })
+                .collect(),
+            ..ready("kv-1")
+        })
+    };
+    assert!(sizes(&[(0, 10, 5), (10, 0, 0)]).is_ok());
+    assert!(sizes(&[(10, 0, 0), (0, 10, 0)]).is_err());
+    assert!(sizes(&[(0, 10, 0), (5, 20, 0)]).is_err());
+    assert!(sizes(&[(5, 5, 0)]).is_err());
+    assert!(sizes(&[(0, 10, 10)]).is_err());
+    assert!(sizes(&[(0, 0, 0), (0, 0, 0)]).is_err());
 }
 
 #[test]

@@ -435,6 +435,15 @@ impl Session {
         }
     }
 
+    /// Announces the approximate stored bytes of the ranges this member holds (#111 / S-03); the relays publish them with
+    /// its entry for placement. Callers send only changes worth a membership write.
+    pub fn set_sizes(&self, sizes: Vec<pb::RangeSize>) {
+        let Some(member) = &self.member else { return };
+        if member.get().sizes != sizes {
+            member.update(|m| m.sizes = sizes);
+        }
+    }
+
     /// Stop and join the task before replacing or reusing its local storage.
     pub async fn stop(mut self) {
         self.task.abort();

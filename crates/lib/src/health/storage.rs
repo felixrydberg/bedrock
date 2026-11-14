@@ -407,6 +407,10 @@ impl StorageEngine for Monitored {
     fn compact(&self, range: &KeyRange) -> StorageResult<()> {
         self.call(|| self.inner.compact(range))
     }
+
+    fn approximate_size(&self, range: &KeyRange) -> StorageResult<u64> {
+        self.call(|| self.inner.approximate_size(range))
+    }
 }
 
 struct MonitoredSnapshot<'a> {

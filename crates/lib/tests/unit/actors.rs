@@ -105,8 +105,9 @@ fn malformed_ids_are_rejected() {
     }
 }
 
-#[test]
-fn unknown_regions_are_rejected() {
+// `unique` draws from the runtime RNG, which needs a runtime under madsim.
+#[tokio::test]
+async fn unknown_regions_are_rejected() {
     let text = named("alice").to_string().replace("eu_", "us_");
     let unknown = Err(Error::UnknownRegion("us".into()));
     assert_eq!(ActorId::parse(&regions(), &text), unknown);
