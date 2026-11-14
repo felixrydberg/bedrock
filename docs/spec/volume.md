@@ -1,17 +1,20 @@
-# Actor volume protocol model (S-02 / #110)
+# Actor volume protocol model (S-02 / #110, S-02b / #131)
 
 `volume.tla` models one actor's quorum log on `bedrock-volume`, as planned in
 [statefull/v2.md §5](../implementation-prototype/statefull/v2.md#5-storage-bedrock-volume): an appointed holder claims
 with epochs and appends, three slots in different cells promise and fsync, and a maintainer flushes committed entries
-to S3. It also models the three changes that move votes. Nothing here is implemented yet; S-03 (#111) and S-06 (#114)
-build on it.
+to S3. It also models the three changes that move votes. S-02b (#131) adds epoch reservation and the repaired state
+after a disk wipe. Nothing here is implemented yet; S-03 (#111), S-04 (#112) and S-06 (#114) build on it.
 
 ## What is modeled
 
-- **Slots** `a`, `b`, `c` hold a promise (epoch and holder), a log of entries (epoch and holder), a state (`vote`,
-  `leave`, `seal`, `pop`, `off`) and the topology version they accept. `d` is the node a change brings in.
-- **Holders** `h1`, `h2` compete. `Start` claims at the highest epoch seen plus one. `Grant` accepts a claim only above
-  the slot's promise, at its version or newer, and not while another holder's lease is live there. With a quorum,
+- **Slots** `a`, `b`, `c` hold a promise (epoch and holder), a highest reserved epoch, a log of entries (epoch and
+  holder), a state (`vote`, `leave`, `seal`, `pop`, `repaired`, `off`) and the topology version they accept. `d` is
+  the node a change brings in.
+- **Holders** `h1`, `h2` compete. `Start` picks the highest epoch seen plus one, and `Reserve` records it at slots: a
+  slot accepts only an epoch above its highest reservation. Once a quorum has reserved it (`Reserved`), the holder
+  claims at that epoch. `Grant` accepts a claim only above the slot's promise, at its version or newer, and not while
+  another holder's lease is live there. With a quorum,
   `Recover` fixes the most advanced log the slots sent (highest last-entry epoch, then sequence). `Write` appends the
   no-op and later entries. `Release` is a last entry after which no lease is live. `Fence` is a self-fence or a crash.
 - **Appends.** `Replicate` sends the holder's log to a slot whose promise is the holder's ballot. The slot takes the log,
@@ -26,8 +29,10 @@ build on it.
   - `handoff`: `c` becomes the leaving owner and seals. The populating owner `d` copies from the sealed `c`, reports
     ready, then votes in `c`'s slot position; `c` drops the range. Readiness is reported by the node and checked by
     its relay (the B-21 change for `volume` ranges).
-  - `wipe`: `c` loses its promise and log and comes back populating. It copies from both peers (keeping the higher
-    promise and the more advanced log) before voting again.
+  - `wipe`: `c` loses its promise, reservation and log, and comes back populating. It copies from both peers, keeping
+    the higher promise and reservation and the more advanced log. It then waits as `repaired`: it takes claims and
+    appends, but counts towards no reservation, claim or commit quorum. It votes again once an append tells it that a
+    claim above the highest reservation it copied has committed.
   - `topology`: version 1 is `{a, b, c}`, version 2 needs majorities of both `{a, b, c}` and `{a, b, d}`, version 3 is
     `{a, b, d}`. Claims and appends carry the version the holder read, and a slot refuses an older one.
 
@@ -53,6 +58,8 @@ Each deliberate bug in `scripts/tlc.sh` breaks the invariant named beside it:
 | `volume-base` | `flush` | `S3Committed` | The maintainer flushes past the announced commit point |
 | `volume-handoff` | `populating` | `NoLostAck` | A populating slot votes |
 | `volume-handoff` | `unsealed` | `NoLostAck` | The populating owner copies from an unsealed leaving owner, which keeps voting |
+| `volume-wipe` | `self-epoch` | `NoLostAck` | A holder claims at its own highest seen + 1, without reserving it |
+| `volume-wipe` | `early` | `NoLostAck` | A repaired slot votes at once |
 | `volume-topology` | `new-only` | `NoLostAck`, `OneWriter`, `NoStaleAppend` | During the transition a quorum of only the new slot set counts |
 
 ## Bounds
@@ -72,8 +79,7 @@ finishing.
 ## Model choices to confirm in S-03
 
 - **Appends check the holder too.** A slot writes an append only when its claim's epoch and holder both match. v2.md
-  says "the epoch matches its claim"; the claim record holds both. It matters only if two holders win one epoch, which
-  the wipe finding below allows.
+  says "the epoch matches its claim"; the claim record holds both. It matters only if two holders win one epoch.
 - **The topology transition ends after a joint commit.** v2.md does not say when version 3 starts. The model allows it
   only after an entry has committed under joint majorities, as Raft commits `C_old,new` before `C_new`. Without such
   a rule, a version-1 commit on `{a, c}` and a version-3 claim on `{b, d}` share no slot.
@@ -82,30 +88,48 @@ finishing.
 - **Log truncation after a flush** is not modeled; slots keep their whole log. Alarms, reads and the overlay are out
   of scope.
 
-## Finding: a wiped slot's promise is lost
+## Resolved: slot repair after a disk wipe (S-02b / #131)
 
-`volume-wipe` fails `NoLostAck`. Copying from both peers before voting restores the peers' promises, but not a
-promise the wiped slot gave just before the wipe, while that grant is still counted by its claimant. Shortest trace
-(16 states, `MaxEpoch 2`, `MaxLen 2`):
+A slot that loses its data also loses the promises it gave. The rule is:
+
+1. **Epochs are reserved at a quorum.** Before claiming, a holder reserves `highest seen + 1` at two slots. A slot
+   accepts only an epoch above its highest reservation, and fsyncs it. A holder never claims at an epoch it picked
+   alone, as Rivet's Depot volume never lets a writer pick its own epoch.
+2. **A repaired slot is a learner.** It copies claims, reservations and logs from both peers and keeps the highest
+   reservation as its floor. It then takes claims and appends, but counts towards no reservation, claim or commit
+   quorum.
+3. **It votes again once a claim above its floor has committed its no-op.** Every promise it gave before the wipe was
+   for an epoch reserved at a quorum, so one of its peers holds that reservation and the floor covers it.
+
+The cost is one round trip and one fsync per claim (each wake and failover). Durable safety still uses no clock. Range
+handoff needs no such rule: the populating owner copies from the sealed leaving owner, which has given every promise
+and reservation it will give.
+
+### Why: copying from both peers is not enough
+
+`volume-wipe` failed `NoLostAck` when the repaired slot voted after copying (16 states, `MaxEpoch 2`, `MaxLen 2`):
 
 1. `h1` and `h2` both claim epoch 1.
 2. `c` grants `h1`. Then `c` is wiped and copies from `b`, which has promised nothing yet.
 3. `b` grants `h1`: `h1` wins epoch 1 with the old `c` and `b`.
 4. `c` copies from `a` (nothing promised yet), and `a` grants `h2`. `c` becomes ready with no promise and grants `h2`:
    `h2` also wins epoch 1, with `a` and the new `c`.
-5. `h2` commits its no-op on `a` and `c`. Two holders hold epoch 1, which v2.md says cannot happen.
+5. `h2` commits its no-op on `a` and `c`. Two holders hold epoch 1.
 
-The same race also loses an acknowledged write across different epochs. `h1` wins epoch 1 with `a` and `b`. `h2` wins
-epoch 2 with the old `c` and `b` and recovers an empty log. `c` is wiped, copies epoch 1 from `a` and `b`, and accepts
-`h1`'s no-op, which commits on `a` and the new `c` although two slots had promised epoch 2. Once `h1` fences, `h2`
-takes `a`'s promise and overwrites the acknowledged entry.
+### Why: waiting for a newer claim is not enough on its own
 
-The fix is a design decision and is not in the model. Options:
+Rule 3 alone, with holders still picking their own epoch, also fails `NoLostAck` (22 states):
 
-1. Treat a repaired slot as a new member: a version change with joint majorities, as for topology (above).
-2. Bound claims in time: a claimant drops a claim that has not reached a quorum within a bound, and the repaired slot
-   waits that bound before copying. This puts a clock on durable safety, which epochs avoid today.
-3. Do not vote until a claim started after the repair has committed (Paxos Made Live §5.1).
+1. `h1` claims epoch 1, fences, then claims epoch 2. Only `c` grants `(2, h1)`.
+2. `c` is wiped. `a` and `b` have promised nothing.
+3. `h2` starts after the wipe and picks epoch 1, because epoch 2 existed only on `c`. It commits its no-op on `a` and
+   `b`, opens and appends a Release entry.
+4. `b` grants `(2, h1)`. `h1` recovers with the old `c` and `b`, whose log holds only the no-op.
+5. `c` finishes copying, learns that `h2`'s no-op committed and votes again. The Release entry commits on `a` and `c`,
+   and `h1` lacks it.
+
+A claim that starts after the repair need not have a higher epoch. With rule 1, epoch 2 is reserved on `a` or `b`, so
+`h2` picks a higher epoch and the repaired `c` copies 2 as its floor.
 
 ## Checks run
 
@@ -113,10 +137,11 @@ On 2026-11-14 with TLC 2026.11.06 from `scripts/tla2tools.jar`, 2 workers and a 
 
 | Config | Generated states | Distinct states | Depth | Time | Result |
 | --- | ---: | ---: | ---: | ---: | --- |
-| `volume-base` | 15,170,591 | 3,477,058 | 36 | 67 s | Passed |
-| `volume-handoff` | 20,452,175 | 4,979,696 | 34 | 103 s | Passed |
-| `volume-topology` | 9,059,601 | 2,098,058 | 32 | 38 s | Passed |
-| `volume-wipe` | 652,317 | 196,344 | 16 | under 1 min | Fails `NoLostAck` (finding above) |
+| `volume-base` | 309,236,801 | 73,871,268 | 49 | 1,591 s | Passed |
+| `volume-handoff` | 223,648,667 | 54,367,452 | 42 | 1,258 s | Passed |
+| `volume-topology` | 136,316,807 | 32,069,792 | 40 | 648 s | Passed |
+| `volume-wipe` | 149,000,043 | 33,777,832 | 42 | 1,005 s | Passed |
 
-All eight deliberate bugs broke their invariants, and the existing 50 still did (`scripts/tlc.sh bugs`, 2 min 16 s).
-An earlier run with 4 workers was interrupted when the machine went down; these runs used 2.
+All 10 volume bugs broke their invariants, and the other 50 still did (`scripts/tlc.sh bugs`, 2,231 s). Reservation
+adds a step to every claim, so the passing configs have 11 to 21 times as many distinct states as in S-02
+(`volume-base` had 3.5 million). Runs used 2 workers; an earlier S-02 run with 4 workers was interrupted when the machine went down.
