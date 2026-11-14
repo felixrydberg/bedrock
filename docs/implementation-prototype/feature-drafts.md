@@ -7,18 +7,18 @@ which module it lives in, which doc section it comes from, what it depends on, a
 
 Sources: `docs/implementation-prototype/kv.md`, `cdn.md`, `code-structure.md`, `notes.md`.
 
-> Status: B-01 to B-29 (including B-12b, B-18b, B-22b and B-23a, but not B-09b), plus B-39 and B-61, are created as GitHub issues (linked below; the issue is the source of truth). Later drafts are still drafts.
+> Status: B-01 to B-29 (including B-12b, B-18b, B-22b and B-23a, but not B-09b), plus B-21b, B-39 and B-61, are created as
+> GitHub issues (linked below; the issue is the source of truth). B-26, B-27, B-28 and B-53 are replaced by track O.
+> Track O (S-01 … S-19) and the other later drafts are still drafts.
 
-> Architecture update, 2026-10-29: decision 11 replaces customer-KV origin cells with per-namespace S3 databases,
-> an API writer and read-only KV caches. This document records the new decision; the older customer-KV origin text in
-> `kv.md` and `code-structure.md` is superseded and still needs synchronization. Section 5 audits all 26 GitHub issues:
-> eight open issues now have dated scope-amendment comments, linked there, while their original descriptions are preserved.
-> A second amendment below assigns generic writer materialization/recovery to #11 / B-11 before #25 / B-23;
-> B-39 is later customer-KV reader/cache integration. Seven additional materialized-state issue amendments are posted and linked in §5.
-
-> User decision, 2026-11-09: Quicksilver no longer hosts or places the Auth dataset. Auth serving is deferred until
-> the Gateway binary exists. This supersedes earlier references in this document to Quicksilver hosting Auth ranges;
-> the generic writer and relay contracts remain available for future Auth integration.
+> Architecture updates, newest first:
+> - **2026-11-14: stateful actor platform (decision 16, track O).** Durable Objects, D1, Queues, Cron, Workflows and
+>   customer-KV writers run as actors on two new binaries, `bedrock-compute` and `bedrock-volume`. The plan is
+>   [`statefull/v2.md`](statefull/v2.md). Customer-KV writers are `kv` actors acknowledged by an SSD quorum, so B-26's
+>   owner path is not built (PR #74 closed, #58 amended).
+> - **2026-11-09:** Quicksilver no longer hosts or places the Auth dataset. Auth serving waits for the Gateway binary.
+> - **2026-10-29:** decision 11 replaces customer-KV origin cells with per-namespace S3 databases. §5 audits the issues of
+>   that time and links their amendment comments. `kv.md` and `code-structure.md` still describe the older origin design.
 
 ---
 
@@ -36,19 +36,20 @@ not KV-specific behaviour. So the order is:
    The two tracks can run in parallel.
 4. **KV refinements** and **CDN refinements**. Product-specific depth: optimisations,
    extra adapters, advanced retention. These can also run in parallel.
+5. **Stateful actors** (track O, decision 16). Actor storage and hosting, then the products built on them, including
+   customer-KV writes. Product drafts wait for the #25 / B-23 gate like the other product tracks.
 
 **Hardening order:** B-11 provides the generic API-writer atomic persistence and recovery contract before the initial
 B-23 gate. That gate covers its real backend, atomic event/state/revision/retry records, durable database recovery, publication
-fencing and protected-view GC alongside the retained shared core and minimal reference workload. It does not depend on
-B-39. Only after that gate passes does B-39 integrate customer-KV readers/caches on the existing B-11 store, extend the
-model/checkers and rerun every applicable test layer and the seven-night history before B-26/customer-KV acceptance.
-B-09b is later work with the same protocol-first/revalidation requirement.
+fencing and protected-view GC alongside the retained shared core and minimal reference workload. B-39 (#57) then added
+the read-only namespace `Reader`, the value cache and purge on that store. Track O's volume protocol (S-02) and B-09b are
+later work with the same protocol-first/revalidation requirement.
 Simulation execution follows the latest #26/B-23a discussion: run locally in WSL/Linux/macOS before merging; normal CI
 does not imply a simulation pass. Amend #25's older CI wording accordingly while retaining the required seed/replay and
 seven-night evidence. This document does not enable a simulation CI job or claim an unrun gate passed.
 
 B-11 adds an asynchronous, SlateDB-based atomic S3 persistence contract in `lib/storage` for the generic API writer across datasets.
-B-39 later integrates customer-KV read-only namespace handles and caches on that store; namespace residency and cache policy stay in `kv/storage`.
+Track O reuses it for each actor's S3 database: a volume slot flushes to it and other slots read it through B-39's `Reader`.
 Quicksilver, Auth, relay replay and CDN retention continue using the local `StorageEngine` and pushed replication.
 `full_replica` completeness and CDN phase 3/4 items remain later work. Sequence compression is out of scope.
 
@@ -62,8 +63,10 @@ crates/
 ├── api/          # bedrock/api — write API (B-09)                                         → binary `bedrock-api`
 ├── relay/        # bedrock/relay — relay process: tiers, fan-out, replay, membership      → binary `bedrock-relay`
 ├── quicksilver/  # bedrock/quicksilver — quicksilver storage and namespaces → binary `bedrock-quicksilver`
-├── kv/           # bedrock/kv  — customer KV: S3 namespace readers, cache residency, operations → binary `bedrock-kv`
-└── cdn/          # bedrock/cdn — artifact_storage, artifact_transfer, paths, retention → binary `bedrock-cdn`
+├── kv/           # bedrock/kv  — customer KV: value caches, REST API, namespace management → binary `bedrock-kv`
+├── cdn/          # bedrock/cdn — artifact_storage, artifact_transfer, paths, retention → binary `bedrock-cdn`
+├── compute/      # bedrock/compute — actor host, sandbox, built-in d1/kv/queue/cron     → binary `bedrock-compute` (track O)
+└── volume/       # bedrock/volume  — actor claims, quorum log, overlay, cold tier, alarms → binary `bedrock-volume` (track O)
 ```
 
 ### Deployment model: separate binaries, one shared library
@@ -78,20 +81,22 @@ server runs every service, each service is its own process, and code is shared a
 | `bedrock-api` | Authoritative writes and revisions; generic per-namespace materialized state across datasets (B-09, B-11) | — |
 | `bedrock-relay` | Relay tree, fan-out, replay log, cell membership, L2 placement directory and handoffs (§4 decision 13), regional directory | — (`tier` and `upstreams` in config) |
 | `bedrock-quicksilver` | Pushed `quicksilver` over relay-assigned hash ranges (§4 decision 13) | `l1`, `l2` |
-| `bedrock-kv` | Customer `kv`: S3-backed namespace readers and caches; no hash ranges or buckets (§4 decision 12) | `l1`, `l2` (only logged until B-39) |
+| `bedrock-kv` | Customer `kv` read side: value caches, the REST API and namespace management; no hash ranges or buckets (§4 decisions 12, 16) | `l1`, `l2` (only logged until B-39) |
 | `bedrock-cdn` | Dataset `cdn` (path rows and ref keys) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
-| `bedrock-gateway` (planned, B-57) | Public entry point, internal routing between cells, API-key checks and the local `auth` copy (§4 decision 15) | — (follows its relay's tier) |
+| `bedrock-gateway` (planned, B-57) | Public entry point, internal routing between cells, API-key checks and the local `auth` copy (§4 decision 15); actor routing (S-08) | — (follows its relay's tier) |
+| `bedrock-compute` (planned, S-07) | Actor host: Workers sandbox, Durable Objects and the built-in `d1`, `kv`, `queue` and `cron` handlers (§4 decision 16) | — |
+| `bedrock-volume` (planned, S-03) | Actor storage: claims, leases, quorum log, overlay, flushes to S3, alarm index; `volume` hash ranges per cell (§4 decision 16) | — |
 
 Rules this implies:
 
 - **Relays are their own binary.** `bedrock-relay` holds no product logic: it is generic over datasets and uses `lib`
   for everything (`lib/relays` for fan-out and tiers, `lib/replication` for streams, `lib/storage` RocksDB for its replay log,
   `lib/membership` for the cell view). A Quicksilver, KV or CDN crash never takes a relay with it, and relays deploy on their own schedule.
-- **`quicksilver`, `kv`, `cdn`, `relay`, `api` and `gateway` depend on `lib` only, never on each other.**
+- **`quicksilver`, `kv`, `cdn`, `relay`, `api`, `gateway`, `compute` and `volume` depend on `lib` only, never on each other.**
 - **KV and CDN share infrastructure, not data.** Writes use `bedrock-api` and its sequencing/durability system.
   `bedrock-quicksilver` subscribes to `quicksilver`; `bedrock-cdn` follows only the `cdn` ranges its relay pushes.
-  Customer `kv` has no relay subscriptions, replay queues or subscription-driven placement. Its readers use S3-backed
-  namespace databases. `bedrock-kv` holds a relay connection only for its own `kv` membership, without another heartbeat,
+  Customer `kv` has no relay subscriptions, replay queues or subscription-driven placement. Its writes go to the
+  namespace's `kv` actor (decision 16). `bedrock-kv` holds a relay connection only for its own `kv` membership,
   and reads the namespace directory from `bedrock-quicksilver` nodes, not from a local copy. Gateways check credentials (§4 decision 15).
 - **Customer KV is isolated from the control plane.** Tenant load (hot namespaces, cold-open storms, slow S3) can exhaust
   `bedrock-kv` without taking down Quicksilver/Auth, which Workers, CDN and deploy tooling depend on (§4 decision 12).
@@ -103,11 +108,11 @@ Rules this implies:
 - **Each binary has its own service view.** Membership, health, the placement directory and the regional directory are
   per service, and each binary reads only its own service's views, except that a Gateway and the shared client read the views of the services they call (§4 decision 15). Relays assign L2 ranges per service (§4 decision 13). A node with a broken CDN cache disk is still a healthy KV node, and the reverse.
 - **Shared storage implementations live in `lib/storage`.** Keep the existing synchronous local `StorageEngine` contract
-  for pushed datasets. B-11 adds a separate asynchronous namespace persistence/recovery contract; B-39 adds customer-KV readers. Do not block on S3 inside
-  the local trait or pretend a read-only handle can write/restore. Dataset identity and permissions remain independent of
-  whether a dataset has a relay-fed local engine. API materialization spans datasets; B-39 replaces the KV-reader
-  one-local-engine-per-dataset assumption only for customer KV. `kv/storage` owns handle retention, memory/disk budgets and cache eviction;
-  `quicksilver/storage` owns the pushed-data L1/L2 hash-range keyspaces; CDN keeps `CacheStorage`.
+  for pushed datasets. B-11 adds a separate asynchronous namespace persistence/recovery contract; B-39 adds read-only
+  handles. Do not block on S3 inside the local trait or pretend a read-only handle can write/restore. Dataset identity
+  and permissions remain independent of whether a dataset has a relay-fed local engine. `kv/storage` owns the value
+  cache budgets; `volume/cold` owns S3 reader handles for actor databases (S-05); `quicksilver/storage` owns the
+  pushed-data L1/L2 hash-range keyspaces; CDN keeps `CacheStorage`.
 
 ---
 
@@ -156,10 +161,10 @@ Rules this implies:
 | [B-24](https://github.com/felixrydberg/bedrock/issues/55) | Quicksilver dataset | KV | `quicksilver/namespaces` | B-23 |
 | [B-25](https://github.com/felixrydberg/bedrock/issues/56) | KV namespace directory and management | KV | `kv/namespaces` | B-24 |
 | [B-39](https://github.com/felixrydberg/bedrock/issues/57) | Customer-KV readers and caches on B-11 materialized storage | KV storage integration | `lib/storage`, `lib/s3`, `kv/storage` | B-23, B-04, B-06, B-07, B-11 |
-| [B-26](https://github.com/felixrydberg/bedrock/issues/58) | KV write path and durable namespace publication | KV | `kv/operations`, `api` wiring | B-25, B-39 |
-| [B-27](https://github.com/felixrydberg/bedrock/issues/59) | KV reads through cache-affinity routing and S3 namespace readers | KV | `kv/operations`, `kv/storage` | B-26 |
-| [B-28](https://github.com/felixrydberg/bedrock/issues/60) | Namespace reader residency, cache budgets and basic eviction | KV | `kv/storage`, `kv/namespaces` | B-27 |
-| [B-29](https://github.com/felixrydberg/bedrock/issues/61) | KV end-to-end acceptance | KV | `kv`, `api`, storage integration tests | B-24 … B-28, B-39 |
+| ~~[B-26](https://github.com/felixrydberg/bedrock/issues/58)~~ | ~~KV write path~~ (replaced by S-18, decision 16) | — | — | — |
+| ~~[B-27](https://github.com/felixrydberg/bedrock/issues/59)~~ | ~~KV reads through home-region S3 readers~~ (replaced by S-18, decision 16) | — | — | — |
+| ~~[B-28](https://github.com/felixrydberg/bedrock/issues/60)~~ | ~~Namespace reader residency~~ (value-cache budgets landed in B-39; reader handles move to S-05) | — | — | — |
+| [B-29](https://github.com/felixrydberg/bedrock/issues/61) | KV end-to-end acceptance | KV | `kv`, `compute`, `volume`, integration tests | B-24, B-25, B-39, S-18 |
 | B-58 | Simulation load: KV reads, listing and namespaces | KV | `tests/sim` | B-23, B-29 |
 | **I — First CDN** (parallel with H; no dependency on KV drafts) |||||
 | B-30 | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
@@ -176,7 +181,7 @@ Rules this implies:
 | B-40 | `full_replica` placement and completeness | KV | `quicksilver/storage`, `lib/buckets` | B-24, B-21 |
 | B-41 | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
 | B-42 | Auth dataset | Shared infrastructure | `gateway` | B-57 |
-| B-53 | Namespace residency fairness and cold-open tuning at scale | KV | `kv/storage`, `kv/namespaces` | B-29 |
+| ~~B-53~~ | ~~Namespace residency fairness and cold-open tuning~~ (replaced by S-05's per-actor database measurements) | — | — | — |
 | **K — CDN refinements** (parallel with J) |||||
 | B-43 | Artifact replica repair and range migration | CDN | `cdn/retention` | B-36 |
 | B-44 | Coordinated eviction, GC and failure recovery | CDN | `cdn/retention` | B-43 |
@@ -203,23 +208,44 @@ Rules this implies:
 | B-65 | Shared durable log store with one group-committed fsync for every writer group on a node | Shared core | `lib/replication` log store | B-09b; B-64 for more than one group |
 | B-66 | Safety versus discovery: stale or unreachable discovery inputs may only cost availability | Shared core | `docs/spec/`, `tests/sim`, `tests/crash` | B-23; B-09b and B-57 for their parts |
 | B-67 | Explicit operator-controlled membership changes for the API Raft group | Shared core | `lib/replication` + `api` bin | B-09b |
+| **O — Stateful actors** (decision 16; scope and acceptance in [`statefull/v2.md`](statefull/v2.md) §11) |||||
+| S-01 | Actor IDs, topology record and placement functions | Actors | `lib/actors`, Quicksilver schema | B-24 |
+| S-02 | Volume protocol in TLA+: claim, append, lease, release, repair, topology change | Actors | `docs/spec/volume.tla` | decision 16 |
+| S-03 | `bedrock-volume` binary: records, gRPC service, membership, ranges, owner checks | Actors | `volume` bin | S-01, S-02, B-21 |
+| S-04 | Volume client in Compute: claim, recovery, append window, reads | Actors | `compute/actors` | S-03 |
+| S-05 | Cold tier: maintainer, SlateDB flush, truncation, SSD cache, S3 reader handles | Actors | `volume/cold` | S-03, B-11, B-39 |
+| S-06 | Slot repair and node-reported range readiness | Actors | `volume/repair`, `lib/relays` | S-02, S-03 |
+| S-07 | `bedrock-compute` actor host: acquire, wake, sleep, leases, SQLite VFS, gates | Actors | `compute` bin | S-04 |
+| S-08 | Gateway actor routing and location cache | Actors | `gateway/actors` | B-57, S-07 |
+| S-09 | Alarms: holder timers and volume index wake | Actors | `compute/actors`, `volume/alarms` | S-07, S-08 |
+| S-10 | Durable Objects API | Compute | `compute` | S-07 … S-09, sandbox decision |
+| S-11 | D1 | Compute | `compute/builtin` | S-10 |
+| S-12 | Queues | Compute | `compute/builtin` | S-09, S-10 |
+| S-13 | Cron Triggers | Compute | `compute/builtin` | S-09, B-50 |
+| S-14 | Workflows | Compute | `compute` (runtime library) | S-10 |
+| S-15 | Hibernatable WebSockets held at the Gateway | Compute | `gateway/actors` | S-08 |
+| S-16 | Simulation and crash load: actor workload, kills mid-append, slot loss, cell loss | Actors | `tests/sim`, `tests/crash` | S-07, B-23 |
+| S-17 | Planned DC changes and manual DC-loss restore | Actors | `lib/actors`, operator tooling | S-05 |
+| S-18 | Customer-KV writers as `kv` actors, with reads through the value cache to the holder (replaces B-26, B-27) | KV | `compute/builtin`, `kv` | S-05, S-08, B-25 |
+| S-19 | Load-based range splitting for `volume` ranges (later, gated on measurements) | Actors | `lib/placement`, `volume` | S-03, S-16 |
 
 ### Parallel work inside the shared core
 
 - B-04/B-05/B-06 and B-07 have no dependency on each other.
 - Track D (B-13, B-14) can start as soon as B-03 and B-04 are done, alongside track C.
 - Track F (B-17, B-12, B-18) needs B-10 and B-13. Track E (B-15, B-16, B-19) needs B-12. Track G needs everything before it.
+- Track O: S-01 and S-02 can run in parallel. After S-03, S-04 and S-05 and S-06 are independent of each other.
 
 ### Mapping to the doc phases
 
 | Doc phase | Where it lands |
 |---|---|
-| KV Phase 1 (engine, datasets, writes, replication, S3) | B-01 … B-11, plus KV parts in B-24 … B-26 |
+| KV Phase 1 (engine, datasets, writes, replication, S3) | B-01 … B-11, plus KV parts in B-24, B-25 and S-18 |
 | KV Phase 2 (storage fault tolerance) | B-14, B-22, B-23a, B-23 |
-| Generic materialized namespace engine; later customer-KV readers/caches | B-11; B-39 after B-23 and before B-26 |
+| Generic materialized namespace engine; read-only handles and value caches | B-11; B-39 |
 | KV Phase 4 (relays, streams, replay) | B-17 … B-19 (cache-fill broadcast dropped, decision 11) |
-| KV Phase 5 (cache routing and residency; pushed-data redistribution stays shared) | B-15, B-16, B-19, B-27, B-28 |
-| KV Phase 6 (optimisation) | B-38, B-40, B-41, B-53 |
+| KV Phase 5 (cache routing and residency; pushed-data redistribution stays shared) | B-15, B-16, B-19, B-39, S-18 |
+| KV Phase 6 (optimisation) | B-38, B-40, B-41 |
 | CDN Phase 1 (artifact storage, transfer, path rows + publish, key- and hash-addressed retrieval) | B-30, B-31, B-33, B-35 (dependency order still applies: B-33 needs B-32's row codec, B-35 needs B-34's L2) |
 | CDN Phase 2 (global retention streams, regional placement) | B-32, B-34 |
 | CDN Phase 3 (ref-key retention and recovery) | B-32 (ref keys), B-43, B-44 |
@@ -536,7 +562,7 @@ Decided 2026-11-01 while implementing #20: each node selects sources itself (`li
 `membership::View`, its breakers and holders' rejections. A holder checks the minimum revision when it serves and rejects
 a read it is behind on with its applied revision; callers skip it for newer reads for one second. Relay acknowledgements
 stay relay-local for B-21 readiness. "Nearby" means the caller's failure domain within its cell; there is no cross-cell
-peer discovery. Customer-KV home-writer resolution moves to B-27 (it needs B-25), and CDN availability filtering to B-34.
+peer discovery. Customer-KV writer resolution moves to S-18 (it needs B-25), and CDN availability filtering to B-34.
 
 ---
 
@@ -597,7 +623,7 @@ Created: [#23](https://github.com/felixrydberg/bedrock/issues/23) — Feature �
 
 Created: [#24](https://github.com/felixrydberg/bedrock/issues/24) — Feature 🚀: Request coalescing at every tier and per-cell rate limits on origin reads
 
-Limits per source on each node (`lib/health/protection`). They are starting values, not measurements; B-53 tunes them.
+Limits per source on each node (`lib/health/protection`). They are starting values, not measurements; S-05 and S-16 measure them.
 
 | Source | Total running | Running per cell | Queued per cell |
 |---|---|---|---|
@@ -606,8 +632,7 @@ Limits per source on each node (`lib/health/protection`). They are starting valu
 | Recent committed state | 32 | 8 | 32 |
 
 A request over its cell's queue fails at once with a retryable `Overloaded`. Fairness comes from the first-come shared
-queue: a cell can have at most its per-cell share in it. New read paths must wrap these sources: B-27 (S3 reads, recent
-state), B-28 (`NamespaceOpens`) and B-31/B-34 (artifact fetches; warming uses its own lane, e.g. `{cell}/warm`).
+queue: a cell can have at most its per-cell share in it. New read paths must wrap these sources: S-05 (S3 reads and reader opens on volume slots) and B-31/B-34 (artifact fetches; warming uses its own lane, e.g. `{cell}/warm`).
 
 ---
 
@@ -669,11 +694,19 @@ Created: [#57](https://github.com/felixrydberg/bedrock/issues/57) — Feature �
 
 Created: [#58](https://github.com/felixrydberg/bedrock/issues/58) — Feature 🚀: Customer KV write path with home-region forwarding
 
+Replaced by S-18 (decision 16, user decision 2026-11-14). PR #74 is closed unmerged; its retry results, event retention,
+limit checks and quota accounting are reused in S-18. Amendment:
+[#58 comment](https://github.com/felixrydberg/bedrock/issues/58#issuecomment-6867978192).
+
 ---
 
 #### B-27 — KV reads through cache-affinity routing and S3 namespace readers
 
 Created: [#59](https://github.com/felixrydberg/bedrock/issues/59) — Feature 🚀: Customer KV get and list through bounded caches and S3 namespace readers
+
+Replaced by S-18 (decision 16). Reads still go L1 → the cell value cache by HRW over `(namespace, key)` with a 60-second
+TTL, but a miss goes to the namespace's `kv` actor instead of a home-region S3 reader. The holder answers
+minimum-revision reads and `LIST`. The issue amendment is pending.
 
 ---
 
@@ -681,11 +714,17 @@ Created: [#59](https://github.com/felixrydberg/bedrock/issues/59) — Feature �
 
 Created: [#60](https://github.com/felixrydberg/bedrock/issues/60) — Feature 🚀: Per-node namespace reader retention and bounded customer-KV caching
 
+Replaced (decision 16). The value cache budget and per-namespace share landed in B-39 (#73). Reader handle residency
+moves to `volume/cold` in S-05, keyed by actor database. The issue amendment is pending.
+
 ---
 
 #### B-29 — KV end-to-end acceptance
 
 Created: [#61](https://github.com/felixrydberg/bedrock/issues/61) — Feature 🚀: KV end-to-end acceptance suite on the multi-region deployment
+
+Depends on S-18 now (decision 16). Writer-crash scenarios become holder and slot kills; "home-region reader" scenarios
+become value-cache misses to the holder. The issue amendment is pending.
 
 ---
 
@@ -707,7 +746,8 @@ inspecting engine state rather than through a served read.
   opens and writes after deletion. Include a deliberate bug for each request type so its expectation demonstrably fails.
 - Quicksilver `Get`/`List` reads may join the fixed load, with expected values, absence and minimum-revision outcomes.
 - Prove `MinRevisionReads` through served reads, including absence and listing as #25 requires.
-- Run real `bedrock-kv` readers under faults: reader loss, pressure and idle eviction, reopen, and publication lag.
+- Run real `bedrock-kv` value caches and `kv` actors under faults: cache loss and pressure, holder sleep and wake, and
+  slot loss.
 - Add real reads to the simulation. Damage is found today by those and by the scrubber (`health::scrub`, #25 / B-23).
 
 **Additional context**
@@ -1022,14 +1062,13 @@ Labels: enhancement
 ```
 
 **Is your feature request related to a problem? Please describe.**
-The bounded reader/block residency from B-28 needs workload-driven admission and eviction tuning. Pushed datasets still
+The bounded value cache from B-39 needs workload-driven admission and eviction tuning. Pushed datasets still
 need their own recent-update behavior; customer KV receives no push stream.
 
 **Describe the solution you'd like**
-- Tune hot/warm/cold admission and pressure behavior using measured cache reuse; keep reader-handle and block lifetimes separate.
-- Reuse the selected engine cache rather than introducing a second memory/disk layer for the same blocks without evidence.
+- Tune hot/warm/cold admission and pressure behavior using measured cache reuse.
 - Preserve the L1 recent-update window for pushed datasets only. Customer KV admission follows reads and freshness checks.
-- Score by frequency, age, pressure and policy, respecting B-28's hard budgets and namespace fairness.
+- Score by frequency, age, pressure and policy, respecting B-39's byte budget and per-namespace share.
 - Metrics: hit rate, admission/eviction reasons, cache churn and p99 read latency; namespace details remain introspection/top-N.
 
 **Additional context**
@@ -1037,7 +1076,7 @@ need their own recent-update behavior; customer KV receives no push stream.
 - **Module:** `kv/storage`; the pushed-data L1 recent-update window lives in `quicksilver/storage`.
 - **Doc reference:** `kv.md` §9 L1, §16.
 - **Depends on:** B-29.
-- **Acceptance criteria:** Hit rate improves on a benchmark workload compared with B-28. State transitions are observable in metrics.
+- **Acceptance criteria:** Hit rate improves on a benchmark workload compared with B-39's cache. State transitions are observable in metrics.
 
 ---
 
@@ -1128,41 +1167,9 @@ Labels: enhancement
 
 #### B-53 — Namespace residency fairness and cold-open tuning at scale
 
-```
-Title:  Feature 🚀: Tune namespace reader residency, fairness and cold-open cost at scale
-Labels: enhancement
-```
-
-**Is your feature request related to a problem? Please describe.**
-Basic namespace residency is already mandatory in B-28. At large namespace counts, cold-open churn, tiny S3 objects and
-uneven cache use need measured tuning without introducing a global namespace dormancy protocol.
-
-**Describe the solution you'd like**
-- Benchmark many mostly idle namespaces, bursts across more namespaces than fit in the handle pool, one large/hot tenant,
-  cache-node replacement and concurrent opens. Vary idle timeout, per-namespace shares and open/fetch concurrency.
-- Tune pressure watermarks, borrowing and admission using observed memory/manifest overhead as well as cached block bytes.
-  Preserve node hard limits; do not pre-open every namespace, restore full databases or announce evictions to other regions.
-- Measure the number/size of namespace manifests/SSTs, request cost, cold-open metadata requests, replay tail and GC backlog.
-  Coordinate bounded maintenance with B-39. Namespace grouping/segmentation remains a separate future decision if evidence
-  warrants it, not an automatic rewrite of the per-namespace storage contract.
-- Report cold namespace-open plus key-read p50/p95/p99 for the actual Frankfurt/R2-EU path against the 100–300 ms target.
-  Warm-block, cold-block and cold-handle results must be separate. No global latency or petabyte-capacity guarantee.
-- Metrics: reader churn, open/fetch queues, budget pressure, fairness and maintenance backlog with low-cardinality labels.
-  Namespace sizes, last access and allocations are introspection/top-N only.
-
-**Additional context**
-- **Implementation:** KV refinement, replacing the former origin dormancy/rehydration proposal.
-- **Module:** `kv/storage`, `kv/namespaces`, shared engine maintenance from B-11 via B-39.
-- **Doc reference:** §4 decision 11; B-28's mandatory residency policy.
-- **Depends on:** B-29.
-- **Known limits:** storage capacity, one writer's throughput, manifest growth, maintenance and cold-open costs are separate
-  limits. Closing local readers saves no S3 storage; persistent retention/deletion is an explicit data-lifecycle decision.
-- **Acceptance criteria:**
-  - The documented workload stays within bounded memory/disk/handle budgets and avoids starvation between namespaces.
-  - Reopening a closed namespace reads relevant metadata/blocks without a full restore or a new customer-KV subscription.
-  - Minimum revisions, expiration, delete safety and namespace isolation survive eviction, reopen and node replacement.
-  - Concurrent misses share one open; in-flight reads finish safely during eviction and checkpoint release.
-  - Publish reproducible latency/resource/object-count results and any limits found; an unmet target is reported as such.
+Replaced (decision 16). Customer-KV writes and reads now go through `kv` actors, so the cost of many small S3 databases
+is measured once, for all actors, in S-05 (`statefull/v2.md` §12 question 2). The fallback named there is a chunk store
+with a conditional-PUT manifest.
 
 ---
 
@@ -1336,7 +1343,8 @@ Large assets and partial (range) requests should not need the whole object trans
 ### L — Compute and deploy control plane (future)
 
 KV, CDN and (later) Compute are backing services. Everything that knows about Workers, Pages, deployments or revisions lives here,
-as a client of those services. Nothing in tracks A-K depends on this track. The crate layout is decided when the track starts.
+as a client of those services. Nothing in tracks A-K depends on this track. Worker execution runs in `bedrock-compute`
+(track O); the deploy control plane's crate is decided when the track starts.
 
 ---
 
@@ -1364,6 +1372,7 @@ Something has to own the order, so that every intermediate state is safe and a f
   2. *(Optional)* wait for readiness of the deployment's artifacts (B-45).
   3. Write `deployment/{deployment_id}` to Quicksilver.
   4. Write `worker/{worker_id}/active` to make it live. Can be batched with step 3, or written later.
+  5. Send the deployment's cron schedules to the Worker's cron actor (S-13). Rerunning sends the same schedules again.
 - **Why this order:** Quicksilver only ever names deployments whose rows exist and whose artifacts are retained, so CDN GC
   (B-44) cannot delete artifacts a deployment points at. A deploy that fails after step 1
   leaves retained rows that nothing uses (harmless, cleaned up by a retry or a release).
@@ -2035,6 +2044,26 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
   - A learner is never promoted before it has caught up, and a removed voter cannot disturb the group after it restarts.
   - A removal while the leader crashes leaves exactly one consistent membership, replayable per seed.
 
+---
+
+### O — Stateful actor platform
+
+Decision 16. The drafts' scope, dependencies and acceptance live in [`statefull/v2.md`](statefull/v2.md): §4–§8 for the
+design, §11 for the drafts S-01 … S-19 and their acceptance highlights, §12 for open questions. When a draft becomes an
+issue, its body is written from those sections in the usual template, and its entry here becomes a `Created:` link.
+
+- **Storage first.** S-01 … S-06 build actor storage. S-02 updates the specification before any protocol code, and
+  S-03 waits for it.
+- **Hosting.** S-07 … S-09 host actors in `bedrock-compute`, route to them through the Gateway (needs B-57) and fire
+  alarms.
+- **Products.** S-10 … S-15 and S-18 wait for the #25 / B-23 gate like the other product tracks. S-10 also waits for
+  the sandbox runtime decision (leaning towards sandboxed workerd).
+- **Hardening and operations.** S-16 adds the actor workload to the simulation and crash tests; S-17 covers planned DC
+  changes and DC-loss restore.
+- **Later.** S-19 (load-based splitting) starts only once measurements show hot volume nodes with similar range sizes.
+
+---
+
 ## 4. Open decisions
 
 ### Decided
@@ -2045,8 +2074,8 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
    See §1 "Deployment model" and decision 12.
 2. **Storage contracts and adapters live in `lib/storage`.** The synchronous local `StorageEngine` remains for pushed
    datasets, relay replay and CDN metadata. B-11 adds asynchronous S3 materialized storage for generic API writers across
-   datasets; B-39 later integrates KV readers. `kv/storage` owns reader retention/cache policy; `quicksilver/storage` owns
-   the pushed L1/L2 keyspaces; CDN retains `CacheStorage`.
+   datasets; B-39 adds read-only handles. `kv/storage` owns the value cache; `volume/cold` owns S3 reader handles for
+   actor databases (decision 16); `quicksilver/storage` owns the pushed L1/L2 keyspaces; CDN retains `CacheStorage`.
 3. **KV and CDN share infrastructure, not datasets.** CDN path rows and ref keys are plain writes to the `cdn` dataset through the
    generic `bedrock-api` and `bedrock-relay`; only `bedrock-cdn` reads them (B-32, decision 14). `bedrock-quicksilver` and `bedrock-kv` never
    subscribe to `cdn`, and `bedrock-cdn` never subscribes to `quicksilver`, `kv` or `auth`. Customer `kv` has no relay delivery at all;
@@ -2056,8 +2085,10 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
    relays merge their connected lists and publish them as a replicated namespace, with a grace period on disconnect.
    A member is a node that is receiving updates. Routing decisions use a local per-peer circuit breaker fed by real traffic (B-13).
    There is no separate membership or placement epoch; owners reject requests for L2 ranges they don't own (B-16, decision 13).
-   Customer-KV hash routing only selects a preferred cache; another eligible reader can serve without owning persistent data.
-   It hashes `(namespace, key)` directly and uses no ranges or buckets (decisions 12, 13).
+   Customer-KV hash routing only selects a preferred cache; another eligible cache node can serve without owning persistent
+   data. It hashes `(namespace, key)` directly and uses no ranges or buckets (decisions 12, 13).
+   Amended 2026-11-14 (decision 16): actor hosts send lease heartbeats to the volume nodes of the actors they hold. They
+   are for actors only; membership is unchanged.
 5. **Cells.** A cell (one DC by default) has its own membership, placement directory, L2 and relays. No fixed bucket count
    caps its size (decision 13); the actual size is chosen for blast radius. Large sites run several cells.
    Amended 2026-11-09: the cell's relays own authoritative membership, placement and drain state. Publishing, reading,
@@ -2083,8 +2114,10 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
    local cluster management. Recovery through another path resumes from validated revisions, preserving the
    Writer's order and original commit times. Cell consensus cannot substitute for missing product data or proof
    of Writer freshness.
-   Customer-KV misses read shared S3 namespace state; minimum-revision reads can use the home writer's recent-state path.
+   Customer-KV cache misses go to the namespace's `kv` actor, which also answers minimum-revision reads (decision 16).
    There is no mandatory regional KV tier or origin cell. Moving client traffic between cells is out of scope for now.
+   Amended 2026-11-14 (decision 16): an actor's three volume slots span the cells of one DC. Each cell still decides its
+   own placement; only the data plane crosses cells, and each slot's owner comes from its own cell's directory.
 6. **Relay tree.** Relays form tiers in static config (region top → optional DC → cell). The downstream dials and the upstream
    pushes; gaps are pulled from the replay log. Fan-out for pushed datasets is routed by `(namespace, hash range)`.
    `quicksilver`, `auth` and `cdn` continue using this path; customer-KV values/revisions are not published through it.
@@ -2102,68 +2135,35 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
    needs them. `code-structure.md` reflects this, including `storage` moving out of `kv/` (B-01).
 10. **Crate naming.** The shared crate is the package `bedrock-lib` (`use bedrock_lib::…`) in `crates/lib`; the binary
     crates are `bedrock-quicksilver`, `bedrock-kv`, `bedrock-cdn`, `bedrock-relay` and `bedrock-api` (B-01, decision 12).
-11. **Customer KV is per-namespace S3 storage with one logical API writer and read-only KV caches.** Decided 2026-10-29;
-    replaces the 2026-10-26 origin-cell design. B-11 supplies a scoped SlateDB-derived generic API-writer engine across datasets;
-    B-39 later integrates customer-KV readers/caches on that engine embedded in the `bedrock-kv` binary (customer KV only
-    since decision 12), with no separate database service. This decision does not claim that the engine, Raft or the latency targets are implemented.
-    - **Persistent layout:** each namespace has its own stable S3 database identity, manifest, indexed SSTs and recoverable
-      committed tail. Empty namespaces need only Quicksilver directory metadata. Open writer/reader handles on demand;
-      no LSM per virtual bucket, global per-namespace segment manifest or whole-namespace local disk requirement.
-      S3 is on the normal read path. Many small databases have object/open/maintenance costs that B-39/B-53 must measure.
-    - **Writer and durability:** the home bedrock-api writer orders mutations with per-namespace revisions through
-      B-11's shared lib/storage across datasets. One atomic SlateDB batch stores original retained events, resolved
-      values/deletes/metadata, namespace revision and original commit time, retry result/fixed expiry, and optional
-      represented Raft index/term. Standalone acknowledgement awaits remote durable flush. Startup validates the durable
-      database and recent events; no separate raw S3 journal or published/pruned-object protocol is retained.
-      Future B-09b acknowledges majority-fsynced Raft entries before batched SlateDB persistence and retains the committed
-      not-yet-durable tail for retry/recovery. Truncation requires a recoverable native checkpoint covering every namespace
-      in the prefix plus cutoff index/term/membership; a progress record alone is insufficient. Keep committed, buffered,
-      durable and reader-visible positions distinct. Fence stale engine publishers. Portable live-key export is optional.
-    - **Readers and routing:** only the namespace's home region opens its SlateDB database through a dedicated read-only
-      namespace reader. Other regions do not open that database. HRW over `(namespace, key)` selects the cell's preferred
-      value-cache node (no ranges or buckets, decisions 12, 13); it does not shard persistent data or impose durable ownership.
-      On a cell cache miss, resolve the home region from Quicksilver and forward there. The home reader returns the
-      value, and the requesting cell may cache it for at most 60 seconds. Adding/removing a cache node needs no namespace
-      move, replica rebuild or customer-KV relay subscription. Membership still comes from the Quicksilver/Auth connection.
-      One logical writer remains a write-throughput limit even when readers scale out.
-    - **Read semantics:** optional local L1 → preferred healthy cell value cache → on miss, Quicksilver home-region
-      lookup → home-region SlateDB reader → its block cache/S3 ranges or coherent recent committed state. `LIST` runs against
-      the home namespace's full ordered database view; pagination uses original keys and a logical cursor, not cache-node
-      locations or a scatter/merge over cache holders. A minimum-revision read requires a sufficiently new namespace view,
-      including for an absence. Wait for publication or read coherent recent committed state if the home S3 view lags; a
-      cell value cache must not satisfy a minimum revision it cannot prove. The fixed 60-second TTL bounds cell cache
-      residence, not publication lag.
-    - **Local residency:** KV nodes independently bound value-cache bytes, RAM and in-flight fetches. Only home-
-      region nodes manage SlateDB block cache, memory/manifest overhead, open readers and in-flight opens. Soft per-namespace
-      cache shares may borrow free capacity; quotas on total persistent namespace size are separate. Pressure can evict
-      cached values or cold home-region blocks; idle timeout closes home readers. Finish in-flight reads, coalesce reopen
-      and release checkpoint protection safely. No global dormant/rehydrating state or eviction broadcasts.
-    - **Lifecycle and retention:** closing/evicting a local reader never deletes S3 data or expires customer keys. TTL and
-      namespace deletion are explicit data semantics; KV enforces expiration on reads, and background compaction/GC reclaims
-      obsolete physical data with reader protection. API writer handles have a separate retention policy and recovery duty.
-      B-11 runs bounded, event-triggered asynchronous cleanup, with failures metered independently of completed HTTP responses
-      and no idle polling. Event history and retry records have separate configurable time-based retention, both default 24 hours;
-      recorded retry expiry never moves on retry/restart. Expired event rows can be removed without losing resolved state;
-      preserve native read/checkpoint protection. Idle expiry is logical; physical cleanup may wait for activity. SlateDB's
-      internal compaction/GC remain. Node/cell drains release caches/handles;
-      they do not move an authoritative KV namespace. B-28 is baseline; B-53 tunes fairness and cold-open costs.
-    - **Storage boundary:** preserve the existing synchronous local `StorageEngine` for pushed datasets, and add a shared
-      asynchronous namespace contract in `lib/storage`. Range/conditional object I/O and simulation seams live in `lib/s3`;
-      KV residency stays in `kv/storage`. Dataset identity/authz must not imply opening a relay-fed local engine. Fork only
-      needed capabilities while retaining SST/manifest/recovery compatibility and tests; keep compaction, GC, atomic batches,
-      read views and fencing. Later custom readers/writers must preserve that storage protocol or migrate it explicitly.
-    - **Push remains separate:** Quicksilver, Auth and CDN retention continue their agreed relay policies. Customer KV has
-      no `global`, `full_replica` or `on_demand` push override. B-37 stays dropped. Source WAL replay from S3, when used, is
-      a storage recovery/reader mechanism, not a customer-KV relay stream. This does not change CDN byte placement or Auth policy.
+11. **Customer KV is per-namespace S3 storage behind one writer, with read-only caches.** Decided 2026-10-29; replaces
+    the 2026-10-26 origin-cell design. Amended 2026-11-14 by decision 16: the writer is the namespace's `kv` actor, not
+    `bedrock-api` or a B-26 owner node, and the home-region S3 readers are replaced by the holder. What still holds:
+    - **Persistent layout:** each namespace has its own S3 database `kv/{id}` (SlateDB through B-11's namespace contract).
+      Empty namespaces need only Quicksilver directory metadata. No LSM per virtual bucket and no whole-namespace local
+      disk requirement.
+    - **One writer per namespace,** which orders mutations with per-namespace revisions and keeps retry results and
+      events. One logical writer remains a write-throughput limit even when caches scale out.
+    - **Reads:** optional local L1 → the cell value cache, chosen by HRW over `(namespace, key)` with no ranges or buckets
+      (decisions 12, 13) → on a miss, the writer. The cache keeps a value for at most 60 seconds; the TTL bounds cache
+      residence, not freshness. A minimum-revision read, including one for an absence, needs a source that can prove that
+      revision; a cache must not satisfy one it cannot prove. `LIST` runs against the namespace's full ordered view with a
+      logical cursor over original keys, never a scatter over cache holders.
+    - **Local residency:** KV nodes bound value-cache bytes and in-flight fetches, with a per-namespace share. Closing a
+      cache or handle never deletes S3 data or expires keys. No global dormant state or eviction broadcasts.
+    - **Lifecycle:** TTL and namespace deletion are explicit data semantics. Expiration is enforced on read; compaction
+      and GC reclaim obsolete data. Deleting a namespace purges its S3 database after a grace period (B-39).
+    - **Push remains separate:** customer KV has no relay delivery and no `global`, `full_replica` or `on_demand` push
+      override. B-37 stays dropped. Quicksilver, Auth and CDN keep their relay policies.
 12. **Customer KV is its own binary and uses no virtual buckets.** Decided 2026-10-31.
     - **Split:** `bedrock-quicksilver` (`crates/quicksilver`) hosts the pushed `quicksilver` and `auth` datasets with today's
       L1/L2 hash-range keyspaces (decision 13), relay subscriptions and `full_replica` work (B-24, B-40, B-42). `bedrock-kv` (`crates/kv`) is
-      customer KV only: S3 namespace readers and caches (B-27, B-28, B-39, B-53). Each publishes its own membership
+      the customer-KV read side: value caches, the REST API and namespace management (B-25, B-39); its writers are `kv`
+      actors in `bedrock-compute` (decision 16). Each publishes its own membership
       (`quicksilver`, `kv`); `bedrock-kv` subscribes to no dataset.
     - **Why:** Quicksilver/Auth are the control plane that Workers, CDN and deploy tooling depend on; customer KV is tenant
       traffic. A hot namespace, cold-open storm or slow S3 must not exhaust the process serving Quicksilver/Auth. The two
       also share no storage engine, replication path or scaling signal.
-    - **Routing:** a customer-KV request picks its preferred reader by rendezvous hash of `(namespace, key)` over the
+    - **Routing:** a customer-KV read picks its preferred cache node by rendezvous hash of `(namespace, key)` over the
       healthy `bedrock-kv` members of the cell (B-15), without a placement directory, owner checks or range moves. The
       relay-assigned ranges of decision 13 (B-16) serve Quicksilver/Auth and CDN.
     - **Cost:** a fifth binary, one more relay stream per machine (membership only), and cell-local lookups from
@@ -2208,7 +2208,8 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
       without a majority. Amendment 2026-11-09: embedded cell Raft serializes directory changes even with asymmetric relay
       partitions; member observations can still differ during failover. Relay-pushed interests
       and revokes change `Relay.Session`. Estimated 2026-10-31 at about 10–14 weeks for one developer including
-      specification and simulation; load-based splitting adds 3–4 weeks.
+      specification and simulation. Load-based splitting is S-19, re-estimated 2026-11-14 at 2–3 weeks now that
+      splitting and merging exist.
     - **Specification first:** `membership.tla` gains the directory writes and a single assigner; a handoff model checks that
       a range is never dropped before its new owners are ready and that no node serves a range it neither owns nor is leaving;
       `relays.tla` covers relay-pushed interests and revokes. Update them before implementation.
@@ -2316,19 +2317,35 @@ automatically would shrink the quorum. Enroute makes removal an explicit operato
       client tries the next owner, then a newer table, a bounded number of times. A table unused for 10 minutes is dropped.
       Relays answer only table fetches, never reads, so decision 13 still holds. `Routes` and the owners' `Reads` service are
       read-only and change no replication state; no TLA+ change. B-25 wires Quicksilver `Get`/`List`; `bytes()`, customer-KV
-      rendezvous and Gateway/Compute use stay with B-27 and B-57.
+      rendezvous and Gateway/Compute use stay with S-18 and B-57.
+    - **Amendment 2026-11-14 (decision 16): sibling cells in one DC.** Compute and volume nodes may fetch the `volume.{cell}`
+      routing tables of sibling cells in the same DC through `Relay.Routes`, for direct quorum traffic. Going through a
+      Gateway would add a hop to every commit. Reads and requests between cells otherwise still go through a Gateway.
+16. **Stateful actors on `bedrock-compute` and `bedrock-volume`.** Decided 2026-11-13; KV part decided 2026-11-14. The
+    plan is [`statefull/v2.md`](statefull/v2.md), implemented by track O (S-01 … S-19).
+    - **Actors** are the single primitive for Durable Objects, D1, Queues, Cron, Workflows and customer-KV writers. An
+      actor ID is `{region}_{128 bits}`. The DC, cells and wake host are computed from it, so no directory lookup is needed.
+    - **Storage:** `bedrock-volume` keeps each actor's claim, quorum log and key/value overlay on three slots in different
+      cells of one DC. A commit is acknowledged at 2 of 3 fsyncs; S3 is never on the write path. A maintainer flushes to
+      the actor's SlateDB database every second or 4 MiB. Epochs fence writers, and a host lease protects in-memory state.
+    - **Hosting:** `bedrock-compute` holds awake actors, sleeps idle ones and wakes them on request or alarm. Gateways
+      route region → DC → cell → host with a location cache.
+    - **Failure model:** losing a cell loses no acknowledged write. Losing a whole DC means downtime for its actors, and
+      losing it for good can lose up to about 1 second of acknowledged writes.
+    - **Changes to earlier decisions:** 4 (lease heartbeats for actors), 5 (slots span a DC's cells), 11 (the writer is a
+      `kv` actor; PR #74 closed, #58 amended), 12 (`bedrock-kv` is the read side), 15 (sibling-cell routing tables), plus
+      B-21 (node-reported readiness for `volume` ranges, a protocol change) and B-50 (cron schedules on activation).
 
 ### Still open
 
 1. **Gateway entry and placement (B-57).** The DNS, anycast and L4 layer in front of Gateways, how traffic moves between cells,
    and how a Worker is assigned to a Compute node. Decision 15 assumes these and does not design them.
-2. **Publication and reader-refresh budgets (B-39/B-27).** Choose measured bounds and overload behavior for publication lag,
-   manifest refresh, recent-state reads/waits and cold namespace opens. The Frankfurt/R2-EU 100–300 ms goal is a measurement
-   target, not a guaranteed S3 latency. An unavailable source is an error, never proof that a key is missing.
-3. **Fork and runtime integration (B-11, reader extension B-39).** Pin the source/format baseline and upstream-update policy;
-   prove Bedrock's I/O, simulation, range-integrity, checkpoint and recovery contracts before selecting engine features to remove.
-4. **Namespace scale (B-53).** Measure per-open metadata, small-object cost, writer/maintenance backlog and cache fairness.
-   Grouping namespaces, paged metadata or partitioning a single large namespace requires a later explicit decision.
+2. **SlateDB fork and patch set (B-11, S-05).** Pin the source/format baseline and upstream-update policy; prove
+   Bedrock's I/O, simulation, range-integrity, checkpoint and recovery contracts before selecting engine features to
+   remove. Which of Rivet's vendored SlateDB patches to carry is not decided.
+3. **Stateful actor questions.** Sandbox runtime, per-actor SlateDB cost, page or chunk granularity, DC choice, a KV
+   durability option, large KV values and heartbeat volume: see `statefull/v2.md` §12. An unavailable source is an
+   error, never proof that a key is missing.
 
 ---
 
