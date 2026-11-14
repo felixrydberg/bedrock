@@ -105,11 +105,14 @@ fn a_reservation_must_rise_and_a_refusal_names_the_highest() {
         refused(&store.reserve(&actor, 3, 1).unwrap()),
         Refusal::None
     );
-    // A slot refuses an older topology version once it has seen a newer one.
+    // The reservation adopted version 1: the slot refuses an older version, for reservations and claims.
     assert_eq!(
         refused(&store.reserve(&actor, 4, 0).unwrap()),
         Refusal::StaleVersion
     );
+    let (answer, _) = store.claim(&actor, &host("a"), 3, 0, |_| false).unwrap();
+    assert_eq!(refused(&answer), Refusal::StaleVersion);
+    assert_eq!(slot(&answer).reserved, 3);
 }
 
 #[test]
@@ -402,6 +405,9 @@ fn repair_records_cover_one_hash_span() {
     store.reserve(&other, 1, 0).unwrap();
     let (records, more) = store.records(0, actor().hash() + 1, b"", 10).unwrap();
     assert_eq!((records.len(), more), (1, false));
+    // The reservation lives in the claim record, so a repair copy carries it.
+    let claim = pb::ClaimRecord::decode(records[0].value.as_slice()).unwrap();
+    assert_eq!(claim.reserved, 1);
     let (records, more) = store.records(0, 0, b"", 1).unwrap();
     assert_eq!((records.len(), more), (1, true));
     let (records, _) = store.records(0, 0, &records[0].key, 10).unwrap();

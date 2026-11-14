@@ -380,3 +380,7 @@ impl pb::volume_server::Volume for Service {
         Ok(Response::new(pb::RepairReply { records, more }))
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/serve.rs"]
+mod tests;
