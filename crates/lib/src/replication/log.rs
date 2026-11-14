@@ -8,22 +8,6 @@ use tonic::Status;
 
 use super::Event;
 
-/// A source's committed history: the writer's durable log (B-09) or a relay's replay log (B-18).
-pub trait Log: Send + Sync + 'static {
-    /// Up to `limit` committed events of the namespace from sequence `from`, consecutive and in order; empty when
-    /// `from` is past the head.
-    fn read(
-        &self,
-        dataset: &str,
-        namespace: &str,
-        from: u64,
-        limit: usize,
-    ) -> impl Future<Output = Result<Vec<Event>, Status>> + Send;
-
-    /// The namespace's head sequence (0 before its first commit), updated after every commit.
-    fn head(&self, dataset: &str, namespace: &str) -> Arc<Watched<u64>>;
-}
-
 /// A value whose changes can be awaited. `tokio::sync::watch` spreads its waiters over shards picked by an RNG the
 /// simulation does not seed, so a seed would not replay; this is a lock and a [`Notify`].
 #[derive(Default)]
@@ -66,7 +50,7 @@ impl<T: Clone> Watched<T> {
     }
 }
 
-/// A [`Log`] held in memory, e.g. the writer's recent tail.
+/// A source's committed history held in memory: the writer's recent tail (B-09).
 #[derive(Default)]
 pub struct MemoryLog {
     namespaces: Mutex<BTreeMap<(String, String), NamespaceLog>>,
@@ -91,7 +75,7 @@ impl NamespaceLog {
 }
 
 impl NamespaceLog {
-    /// [`Log::read`] indexes `events` by sequence, which holds only while they exactly fill `base_sequence..=head`.
+    /// [`MemoryLog::read`] indexes `events` by sequence, which holds only while they exactly fill `base_sequence..=head`.
     fn assert_contiguous(&self) {
         assert_eq!(
             self.base_sequence + self.events.len() as u64,
@@ -199,8 +183,10 @@ impl MemoryLog {
     }
 }
 
-impl Log for MemoryLog {
-    async fn read(
+impl MemoryLog {
+    /// Up to `limit` committed events of the namespace from sequence `from`, consecutive and in order; empty when
+    /// `from` is past the head.
+    pub async fn read(
         &self,
         dataset: &str,
         namespace: &str,
@@ -238,7 +224,8 @@ impl Log for MemoryLog {
         Ok(events.iter().take(limit).cloned().collect())
     }
 
-    fn head(&self, dataset: &str, namespace: &str) -> Arc<Watched<u64>> {
+    /// The namespace's head sequence (0 before its first commit), updated after every commit.
+    pub fn head(&self, dataset: &str, namespace: &str) -> Arc<Watched<u64>> {
         let mut namespaces = self.namespaces.lock().unwrap();
         let log = self.entry(&mut namespaces, dataset, namespace);
         log.head.clone()

@@ -21,7 +21,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::placement::{hash_of, in_span, valid_span};
 use crate::replication::Event;
-use crate::replication::log::{Log, Watched};
+use crate::replication::log::Watched;
 use crate::replication::pb;
 use crate::replication::writer::{RecoveryLease, Writer};
 use crate::transport::{Caller, Class, Peers, host_of};

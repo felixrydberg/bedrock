@@ -936,7 +936,7 @@ A publish must not make both cold holders independently download the same artifa
 - Track artifact availability separately from ownership and filter `relays::sources::Sources::select` by it (deferred from #20 / B-19, which returns range owners only).
 - Range repopulation hook for B-21.
 - Per-service owner count: B-16 made the owners per range (`REPLICAS = 3`) and the ranges moving at once
-  (`MAX_MOVING = 16`) constants in `crates/lib/src/membership.rs`. Make them per-service settings that the relay reads
+  (`MAX_MOVING = 16`) constants in `crates/relay/src/membership.rs`. Make them per-service settings that the relay reads
   at startup, from an environment variable or `[membership]`, with `cdn` set to 2.
 
 **Additional context**

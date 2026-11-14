@@ -14,7 +14,7 @@ use prometheus_client::{
 };
 use tokio::sync::oneshot;
 
-use super::log::{Log, MemoryLog};
+use super::log::MemoryLog;
 use super::materialized::{
     Committed, Materialized, Persisted, Retention, Retries, RetryRecord, Snapshot, View,
     validate_scope,

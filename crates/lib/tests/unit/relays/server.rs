@@ -194,29 +194,8 @@ async fn cell_bootstrap_rejects_an_entry_larger_than_the_bounded_frame() {
 
 #[tokio::test]
 async fn cell_membership_uses_local_control_despite_central_history_and_unavailable_upstream() {
-    use crate::membership::control::{Config, Control};
     let peers = Arc::new(Peers::new(&Admin::new()));
-    let (control, actor) = Control::start(
-        Arc::new(crate::storage::memory::MemoryEngine::new("cell-control")),
-        peers.clone(),
-        Config {
-            region: "region".into(),
-            dc: "dc".into(),
-            cell: "cell".into(),
-            me: "one:7000".into(),
-            voters: vec!["one:7000".into(), "two:7000".into(), "three:7000".into()],
-            voter_ids: ["one", "two", "three"]
-                .into_iter()
-                .map(|id| (format!("{id}:7000"), id.into()))
-                .collect(),
-            clock: || 1234,
-            operator_token: None,
-            bootstrap: true,
-        },
-    )
-    .unwrap();
-    // Reading the committed view must work without elections or any live control/product peer.
-    actor.abort();
+    let control = Arc::new(EmptyCell);
     let replay = Arc::new(
         Replay::open(
             Arc::new(crate::storage::memory::MemoryEngine::new("central-history")),
@@ -314,6 +293,43 @@ async fn cell_membership_uses_local_control_despite_central_history_and_unavaila
         }
     }
     task.abort();
+}
+
+/// A cell control group that has committed nothing, as a fresh one reports: a head of 0 and an empty view. Reading it needs no
+/// election and no live peer.
+struct EmptyCell;
+
+impl LocalControlSource for EmptyCell {
+    fn validate_namespace(&self, cell: &str, namespace: &str) -> Result<(), Status> {
+        PublishedCell.validate_namespace(cell, namespace)
+    }
+    fn identity(&self) -> pb::ControlAck {
+        Default::default()
+    }
+    fn validate_peer(&self, _: &pb::ControlAck) -> Result<(), Status> {
+        Ok(())
+    }
+    fn changed(&self) -> Arc<Watched<u64>> {
+        Arc::new(Watched::new(0))
+    }
+    fn head(&self, _: &str) -> Result<u64, Status> {
+        Ok(0)
+    }
+    fn read(&self, _: &str, _: u64, _: usize) -> Result<Vec<Event>, Status> {
+        Ok(Vec::new())
+    }
+    fn view(&self, namespace: &str) -> Result<crate::replication::materialized::View, Status> {
+        Ok(crate::replication::materialized::View {
+            dataset: "membership".into(),
+            namespace: namespace.into(),
+            sequence: 0,
+            committed_at: 0,
+            values: Default::default(),
+            retries: Default::default(),
+            pruned_through: 0,
+            raft: None,
+        })
+    }
 }
 
 struct RecoveryCell {

@@ -744,8 +744,6 @@ async fn restarted_relay_serves_validated_persisted_replay_while_parent_is_unava
 
 #[tokio::test]
 async fn stale_recovery_candidate_falls_back_to_the_writer_with_required_history() {
-    use bedrock_lib::replication::log::Log;
-
     let authoritative = writer().await;
     let stale = writer().await;
     for writer in [&authoritative, &stale] {

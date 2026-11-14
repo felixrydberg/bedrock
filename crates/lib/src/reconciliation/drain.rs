@@ -6,9 +6,9 @@
 //! nothing to move, or an explicit [`Error::Unsupported`], never a silent no-op.
 //!
 //! - **Placement.** [`apply`] marks drained members `draining`, so range assignment gives them nothing new and
-//!   hands their ranges off ([`crate::placement::assign`], #22 / B-21). Customer-KV ranking already skips them.
+//!   hands their ranges off (`bedrock_relay::placement::assign`, #22 / B-21). Customer-KV ranking already skips them.
 //! - **Progress.** [`left`] sums the hooks' units; the drain is complete when every selected dataset reports zero.
-//! - **Pace.** [`Drain::rate`] bounds the ranges in handoff at once ([`crate::membership::place`]).
+//! - **Pace.** [`Drain::rate`] bounds the ranges in handoff at once (`bedrock_relay::membership::place`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

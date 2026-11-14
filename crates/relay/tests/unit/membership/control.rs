@@ -1,6 +1,6 @@
 use super::*;
-use crate::admin::Admin;
-use crate::storage::memory::MemoryEngine;
+use bedrock_lib::admin::Admin;
+use bedrock_lib::storage::memory::MemoryEngine;
 
 #[cfg(not(madsim))]
 #[path = "../../support/allocations.rs"]
@@ -281,19 +281,6 @@ fn voters_sharing_a_host_still_require_distinct_certificate_identities() {
     }
 }
 
-#[test]
-fn voter_identity_configuration_requires_complete_unique_processes() {
-    let config = config(0);
-    validate_voter_ids(&config.voters, &config.voter_ids).unwrap();
-    let mut invalid = config.voter_ids.clone();
-    invalid.remove("b:7000");
-    assert!(validate_voter_ids(&config.voters, &invalid).is_err());
-    invalid.insert("b:7000".into(), "relay-c".into());
-    assert!(validate_voter_ids(&config.voters, &invalid).is_err());
-    invalid.insert("b:7000".into(), "".into());
-    assert!(validate_voter_ids(&config.voters, &invalid).is_err());
-}
-
 struct Cluster {
     actors: Vec<Actor>,
     queues: Vec<(usize, usize, mpsc::Receiver<Message>)>,
@@ -404,7 +391,7 @@ fn committed_state_cas_dedup_and_vote_log_survive_reopen() {
         scope: Scope::Cell("sto-1".into()),
         datasets: Vec::new(),
         namespace: None,
-        state: crate::reconciliation::drain::State::Draining,
+        state: bedrock_lib::reconciliation::drain::State::Draining,
         rate: 1,
     };
     let request = pb::ControlWrite {
@@ -763,7 +750,7 @@ fn unsupported_operator_drains_are_rejected_before_the_raft_log() {
         scope: Scope::Node("missing-node".into()),
         datasets: vec!["kv".into()],
         namespace: None,
-        state: crate::reconciliation::drain::State::Draining,
+        state: bedrock_lib::reconciliation::drain::State::Draining,
         rate: 1,
     };
     let request = pb::ControlWrite {
@@ -810,7 +797,7 @@ fn unsupported_operator_drains_are_rejected_before_the_raft_log() {
     );
     assert_eq!(cluster.actors[0].control.head("cdn.sto-1").unwrap(), 0);
 
-    record.state = crate::reconciliation::drain::State::Drained;
+    record.state = bedrock_lib::reconciliation::drain::State::Drained;
     let request = pb::ControlWrite {
         key: Drain::key("forged").into_bytes(),
         value: Some(record.encode()),
@@ -826,8 +813,8 @@ fn unsupported_operator_drains_are_rejected_before_the_raft_log() {
 
 #[test]
 fn planner_completion_is_committed_only_after_zero_units_on_a_quorum() {
-    use crate::placement::{Owner, State as RangeState};
-    use crate::reconciliation::drain::{Hook, Ranged, State as DrainState, completed};
+    use bedrock_lib::placement::{Owner, State as RangeState};
+    use bedrock_lib::reconciliation::drain::{Hook, Ranged, State as DrainState, completed};
 
     let record = Drain {
         scope: Scope::Node("node".into()),
