@@ -552,3 +552,176 @@ fn a_drain_with_no_member_to_take_the_range_keeps_the_owner() {
         "the only copy of a range left: {changes:?}"
     );
 }
+
+/// Stored bytes of the volume test: the first 4 of 64 equal hash buckets hold 64 GiB each, the rest 1 GiB, each spread
+/// evenly within its bucket.
+fn stored_below(x: u128) -> f64 {
+    let (buckets, width) = (64, SPACE / 64);
+    let bytes = |i: u128| {
+        if i < 4 {
+            64.0 * (1u64 << 30) as f64
+        } else {
+            (1u64 << 30) as f64
+        }
+    };
+    let full = x / width;
+    let part = if full < buckets {
+        bytes(full) * (x % width) as f64 / width as f64
+    } else {
+        0.0
+    };
+    (0..full).map(bytes).sum::<f64>() + part
+}
+
+fn stored(start: u128, end: u128) -> f64 {
+    stored_below(end) - stored_below(start)
+}
+
+/// What each volume node publishes: the size and byte middle of every range it holds ready or leaving.
+fn measure(directory: &Directory, members: &mut BTreeMap<String, pb::Member>) {
+    for member in members.values_mut() {
+        member.sizes.clear();
+    }
+    for (&start, owners) in directory {
+        let (from, end) = (
+            u128::from(start),
+            u128::from(start) + size(directory, start),
+        );
+        let bytes = stored(from, end);
+        let (mut low, mut high) = (from, end);
+        while high - low > 1 {
+            let mid = (low + high) / 2;
+            if stored(from, mid) * 2.0 < bytes {
+                low = mid
+            } else {
+                high = mid
+            }
+        }
+        for owner in owners.iter().filter(|o| o.state != State::Populating) {
+            members
+                .get_mut(&owner.node)
+                .unwrap()
+                .sizes
+                .push(pb::RangeSize {
+                    span: Some(pb::Span {
+                        start,
+                        end: end as u64,
+                    }),
+                    bytes: bytes as u64,
+                    middle: if high < end { high as u64 } else { 0 },
+                });
+        }
+    }
+}
+
+#[test]
+fn volume_members_balance_on_skewed_stored_bytes() {
+    let mut members = cell(12, 4);
+    for member in members.values_mut() {
+        member.service = "volume".into();
+    }
+    let mut directory = Directory::new();
+    converge(&mut directory, &members, &BTreeSet::new());
+    let count = members.len();
+    // Placed by hash span, the members holding the hot buckets hold far more than their share of bytes.
+    let shares = |directory: &Directory| {
+        let mut held = BTreeMap::<String, f64>::new();
+        for (&start, owners) in directory {
+            let from = u128::from(start);
+            for owner in owners.iter().filter(|o| holds(o)) {
+                *held.entry(owner.node.clone()).or_default() +=
+                    stored(from, from + size(directory, start));
+            }
+        }
+        let target = R as f64 * stored(0, SPACE) / count as f64;
+        held.into_values()
+            .map(|bytes| bytes / target)
+            .collect::<Vec<_>>()
+    };
+    assert!(shares(&directory).iter().any(|s| *s > 1.15));
+
+    // Each move: the hashes, the owners leaving them and the owners taking them.
+    type Move = (u128, u128, BTreeSet<String>, BTreeSet<String>);
+    let mut moved_before: Vec<Move> = Vec::new();
+    for pass in 0.. {
+        assert!(pass < 100, "placement did not converge on bytes");
+        measure(&directory, &mut members);
+        let changes = assign(&directory, &members, &BTreeSet::new(), R, 16);
+        // The same directory, membership and sizes give the same plan.
+        assert_eq!(
+            changes,
+            assign(&directory, &members, &BTreeSet::new(), R, 16)
+        );
+        if changes.is_empty() {
+            break;
+        }
+        directory.extend(changes.clone());
+        assert!(moving(&directory) <= 16);
+        let nodes = |owners: &[Owner], state| {
+            owners
+                .iter()
+                .filter(|o| o.state == state)
+                .map(|o| o.node.clone())
+                .collect::<BTreeSet<_>>()
+        };
+        let moved: Vec<Move> = changes
+            .iter()
+            .map(|(start, owners)| {
+                let from = u128::from(*start);
+                (
+                    from,
+                    from + size(&directory, *start),
+                    nodes(owners, State::Leaving),
+                    nodes(owners, State::Populating),
+                )
+            })
+            .collect();
+        // With the stored bytes unchanged, a pass never moves hashes the previous pass moved off a member that just took
+        // them, or back to one that just gave them up. Pass 0 stops at the cap of 16 moves, so other replicas of the
+        // same hashes may still move.
+        for (a, b, leaving, taking) in &moved {
+            for (c, d, gave, took) in &moved_before {
+                let overlap = a < d && c < b;
+                assert!(
+                    !overlap || (took.is_disjoint(leaving) && gave.is_disjoint(taking)),
+                    "pass {pass} moved [{a:x}, {b:x}) back and forth"
+                );
+            }
+        }
+        moved_before = moved;
+        settle(&mut directory, &members);
+    }
+    for share in shares(&directory) {
+        assert!(
+            (0.85..=1.15).contains(&share),
+            "a member holds {share:.3} of its byte share"
+        );
+    }
+}
+
+#[test]
+fn ranges_without_a_reported_size_count_by_hash_span() {
+    let mut members = cell(12, 4);
+    let mut directory = Directory::new();
+    converge(&mut directory, &members, &BTreeSet::new());
+    // Every range reports bytes in proportion to its span: the same plan as with no sizes at all, which moves nothing.
+    measure(&directory, &mut members);
+    for member in members.values_mut() {
+        for size in &mut member.sizes {
+            let span = size.span.unwrap();
+            let end = if span.end == 0 {
+                SPACE
+            } else {
+                u128::from(span.end)
+            };
+            size.bytes = ((end - u128::from(span.start)) >> 24) as u64;
+            size.middle = 0;
+        }
+    }
+    assert!(assign(&directory, &members, &BTreeSet::new(), R, 16).is_empty());
+    // Dropping half of the reports changes nothing either: unreported ranges weigh their span at the same density.
+    for member in members.values_mut().step_by(2) {
+        member.sizes.clear();
+    }
+    assert!(assign(&directory, &members, &BTreeSet::new(), R, 16).is_empty());
+}

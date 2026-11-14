@@ -637,7 +637,8 @@ impl Hub {
         }
         self.changed();
     }
-    /// The first member must arrive on a leaf Hello; later ones may change only its status and unhealthy datasets.
+    /// The first member must arrive on a leaf Hello; later ones may change only its status, unhealthy datasets and range
+    /// sizes.
     fn member(&self, id: u64, member: pb::Member) -> bool {
         if crate::membership::validate(&member).is_err() {
             return false;
@@ -657,6 +658,7 @@ impl Hub {
         };
         current.status = member.status;
         current.unhealthy = member.unhealthy;
+        current.sizes = member.sizes;
         drop(subscribers);
         self.members_changed();
         true

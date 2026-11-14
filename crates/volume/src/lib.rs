@@ -11,6 +11,8 @@ use std::sync::{Arc, PoisonError};
 use bedrock_lib::datasets::capabilities::VOLUME;
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, ConfigError, NodeConfig, Role, ServiceConfig};
+use bedrock_lib::placement::{Directory, State};
+use bedrock_lib::replication::pb::RangeSize;
 use bedrock_lib::storage::StorageEngine;
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
@@ -28,7 +30,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     let store = Arc::new(store::Store::new(open(node)?));
     let service = serve::Service::new(
         &admin,
-        store,
+        store.clone(),
         &node.node_id,
         &node.location.cell,
         &node.location.dc,
@@ -53,6 +55,8 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     );
     let mut serving = std::pin::pin!(bedrock_lib::transport::serve(router, node.listen, tls));
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut measure = tokio::time::interval(SIZES);
+    let mut published = Vec::new();
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
         tokio::select! {biased;
@@ -72,12 +76,46 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
                     Err(error)=>tracing::warn!(%error,"volume directory unreadable"),
                 }
             },
+            _=measure.tick()=>{
+                let current=directory.read().unwrap_or_else(PoisonError::into_inner).clone();
+                match sizes(&store,&current,&node.node_id) {
+                    Ok(sizes) if store::worth_publishing(&published,&sizes)=>{
+                        session.set_sizes(sizes.clone());
+                        published=sizes;
+                    }
+                    Ok(_)=>{}
+                    Err(error)=>tracing::warn!(%error,"volume range sizes unreadable"),
+                }
+            },
         }
     }
     admin.set_ready(false);
     session.drain().await;
     tracing::info!("shutting down");
     Ok(())
+}
+
+/// How often a node measures the ranges it holds for placement (#111 / S-03).
+const SIZES: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The sizes of the ranges `node` holds ready or leaving, in order; a populating copy is still incomplete.
+fn sizes(
+    store: &store::Store,
+    directory: &Directory,
+    node: &str,
+) -> Result<Vec<RangeSize>, bedrock_lib::storage::StorageError> {
+    let mut entries = directory.iter().peekable();
+    let mut sizes = Vec::new();
+    while let Some((&start, owners)) = entries.next() {
+        let end = entries.peek().map_or(0, |(next, _)| **next);
+        if owners
+            .iter()
+            .any(|o| o.node == node && o.state != State::Populating)
+        {
+            sizes.push(store.size(start, end)?);
+        }
+    }
+    Ok(sizes)
 }
 
 /// The slot store: RocksDB in `data_dir/volume`, or in memory in simulation builds (B-23a). Unlike a relay-fed dataset,

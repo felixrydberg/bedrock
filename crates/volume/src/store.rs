@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bedrock_lib::actors::ActorId;
+use bedrock_lib::replication::pb::{RangeSize, Span};
 use bedrock_lib::storage::{
     ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, WriteBatch,
 };
@@ -676,6 +677,32 @@ impl Store {
         Ok((records, false))
     }
 
+    /// About how many bytes the slots of `[start, end)` hold (`end` 0 meaning 2⁶⁴), and a hash with about half of them
+    /// below it, or 0 when the range is empty or one hash wide. Placement balances ranges on these (#111 / S-03).
+    pub fn size(&self, start: u64, end: u64) -> StorageResult<RangeSize> {
+        let bytes = self.engine.approximate_size(&span(start, end))?;
+        let to = if end == 0 { 1 << 64 } else { u128::from(end) };
+        let (mut low, mut high) = (u128::from(start), to);
+        // Twenty halvings put the middle within a millionth of the span.
+        for _ in 0..20 {
+            if bytes == 0 || high - low < 2 {
+                break;
+            }
+            let mid = (low + high) / 2;
+            if self.engine.approximate_size(&span(start, mid as u64))? * 2 < bytes {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let inside = bytes > 0 && high > u128::from(start) && high < to;
+        Ok(RangeSize {
+            span: Some(Span { start, end }),
+            bytes,
+            middle: if inside { high as u64 } else { 0 },
+        })
+    }
+
     /// Overlay bytes per actor kind, for the gauge at startup: one pass over every slot record.
     // ponytail: a full scan at startup; keep running totals in a record if startup time matters.
     pub fn overlay_bytes(&self) -> Result<BTreeMap<i32, i64>, Error> {
@@ -701,6 +728,16 @@ impl Store {
         }
         Ok(bytes)
     }
+}
+
+/// Whether `new` sizes are worth a membership write over the `published` ones: the ranges differ, or one range's bytes
+/// moved by more than an eighth and 1 MiB. Placement's own band absorbs smaller drift.
+pub fn worth_publishing(published: &[RangeSize], new: &[RangeSize]) -> bool {
+    published.len() != new.len()
+        || published.iter().zip(new).any(|(old, new)| {
+            let moved = old.bytes.abs_diff(new.bytes);
+            old.span != new.span || (moved > old.bytes / 8 && moved > 1 << 20)
+        })
 }
 
 #[cfg(test)]

@@ -578,3 +578,37 @@ fn killing_one_slot_at_every_append_boundary_loses_no_acknowledged_commit() {
         }
     }
 }
+
+#[test]
+fn a_range_size_reports_its_bytes_and_a_middle_between_them() {
+    let store = store();
+    for hash in [1u64 << 60, 3 << 60] {
+        let key = [b"s/".as_slice(), &hash.to_be_bytes(), b"ns\0x\0claim"].concat();
+        store.engine.put(&key, &[0; 1000]).unwrap();
+    }
+    let size = store.size(0, 0).unwrap();
+    assert!(size.bytes > 2000);
+    assert!(
+        size.middle > 1 << 60 && size.middle <= 3 << 60,
+        "{:x}",
+        size.middle
+    );
+    let empty = store.size(4 << 60, 5 << 60).unwrap();
+    assert_eq!((empty.bytes, empty.middle), (0, 0));
+}
+
+#[test]
+fn sizes_are_republished_only_for_new_ranges_or_large_changes() {
+    let size = |start, bytes| RangeSize {
+        span: Some(Span { start, end: 0 }),
+        bytes,
+        middle: 0,
+    };
+    let published = [size(0, 100 << 20)];
+    assert!(!worth_publishing(&published, &[size(0, 110 << 20)]));
+    assert!(worth_publishing(&published, &[size(0, 120 << 20)]));
+    assert!(worth_publishing(&published, &[size(1, 100 << 20)]));
+    assert!(worth_publishing(&published, &[]));
+    // Small ranges wait for a mebibyte of change.
+    assert!(!worth_publishing(&[size(0, 1000)], &[size(0, 3000)]));
+}
