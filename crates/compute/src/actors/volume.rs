@@ -67,6 +67,8 @@ const ATTEMPTS: usize = 8;
 /// Log entries per recovery page. `Store::log` bounds a page by entries only, so the client's decode limit covers a
 /// page of the largest entries.
 const LOG_PAGE: u32 = 64;
+/// The most keys one `Scan` answer carries (`Store::scan` clamps to it).
+const SCAN_LIMIT: u32 = 1000;
 const LOG_PAGE_BYTES: usize = LOG_PAGE as usize * (MAX_ENTRY_BYTES + 1024) + (64 << 10);
 const VOLUME: &str = bedrock_lib::datasets::capabilities::VOLUME;
 
@@ -207,8 +209,10 @@ fn too_large(status: &Status) -> bool {
     status.code() == Code::OutOfRange
 }
 
-fn refused(answer: &pb::Answer) -> Refusal {
-    Refusal::try_from(answer.refused).unwrap_or(Refusal::None)
+/// Why the slot refused, `Some(Refusal::None)` for an acceptance. A code this client does not know (a newer slot) is
+/// `None`: never an acceptance, a grant or an acknowledgement.
+fn refused(answer: &pb::Answer) -> Option<Refusal> {
+    Refusal::try_from(answer.refused).ok()
 }
 
 fn slot_of(answer: &pb::Answer) -> pb::Slot {
@@ -219,18 +223,19 @@ fn slot_of(answer: &pb::Answer) -> pb::Slot {
 fn counts(answer: &Result<pb::Answer, Status>) -> bool {
     answer
         .as_ref()
-        .is_ok_and(|a| refused(a) == Refusal::None && slot_of(a).voting)
+        .is_ok_and(|a| refused(a) == Some(Refusal::None) && slot_of(a).voting)
 }
 
 fn quorum(answers: &[(usize, Result<pb::Answer, Status>)]) -> usize {
     answers.iter().filter(|(_, a)| counts(a)).count()
 }
 
-/// The highest sequence two voting slots hold, once it reaches the claim's no-op: an older epoch's entry commits only
-/// under one of this claim's (Raft's Figure 8 rule).
-fn quorum_point(acked: &[u64; SLOTS], voting: &[bool; SLOTS], noop: u64) -> Option<u64> {
+/// The highest sequence two counted slots hold, once it reaches the claim's no-op: an older epoch's entry commits only
+/// under one of this claim's (Raft's Figure 8 rule). A slot counts while it votes and still takes this writer's
+/// appends.
+fn quorum_point(acked: &[u64; SLOTS], counted: &[bool; SLOTS], noop: u64) -> Option<u64> {
     let mut held: Vec<u64> = (0..SLOTS)
-        .filter(|&i| voting[i])
+        .filter(|&i| counted[i])
         .map(|i| acked[i])
         .collect();
     held.sort_unstable_by(|a, b| b.cmp(a));
@@ -413,7 +418,9 @@ impl State {
         self.next[i] = self.next[i].max(through + 1);
         self.voting[i] = voting;
         self.told[i] = self.told[i].max(told);
-        if let Some(point) = quorum_point(&self.acked, &self.voting, self.noop)
+        // A lost slot's last acknowledgement is stale: it may have lost those entries since.
+        let counted = std::array::from_fn(|i| self.voting[i] && !self.lost[i]);
+        if let Some(point) = quorum_point(&self.acked, &counted, self.noop)
             && point > self.commit
         {
             for seq in self.commit + 1..=point {
@@ -427,7 +434,11 @@ impl State {
         }
         // Keep what a slot still lacks, including the entry it holds last, which a commit-only append resends; but no
         // more than RETAIN committed entries or RETAIN_BYTES.
-        let slowest = self.acked.iter().copied().min().unwrap_or(0);
+        let slowest = (0..SLOTS)
+            .filter(|&i| !self.lost[i])
+            .map(|i| self.acked[i])
+            .min()
+            .unwrap_or(self.commit);
         let floor = self
             .commit
             .min(slowest.saturating_sub(1))
@@ -532,6 +543,9 @@ impl Shared {
 /// Sends slot `i` the log until the writer stops.
 async fn replicate(shared: Arc<Shared>, i: usize) {
     let mut idle = false;
+    // When an idle slot is sent the commit point alone. Absolute, so other slots' acknowledgements, which wake this
+    // task, cannot keep pushing it back.
+    let mut due: Option<Instant> = None;
     loop {
         // Registered before reading the state, so no change between the two is missed.
         let mut changed = std::pin::pin!(shared.changed.notified());
@@ -545,12 +559,19 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
         };
         idle = false;
         let request = match next {
-            Next::Send(request) => request,
+            Next::Send(request) => {
+                due = None;
+                request
+            }
             Next::Idle => {
+                let at = *due.get_or_insert_with(|| bedrock_lib::monotonic_now() + HEARTBEAT);
                 tokio::select! {
                     biased;
                     () = changed => {}
-                    () = sleep(HEARTBEAT) => idle = true,
+                    () = sleep_until(at) => {
+                        idle = true;
+                        due = None;
+                    }
                 }
                 continue;
             }
@@ -596,11 +617,11 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
         let slot = slot_of(&answer);
         let mut state = shared.lock();
         match refused(&answer) {
-            Refusal::None => {
+            Some(Refusal::None) => {
                 state.ack(i, through, slot.voting, commit);
                 shared.changed.notify_waiters();
             }
-            Refusal::LogGap => {
+            Some(Refusal::LogGap) => {
                 if from <= state.base + 1 {
                     drop(state);
                     return shared.lose(i);
@@ -610,8 +631,8 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             }
             // A newer claim or topology took the slot: stop serving. A slot that lost our promise in a wipe is
             // dropped until it repairs.
-            Refusal::NotPromised | Refusal::StaleVersion => {
-                if refused(&answer) == Refusal::StaleVersion || slot.epoch > shared.epoch {
+            Some(refusal @ (Refusal::NotPromised | Refusal::StaleVersion)) => {
+                if refusal == Refusal::StaleVersion || slot.epoch > shared.epoch {
                     return shared.fence(&mut state);
                 }
                 drop(state);
@@ -697,7 +718,7 @@ impl Writer {
             let mut seen = epoch;
             for (_, answer) in &answers {
                 if let Ok(answer) = answer {
-                    if refused(answer) == Refusal::StaleVersion {
+                    if refused(answer) == Some(Refusal::StaleVersion) {
                         return Err(Error::StaleVersion);
                     }
                     let slot = slot_of(answer);
@@ -752,10 +773,10 @@ impl Writer {
             {
                 let slot = slot_of(answer);
                 match refused(answer) {
-                    Refusal::LeaseLive => {
+                    Some(Refusal::LeaseLive) => {
                         return Err(Error::Held(slot.holder.unwrap_or_default()));
                     }
-                    Refusal::StaleVersion => return Err(Error::StaleVersion),
+                    Some(Refusal::StaleVersion) => return Err(Error::StaleVersion),
                     _ => seen = seen.max(slot.reserved).max(slot.epoch),
                 }
             }
@@ -937,7 +958,8 @@ impl Writer {
     /// [`Writer::read`], it may include this writer's own pending commits.
     /// A reply too large to decode is asked again with half the limit, so it returns fewer keys and `more`.
     pub async fn scan(&self, start: Vec<u8>, limit: u32) -> Result<(Vec<pb::Value>, bool), Error> {
-        let mut limit = limit;
+        // Above the slot's own clamp, halving would ask for the same page again.
+        let mut limit = limit.min(SCAN_LIMIT);
         loop {
             match self.scan_once(start.clone(), limit).await {
                 Err(Error::Rpc(status)) if too_large(&status) && limit > 1 => limit /= 2,
@@ -986,13 +1008,13 @@ impl Writer {
             }
             match call(&shared.joined.host.peers, &shared.joined.slots[i], &f).await {
                 Ok(reply) => match answer(&reply).map(|a| (refused(a), slot_of(a).epoch)) {
-                    Some((Refusal::None, epoch)) if epoch == shared.epoch => {
+                    Some((Some(Refusal::None), epoch)) if epoch == shared.epoch => {
                         if !self.serving() {
                             return Err(Error::Fenced);
                         }
                         return Ok(reply);
                     }
-                    Some((Refusal::None, epoch)) => {
+                    Some((Some(Refusal::None), epoch)) => {
                         last = format!("slot {i} is promised to epoch {epoch}");
                     }
                     refusal => last = format!("slot {i} refused: {refusal:?}"),
@@ -1060,7 +1082,7 @@ async fn recover(
         })
         .await
         .map_err(|s| Error::Unavailable(format!("reading the log: {s}")))?;
-        if reply.answer.as_ref().map(refused) != Some(Refusal::None) {
+        if reply.answer.as_ref().and_then(refused) != Some(Refusal::None) {
             return Err(Error::Unavailable(
                 "the recovery slot took a newer claim".into(),
             ));

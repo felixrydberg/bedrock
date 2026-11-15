@@ -282,3 +282,35 @@ fn a_writer_with_fewer_than_two_slots_taking_appends_stops_serving() {
         assert!(matches!(pending.await, Err(Error::Fenced)));
     });
 }
+
+#[test]
+fn a_lost_slots_stale_acknowledgement_commits_nothing() {
+    let mut state = state(10, 0);
+    for i in 0..SLOTS {
+        state.ack(i, 1, true, 0);
+    }
+    state.ack(2, 10, true, 0);
+    assert_eq!(state.commit, 1);
+    // Slot 2 stops taking appends (wiped, say); its 10 may be gone.
+    state.lost[2] = true;
+    state.ack(0, 5, true, 0);
+    state.ack(1, 3, true, 0);
+    assert_eq!(state.commit, 3, "only slots 0 and 1 count");
+}
+
+#[test]
+fn an_unknown_refusal_code_counts_for_no_quorum() {
+    let answer = |refused| {
+        Ok(pb::Answer {
+            refused,
+            slot: Some(pb::Slot {
+                voting: true,
+                ..Default::default()
+            }),
+        })
+    };
+    assert!(counts(&answer(Refusal::None as i32)));
+    let unknown = answer(99);
+    assert!(!counts(&unknown));
+    assert_eq!(refused(unknown.as_ref().unwrap()), None);
+}
