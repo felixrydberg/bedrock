@@ -160,19 +160,25 @@ async fn stored_meta(bucket: &Memory) -> u64 {
         .map_or(0, |meta| meta.seq)
 }
 
-/// Every database of the bucket holds at most `committed` for the actor: no clone or stale maintainer wrote past it.
-fn assert_committed_only(bucket: &Memory, committed: u64) {
+/// Whether every database of the bucket holds at most `committed` for the actor: no clone or stale maintainer wrote
+/// past it.
+fn committed_only(bucket: &Memory, committed: u64) -> Option<String> {
     let actor = Actor::new(&actor()).unwrap();
-    for name in bucket.names() {
+    bucket.names().into_iter().find_map(|name| {
         let seq = bucket
             .contents(&name)
             .get(&cold::meta_key(actor.name()))
             .and_then(|bytes| Meta::decode(bytes))
             .map_or(0, |meta| meta.seq);
-        assert!(
-            seq <= committed,
-            "{name} holds sequence {seq}, past the commit point"
-        );
+        (seq > committed)
+            .then(|| format!("{name} holds sequence {seq}, past the commit point {committed}"))
+    })
+}
+
+/// Keeps the first broken invariant a background task saw.
+fn record(violation: &Mutex<Option<String>>, found: Option<String>) {
+    if let Some(found) = found {
+        violation.lock().unwrap().get_or_insert(found);
     }
 }
 
@@ -210,14 +216,17 @@ async fn scenario() -> (u64, u64) {
     let directory = Arc::new(Mutex::new(whole.clone()));
     let cold = Arc::new(Mutex::new(Arc::new(maintainer(&stores, &bucket))));
     let committed = Arc::new(Mutex::new(0u64));
+    // The flush task records a broken invariant here rather than panicking, so its abort cannot hide one.
+    let violation: Arc<Mutex<Option<String>>> = Arc::default();
 
     // The maintainer: flushes about every second, and S3 never holds more than the holder announced.
     let flushing = {
-        let (cold, bucket, committed, fingerprint) = (
+        let (cold, bucket, committed, fingerprint, violation) = (
             cold.clone(),
             bucket.clone(),
             committed.clone(),
             fingerprint.clone(),
+            violation.clone(),
         );
         let directory = directory.clone();
         tokio::spawn(async move {
@@ -226,7 +235,10 @@ async fn scenario() -> (u64, u64) {
                 let current = cold.lock().unwrap().clone();
                 let seen = directory.lock().unwrap().clone();
                 current.tick(&seen).await;
-                assert_committed_only(&bucket, *committed.lock().unwrap());
+                record(
+                    &violation,
+                    committed_only(&bucket, *committed.lock().unwrap()),
+                );
                 let meta = stored_meta(&bucket).await;
                 fingerprint.mix(("flush", meta, bucket.commits()));
             }
@@ -234,18 +246,22 @@ async fn scenario() -> (u64, u64) {
     };
     // A maintainer that never sees the split: it merges the range back whenever it flushes, racing the first.
     let stale = {
-        let (stores, bucket, committed, whole) = (
+        let (stores, bucket, committed, whole, violation) = (
             stores.clone(),
             bucket.clone(),
             committed.clone(),
             whole.clone(),
+            violation.clone(),
         );
         tokio::spawn(async move {
             let stale = maintainer(&stores, &bucket);
             loop {
                 sleep(Duration::from_millis(thread_rng().gen_range(1000..4000))).await;
                 stale.tick(&whole).await;
-                assert_committed_only(&bucket, *committed.lock().unwrap());
+                record(
+                    &violation,
+                    committed_only(&bucket, *committed.lock().unwrap()),
+                );
             }
         })
     };
@@ -324,6 +340,9 @@ async fn scenario() -> (u64, u64) {
     }
     sleep(Duration::from_secs(10)).await;
     flushing.abort();
+    if let Some(violation) = violation.lock().unwrap().take() {
+        panic!("{violation}");
+    }
     let current = cold.lock().unwrap().clone();
     let directory = directory.lock().unwrap().clone();
     for _ in 0..3 {

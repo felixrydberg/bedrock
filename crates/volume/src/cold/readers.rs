@@ -88,15 +88,20 @@ impl Readers {
     }
 
     /// Keeps `db` for `name` unless another handle already is, retiring the least recently used beyond `max_open`.
-    fn install(&self, name: &str, db: Arc<dyn Database>) -> (Arc<dyn Database>, bool) {
+    pub(crate) fn install(&self, name: &str, db: Arc<dyn Database>) -> (Arc<dyn Database>, bool) {
         let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
+        // A coalesced caller that finished after its handle was retired reads through it once more, but never
+        // reinstalls it: it closes once no read holds it.
+        if retired.iter().any(|r| Arc::ptr_eq(r, &db)) {
+            return (db, false);
+        }
         let now = bedrock_lib::monotonic_now();
         let installed = open
             .entry(name.to_owned())
             .or_insert_with(|| (db.clone(), now));
         installed.1 = now;
         let installed = installed.0.clone();
-        let mut retired = self.retired.lock().unwrap_or_else(PoisonError::into_inner);
         // Coalesced callers share one handle; a second open that lost the install is retired once.
         if !Arc::ptr_eq(&installed, &db) && !retired.iter().any(|r| Arc::ptr_eq(r, &db)) {
             retired.push(db);

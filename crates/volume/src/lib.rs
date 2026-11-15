@@ -169,7 +169,7 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
             },
             _=measure.tick()=>{
                 let current=directory.read().unwrap_or_else(PoisonError::into_inner).clone();
-                match sizes(&store,&cold,&current,&node.node_id).await {
+                match sizes(&store,&cold,&current,&node.node_id) {
                     Ok(sizes) if store::worth_publishing(&published,&sizes)=>{
                         session.set_sizes(sizes.clone());
                         published=sizes;
@@ -239,7 +239,8 @@ async fn databases(
 
 /// The sizes of the ranges `node` holds ready or leaving, in order; a populating copy is still incomplete. A range
 /// database this node writes adds its manifest bytes; the middle is the slot store one, so sizing makes no S3 request.
-async fn sizes(
+/// It never waits for a flush, which runs in the same loop.
+fn sizes(
     store: &store::Store,
     cold: &cold::Cold,
     directory: &Directory,
@@ -254,7 +255,7 @@ async fn sizes(
             .any(|o| o.node == node && o.state != State::Populating)
         {
             let mut size = store.size(start, end)?;
-            size.bytes += cold.size(start, end).await;
+            size.bytes += cold.size(start, end);
             sizes.push(size);
         }
     }

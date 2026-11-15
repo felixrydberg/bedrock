@@ -49,6 +49,9 @@ use readers::Readers;
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Unflushed log bytes on the node that start a flush before the interval ends, and the most one batch carries.
 pub const FLUSH_BYTES: u64 = 4 << 20;
+/// Batches one range flushes per round at most; what is left stays dirty for the next round, so a busy range cannot
+/// hold up the others, pending truncations or reader sweeps.
+pub const FLUSH_ROUNDS: usize = 8;
 /// How long a fenced maintainer waits before opening the database again.
 pub const FENCED_WAIT: Duration = Duration::from_secs(5);
 /// How long a cold read waits for its reader to see the slot's flushed point.
@@ -192,11 +195,12 @@ pub trait Placement: Send + Sync {
     async fn first_cell(&self, actor: &pb::Actor) -> Result<String, Status>;
 }
 
-/// An open writer and the flushed point of every actor it has flushed or read.
+/// An open writer and the flushed point of every actor it has flushed or read. `known` is locked for a whole flush,
+/// which serializes the flushes of one database without holding up other ranges or reads.
 struct Maintained {
     name: String,
     db: Arc<dyn Writer>,
-    known: BTreeMap<Vec<u8>, Meta>,
+    known: tokio::sync::Mutex<BTreeMap<Vec<u8>, Meta>>,
 }
 
 pub struct Cold {
@@ -206,14 +210,12 @@ pub struct Cold {
     pub readers: Readers,
     cell: String,
     node: String,
-    /// Range databases this node writes, by span.
-    writers: tokio::sync::Mutex<BTreeMap<(u64, u64), Maintained>>,
+    /// Range databases this node writes, by span. Locked only to look one up, never across range I/O.
+    writers: Mutex<BTreeMap<(u64, u64), Arc<Maintained>>>,
     /// When a fenced span may be opened again.
     fenced: Mutex<BTreeMap<(u64, u64), Instant>>,
     /// Catalogs cold reads and copies used, by cell; dropped when a read through one fails.
     catalogs: Mutex<BTreeMap<String, Arc<Catalog>>>,
-    /// Truncations other slots still owe, by actor prefix.
-    owed: Mutex<BTreeMap<Vec<u8>, (pb::Actor, u64)>>,
     /// Unflushed bytes at the last flush, for the early trigger.
     mark: Mutex<i64>,
 }
@@ -242,10 +244,9 @@ impl Cold {
             readers,
             cell: cell.to_owned(),
             node: node.to_owned(),
-            writers: Default::default(),
+            writers: Mutex::default(),
             fenced: Mutex::default(),
             catalogs: Mutex::default(),
-            owed: Mutex::default(),
             mark: Mutex::new(0),
         }
     }
@@ -256,10 +257,18 @@ impl Cold {
             >= FLUSH_BYTES as i64
     }
 
-    /// Bytes of the range database this node writes for `[start, end)`, from its manifest; 0 when it writes none.
-    pub async fn size(&self, start: u64, end: u64) -> u64 {
-        let writers = self.writers.lock().await;
-        writers.get(&(start, end)).map_or(0, |m| m.db.size())
+    fn writer(&self, span: (u64, u64)) -> Option<Arc<Maintained>> {
+        self.writers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&span)
+            .cloned()
+    }
+
+    /// Bytes of the range database this node writes for `[start, end)`, from its manifest; 0 when it writes none. It
+    /// never waits for a flush.
+    pub fn size(&self, start: u64, end: u64) -> u64 {
+        self.writer((start, end)).map_or(0, |m| m.db.size())
     }
 
     /// One flush round: every range this node maintains, then the truncations other slots still owe. Ranges it no
@@ -274,8 +283,8 @@ impl Cold {
                 ranges.push((start, end));
             }
         }
-        let stale: Vec<Maintained> = {
-            let mut writers = self.writers.lock().await;
+        let stale: Vec<Arc<Maintained>> = {
+            let mut writers = self.writers.lock().unwrap_or_else(PoisonError::into_inner);
             let gone: Vec<(u64, u64)> = writers
                 .keys()
                 .filter(|span| !ranges.contains(span))
@@ -289,7 +298,7 @@ impl Cold {
             close(&maintained.name, maintained.db.as_ref()).await;
         }
         for (start, end) in ranges {
-            loop {
+            for _ in 0..FLUSH_ROUNDS {
                 match self.flush(start, end).await {
                     Ok(true) => continue,
                     Ok(false) => break,
@@ -358,7 +367,7 @@ impl Cold {
             return Ok(Some(Maintained {
                 name,
                 db: writer,
-                known: BTreeMap::new(),
+                known: tokio::sync::Mutex::default(),
             }));
         }
         Err(StorageError::Unavailable(
@@ -392,16 +401,20 @@ impl Cold {
     }
 
     /// The actor's flushed point in `maintained`'s database, read once.
-    async fn known(maintained: &mut Maintained, actor: &[u8]) -> Result<Meta, Status> {
-        if let Some(meta) = maintained.known.get(actor) {
+    async fn known(
+        db: &dyn Writer,
+        known: &mut BTreeMap<Vec<u8>, Meta>,
+        actor: &[u8],
+    ) -> Result<Meta, Status> {
+        if let Some(meta) = known.get(actor) {
             return Ok(*meta);
         }
-        let meta = match maintained.db.get(&meta_key(actor)).await.map_err(storage)? {
+        let meta = match db.get(&meta_key(actor)).await.map_err(storage)? {
             Some(bytes) => Meta::decode(&bytes)
                 .ok_or_else(|| Status::data_loss("an actor meta does not decode"))?,
             None => Meta::default(),
         };
-        maintained.known.insert(actor.to_vec(), meta);
+        known.insert(actor.to_vec(), meta);
         Ok(meta)
     }
 
@@ -494,14 +507,22 @@ impl Cold {
     /// wait than one batch took.
     async fn flush(&self, start: u64, end: u64) -> Result<bool, Status> {
         let span = (start, end);
-        let mut writers = self.writers.lock().await;
-        if let std::collections::btree_map::Entry::Vacant(vacant) = writers.entry(span) {
-            match self.open(start, end).await.map_err(storage)? {
-                Some(maintained) => vacant.insert(maintained),
+        // Only the flush loop opens writers, so no other open of the span races this one.
+        let maintained = match self.writer(span) {
+            Some(maintained) => maintained,
+            None => match self.open(start, end).await.map_err(storage)? {
+                Some(opened) => {
+                    let opened = Arc::new(opened);
+                    self.writers
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(span, opened.clone());
+                    opened
+                }
                 None => return Ok(false),
-            };
-        }
-        let maintained = writers.get_mut(&span).expect("just opened");
+            },
+        };
+        let mut known_points = maintained.known.lock().await;
         let mut batch: Changes = Vec::new();
         let mut bytes = 0;
         let mut written = Vec::new();
@@ -524,7 +545,8 @@ impl Cold {
                     .map_err(status)?
             };
             let Some(pending) = pending else { continue };
-            let mut known = Self::known(maintained, parsed.name()).await?;
+            let mut known =
+                Self::known(maintained.db.as_ref(), &mut known_points, parsed.name()).await?;
             if pending.flushed > known.seq {
                 // Flushed in another cell's database: its first slot moved here. Copy it from there first.
                 match self
@@ -569,7 +591,10 @@ impl Cold {
         if !batch.is_empty() {
             if let Err(error) = maintained.db.commit(batch).await {
                 if matches!(error, StorageError::Fenced(_)) {
-                    writers.remove(&span);
+                    self.writers
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&span);
                     self.fenced
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
@@ -578,51 +603,44 @@ impl Cold {
                 return Err(storage(error));
             }
             for (key, meta, actor, through) in written {
-                maintained.known.insert(key, meta);
+                known_points.insert(key, meta);
                 truncate.push((actor, through));
             }
             // An adopted actor is listed twice when its pending changes went over the copy: truncate once, the furthest.
             truncate.sort_by(|a, b| a.0.id.cmp(&b.0.id).then(b.1.cmp(&a.1)));
             truncate.dedup_by(|a, b| a.0 == b.0);
         }
-        drop(writers);
+        drop(known_points);
         for (actor, through) in truncate {
             self.truncate(actor, through).await?;
         }
         Ok(more)
     }
 
-    /// Truncates the actor's own slot here, and asks its other slots to, through `through`.
+    /// Truncates the actor's own slot here and records that its other slots owe the same, which [`Cold::settle`] asks of
+    /// them. The record is stored with the truncation, so a restart or a range handoff keeps it.
     async fn truncate(&self, actor: pb::Actor, through: u64) -> Result<(), Status> {
         let parsed = Actor::new(&actor).map_err(status)?;
         let store = self.store.clone();
-        crate::serve::blocking(move || store.truncate(&parsed, through))
+        crate::serve::blocking(move || store.truncate_owing(&parsed, through))
             .await?
             .map_err(status)?;
-        let prefix = Actor::new(&actor).map_err(status)?.name().to_vec();
-        self.owed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(prefix, (actor, through));
         Ok(())
     }
 
-    /// Retries the truncations other slots still owe.
+    /// Retries the truncations other slots still owe; one done is settled unless a newer flush raised it meanwhile.
     async fn settle(&self) {
-        let owed: Vec<_> = self
-            .owed
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (prefix, (actor, through)) in owed {
+        for (actor, through) in self.store.owed() {
             match self.placement.truncate_others(&actor, through).await {
                 Ok(true) => {
-                    let mut owed = self.owed.lock().unwrap_or_else(PoisonError::into_inner);
-                    // A newer flush may have raised it meanwhile.
-                    if owed.get(&prefix).is_some_and(|(_, t)| *t == through) {
-                        owed.remove(&prefix);
+                    let Ok(parsed) = Actor::new(&actor) else {
+                        continue;
+                    };
+                    let store = self.store.clone();
+                    let settled =
+                        crate::serve::blocking(move || store.settle(&parsed, through)).await;
+                    if let Ok(Err(error)) = settled {
+                        tracing::warn!(error = ?error, "settling a slot truncation failed");
                     }
                 }
                 Ok(false) => {}
@@ -641,12 +659,15 @@ impl Cold {
         let first = self.placement.first_cell(actor).await?;
         let hash = Actor::new(actor).map_err(status)?.hash();
         if first == self.cell {
-            let writers = self.writers.lock().await;
-            if let Some((_, maintained)) = writers
+            let maintained = self
+                .writers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
                 .range(..=(hash, u64::MAX))
                 .next_back()
                 .filter(|((_, end), _)| u128::from(hash) < top(*end))
-            {
+                .map(|(_, maintained)| maintained.clone());
+            if let Some(maintained) = maintained {
                 return Ok((
                     first,
                     maintained.name.clone(),
@@ -757,6 +778,76 @@ impl Cold {
     }
 }
 
+/// Merges a page of overlay records (deletes included) over a page of range database entries, both from the same start:
+/// the overlay wins. Only keys up to the end of a page with more after it are certain, so the answer stops there.
+/// Returns up to `limit` live values, whether more follow, and where the next page starts.
+pub fn merge(
+    overlay: Vec<pb::Value>,
+    overlay_more: bool,
+    stored: Vec<(Vec<u8>, Vec<u8>)>,
+    stored_more: bool,
+    limit: usize,
+) -> (Vec<pb::Value>, bool, Vec<u8>) {
+    let cutoff = [
+        overlay
+            .last()
+            .filter(|_| overlay_more)
+            .map(|v| v.key.clone()),
+        stored
+            .last()
+            .filter(|_| stored_more)
+            .map(|(k, _)| k.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+        stored.into_iter().map(|(k, v)| (k, Some(v))).collect();
+    merged.extend(overlay.into_iter().map(|v| (v.key, v.value)));
+    let mut more = cutoff.is_some();
+    let mut values = Vec::new();
+    // The last key consumed, deletes included: where the next page starts when the limit stops this one.
+    let mut consumed = None;
+    for (key, value) in merged {
+        if cutoff.as_ref().is_some_and(|c| key > *c) {
+            break;
+        }
+        if value.is_some() && values.len() == limit {
+            more = true;
+            break;
+        }
+        consumed = Some(key.clone());
+        if let Some(value) = value {
+            values.push(pb::Value {
+                key,
+                value: Some(value),
+            });
+        }
+    }
+    let after = |key: Vec<u8>| [key.as_slice(), &[0]].concat();
+    let next = if values.len() == limit && more {
+        consumed.map_or_else(Vec::new, after)
+    } else {
+        cutoff.map_or_else(Vec::new, after)
+    };
+    (values, more, next)
+}
+
+fn meta(pending: &Pending) -> Meta {
+    Meta {
+        seq: pending.through,
+        epoch: pending.epoch,
+        alarm: pending.alarm,
+    }
+}
+
+fn add(batch: &mut Changes, actor: &[u8], pending: &Pending) {
+    for (key, value) in &pending.changes {
+        batch.push((data_key(actor, key), value.clone()));
+    }
+    batch.push((meta_key(actor), Some(meta(pending).encode())));
+}
+
 /// Every key of `actor` in `db`.
 async fn all(db: &dyn Database, actor: &[u8]) -> Result<Vec<Entry>, StorageError> {
     let end = KeyRange::prefix(actor.to_vec())
@@ -808,67 +899,6 @@ async fn copy(db: &dyn Database, actor: &[u8]) -> Result<Option<(Meta, Vec<Entry
             detail: "the actor kept changing while it was copied".into(),
         },
     ))
-}
-
-/// Merges a page of overlay records (deletes included) over a page of range database entries, both from the same start:
-/// the overlay wins. Only keys up to the end of a page with more after it are certain, so the answer stops there.
-/// Returns up to `limit` live values, whether more follow, and where the next page starts.
-pub fn merge(
-    overlay: Vec<pb::Value>,
-    overlay_more: bool,
-    stored: Vec<(Vec<u8>, Vec<u8>)>,
-    stored_more: bool,
-    limit: usize,
-) -> (Vec<pb::Value>, bool, Vec<u8>) {
-    let cutoff = [
-        overlay
-            .last()
-            .filter(|_| overlay_more)
-            .map(|v| v.key.clone()),
-        stored
-            .last()
-            .filter(|_| stored_more)
-            .map(|(k, _)| k.clone()),
-    ]
-    .into_iter()
-    .flatten()
-    .min();
-    let mut merged: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
-        stored.into_iter().map(|(k, v)| (k, Some(v))).collect();
-    merged.extend(overlay.into_iter().map(|v| (v.key, v.value)));
-    let mut more = cutoff.is_some();
-    let mut values = Vec::new();
-    for (key, value) in merged {
-        if cutoff.as_ref().is_some_and(|c| key > *c) {
-            break;
-        }
-        let Some(value) = value else { continue };
-        if values.len() == limit {
-            more = true;
-            break;
-        }
-        values.push(pb::Value {
-            key,
-            value: Some(value),
-        });
-    }
-    let next = cutoff.map_or_else(Vec::new, |c| [c.as_slice(), &[0]].concat());
-    (values, more, next)
-}
-
-fn meta(pending: &Pending) -> Meta {
-    Meta {
-        seq: pending.through,
-        epoch: pending.epoch,
-        alarm: pending.alarm,
-    }
-}
-
-fn add(batch: &mut Changes, actor: &[u8], pending: &Pending) {
-    for (key, value) in &pending.changes {
-        batch.push((data_key(actor, key), value.clone()));
-    }
-    batch.push((meta_key(actor), Some(meta(pending).encode())));
 }
 
 #[cfg(test)]
