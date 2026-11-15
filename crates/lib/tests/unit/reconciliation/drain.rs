@@ -60,6 +60,37 @@ fn ranged_datasets_move_a_nodes_ranges_and_leave_a_cell_alone() {
 }
 
 #[test]
+fn a_volume_cell_drain_is_refused_while_its_nodes_hold_slots() {
+    let directory: Directory = [(0, vec!["a"]), (1 << 63, vec!["b"])]
+        .into_iter()
+        .map(|(start, nodes)| {
+            let owners = nodes
+                .into_iter()
+                .map(|n| Owner {
+                    node: n.into(),
+                    state: Range::Ready,
+                })
+                .collect();
+            (start, owners)
+        })
+        .collect();
+    let hook = Ranged::new("volume", move || Ok(directory.clone()));
+    let cell = Scope::Cell("c1".into());
+    // The generic hook would call a cell drain done; volume slots would still be there.
+    assert!(matches!(
+        hook.drain(&cell, None),
+        Err(Error::Unsupported { .. })
+    ));
+    assert!(validate_ranged_selection("volume", &drain(cell)).is_err());
+    // A node drain counts the ranges the node still holds.
+    assert_eq!(
+        hook.drain(&Scope::Node("a".into()), None),
+        Ok(Outcome::Moves(1))
+    );
+    assert!(validate_ranged_selection("volume", &drain(Scope::Node("a".into()))).is_ok());
+}
+
+#[test]
 fn an_unreadable_directory_is_an_error_not_zero_units() {
     let hook = Ranged::new("cdn", || Err("scan failed".into()));
     assert_eq!(

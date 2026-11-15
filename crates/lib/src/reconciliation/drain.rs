@@ -204,7 +204,11 @@ fn validate_ranged_scope(
     scope: &Scope,
     namespace: Option<&str>,
 ) -> Result<(), Error> {
-    if namespace.is_some() {
+    // A cell holds one slot of every actor homed in its DC, so emptying it moves slots to other cells (S-17). Nothing
+    // verifies that yet, and the generic hook would report a cell drain done at once.
+    let volume_cell =
+        dataset == crate::datasets::capabilities::VOLUME && matches!(scope, Scope::Cell(_));
+    if namespace.is_some() || volume_cell {
         return Err(unsupported(dataset, scope, namespace));
     }
     Ok(())

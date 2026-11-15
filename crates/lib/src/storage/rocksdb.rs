@@ -434,6 +434,9 @@ impl StorageEngine for RocksDbAdapter {
 
     /// From the SST index: memtables are not counted, and compressed files count as stored.
     fn approximate_size(&self, range: &KeyRange) -> StorageResult<u64> {
+        if range.bounds().is_none() {
+            return Ok(0);
+        }
         let start = data_key(&range.start);
         let end = range.end.as_deref().map_or(KEY_END.to_vec(), data_key);
         let sizes = self

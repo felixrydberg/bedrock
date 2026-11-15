@@ -433,12 +433,16 @@ impl<'a> Plan<'a> {
     }
 
     /// `d`'s ready range for `u` to take without losing failure-domain spread, preferring ranges `u` spreads further,
-    /// then the largest.
+    /// then the largest. A range one hash wide cannot be split, so it is taken only whole and only if it fits the piece:
+    /// otherwise `u` would end as far over its target as `d` was, and the next plan would move it again.
     fn donor_range(&self, d: &str, u: &str) -> Option<u64> {
         let mut best: Option<((usize, u128), u64)> = None;
+        let piece = self.piece(d, u);
         for &start in self.held.get(d)? {
             let owners = &self.ranges[&start];
+            let indivisible = self.bytes && self.span(start) < 2 && self.size(start) > piece;
             if self.size(start) == 0
+                || indivisible
                 || owners
                     .iter()
                     .any(|o| o.state != State::Ready || o.node == u)
@@ -459,11 +463,16 @@ impl<'a> Plan<'a> {
         best.map(|(_, start)| start)
     }
 
-    /// Hands the tail of `d`'s range to `u`: as much as `u` has room for and `d` can spare.
-    fn give(&mut self, start: u64, d: &'a str, u: &'a str) {
+    /// As much as `u` has room for and `d` can spare.
+    fn piece(&self, d: &str, u: &str) -> u128 {
         let need = (1.0 + FILL) * self.target[u] - self.load[u] as f64;
         let spare = self.load[d] as f64 - (1.0 - FILL) * self.target[d];
-        let at = self.split(start, need.min(spare).max(1.0) as u128);
+        need.min(spare).max(1.0) as u128
+    }
+
+    /// Hands the tail of `d`'s range to `u`, a [`Plan::piece`] of it.
+    fn give(&mut self, start: u64, d: &'a str, u: &'a str) {
+        let at = self.split(start, self.piece(d, u));
         self.mark_leaving(at, d);
         self.add(at, u);
         self.moving += 1;

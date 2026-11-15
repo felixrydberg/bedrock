@@ -35,6 +35,7 @@ macro_rules! storage_contract {
             corruption_is_an_error_not_a_miss,
             stats_disk_usage_and_health,
             compact_keeps_data_outside_range,
+            approximate_size_of_an_empty_or_reversed_range_is_zero,
         );
         #[tokio::test]
         async fn data_and_revision_commit_together() {
@@ -394,4 +395,16 @@ pub fn compact_keeps_data_outside_range(h: &mut impl Harness) {
         keys(engine.scan(&KeyRange::all())),
         vec![b"a/1".to_vec(), b"c/1".to_vec()]
     );
+}
+
+/// Placement reads range sizes (#111 / S-03). A range with no keys in it, empty or reversed, holds nothing, as a scan of
+/// it returns nothing.
+pub fn approximate_size_of_an_empty_or_reversed_range_is_zero(h: &mut impl Harness) {
+    let engine = h.open();
+    engine.put(b"a", b"1").unwrap();
+    engine.put(b"m", b"2").unwrap();
+    for range in [KeyRange::new(*b"m", *b"m"), KeyRange::new(*b"z", *b"a")] {
+        assert_eq!(engine.approximate_size(&range), Ok(0), "{range:?}");
+    }
+    assert!(engine.approximate_size(&KeyRange::all()).is_ok());
 }

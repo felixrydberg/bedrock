@@ -725,3 +725,43 @@ fn ranges_without_a_reported_size_count_by_hash_span() {
     }
     assert!(assign(&directory, &members, &BTreeSet::new(), R, 16).is_empty());
 }
+
+#[test]
+fn a_hot_range_one_hash_wide_is_not_moved_to_overfill_another_member() {
+    // One hash holds 1000 GiB; the rest of the space holds 1 GiB. Each holder reports what it holds.
+    let mut members = cell(6, 6);
+    let mut directory = Directory::new();
+    let owners = |nodes: &[&str]| {
+        nodes
+            .iter()
+            .map(|n| Owner {
+                node: (*n).into(),
+                state: State::Ready,
+            })
+            .collect::<Vec<_>>()
+    };
+    directory.insert(0, owners(&["n00000", "n00001", "n00002"]));
+    directory.insert(1, owners(&["n00003", "n00004", "n00005"]));
+    for (i, member) in members.values_mut().enumerate() {
+        let (span, bytes) = if i < 3 {
+            ((0, 1), 1000u64 << 30)
+        } else {
+            ((1, 0), 1 << 30)
+        };
+        member.service = "volume".into();
+        member.sizes = vec![pb::RangeSize {
+            span: Some(pb::Span {
+                start: span.0,
+                end: span.1,
+            }),
+            bytes,
+            middle: 0,
+        }];
+    }
+    // Moving the hot hash whole would leave its taker twice over target, and the next plan would move it on.
+    let changes = assign(&directory, &members, &BTreeSet::new(), R, 16);
+    assert!(
+        !changes.contains_key(&0),
+        "the indivisible hot range moved: {changes:?}"
+    );
+}
