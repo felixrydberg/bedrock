@@ -94,8 +94,12 @@ fn compute(n: usize) -> NodeHandle {
 }
 
 fn host(name: &str) -> Arc<Host> {
+    host_in(name, CELLS[0])
+}
+
+fn host_in(name: &str, cell: &str) -> Arc<Host> {
     let holder = pb::Holder {
-        cell: CELLS[0].into(),
+        cell: cell.into(),
         host: name.into(),
     };
     Host::start(Arc::new(Peers::new(&Admin::new())), holder)
@@ -326,6 +330,67 @@ async fn unreserved(
     handle.kill(node.id());
 }
 
+/// A slot still promised to an older epoch can hold that epoch's uncommitted tail at sequences at or past the new
+/// holder's commit point. A read from it would return a write that never committed, so the reader skips it.
+async fn stale_epoch(
+    fingerprint: &Fingerprint,
+    next: &mut usize,
+    engines: &[Arc<SimEngine>],
+    nodes: &[NodeHandle],
+) {
+    let case = *next;
+    *next += 1;
+    let (first, second) = (compute(2 * case), compute(2 * case + 1));
+    let slot_ids: Vec<_> = nodes.iter().map(NodeHandle::id).collect();
+    let cut = |a, b| {
+        NetSim::current().clog_link(a, b);
+        NetSim::current().clog_link(b, a);
+    };
+    let (opened, wait_opened) = oneshot::channel();
+    let (id, ids) = (first.id(), slot_ids.clone());
+    first.spawn(async move {
+        let writer = open(&host("old"), actor(case)).await;
+        // Only slot 2 still hears this holder, so its next entry reaches that slot alone and never commits.
+        for &slot in &ids[..2] {
+            NetSim::current().clog_link(id, slot);
+            NetSim::current().clog_link(slot, id);
+        }
+        let _ = opened.send(writer.epoch());
+        let _ = writer.commit(change("ghost", 1), None, 1).await;
+        std::future::pending::<()>().await;
+    });
+    let old_epoch = wait_opened.await.unwrap();
+    sleep(Duration::from_secs(1)).await;
+    Handle::current().kill(first.id());
+    // The next holder, in slot 2's cell, claims without slot 2.
+    cut(second.id(), slot_ids[2]);
+    let (id, slot) = (second.id(), slot_ids[2]);
+    let (committed, read) = second
+        .spawn(async move {
+            let writer = open(&host_in("new", CELLS[2]), actor(case)).await;
+            // Past every call that was cut, so slot 2 never takes the claim.
+            sleep(Duration::from_secs(3)).await;
+            NetSim::current().unclog_link(id, slot);
+            NetSim::current().unclog_link(slot, id);
+            let read = writer.read(vec![b"ghost".to_vec()]).await.unwrap();
+            (writer.committed(), number(&read[0]))
+        })
+        .await
+        .unwrap();
+    let key = store::claim_key(&store::Actor::new(&actor(case)).unwrap());
+    let bytes = engines[2].get(&key).unwrap().unwrap();
+    let claim = pb::ClaimRecord::decode(bytes.as_slice()).unwrap();
+    let end = claim.end.unwrap_or_default();
+    assert_eq!(claim.epoch, old_epoch, "slot 2 kept the old promise");
+    assert!(
+        end.seq >= committed,
+        "slot 2's old tail reaches the new commit point"
+    );
+    assert_eq!(read, None, "a read returned a write that never committed");
+    fingerprint.mix(("stale epoch", old_epoch, committed, end.seq));
+    Handle::current().kill(second.id());
+}
+
 /// Reads at the commit point while seeded cuts leave the nearest slot behind; the SQLite chunk read and scan follow.
 async fn reads(fingerprint: &Fingerprint, next: &mut usize, nodes: &[NodeHandle]) {
     let case = *next;
@@ -394,6 +459,7 @@ async fn scenario() -> u64 {
     holder_crashes(&fingerprint, &mut next).await;
     cut_off(&fingerprint, &mut next).await;
     reads(&fingerprint, &mut next, &nodes).await;
+    stale_epoch(&fingerprint, &mut next, &engines, &nodes).await;
     unreserved(&fingerprint, &mut next, &engines, &nodes).await;
     for node in &nodes {
         Handle::current().kill(node.id());

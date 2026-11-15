@@ -14,11 +14,9 @@ tonic.workspace = true
 
 [target.'cfg(madsim)'.dev-dependencies]
 bedrock-cdn = { path = "../../crates/cdn" }
-bedrock-compute = { path = "../../crates/compute" }
 bedrock-kv = { path = "../../crates/kv" }
 bedrock-quicksilver = { path = "../../crates/quicksilver" }
 bedrock-relay = { path = "../../crates/relay" }
-bedrock-volume = { path = "../../crates/volume" }
 # The VOPR binary's allocator: about a quarter faster than glibc's, and traces do not depend on it (B-61). Simulation only.
 mimalloc = { version = "0.1.52", default-features = false }
 
@@ -29,6 +27,9 @@ tonic-build = { package = "madsim-tonic-build", version = "0.6" }
 
 [dev-dependencies]
 bedrock-api = { path = "../../crates/api" }
+# Both builds: `tests/volume_client_limits.rs` needs real tonic's message limits.
+bedrock-compute = { path = "../../crates/compute" }
+bedrock-volume = { path = "../../crates/volume" }
 bedrock-lib = { workspace = true, features = ["test-support"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1"] }

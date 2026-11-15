@@ -11,9 +11,10 @@
 //!   window bounded by entries and bytes. Appends carry the commit point; an idle slot learns it within [`HEARTBEAT`].
 //! - **Lease.** [`Host`] heartbeats every volume node it holds actors on once per [`HEARTBEAT`]. A writer stops serving
 //!   for good once fewer than two of its slots acknowledged a heartbeat sent within [`FENCE`], or a slot promised a newer
-//!   epoch. Slots refuse another claim for 5 s after the host's last heartbeat, so the writer stops first.
+//!   epoch. A lease task wakes at that deadline, so a later heartbeat cannot hide a lapse. Slots refuse another claim
+//!   for 5 s after the host's last heartbeat, so the writer stops first.
 //! - **Reads** go to the nearest slot (the holder's cell first) with `min_seq` = the commit point, and to the next slot
-//!   when one is behind. A slot's overlay also holds this writer's own appended but uncommitted entries, so a read may
+//!   when one is behind or not promised to this writer's epoch. A slot's overlay also holds this writer's own appended but uncommitted entries, so a read may
 //!   see this writer's pending writes, never another holder's: a claim truncates an old epoch's tail before a slot takes
 //!   its appends. The actor host (S-07) keeps pending keys in its cache and holds output until their commits, so a
 //!   pending write that is later lost never leaves the host (user decision 2026-11-15).
@@ -36,7 +37,7 @@ use bedrock_lib::volume::{self as pb, Refusal, entry::Kind};
 use prost::Message;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, sleep_until};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
@@ -200,6 +201,11 @@ where
     done
 }
 
+/// The reply exceeded the client's decode limit.
+fn too_large(status: &Status) -> bool {
+    status.code() == Code::OutOfRange
+}
+
 fn refused(answer: &pb::Answer) -> Refusal {
     Refusal::try_from(answer.refused).unwrap_or(Refusal::None)
 }
@@ -324,6 +330,18 @@ impl Host {
                 }
             }
         }
+    }
+
+    /// When fewer than two of `slots` will have acknowledged a heartbeat sent within [`FENCE`], unless another is
+    /// acknowledged first; `None` when fewer than two ever have.
+    fn deadline(&self, slots: &[Slot]) -> Option<Instant> {
+        let nodes = self.lock();
+        let mut acked: Vec<Instant> = slots
+            .iter()
+            .filter_map(|s| nodes.get(&s.address).and_then(|n| n.acked))
+            .collect();
+        acked.sort_unstable_by(|a, b| b.cmp(a));
+        acked.get(1).map(|sent| *sent + FENCE)
     }
 
     /// How many of `slots` acknowledged a heartbeat sent within [`FENCE`].
@@ -589,6 +607,22 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
     }
 }
 
+/// Fences the writer once its lease deadline passes without a heartbeat extending it.
+async fn lease(shared: Arc<Shared>) {
+    loop {
+        let deadline = shared.joined.host.deadline(&shared.joined.slots);
+        match deadline {
+            Some(deadline) if deadline > bedrock_lib::monotonic_now() => {
+                sleep_until(deadline).await
+            }
+            _ => {
+                shared.fence(&mut shared.lock());
+                return;
+            }
+        }
+    }
+}
+
 /// An open actor: the holder's writer over its three slots.
 pub struct Writer {
     shared: Arc<Shared>,
@@ -716,9 +750,10 @@ impl Writer {
 
     /// Starts the slot tasks and waits for the no-op to commit.
     async fn start(shared: Arc<Shared>) -> Result<Self, Error> {
-        let tasks = (0..SLOTS)
+        let mut tasks: Vec<_> = (0..SLOTS)
             .map(|i| tokio::spawn(replicate(shared.clone(), i)))
             .collect();
+        tasks.push(tokio::spawn(lease(shared.clone())));
         let writer = Writer { shared, tasks };
         let noop = writer.shared.lock().noop;
         match tokio::time::timeout(FENCE, writer.wait(|s| (s.commit >= noop).then_some(()))).await {
@@ -831,7 +866,21 @@ impl Writer {
 
     /// `keys` at the commit point or later from the nearest slot caught up with it; a missing key has no value. A value
     /// may come from this writer's own pending commit (see the module docs).
+    ///
+    /// A reply too large to decode is split: each half is read on its own, at the commit point when it is sent.
     pub async fn read(&self, keys: Vec<Vec<u8>>) -> Result<Vec<pb::Value>, Error> {
+        match self.read_once(keys.clone()).await {
+            Err(Error::Rpc(status)) if too_large(&status) && keys.len() > 1 => {
+                let (first, second) = keys.split_at(keys.len() / 2);
+                let mut values = Box::pin(self.read(first.to_vec())).await?;
+                values.extend(Box::pin(self.read(second.to_vec())).await?);
+                Ok(values)
+            }
+            other => other,
+        }
+    }
+
+    async fn read_once(&self, keys: Vec<Vec<u8>>) -> Result<Vec<pb::Value>, Error> {
         let request = pb::ReadRequest {
             actor: Some(self.shared.actor.clone()),
             keys,
@@ -860,7 +909,18 @@ impl Writer {
 
     /// Up to `limit` live keys from `start` in order at the commit point or later, and whether more follow. Like
     /// [`Writer::read`], it may include this writer's own pending commits.
+    /// A reply too large to decode is asked again with half the limit, so it returns fewer keys and `more`.
     pub async fn scan(&self, start: Vec<u8>, limit: u32) -> Result<(Vec<pb::Value>, bool), Error> {
+        let mut limit = limit;
+        loop {
+            match self.scan_once(start.clone(), limit).await {
+                Err(Error::Rpc(status)) if too_large(&status) && limit > 1 => limit /= 2,
+                other => return other,
+            }
+        }
+    }
+
+    async fn scan_once(&self, start: Vec<u8>, limit: u32) -> Result<(Vec<pb::Value>, bool), Error> {
         let request = pb::ScanRequest {
             actor: Some(self.shared.actor.clone()),
             start,
@@ -879,7 +939,8 @@ impl Writer {
         Ok((reply.values, reply.more))
     }
 
-    /// Tries the slots in the holder's cell first, then the rest in slot order, until one is caught up.
+    /// Tries the slots in the holder's cell first, then the rest in slot order, until one promised to this epoch is
+    /// caught up. A slot still promised to an older epoch may hold that epoch's uncommitted tail.
     async fn nearest<T, Fut>(
         &self,
         f: impl Fn(VolumeClient<Channel>) -> Fut,
@@ -898,9 +959,16 @@ impl Writer {
                 return Err(Error::Fenced);
             }
             match call(&shared.joined.host.peers, &shared.joined.slots[i], &f).await {
-                Ok(reply) => match answer(&reply).map(refused) {
-                    Some(Refusal::None) if !self.serving() => return Err(Error::Fenced),
-                    Some(Refusal::None) => return Ok(reply),
+                Ok(reply) => match answer(&reply).map(|a| (refused(a), slot_of(a).epoch)) {
+                    Some((Refusal::None, epoch)) if epoch == shared.epoch => {
+                        if !self.serving() {
+                            return Err(Error::Fenced);
+                        }
+                        return Ok(reply);
+                    }
+                    Some((Refusal::None, epoch)) => {
+                        last = format!("slot {i} is promised to epoch {epoch}");
+                    }
                     refusal => last = format!("slot {i} refused: {refusal:?}"),
                 },
                 Err(status)
@@ -999,10 +1067,12 @@ async fn recover(
         kind: Kind::Noop as i32,
         ..Default::default()
     };
+    // Everything through the flushed point is committed.
     let mut state = State {
         log: log.into(),
         base,
         base_epoch,
+        commit: base,
         noop: noop.seq,
         pending: noop.encoded_len(),
         next: [noop.seq; SLOTS],

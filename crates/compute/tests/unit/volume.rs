@@ -169,3 +169,41 @@ fn a_join_guard_leaves_the_heartbeat_set_when_dropped() {
         assert!(host.lock().is_empty());
     });
 }
+
+#[test]
+fn the_lease_deadline_follows_the_second_newest_acknowledged_heartbeat() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let peers = Arc::new(bedrock_lib::transport::Peers::new(
+            &bedrock_lib::admin::Admin::new(),
+        ));
+        let host = Host::start(peers, pb::Holder::default());
+        let slot = |i: usize| Slot {
+            cell: format!("c{i}"),
+            address: format!("10.0.0.{i}:7000"),
+            identity: tls::Identity {
+                service: "volume".into(),
+                cell: format!("c{i}"),
+                node_id: format!("v{i}"),
+                host: format!("10.0.0.{i}"),
+            },
+        };
+        let slots = [slot(0), slot(1), slot(2)];
+        let _joined = host.join(&slots);
+        assert_eq!(host.deadline(&slots), None, "no acknowledgement yet");
+        let now = bedrock_lib::monotonic_now();
+        let sent = [
+            now,
+            now + Duration::from_secs(1),
+            now + Duration::from_secs(2),
+        ];
+        for (slot, sent) in slots.iter().zip(sent) {
+            host.lock().get_mut(&slot.address).unwrap().acked = Some(sent);
+        }
+        // Two slots must have acknowledged within FENCE: the lease ends FENCE after the second newest.
+        assert_eq!(host.deadline(&slots), Some(sent[1] + FENCE));
+    });
+}
