@@ -86,7 +86,31 @@ finishing.
 - **Slots learn a version from claims and appends.** Reading it from the topology record earlier only adds refusals,
   which a lost message already covers, so the model leaves that out.
 - **Log truncation after a flush** is not modeled; slots keep their whole log. Alarms, reads and the overlay are out
-  of scope.
+  of scope. The next section says what the code needs so that this abstraction stays sound.
+
+## Truncation and `Slot.flushed_epoch` (#112 / S-04)
+
+The model's `Replicate` sends a slot the holder's whole log (`hlog`), so the holder always knows the epoch of the
+entry before anything it sends. That is how a slot's log is checked against the holder's at the append point, and
+how a slot holding an old epoch's tail gets it truncated. In the code, a slot answers `Log` only with entries after
+its flushed point (S-05 truncates the rest once S3 holds it). A holder that recovers from such a slot therefore lacks
+the entry at the flushed point, and without its epoch it cannot send a lagging slot the entry after it.
+
+`Slot.flushed_epoch` (`crates/lib/proto/volume.proto`, field 10) closes that gap. Every slot answer carries the epoch
+of the entry at its flushed point, from `ClaimRecord.flushed_epoch`. The claimant's recovery reads it with the first
+`Log` page and uses it as the epoch before its first recovered entry (`recover` in
+`crates/compute/src/actors/volume.rs`). The field adds no step and no state the model lacks. It only lets the code
+keep the model's assumption after truncation, so the specification and its checks are unchanged. Two facts make it
+safe:
+
+- An entry at a slot's flushed point is committed, because S3 holds only committed entries (`S3Committed`). Its epoch
+  is the same on every slot that holds it.
+- A slot without that entry still refuses the append with `LOG_GAP`, as in the model. The holder then stops sending
+  to it until S-06 repairs it.
+
+The `flushed_point` scenario in `tests/sim/tests/volume_client.rs` checks this. Two slots are truncated, and a third
+whose log ends exactly at the flushed point catches up through the next holder. Without the field, it is stuck.
+Modeling truncation itself (a `Truncate` action and recovery from the S3 prefix) belongs with S-05.
 
 ## Resolved: slot repair after a disk wipe (S-02b / #131)
 

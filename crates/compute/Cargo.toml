@@ -1,0 +1,15 @@
+[package]
+name = "bedrock-compute"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Compute hosts' side of stateful actors: the volume client (#112 / S-04); the actor host follows in S-07."
+
+[dependencies]
+bedrock-lib.workspace = true
+prost.workspace = true
+tokio.workspace = true
+tonic.workspace = true
+
+[lints]
+workspace = true
