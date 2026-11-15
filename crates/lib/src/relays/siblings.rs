@@ -286,9 +286,10 @@ impl pb::siblings_server::Siblings for Server {
                     synced = true;
                 }
                 tokio::select! {
-                    _ = version.wait_until(|v| *v != at) => {},
-                    _ = readiness.tick() => {},
+                    biased;
                     _ = tick.tick() => if !send(pb::SiblingUpdate::default()).await { return },
+                    _ = readiness.tick() => {},
+                    _ = version.wait_until(|v| *v != at) => {},
                 }
             }
         });

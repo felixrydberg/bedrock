@@ -287,6 +287,7 @@ fn spawn_member(
                 let namespace = membership::namespace(service, cell);
                 loop {
                     tokio::select! {
+                        biased;
                         () = state.drain.notified() => break,
                         () = sleep(Duration::from_millis(100)) => {
                             if let Some(revision) = session.applied(membership::DATASET, &namespace) {

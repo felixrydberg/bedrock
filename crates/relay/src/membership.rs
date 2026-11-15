@@ -392,6 +392,7 @@ impl Cell {
             let (members_at, siblings_at) = (version.get(), self.siblings.version());
             if !std::mem::take(&mut again) {
                 tokio::select! {
+                    biased;
                     _ = version.wait_until(|v| *v != members_at) => {},
                     _ = self.siblings.changed(siblings_at) => {},
                     _ = tokio::time::sleep(RECONCILE) => {},

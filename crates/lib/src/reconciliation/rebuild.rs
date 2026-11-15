@@ -98,6 +98,7 @@ impl Reconcile for Rebuild {
             return Err(failed("is not rebuilding"));
         }
         let outcome = tokio::select! {
+            biased;
             outcome = self.sources[source].restore() => outcome,
             // A new failure quarantines the source, which then refuses the installs a resubscribe waits for, so waiting
             // on could only end at the repair timeout. Start again instead.

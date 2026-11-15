@@ -400,6 +400,7 @@ pub async fn shutdown_signal() {
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
         tokio::select! {
+            biased;
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}
         }

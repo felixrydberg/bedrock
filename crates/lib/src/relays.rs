@@ -1835,7 +1835,7 @@ impl Hub {
                                     if acked >= through {
                                         return Ok(());
                                     }
-                                    tokio::select!{
+                                    tokio::select!{biased;
                                         _=tokio::time::sleep(Duration::from_millis(10))=>{},
                                         _=progress.tick()=>tx.send(pb::RelayRequest{kind:Some(pb::relay_request::Kind::Progress(true))}).await.map_err(|_|Status::unavailable("recovery requests closed"))?,
                                     }
@@ -1879,7 +1879,7 @@ impl Hub {
                                         if acked >= boundary {
                                             break;
                                         }
-                                        tokio::select!{
+                                        tokio::select!{biased;
                                             _=tokio::time::sleep(Duration::from_millis(10))=>{},
                                             _=progress.tick()=>tx.send(pb::RelayRequest{kind:Some(pb::relay_request::Kind::Progress(true))}).await.map_err(|_|Status::unavailable("recovery requests closed"))?,
                                         }
