@@ -18,7 +18,7 @@ use bedrock_lib::volume as pb;
 use tokio::time::Instant;
 use tonic::Status;
 
-use super::{Placement, database};
+use super::Placement;
 
 /// The topology record is static config; a node rereads it this often.
 const TOPOLOGY_TTL: Duration = Duration::from_secs(10 * 60);
@@ -170,16 +170,7 @@ impl Placement for Cells {
         Ok(done)
     }
 
-    async fn database_of(&self, actor: &pb::Actor) -> Result<String, Status> {
-        let hash = hash(actor)?;
-        let first = self.slots(actor).await?[0].clone();
-        let table = self.routes(&first).await?;
-        let directory = table.directories.get(VOLUME).cloned().unwrap_or_default();
-        let start = placement::start_of(&directory, hash);
-        Ok(database(
-            &first,
-            start,
-            placement::end_of(&directory, start),
-        ))
+    async fn first_cell(&self, actor: &pb::Actor) -> Result<String, Status> {
+        Ok(self.slots(actor).await?[0].clone())
     }
 }

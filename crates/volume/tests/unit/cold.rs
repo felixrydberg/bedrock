@@ -23,9 +23,10 @@ fn actor(i: usize) -> pb::Actor {
     }
 }
 
-/// Every actor's first slot is here; truncations other slots owe are recorded.
+/// Every actor's first slot is in `cell`, this node's; truncations other slots owe are recorded.
 #[derive(Default)]
 struct Here {
+    cell: String,
     truncated: Mutex<Vec<(String, u64)>>,
 }
 
@@ -43,9 +44,21 @@ impl Placement for Here {
         Ok(true)
     }
 
-    async fn database_of(&self, _: &pb::Actor) -> Result<String, Status> {
-        Ok(database("cell-1", 0, 0))
+    async fn first_cell(&self, _: &pb::Actor) -> Result<String, Status> {
+        Ok(self.cell.clone())
     }
+}
+
+/// The first database of a cell's first range.
+fn first_db() -> String {
+    database(
+        "cell-1",
+        &Generation {
+            start: 0,
+            end: 0,
+            generation: 0,
+        },
+    )
 }
 
 struct Node {
@@ -56,21 +69,21 @@ struct Node {
 }
 
 fn node(bucket: &Memory, name: &str, max_unflushed: u64) -> Node {
+    node_in(bucket, "cell-1", name, max_unflushed)
+}
+
+fn node_in(bucket: &Memory, cell: &str, name: &str, max_unflushed: u64) -> Node {
     let store = Arc::new(
         Store::new(Arc::new(MemoryEngine::new("volume"))).with_max_unflushed(max_unflushed),
     );
-    let here = Arc::new(Here::default());
+    let here = Arc::new(Here {
+        cell: cell.into(),
+        ..Here::default()
+    });
     let admin = Admin::new();
     let databases: Arc<dyn Databases> = Arc::new(bucket.clone());
     let readers = Readers::new(databases.clone(), 4, &Metrics::new(&admin));
-    let cold = Cold::new(
-        store.clone(),
-        databases,
-        here.clone(),
-        readers,
-        "cell-1",
-        name,
-    );
+    let cold = Cold::new(store.clone(), databases, here.clone(), readers, cell, name);
     let directory = BTreeMap::from([(
         0,
         vec![Owner {
@@ -147,7 +160,7 @@ fn flushed(store: &Store, i: usize) -> u64 {
 fn stored(bucket: &Memory, i: usize, key: &str) -> Option<Vec<u8>> {
     let name = Actor::new(&actor(i)).unwrap().name().to_vec();
     bucket
-        .contents(&database("cell-1", 0, 0))
+        .contents(&first_db())
         .get(&data_key(&name, key.as_bytes()))
         .cloned()
 }
@@ -155,7 +168,7 @@ fn stored(bucket: &Memory, i: usize, key: &str) -> Option<Vec<u8>> {
 fn meta_of(bucket: &Memory, i: usize) -> Option<Meta> {
     let name = Actor::new(&actor(i)).unwrap().name().to_vec();
     bucket
-        .contents(&database("cell-1", 0, 0))
+        .contents(&first_db())
         .get(&meta_key(&name))
         .and_then(|bytes| Meta::decode(bytes))
 }
@@ -245,7 +258,7 @@ async fn a_crash_between_flush_and_truncation_applies_nothing_twice() {
         0,
         "no truncation without a durable answer"
     );
-    let before = bucket.contents(&database("cell-1", 0, 0));
+    let before = bucket.contents(&first_db());
     // A restarted maintainer knows only what S3 holds.
     let restarted = Cold::new(
         n.store.clone(),
@@ -259,10 +272,10 @@ async fn a_crash_between_flush_and_truncation_applies_nothing_twice() {
     assert_eq!(flushed(&n.store, 0), 1);
     // Its meta already holds the entry, so the slot only truncates: nothing is written again.
     assert_eq!(bucket.commits(), 1);
-    assert_eq!(bucket.contents(&database("cell-1", 0, 0)), before);
+    assert_eq!(bucket.contents(&first_db()), before);
     // The entry is gone from the log, so nothing applies it again.
     restarted.tick(&n.directory).await;
-    assert_eq!(bucket.contents(&database("cell-1", 0, 0)), before);
+    assert_eq!(bucket.contents(&first_db()), before);
     assert_eq!(bucket.commits(), 1);
 }
 
@@ -444,6 +457,191 @@ async fn only_the_maintainer_flushes() {
 }
 
 /// Against real SlateDB over an in-memory bucket that counts requests.
+fn generation(start: u64, end: u64, generation: u64) -> Generation {
+    Generation {
+        start,
+        end,
+        generation,
+    }
+}
+
+fn create(plan: Plan) -> (Catalog, Generation, Vec<(Generation, u64, u64)>) {
+    match plan {
+        Plan::Create {
+            catalog,
+            db,
+            sources,
+        } => (catalog, db, sources),
+        Plan::Open(db) => panic!("expected a new database, got {db:?}"),
+    }
+}
+
+/// A span opens its own database, or clones one from the databases serving it: a split leaves the other half reading
+/// the old one, a merge takes every part, and a retired database is cloned onto itself.
+#[test]
+fn plans_open_split_merge_and_takeover() {
+    let middle = 1 << 63;
+    let (one, db, sources) = create(plan(&Catalog::default(), 0, 0, false));
+    assert_eq!((db, sources), (generation(0, 0, 0), Vec::new()));
+    assert_eq!(plan(&one, 0, 0, false), Plan::Open(db));
+    assert_eq!(Catalog::decode(&one.encode()), Some(one.clone()));
+
+    let (split, db, sources) = create(plan(&one, 0, middle, false));
+    assert_eq!(db, generation(0, middle, 1));
+    assert_eq!(sources, vec![(generation(0, 0, 0), 0, middle)]);
+    assert_eq!(
+        split.spans,
+        BTreeMap::from([
+            (0, (middle, generation(0, middle, 1))),
+            (middle, (0, generation(0, 0, 0))),
+        ])
+    );
+    assert_eq!(Catalog::decode(&split.encode()), Some(split.clone()));
+    // The upper half reads the old database until it clones its own.
+    let (halves, _, sources) = create(plan(&split, middle, 0, false));
+    assert_eq!(sources, vec![(generation(0, 0, 0), middle, 0)]);
+
+    let (merged, db, sources) = create(plan(&halves, 0, 0, false));
+    assert_eq!(db, generation(0, 0, 3));
+    assert_eq!(
+        sources,
+        vec![
+            (generation(0, middle, 1), 0, middle),
+            (generation(middle, 0, 2), middle, 0),
+        ]
+    );
+    assert_eq!(merged.spans, BTreeMap::from([(0, (0, db))]));
+
+    let (_, db, sources) = create(plan(&merged, 0, 0, true));
+    assert_eq!(
+        (db, sources),
+        (generation(0, 0, 4), vec![(generation(0, 0, 3), 0, 0)])
+    );
+}
+
+/// Retries a cold read once: the first read after a split may go to the database a cached catalog named, which is
+/// behind; it fails, and the retry reads the new catalog.
+async fn read(cold: &Cold, i: usize, flushed: u64) -> Option<Vec<u8>> {
+    let keys = [b"k".to_vec()];
+    let got = match cold.get("cell-1", &actor(i), flushed, &keys).await {
+        Ok(got) => got,
+        Err(_) => cold.get("cell-1", &actor(i), flushed, &keys).await.unwrap(),
+    };
+    got.into_iter().next().unwrap()
+}
+
+/// The acceptance check: a split and a merge by clone leave every actor readable at its flushed sequence, through the
+/// maintainer and through another node's readers, and later flushes land in the clones.
+#[tokio::test(start_paused = true)]
+async fn a_split_or_merge_by_clone_leaves_every_actor_readable() {
+    let bucket = Memory::default();
+    let mut n = node(&bucket, "n1", u64::MAX);
+    let reader = node(&bucket, "n2", u64::MAX);
+    let actors = 8;
+    let whole = n.directory.clone();
+    let middle = Actor::new(&actor(actors / 2)).unwrap().hash();
+    let mut split = whole.clone();
+    split.insert(middle, whole[&0].clone());
+    for i in 0..actors {
+        claim(&n.store, i);
+    }
+    for (round, directory) in [whole.clone(), split, whole].into_iter().enumerate() {
+        n.directory = directory;
+        let seq = round as u64;
+        for i in 0..actors {
+            let value = format!("{i}-{round}");
+            let entries = vec![entry(seq + 1, &[("k", Some(&value))])];
+            append(&n.store, i, seq, entries, seq + 1).unwrap();
+        }
+        n.cold.tick(&n.directory).await;
+        for i in 0..actors {
+            assert_eq!(flushed(&n.store, i), seq + 1);
+            let value = Some(format!("{i}-{round}").into_bytes());
+            assert_eq!(read(&n.cold, i, seq + 1).await, value, "round {round}");
+            assert_eq!(read(&reader.cold, i, seq + 1).await, value, "round {round}");
+        }
+    }
+    // Clones copy no data: each flush is one commit per range, plus one retire mark per source.
+    assert_eq!(bucket.commits(), 1 + (2 + 2) + (2 + 1));
+}
+
+/// A maintainer that has not seen a split yet cannot lose a flush: the clone fenced and retired its database, so its
+/// flush fails and its slot keeps the entry until a database that every read finds holds it.
+#[tokio::test(start_paused = true)]
+async fn a_late_flush_by_the_old_maintainer_is_fenced_not_lost() {
+    let bucket = Memory::default();
+    let old = node(&bucket, "n1", u64::MAX);
+    let mut new = node(&bucket, "n2", u64::MAX);
+    let middle = Actor::new(&actor(4)).unwrap().hash();
+    new.directory.insert(middle, new.directory[&0].clone());
+    for n in [&old, &new] {
+        claim(&n.store, 0);
+        append(&n.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    }
+    old.cold.tick(&old.directory).await;
+    append(&old.store, 0, 1, vec![entry(2, &[("k", Some("2"))])], 2).unwrap();
+    new.cold.tick(&new.directory).await;
+    old.cold.tick(&old.directory).await;
+    assert_eq!(flushed(&old.store, 0), 1, "the late flush failed");
+    // Restarted with the same stale directory, it does not write the retired database: it merges the halves into a
+    // new one, which holds the entry.
+    let restarted = Cold::new(
+        old.store.clone(),
+        Arc::new(bucket.clone()),
+        old.here.clone(),
+        Readers::new(Arc::new(bucket.clone()), 4, &Metrics::new(&Admin::new())),
+        "cell-1",
+        "n1",
+    );
+    restarted.tick(&old.directory).await;
+    assert_eq!(flushed(&old.store, 0), 2);
+    let reader = node(&bucket, "n3", u64::MAX);
+    assert_eq!(read(&reader.cold, 0, 2).await, Some(b"2".to_vec()));
+}
+
+/// When an actor's first slot moves to another cell, that cell's maintainer copies the actor's keys from the database
+/// that held it, under its pending changes, and its slot then truncates as usual.
+#[tokio::test(start_paused = true)]
+async fn a_first_slot_move_copies_the_actor_into_the_new_cell() {
+    let bucket = Memory::default();
+    let before = node_in(&bucket, "cell-1", "n1", u64::MAX);
+    let after = node_in(&bucket, "cell-2", "n2", u64::MAX);
+    let first = [("k", Some("1")), ("x", Some("1")), ("y", Some("1"))];
+    for n in [&before, &after] {
+        claim(&n.store, 0);
+        append(&n.store, 0, 0, vec![entry(1, &first)], 1).unwrap();
+    }
+    before.cold.tick(&before.directory).await;
+    // The other slots truncate when the maintainer asks.
+    let actor0 = Actor::new(&actor(0)).unwrap();
+    after.store.truncate(&actor0, 1).unwrap();
+    // The topology changes: the first slot is now in cell-2, whose database does not hold the actor.
+    for n in [&before, &after] {
+        append(
+            &n.store,
+            0,
+            1,
+            vec![entry(2, &[("k", Some("2")), ("x", None)])],
+            2,
+        )
+        .unwrap();
+    }
+    after.cold.tick(&after.directory).await;
+    assert_eq!(flushed(&after.store, 0), 2);
+    let cell2 = bucket.contents(&database("cell-2", &generation(0, 0, 0)));
+    let name = actor0.name();
+    assert_eq!(cell2.get(&data_key(name, b"k")), Some(&b"2".to_vec()));
+    assert_eq!(cell2.get(&data_key(name, b"x")), None);
+    assert_eq!(cell2.get(&data_key(name, b"y")), Some(&b"1".to_vec()));
+    assert_eq!(Meta::decode(&cell2[&meta_key(name)]).unwrap().seq, 2);
+    let got = after
+        .cold
+        .get("cell-2", &actor(0), 2, &[b"y".to_vec()])
+        .await
+        .unwrap();
+    assert_eq!(got, vec![Some(b"1".to_vec())]);
+}
+
 #[cfg(not(madsim))]
 mod slate {
     use std::fmt;
@@ -595,6 +793,33 @@ mod slate {
         std::array::from_fn(|k| after[k] - before[k])
     }
 
+    /// On SlateDB, a split and a merge by clone copy no object and keep every actor readable at its flushed sequence,
+    /// through the maintainer and through another node's readers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_split_and_merge_by_clone_on_slatedb_keep_every_actor_readable() {
+        let store = Arc::new(Counting::default());
+        let mut n = slate_node(&store, "n1");
+        let actors = 4;
+        let whole = n.directory.clone();
+        let mut split = whole.clone();
+        split.insert(
+            Actor::new(&actor(actors / 2)).unwrap().hash(),
+            whole[&0].clone(),
+        );
+        for (step, directory) in [whole.clone(), split, whole].into_iter().enumerate() {
+            n.directory = directory;
+            let seq = step as u64;
+            round(&n, &store, actors, seq).await;
+            let reader = slate_node(&store, "n2");
+            for i in 0..actors {
+                let want = Some(format!("{i}-{seq}").into_bytes());
+                assert_eq!(read(&n.cold, i, seq + 1).await, want, "step {step}");
+                assert_eq!(read(&reader.cold, i, seq + 1).await, want, "step {step}");
+            }
+        }
+        assert_eq!(store.requests()[3], 0, "a clone copies no object");
+    }
+
     /// The acceptance check: S3 requests per flush do not grow with the actors in a range. One flush is one L0 file
     /// and one manifest update; measuring sizes reads the manifest the writer holds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -633,7 +858,7 @@ mod slate {
         println!("requests as [puts, gets, lists, copies, deletes]");
         let store = Arc::new(Counting::default());
         let databases = Slate::new(store.clone(), None);
-        let name = database("cell-1", 0, 0);
+        let name = first_db();
         let before = store.requests();
         let writer = databases.open(&name).await.unwrap();
         println!(
@@ -727,7 +952,7 @@ mod slate {
         assert_eq!(moved[3], before[3], "a handoff copies no S3 data");
 
         let databases = Slate::new(store.clone(), None);
-        let name = database("cell-1", 0, 0);
+        let name = first_db();
         let reader = databases.open_reader(&name).await.unwrap().unwrap();
         let key = |i: usize| data_key(Actor::new(&actor(i)).unwrap().name(), b"k");
         assert_eq!(reader.get(&key(1)).await.unwrap(), Some(b"1-0".to_vec()));

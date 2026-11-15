@@ -1,7 +1,8 @@
 //! #113 / S-05: the cold tier under seeded faults. A holder commits to an actor's three slots while the range maintainer
 //! flushes to the simulated bucket; S3 commits fail, some after they became durable (a lost answer), and the maintainer
-//! restarts. S3 never holds more than the announced commit point, every slot reads the committed state through its
-//! overlay and the range database, and a seed replays the same trace.
+//! restarts. The range splits and merges by clone while a second maintainer, which never sees the directory change,
+//! races the first. S3 never holds more than the announced commit point, every slot reads the committed state through
+//! its overlay and the range database, and a seed replays the same trace.
 //!
 //! The slots are in-process stores: the slot protocol over the network is `volume.rs`'s; this checks flush, truncation
 //! and cold reads.
@@ -19,7 +20,7 @@ use bedrock_lib::placement::{Directory, Owner, State};
 use bedrock_lib::storage::memory::MemoryEngine;
 use bedrock_lib::storage::sim::Fingerprint;
 use bedrock_lib::volume::{self as pb, Refusal};
-use bedrock_volume::cold::db::Memory;
+use bedrock_volume::cold::db::{Databases, Memory, database};
 use bedrock_volume::cold::readers::Readers;
 use bedrock_volume::cold::{self, Cold, Meta, Placement};
 use bedrock_volume::store::{Actor, Store};
@@ -37,10 +38,6 @@ fn actor() -> pb::Actor {
         id: format!("eu_{}a", "c".repeat(25)),
         kind: 0,
     }
-}
-
-fn name() -> String {
-    cold::database("cell-1", 0, 0)
 }
 
 /// The actor's first slot is here (slot 0); the others truncate in process, refusing while behind.
@@ -74,12 +71,12 @@ impl Placement for Slots {
         })
     }
 
-    fn database_of<'a, 'b, 'c>(&'a self, _: &'b pb::Actor) -> Answer<'c, String>
+    fn first_cell<'a, 'b, 'c>(&'a self, _: &'b pb::Actor) -> Answer<'c, String>
     where
         'a: 'c,
         'b: 'c,
     {
-        Box::pin(async { Ok(name()) })
+        Box::pin(async { Ok("cell-1".into()) })
     }
 }
 
@@ -149,16 +146,38 @@ fn state(log: &[pb::Entry], seq: u64) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
     keys
 }
 
-fn stored_meta(bucket: &Memory) -> u64 {
+/// The actor's flushed sequence in the database the catalog names for it.
+async fn stored_meta(bucket: &Memory) -> u64 {
     let actor = Actor::new(&actor()).unwrap();
+    let (catalog, _) = bucket.catalog("cell-1").await.unwrap();
+    let Some((_, (_, db))) = catalog.spans.range(..=actor.hash()).next_back() else {
+        return 0;
+    };
     bucket
-        .contents(&name())
+        .contents(&database("cell-1", db))
         .get(&cold::meta_key(actor.name()))
         .and_then(|bytes| Meta::decode(bytes))
         .map_or(0, |meta| meta.seq)
 }
 
-async fn scenario() -> u64 {
+/// Every database of the bucket holds at most `committed` for the actor: no clone or stale maintainer wrote past it.
+fn assert_committed_only(bucket: &Memory, committed: u64) {
+    let actor = Actor::new(&actor()).unwrap();
+    for name in bucket.names() {
+        let seq = bucket
+            .contents(&name)
+            .get(&cold::meta_key(actor.name()))
+            .and_then(|bytes| Meta::decode(bytes))
+            .map_or(0, |meta| meta.seq);
+        assert!(
+            seq <= committed,
+            "{name} holds sequence {seq}, past the commit point"
+        );
+    }
+}
+
+/// The trace and how many range databases the cell created: more than one means clones ran.
+async fn scenario() -> (u64, u64) {
     let fingerprint = Fingerprint::new();
     let bucket = Memory::shared();
     let stores: [Arc<Store>; 3] = std::array::from_fn(|_| {
@@ -173,13 +192,22 @@ async fn scenario() -> u64 {
         };
         store.claim(&claim, &holder, 1, 0, |_| true).unwrap();
     }
-    let directory: Directory = BTreeMap::from([(
+    let whole: Directory = BTreeMap::from([(
         0,
         vec![Owner {
             node: "volume-0".into(),
             state: State::Ready,
         }],
     )]);
+    // The split puts the actor in the lower or the upper half, by seed.
+    let at = if thread_rng().gen_bool(0.5) {
+        claim.hash()
+    } else {
+        claim.hash().saturating_add(1)
+    };
+    let mut split = whole.clone();
+    split.insert(at, whole[&0].clone());
+    let directory = Arc::new(Mutex::new(whole.clone()));
     let cold = Arc::new(Mutex::new(Arc::new(maintainer(&stores, &bucket))));
     let committed = Arc::new(Mutex::new(0u64));
 
@@ -196,13 +224,28 @@ async fn scenario() -> u64 {
             loop {
                 sleep(Duration::from_millis(thread_rng().gen_range(200..1500))).await;
                 let current = cold.lock().unwrap().clone();
-                current.tick(&directory).await;
-                let meta = stored_meta(&bucket);
-                assert!(
-                    meta <= *committed.lock().unwrap(),
-                    "S3 holds sequence {meta}, past the commit point"
-                );
+                let seen = directory.lock().unwrap().clone();
+                current.tick(&seen).await;
+                assert_committed_only(&bucket, *committed.lock().unwrap());
+                let meta = stored_meta(&bucket).await;
                 fingerprint.mix(("flush", meta, bucket.commits()));
+            }
+        })
+    };
+    // A maintainer that never sees the split: it merges the range back whenever it flushes, racing the first.
+    let stale = {
+        let (stores, bucket, committed, whole) = (
+            stores.clone(),
+            bucket.clone(),
+            committed.clone(),
+            whole.clone(),
+        );
+        tokio::spawn(async move {
+            let stale = maintainer(&stores, &bucket);
+            loop {
+                sleep(Duration::from_millis(thread_rng().gen_range(1000..4000))).await;
+                stale.tick(&whole).await;
+                assert_committed_only(&bucket, *committed.lock().unwrap());
             }
         })
     };
@@ -216,6 +259,14 @@ async fn scenario() -> u64 {
         match thread_rng().gen_range(0..10) {
             0 => bucket.fail(thread_rng().gen_range(1..4), thread_rng().gen_bool(0.5)),
             1 => *cold.lock().unwrap() = Arc::new(maintainer(&stores, &bucket)),
+            2 => {
+                let mut current = directory.lock().unwrap();
+                *current = if current.len() == 1 {
+                    split.clone()
+                } else {
+                    whole.clone()
+                };
+            }
             _ => {}
         }
         // A new entry once the last one committed; until then the holder resends it, as its window would.
@@ -246,6 +297,7 @@ async fn scenario() -> u64 {
         sleep(Duration::from_millis(thread_rng().gen_range(10..300))).await;
     }
 
+    stale.abort();
     // Heal: S3 answers again and every slot catches up. Two no-ops: all three slots take the first, and the second
     // announces its commit, so every slot may truncate through it.
     bucket.fail(0, false);
@@ -270,9 +322,10 @@ async fn scenario() -> u64 {
         holder.commit = seq;
         *committed.lock().unwrap() = seq;
     }
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(10)).await;
     flushing.abort();
     let current = cold.lock().unwrap().clone();
+    let directory = directory.lock().unwrap().clone();
     for _ in 0..3 {
         current.tick(&directory).await;
     }
@@ -280,7 +333,7 @@ async fn scenario() -> u64 {
     let commit = holder.commit - 1;
     // Backpressure may hold the holder back through an outage, but some entries commit.
     assert!(commit > 2, "the scenario committed entries");
-    assert_eq!(stored_meta(&bucket), commit);
+    assert_eq!(stored_meta(&bucket).await, commit);
     let expected = state(&holder.log, commit);
     let keys: Vec<Vec<u8>> = (0..KEYS).map(|k| format!("k{k}").into_bytes()).collect();
     for (i, store) in stores.iter().enumerate() {
@@ -302,12 +355,13 @@ async fn scenario() -> u64 {
         let end = slot.end.unwrap_or_default().seq;
         assert_eq!(end, commit + 1, "slot {i} keeps only the unannounced no-op");
     }
-    fingerprint.mix(("end", commit, bucket.commits()));
-    fingerprint.value()
+    let created = bucket.catalog("cell-1").await.unwrap().0.next;
+    fingerprint.mix(("end", commit, bucket.commits(), created));
+    (fingerprint.value(), created)
 }
 
 #[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
-fn run(seed: u64) -> u64 {
+fn run(seed: u64) -> (u64, u64) {
     std::thread::spawn(move || {
         Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(scenario())
     })
@@ -322,12 +376,16 @@ fn run(seed: u64) -> u64 {
 
 #[test]
 fn flushes_under_s3_faults_hold_only_committed_state_and_seeds_replay() {
-    let traces: Vec<u64> = (1..=8).map(run).collect();
+    let traces: Vec<(u64, u64)> = (1..=8).map(run).collect();
     for (seed, trace) in (1..=8).zip(&traces) {
         assert_eq!(run(seed), *trace, "seed {seed} did not replay its trace");
     }
     assert!(
         traces.windows(2).any(|w| w[0] != w[1]),
         "seeds should differ"
+    );
+    assert!(
+        traces.iter().any(|(_, created)| *created > 3),
+        "some seeds split, merge and race clones: {traces:?}"
     );
 }

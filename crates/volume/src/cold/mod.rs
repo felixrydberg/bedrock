@@ -6,9 +6,18 @@
 //! actor's keys up to its commit point in one batch with each actor's `meta`. Once that batch is durable, the actor's
 //! slots truncate their log and overlay through it. Other slots read the database through [`readers`].
 //!
-//! Range database keys are `d/{actor}{key}` for values and `m/{actor}` for the actor's [`Meta`], where `{actor}` is
-//! `{hash}{namespace}\0{id}\0` as on the slots. Meta keys sit together, so a writer loads every actor's flushed point
-//! with one scan when it opens and never reads meta again.
+//! Range database keys are `{actor}d{key}` for values and `{actor}m` for the actor's [`Meta`], where `{actor}` is
+//! `{hash}{namespace}\0{id}\0` as on the slots. Keys start with the hash, so a hash span is one key range, which a
+//! clone can take (SlateDB takes one range per source). A writer reads an actor's meta the first time it flushes it and
+//! keeps it.
+//!
+//! - **Split and merge.** The cell's [`db::Catalog`] names the database serving each span. A maintainer whose range has
+//!   no database of its own fences and retires each database serving part of it, clones a new one from them, and
+//!   commits it by replacing the catalog conditionally. A retired database is never written again, so the clone holds
+//!   everything flushed to it; of concurrent clones only the one that replaced the catalog is ever used.
+//! - **First-slot moves.** When a topology change moves an actor's first slot to this cell, the actor's slot is flushed
+//!   beyond what this cell's database holds. The maintainer then copies the actor's keys from the cell database that
+//!   holds it at the slot's flushed point or later, in the same batch as its pending changes.
 //!
 //! - **Exactly once.** An actor is written only beyond the sequence its `meta` holds, and the batch carries the keys as
 //!   of its commit point, rebuilt from the log. A crash between a flush and its truncation flushes the same keys again
@@ -27,13 +36,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bedrock_lib::placement::{Directory, State};
 use bedrock_lib::storage::namespace::Changes;
-use bedrock_lib::storage::{KeyRange, StorageError};
+use bedrock_lib::storage::{Entry, KeyRange, StorageError};
 use bedrock_lib::volume as pb;
 use tokio::time::Instant;
 use tonic::Status;
 
 use crate::store::{Actor, Error, Pending, Store};
-use db::{Database, Databases, Writer};
+use db::{Catalog, Database, Databases, Generation, RETIRED, Writer, database};
 use readers::Readers;
 
 /// How often a range flushes.
@@ -44,6 +53,10 @@ pub const FLUSH_BYTES: u64 = 4 << 20;
 pub const FENCED_WAIT: Duration = Duration::from_secs(5);
 /// How long a cold read waits for its reader to see the slot's flushed point.
 pub const BEHIND_WAIT: Duration = Duration::from_secs(2);
+/// How often one open tries again after a concurrent catalog change.
+const OPEN_ATTEMPTS: usize = 3;
+/// How often a first-slot move rereads a source whose actor changed during the copy.
+const COPY_ATTEMPTS: usize = 3;
 
 /// What a range database holds for an actor besides its keys: the sequence they are at, its epoch, and the alarm.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,16 +91,85 @@ impl Meta {
 }
 
 pub fn data_key(actor: &[u8], key: &[u8]) -> Vec<u8> {
-    [b"d/", actor, key].concat()
+    [actor, b"d", key].concat()
 }
 
 pub fn meta_key(actor: &[u8]) -> Vec<u8> {
-    [b"m/", actor].concat()
+    [actor, b"m"].concat()
 }
 
-/// The range database of `cell`'s range `[start, end)`. Split and merge (S-05 part 2) clone into a higher generation.
-pub fn database(cell: &str, start: u64, end: u64) -> String {
-    format!("{cell}/{start:016x}-{end:016x}/0")
+/// What opening the database of span `[start, end)` takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Plan {
+    /// The span has its own database.
+    Open(Generation),
+    /// A new database `db`, cloned from `sources` (each a database and the part of the span it serves; none for a new
+    /// span), committed by storing `catalog`.
+    Create {
+        catalog: Catalog,
+        db: Generation,
+        sources: Vec<(Generation, u64, u64)>,
+    },
+}
+
+/// A span end as a number, 0 meaning 2⁶⁴.
+fn top(end: u64) -> u128 {
+    if end == 0 { 1 << 64 } else { end.into() }
+}
+
+/// How to open span `[start, end)` given `catalog`. `retired` means its own database was found retired, so it gets a
+/// new one even though the catalog still names it.
+pub fn plan(catalog: &Catalog, start: u64, end: u64, retired: bool) -> Plan {
+    let overlapping: Vec<(u64, u64, Generation)> = catalog
+        .spans
+        .iter()
+        .filter(|(s, (e, _))| u128::from(**s) < top(end) && top(*e) > u128::from(start))
+        .map(|(s, (e, db))| (*s, *e, *db))
+        .collect();
+    if let [(s, e, db)] = overlapping[..]
+        && !retired
+        && (s, e, db.start, db.end) == (start, end, start, end)
+    {
+        return Plan::Open(db);
+    }
+    let db = Generation {
+        start,
+        end,
+        generation: catalog.next,
+    };
+    let mut next = catalog.clone();
+    next.next += 1;
+    let mut sources = Vec::new();
+    for (s, e, served) in overlapping {
+        next.spans.remove(&s);
+        // What lies outside the new span keeps reading the old database until its own range clones it.
+        if s < start {
+            next.spans.insert(s, (start, served));
+        }
+        if top(e) > top(end) {
+            next.spans.insert(end, (e, served));
+        }
+        let to = if top(e) < top(end) { e } else { end };
+        sources.push((served, s.max(start), to));
+    }
+    next.spans.insert(start, (end, db));
+    Plan::Create {
+        catalog: next,
+        db,
+        sources,
+    }
+}
+
+/// The database of `catalog` serving `hash`.
+fn serving(catalog: &Catalog, hash: u64) -> Option<Generation> {
+    let (_, (end, db)) = catalog.spans.range(..=hash).next_back()?;
+    (u128::from(hash) < top(*end)).then_some(*db)
+}
+
+async fn close(name: &str, db: &dyn Database) {
+    if let Err(error) = db.close().await {
+        tracing::debug!(%error, database = %name, "closing a range database handle failed");
+    }
 }
 
 /// The maintainer of a range: its first owner that is not populating.
@@ -106,12 +188,13 @@ pub trait Placement: Send + Sync {
     async fn first_here(&self, actor: &pb::Actor) -> Result<bool, Status>;
     /// Asks the actor's slots on other nodes to truncate through `through`. `Ok(false)` while one has not yet.
     async fn truncate_others(&self, actor: &pb::Actor, through: u64) -> Result<bool, Status>;
-    /// The range database holding the actor: its first slot cell's range holding its hash.
-    async fn database_of(&self, actor: &pb::Actor) -> Result<String, Status>;
+    /// The cell of the actor's first slot, whose range databases hold it.
+    async fn first_cell(&self, actor: &pb::Actor) -> Result<String, Status>;
 }
 
-/// An open writer and every actor's flushed point in it.
+/// An open writer and the flushed point of every actor it has flushed or read.
 struct Maintained {
+    name: String,
     db: Arc<dyn Writer>,
     known: BTreeMap<Vec<u8>, Meta>,
 }
@@ -123,10 +206,12 @@ pub struct Cold {
     pub readers: Readers,
     cell: String,
     node: String,
-    /// Range databases this node writes, by name.
-    writers: tokio::sync::Mutex<BTreeMap<String, Maintained>>,
-    /// When a fenced database may be opened again.
-    fenced: Mutex<BTreeMap<String, Instant>>,
+    /// Range databases this node writes, by span.
+    writers: tokio::sync::Mutex<BTreeMap<(u64, u64), Maintained>>,
+    /// When a fenced span may be opened again.
+    fenced: Mutex<BTreeMap<(u64, u64), Instant>>,
+    /// Catalogs cold reads and copies used, by cell; dropped when a read through one fails.
+    catalogs: Mutex<BTreeMap<String, Arc<Catalog>>>,
     /// Truncations other slots still owe, by actor prefix.
     owed: Mutex<BTreeMap<Vec<u8>, (pb::Actor, u64)>>,
     /// Unflushed bytes at the last flush, for the early trigger.
@@ -159,6 +244,7 @@ impl Cold {
             node: node.to_owned(),
             writers: Default::default(),
             fenced: Mutex::default(),
+            catalogs: Mutex::default(),
             owed: Mutex::default(),
             mark: Mutex::new(0),
         }
@@ -173,9 +259,7 @@ impl Cold {
     /// Bytes of the range database this node writes for `[start, end)`, from its manifest; 0 when it writes none.
     pub async fn size(&self, start: u64, end: u64) -> u64 {
         let writers = self.writers.lock().await;
-        writers
-            .get(&database(&self.cell, start, end))
-            .map_or(0, |m| m.db.size())
+        writers.get(&(start, end)).map_or(0, |m| m.db.size())
     }
 
     /// One flush round: every range this node maintains, then the truncations other slots still owe. Ranges it no
@@ -190,33 +274,27 @@ impl Cold {
                 ranges.push((start, end));
             }
         }
-        let names: Vec<String> = ranges
-            .iter()
-            .map(|(s, e)| database(&self.cell, *s, *e))
-            .collect();
-        let stale: Vec<(String, Maintained)> = {
+        let stale: Vec<Maintained> = {
             let mut writers = self.writers.lock().await;
-            let gone: Vec<String> = writers
+            let gone: Vec<(u64, u64)> = writers
                 .keys()
-                .filter(|n| !names.contains(n))
-                .cloned()
+                .filter(|span| !ranges.contains(span))
+                .copied()
                 .collect();
-            gone.into_iter()
-                .filter_map(|n| writers.remove(&n).map(|m| (n, m)))
+            gone.iter()
+                .filter_map(|span| writers.remove(span))
                 .collect()
         };
-        for (name, maintained) in stale {
-            if let Err(error) = maintained.db.close().await {
-                tracing::debug!(%error, database = %name, "closing a range database writer failed");
-            }
+        for maintained in stale {
+            close(&maintained.name, maintained.db.as_ref()).await;
         }
-        for ((start, end), name) in ranges.into_iter().zip(names) {
+        for (start, end) in ranges {
             loop {
-                match self.flush(&name, start, end).await {
+                match self.flush(start, end).await {
                     Ok(true) => continue,
                     Ok(false) => break,
                     Err(error) => {
-                        tracing::warn!(%error, database = %name, "range flush failed");
+                        tracing::warn!(%error, start, end, "range flush failed");
                         break;
                     }
                 }
@@ -226,53 +304,204 @@ impl Cold {
         self.readers.sweep().await;
     }
 
-    /// Opens `name` as writer, unless it was fenced less than [`FENCED_WAIT`] ago, and loads every actor's meta.
-    async fn open(&self, name: &str) -> Result<Option<Maintained>, StorageError> {
+    /// Opens the database of span `[start, end)` as writer, unless it was fenced less than [`FENCED_WAIT`] ago. When
+    /// the span has no database of its own, creates one from the databases serving it now (a split or merge).
+    async fn open(&self, start: u64, end: u64) -> Result<Option<Maintained>, StorageError> {
         let now = bedrock_lib::monotonic_now();
         if self
             .fenced
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(name)
+            .get(&(start, end))
             .is_some_and(|until| now < *until)
         {
             return Ok(None);
         }
-        let db = self.databases.open(name).await?;
-        let mut known = BTreeMap::new();
-        let end = KeyRange::prefix(*b"m/").end.expect("`m/` has an end");
-        let mut from = b"m/".to_vec();
-        loop {
-            let page = db.scan(&from, &end, 1000).await?;
-            let Some((last, _)) = page.last() else { break };
-            from = [last.as_slice(), &[0]].concat();
-            for (key, value) in page {
-                let meta = Meta::decode(&value).ok_or_else(|| {
-                    StorageError::Corruption(bedrock_lib::storage::ErrorContext {
-                        engine: "volume",
-                        instance: name.to_owned(),
-                        file: None,
-                        partition: None,
-                        detail: "an actor meta does not decode".into(),
-                    })
-                })?;
-                known.insert(key[2..].to_vec(), meta);
+        let mut retired = false;
+        for _ in 0..OPEN_ATTEMPTS {
+            let (catalog, version) = self.databases.catalog(&self.cell).await?;
+            let db = match plan(&catalog, start, end, retired) {
+                Plan::Open(db) => db,
+                Plan::Create {
+                    catalog,
+                    db,
+                    sources,
+                } => {
+                    let name = database(&self.cell, &db);
+                    self.retire(&name, &sources).await?;
+                    if !sources.is_empty() {
+                        let sources: Vec<_> = sources
+                            .iter()
+                            .map(|(source, s, e)| (database(&self.cell, source), *s, *e))
+                            .collect();
+                        self.databases.create_clone(&name, &sources).await?;
+                    }
+                    if !self
+                        .databases
+                        .put_catalog(&self.cell, &catalog, version)
+                        .await?
+                    {
+                        // Another change won; this clone is never written.
+                        continue;
+                    }
+                    db
+                }
+            };
+            let name = database(&self.cell, &db);
+            let writer = self.databases.open(&name).await?;
+            if writer.get(RETIRED).await?.is_some() {
+                // A clone that took it never replaced the catalog: take it over with a clone of its own.
+                close(&name, writer.as_ref()).await;
+                retired = true;
+                continue;
+            }
+            return Ok(Some(Maintained {
+                name,
+                db: writer,
+                known: BTreeMap::new(),
+            }));
+        }
+        Err(StorageError::Unavailable(
+            bedrock_lib::storage::ErrorContext {
+                engine: "volume",
+                instance: format!("{}/{start:016x}-{end:016x}", self.cell),
+                file: None,
+                partition: None,
+                detail: "the catalog kept changing while opening".into(),
+            },
+        ))
+    }
+
+    /// Fences every source and marks it retired, so nothing written to it after this point can be missing from a clone:
+    /// a writer that opened before the mark makes the mark fail, and one that opens after it finds it.
+    async fn retire(
+        &self,
+        clone: &str,
+        sources: &[(Generation, u64, u64)],
+    ) -> Result<(), StorageError> {
+        for (source, _, _) in sources {
+            let name = database(&self.cell, source);
+            let writer = self.databases.open(&name).await?;
+            let marked = writer
+                .commit(vec![(RETIRED.to_vec(), Some(clone.as_bytes().to_vec()))])
+                .await;
+            close(&name, writer.as_ref()).await;
+            marked?;
+        }
+        Ok(())
+    }
+
+    /// The actor's flushed point in `maintained`'s database, read once.
+    async fn known(maintained: &mut Maintained, actor: &[u8]) -> Result<Meta, Status> {
+        if let Some(meta) = maintained.known.get(actor) {
+            return Ok(*meta);
+        }
+        let meta = match maintained.db.get(&meta_key(actor)).await.map_err(storage)? {
+            Some(bytes) => Meta::decode(&bytes)
+                .ok_or_else(|| Status::data_loss("an actor meta does not decode"))?,
+            None => Meta::default(),
+        };
+        maintained.known.insert(actor.to_vec(), meta);
+        Ok(meta)
+    }
+
+    /// The database of `cell` serving `hash`, from the catalog this node last read for it.
+    async fn serving(&self, cell: &str, hash: u64) -> Result<Option<String>, StorageError> {
+        let cached = self
+            .catalogs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(cell)
+            .cloned();
+        let catalog = match cached {
+            Some(catalog) => catalog,
+            None => {
+                let catalog = Arc::new(self.databases.catalog(cell).await?.0);
+                self.catalogs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(cell.to_owned(), catalog.clone());
+                catalog
+            }
+        };
+        Ok(serving(&catalog, hash).map(|db| database(cell, &db)))
+    }
+
+    /// Forgets `cell`'s catalog and `name`'s reader after a read through them failed.
+    fn forget(&self, cell: &str, name: &str, db: &Arc<dyn Database>) {
+        self.catalogs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(cell);
+        self.readers.discard(name, db);
+    }
+
+    /// The actor's keys and meta from the database of another cell that holds it at `flushed` or later, as changes that
+    /// make `target`'s keys of the actor equal to them. `None` when no cell holds it that far.
+    async fn adopt(
+        &self,
+        target: &dyn Writer,
+        actor: &Actor,
+        flushed: u64,
+    ) -> Result<Option<(Meta, Changes)>, Status> {
+        let mut best: Option<(Meta, Vec<Entry>)> = None;
+        for cell in self.databases.cells().await.map_err(storage)? {
+            if cell == self.cell {
+                continue;
+            }
+            let Some(name) = self.serving(&cell, actor.hash()).await.map_err(storage)? else {
+                continue;
+            };
+            let Some(db) = self.readers.get(&self.cell, &name).await.map_err(storage)? else {
+                continue;
+            };
+            let copied = copy(db.as_ref(), actor.name()).await;
+            match copied {
+                Ok(Some((meta, keys)))
+                    if meta.seq >= flushed
+                        && best.as_ref().is_none_or(|(b, _)| meta.seq > b.seq) =>
+                {
+                    best = Some((meta, keys));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(%error, database = %name, "reading a moved actor failed");
+                    self.forget(&cell, &name, &db);
+                }
             }
         }
-        Ok(Some(Maintained { db, known }))
+        let Some((meta, keys)) = best else {
+            // A catalog read before the move may name a database the actor has left: read them again next time.
+            self.catalogs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+            return Ok(None);
+        };
+        // Start from deletes of what the target holds, so keys the source no longer has go.
+        let mut changes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = all(target, actor.name())
+            .await
+            .map_err(storage)?
+            .into_iter()
+            .map(|(key, _)| (key, None))
+            .collect();
+        changes.extend(keys.into_iter().map(|(key, value)| (key, Some(value))));
+        changes.insert(meta_key(actor.name()), Some(meta.encode()));
+        Ok(Some((meta, changes.into_iter().collect())))
     }
 
     /// Flushes one batch of range `[start, end)` into `name` and truncates what it holds. Returns whether more actors
     /// wait than one batch took.
-    async fn flush(&self, name: &str, start: u64, end: u64) -> Result<bool, Status> {
+    async fn flush(&self, start: u64, end: u64) -> Result<bool, Status> {
+        let span = (start, end);
         let mut writers = self.writers.lock().await;
-        if !writers.contains_key(name) {
-            match self.open(name).await.map_err(storage)? {
-                Some(maintained) => writers.insert(name.to_owned(), maintained),
+        if let std::collections::btree_map::Entry::Vacant(vacant) = writers.entry(span) {
+            match self.open(start, end).await.map_err(storage)? {
+                Some(maintained) => vacant.insert(maintained),
                 None => return Ok(false),
             };
         }
-        let maintained = writers.get_mut(name).expect("just opened");
+        let maintained = writers.get_mut(&span).expect("just opened");
         let mut batch: Changes = Vec::new();
         let mut bytes = 0;
         let mut written = Vec::new();
@@ -295,21 +524,40 @@ impl Cold {
                     .map_err(status)?
             };
             let Some(pending) = pending else { continue };
-            let known = maintained
-                .known
-                .get(parsed.name())
-                .copied()
-                .unwrap_or_default();
+            let mut known = Self::known(maintained, parsed.name()).await?;
             if pending.flushed > known.seq {
-                // The slot dropped entries this database does not hold: never write over that gap.
-                tracing::error!(database = %name, "a slot is flushed beyond its range database");
-                continue;
+                // Flushed in another cell's database: its first slot moved here. Copy it from there first.
+                match self
+                    .adopt(maintained.db.as_ref(), &parsed, pending.flushed)
+                    .await?
+                {
+                    Some((meta, copied)) => {
+                        bytes += copied
+                            .iter()
+                            .map(|(k, v)| (k.len() + v.as_ref().map_or(0, Vec::len)) as u64)
+                            .sum::<u64>();
+                        batch.extend(copied);
+                        known = meta;
+                        written.push((
+                            parsed.name().to_vec(),
+                            meta,
+                            actor.clone(),
+                            meta.seq.min(pending.through),
+                        ));
+                    }
+                    None => {
+                        // The slot dropped entries no database holds: never write over that gap.
+                        tracing::error!(database = %maintained.name, "a slot is flushed beyond its range database");
+                        continue;
+                    }
+                }
             }
             if pending.through <= known.seq {
                 truncate.push((actor, pending.through));
                 continue;
             }
             bytes += pending.bytes();
+            // Later writes of a key in one batch win, so these go over a copy.
             add(&mut batch, parsed.name(), &pending);
             written.push((
                 parsed.name().to_vec(),
@@ -321,11 +569,11 @@ impl Cold {
         if !batch.is_empty() {
             if let Err(error) = maintained.db.commit(batch).await {
                 if matches!(error, StorageError::Fenced(_)) {
-                    writers.remove(name);
+                    writers.remove(&span);
                     self.fenced
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .insert(name.to_owned(), bedrock_lib::monotonic_now() + FENCED_WAIT);
+                        .insert(span, bedrock_lib::monotonic_now() + FENCED_WAIT);
                 }
                 return Err(storage(error));
             }
@@ -333,6 +581,9 @@ impl Cold {
                 maintained.known.insert(key, meta);
                 truncate.push((actor, through));
             }
+            // An adopted actor is listed twice when its pending changes went over the copy: truncate once, the furthest.
+            truncate.sort_by(|a, b| a.0.id.cmp(&b.0.id).then(b.1.cmp(&a.1)));
+            truncate.dedup_by(|a, b| a.0 == b.0);
         }
         drop(writers);
         for (actor, through) in truncate {
@@ -380,19 +631,38 @@ impl Cold {
         }
     }
 
-    /// The database handle for `actor`'s reads: this node's writer when it maintains it, a reader otherwise.
+    /// The database handle for `actor`'s reads: this node's writer when it maintains it, a reader otherwise. Returns the
+    /// first slot's cell too.
     async fn handle(
         &self,
         cell: &str,
         actor: &pb::Actor,
-    ) -> Result<(String, Arc<dyn Database>), Status> {
-        let name = self.placement.database_of(actor).await?;
-        if let Some(maintained) = self.writers.lock().await.get(&name) {
-            return Ok((name, maintained.db.clone() as Arc<dyn Database>));
+    ) -> Result<(String, String, Arc<dyn Database>), Status> {
+        let first = self.placement.first_cell(actor).await?;
+        let hash = Actor::new(actor).map_err(status)?.hash();
+        if first == self.cell {
+            let writers = self.writers.lock().await;
+            if let Some((_, maintained)) = writers
+                .range(..=(hash, u64::MAX))
+                .next_back()
+                .filter(|((_, end), _)| u128::from(hash) < top(*end))
+            {
+                return Ok((
+                    first,
+                    maintained.name.clone(),
+                    maintained.db.clone() as Arc<dyn Database>,
+                ));
+            }
         }
+        let not_yet = || Status::unavailable("the range database is not created yet");
+        let name = self
+            .serving(&first, hash)
+            .await
+            .map_err(storage)?
+            .ok_or_else(not_yet)?;
         match self.readers.get(cell, &name).await.map_err(storage)? {
-            Some(db) => Ok((name, db)),
-            None => Err(Status::unavailable("the range database is not created yet")),
+            Some(db) => Ok((first, name, db)),
+            None => Err(not_yet()),
         }
     }
 
@@ -429,7 +699,7 @@ impl Cold {
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, Status> {
         let parsed = Actor::new(actor).map_err(status)?;
-        let (name, db) = self.handle(cell, actor).await?;
+        let (first, name, db) = self.handle(cell, actor).await?;
         let read = async {
             self.caught_up(db.as_ref(), parsed.name(), flushed).await?;
             let mut values = Vec::with_capacity(keys.len());
@@ -444,7 +714,7 @@ impl Cold {
         };
         let result = read.await;
         if result.is_err() {
-            self.readers.discard(&name, &db);
+            self.forget(&first, &name, &db);
         }
         result
     }
@@ -459,7 +729,7 @@ impl Cold {
         limit: usize,
     ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool), Status> {
         let parsed = Actor::new(actor).map_err(status)?;
-        let (name, db) = self.handle(cell, actor).await?;
+        let (first, name, db) = self.handle(cell, actor).await?;
         let prefix = data_key(parsed.name(), b"");
         let read = async {
             self.caught_up(db.as_ref(), parsed.name(), flushed).await?;
@@ -481,10 +751,63 @@ impl Cold {
         };
         let result = read.await;
         if result.is_err() {
-            self.readers.discard(&name, &db);
+            self.forget(&first, &name, &db);
         }
         result
     }
+}
+
+/// Every key of `actor` in `db`.
+async fn all(db: &dyn Database, actor: &[u8]) -> Result<Vec<Entry>, StorageError> {
+    let end = KeyRange::prefix(actor.to_vec())
+        .end
+        .expect("an actor prefix ends in NUL, so it has an end");
+    let mut from = actor.to_vec();
+    let mut entries = Vec::new();
+    loop {
+        let page = db.scan(&from, &end, 1000).await?;
+        let Some((last, _)) = page.last() else {
+            return Ok(entries);
+        };
+        from = [last.as_slice(), &[0]].concat();
+        entries.extend(page);
+    }
+}
+
+/// The actor's meta and other keys in `db`, as of one flush: the meta read before and after the keys agree, and every
+/// flush of the actor changes it.
+async fn copy(db: &dyn Database, actor: &[u8]) -> Result<Option<(Meta, Vec<Entry>)>, StorageError> {
+    let meta = meta_key(actor);
+    for _ in 0..COPY_ATTEMPTS {
+        let Some(before) = db.get(&meta).await? else {
+            return Ok(None);
+        };
+        let keys = all(db, actor).await?;
+        if db.get(&meta).await?.as_ref() == Some(&before) {
+            let decoded = Meta::decode(&before).ok_or_else(|| {
+                StorageError::Corruption(bedrock_lib::storage::ErrorContext {
+                    engine: "volume",
+                    instance: String::new(),
+                    file: None,
+                    partition: None,
+                    detail: "an actor meta does not decode".into(),
+                })
+            })?;
+            return Ok(Some((
+                decoded,
+                keys.into_iter().filter(|(k, _)| *k != meta).collect(),
+            )));
+        }
+    }
+    Err(StorageError::Unavailable(
+        bedrock_lib::storage::ErrorContext {
+            engine: "volume",
+            instance: String::new(),
+            file: None,
+            partition: None,
+            detail: "the actor kept changing while it was copied".into(),
+        },
+    ))
 }
 
 /// Merges a page of overlay records (deletes included) over a page of range database entries, both from the same start:
