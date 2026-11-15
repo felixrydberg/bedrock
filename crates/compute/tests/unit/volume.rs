@@ -207,3 +207,78 @@ fn the_lease_deadline_follows_the_second_newest_acknowledged_heartbeat() {
         assert_eq!(host.deadline(&slots), Some(sent[1] + FENCE));
     });
 }
+
+/// A writer over unreachable slots whose heartbeats all count as just acknowledged, with no slot tasks.
+fn writer(state: State) -> Writer {
+    let peers = Arc::new(bedrock_lib::transport::Peers::new(
+        &bedrock_lib::admin::Admin::new(),
+    ));
+    let host = Host::start(peers, pb::Holder::default());
+    let slots: [Slot; SLOTS] = std::array::from_fn(|i| Slot {
+        cell: format!("c{i}"),
+        address: format!("10.0.0.{i}:7000"),
+        identity: tls::Identity {
+            service: "volume".into(),
+            cell: format!("c{i}"),
+            node_id: format!("v{i}"),
+            host: format!("10.0.0.{i}"),
+        },
+    });
+    let joined = host.join(&slots);
+    for node in host.lock().values_mut() {
+        node.acked = Some(bedrock_lib::monotonic_now());
+    }
+    Writer {
+        shared: Arc::new(Shared {
+            joined,
+            actor: pb::Actor::default(),
+            epoch: 1,
+            version: 0,
+            state: Mutex::new(state),
+            changed: Notify::new(),
+        }),
+        tasks: Vec::new(),
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn a_waiter_woken_by_a_late_acknowledgement_after_the_fence_fails() {
+    runtime().block_on(async {
+        let writer = writer(state(3, 0));
+        let waiter = writer.wait(|s| (s.commit >= 3).then_some(3));
+        let fence_then_ack = async {
+            tokio::task::yield_now().await;
+            let mut state = writer.shared.lock();
+            writer.shared.fence(&mut state);
+            for i in 0..2 {
+                state.ack(i, 3, true, 0);
+            }
+            drop(state);
+            writer.shared.changed.notify_waiters();
+        };
+        let (result, ()) = tokio::join!(waiter, fence_then_ack);
+        assert!(matches!(result, Err(Error::Fenced)), "{result:?}");
+        assert_eq!(writer.committed(), 3, "the late acknowledgement did commit");
+    });
+}
+
+#[test]
+fn a_writer_with_fewer_than_two_slots_taking_appends_stops_serving() {
+    runtime().block_on(async {
+        let writer = writer(state(1, 0));
+        assert!(writer.serving());
+        writer.shared.lose(0);
+        assert!(writer.serving(), "two slots still take appends");
+        writer.shared.lose(2);
+        assert!(!writer.serving());
+        let pending = writer.wait(|s| (s.commit >= 1).then_some(()));
+        assert!(matches!(pending.await, Err(Error::Fenced)));
+    });
+}

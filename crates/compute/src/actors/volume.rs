@@ -11,12 +11,13 @@
 //!   window bounded by entries and bytes. Appends carry the commit point; an idle slot learns it within [`HEARTBEAT`].
 //! - **Lease.** [`Host`] heartbeats every volume node it holds actors on once per [`HEARTBEAT`]. A writer stops serving
 //!   for good once fewer than two of its slots acknowledged a heartbeat sent within [`FENCE`], or a slot promised a newer
-//!   epoch. A lease task wakes at that deadline, so a later heartbeat cannot hide a lapse. Slots refuse another claim
+//!   epoch, or fewer than two slots still take its appends. A lease task wakes at that deadline, so a later heartbeat
+//!   cannot hide a lapse. Slots refuse another claim
 //!   for 5 s after the host's last heartbeat, so the writer stops first.
 //! - **Reads** go to the nearest slot (the holder's cell first) with `min_seq` = the commit point, and to the next slot
-//!   when one is behind or not promised to this writer's epoch. A slot's overlay also holds this writer's own appended but uncommitted entries, so a read may
-//!   see this writer's pending writes, never another holder's: a claim truncates an old epoch's tail before a slot takes
-//!   its appends. The actor host (S-07) keeps pending keys in its cache and holds output until their commits, so a
+//!   when one is behind or not promised to this writer's epoch. A slot's overlay also holds this writer's own appended
+//!   but uncommitted entries, so a read may see this writer's pending writes, never another holder's: a claim truncates
+//!   an old epoch's tail before a slot takes its appends. The actor host (S-07) keeps pending keys in its cache and holds output until their commits, so a
 //!   pending write that is later lost never leaves the host (user decision 2026-11-15).
 //! - **Placement.** [`slot_nodes`] maps an actor to its slots' nodes through each slot cell's `volume` routing table.
 //!   Fetching sibling cells' tables through `Relay.Routes` waits for S-07 (user decision 2026-11-15).
@@ -365,8 +366,8 @@ struct State {
     /// Entries `base + 1 ..= last`.
     log: VecDeque<pb::Entry>,
     base: u64,
-    /// The epoch of entry `base`; unknown when recovery started after S3's flushed point.
-    base_epoch: Option<u64>,
+    /// The epoch of entry `base`.
+    base_epoch: u64,
     noop: u64,
     /// Per slot: the next entry to send, the last entry it holds, whether it votes and the commit point it knows.
     next: [u64; SLOTS],
@@ -377,14 +378,14 @@ struct State {
     /// Encoded bytes of this writer's entries above the commit point, and of committed entries still kept.
     pending: usize,
     retained: usize,
+    /// Slots this writer stopped appending to (corrupt, behind what it keeps, or promised elsewhere); S-06 repairs them.
+    lost: [bool; SLOTS],
     fenced: bool,
 }
 
 enum Next {
     Send(pb::AppendRequest),
     Idle,
-    /// The slot lacks entries this writer no longer has; S-06 repairs it.
-    Stuck,
 }
 
 impl State {
@@ -397,11 +398,12 @@ impl State {
         self.log.get(usize::try_from(i).ok()?)
     }
 
-    fn epoch_at(&self, seq: u64) -> Option<u64> {
+    /// The epoch of entry `seq`, which lies between `base` and the log end.
+    fn epoch_at(&self, seq: u64) -> u64 {
         if seq == self.base {
             self.base_epoch
         } else {
-            self.entry(seq).map(|e| e.epoch)
+            self.entry(seq).expect("within the log").epoch
         }
     }
 
@@ -437,7 +439,7 @@ impl State {
                 .expect("committed entries lie within the log");
             self.retained -= entry.encoded_len();
             self.base = entry.seq;
-            self.base_epoch = Some(entry.epoch);
+            self.base_epoch = entry.epoch;
         }
     }
 
@@ -453,9 +455,7 @@ impl State {
             return Next::Idle;
         };
         let commit_only = self.next[i] > last;
-        let Some(prev_epoch) = self.epoch_at(from - 1) else {
-            return if commit_only { Next::Idle } else { Next::Stuck };
-        };
+        let prev_epoch = self.epoch_at(from - 1);
         let mut entries = Vec::new();
         let mut bytes = 0;
         for seq in from..=last {
@@ -510,6 +510,23 @@ impl Shared {
         state.fenced = true;
         self.changed.notify_waiters();
     }
+
+    /// Slot `i` takes no more appends from this writer; with fewer than two left, no entry can commit.
+    fn lose(&self, i: usize) {
+        let mut state = self.lock();
+        state.lost[i] = true;
+        if state.lost.iter().filter(|lost| !**lost).count() < 2 {
+            self.fence(&mut state);
+        }
+    }
+
+    /// The slots still taking this writer's appends.
+    fn usable(&self, state: &State) -> Vec<Slot> {
+        (0..SLOTS)
+            .filter(|&i| !state.lost[i])
+            .map(|i| self.joined.slots[i].clone())
+            .collect()
+    }
 }
 
 /// Sends slot `i` the log until the writer stops.
@@ -529,7 +546,6 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
         idle = false;
         let request = match next {
             Next::Send(request) => request,
-            Next::Stuck => return,
             Next::Idle => {
                 tokio::select! {
                     biased;
@@ -571,7 +587,7 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
                 return;
             }
             // A corrupt slot is dropped until it repairs.
-            Err(status) if status.code() == Code::DataLoss => return,
+            Err(status) if status.code() == Code::DataLoss => return shared.lose(i),
             Err(_) => {
                 sleep(RETRY).await;
                 continue;
@@ -586,7 +602,8 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             }
             Refusal::LogGap => {
                 if from <= state.base + 1 {
-                    return;
+                    drop(state);
+                    return shared.lose(i);
                 }
                 let end = slot.end.unwrap_or_default().seq;
                 state.next[i] = (from - 1).min(end + 1);
@@ -595,9 +612,10 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             // dropped until it repairs.
             Refusal::NotPromised | Refusal::StaleVersion => {
                 if refused(&answer) == Refusal::StaleVersion || slot.epoch > shared.epoch {
-                    shared.fence(&mut state);
+                    return shared.fence(&mut state);
                 }
-                return;
+                drop(state);
+                return shared.lose(i);
             }
             _ => {
                 drop(state);
@@ -610,7 +628,8 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
 /// Fences the writer once its lease deadline passes without a heartbeat extending it.
 async fn lease(shared: Arc<Shared>) {
     loop {
-        let deadline = shared.joined.host.deadline(&shared.joined.slots);
+        let usable = shared.usable(&shared.lock());
+        let deadline = shared.joined.host.deadline(&usable);
         match deadline {
             Some(deadline) if deadline > bedrock_lib::monotonic_now() => {
                 sleep_until(deadline).await
@@ -774,23 +793,30 @@ impl Writer {
         self.shared.lock().commit
     }
 
-    /// Whether this writer may still serve: it has not stopped, and two slots acknowledged a heartbeat sent within
-    /// [`FENCE`]. Once false it stays false; the actor host claims again.
+    /// Whether this writer may still serve: it has not stopped, and two of the slots still taking its appends
+    /// acknowledged a heartbeat sent within [`FENCE`]. Once false it stays false; the actor host claims again.
     pub fn serving(&self) -> bool {
         let mut state = self.shared.lock();
-        if !state.fenced && self.shared.joined.host.live(&self.shared.joined.slots) < 2 {
+        if !state.fenced && self.shared.joined.host.live(&self.shared.usable(&state)) < 2 {
             self.shared.fence(&mut state);
         }
         !state.fenced
     }
 
-    /// Waits until `ready` returns a value, failing once the writer stops serving.
+    /// Waits until `ready` returns a value, failing once the writer stops serving, even when an acknowledgement that
+    /// arrived after the fence made it ready.
     async fn wait<R>(&self, mut ready: impl FnMut(&mut State) -> Option<R>) -> Result<R, Error> {
         loop {
             let mut changed = std::pin::pin!(self.shared.changed.notified());
             changed.as_mut().enable();
-            if let Some(value) = ready(&mut self.shared.lock()) {
-                return Ok(value);
+            {
+                let mut state = self.shared.lock();
+                if state.fenced {
+                    return Err(Error::Fenced);
+                }
+                if let Some(value) = ready(&mut state) {
+                    return Ok(value);
+                }
             }
             if !self.serving() {
                 return Err(Error::Fenced);
@@ -848,7 +874,7 @@ impl Writer {
                 let in_flight = state.last() - state.commit;
                 let room = in_flight == 0
                     || (in_flight < WINDOW_ENTRIES && state.pending + size <= WINDOW_BYTES);
-                if state.fenced || !room {
+                if !room {
                     return None;
                 }
                 let mut entry = entry.take().expect("pushed once");
@@ -991,7 +1017,7 @@ impl State {
         State {
             log: VecDeque::new(),
             base: 0,
-            base_epoch: Some(0),
+            base_epoch: 0,
             noop: 0,
             next: [1; SLOTS],
             acked: [0; SLOTS],
@@ -1000,6 +1026,7 @@ impl State {
             commit: 0,
             pending: 0,
             retained: 0,
+            lost: [false; SLOTS],
             fenced: false,
         }
     }
@@ -1017,6 +1044,7 @@ async fn recover(
     let mut log: Vec<pb::Entry> = Vec::new();
     // 0 asks for the first entry after the slot's flushed point.
     let mut from = 0;
+    let mut flushed = pb::LogEnd::default();
     loop {
         let request = pb::LogRequest {
             actor: Some(actor.clone()),
@@ -1037,6 +1065,13 @@ async fn recover(
                 "the recovery slot took a newer claim".into(),
             ));
         }
+        if from == 0 {
+            let slot = reply.answer.as_ref().map(slot_of).unwrap_or_default();
+            flushed = pb::LogEnd {
+                seq: slot.flushed,
+                epoch: slot.flushed_epoch,
+            };
+        }
         for entry in reply.entries {
             if log.last().is_some_and(|last| entry.seq != last.seq + 1) {
                 return Err(Error::Unavailable("the recovered log has a gap".into()));
@@ -1054,12 +1089,15 @@ async fn recover(
             "the recovered log does not end where the claim said".into(),
         ));
     }
-    let base_epoch = if base == 0 {
-        Some(0)
-    } else if log.is_empty() {
-        Some(end.epoch)
+    // The log starts after the slot's flushed point, or is empty and ends there.
+    let base_epoch = if log.is_empty() {
+        end.epoch
+    } else if base == flushed.seq {
+        flushed.epoch
     } else {
-        None
+        return Err(Error::Unavailable(
+            "the recovered log does not start after the flushed point".into(),
+        ));
     };
     let noop = pb::Entry {
         seq: end.seq + 1,

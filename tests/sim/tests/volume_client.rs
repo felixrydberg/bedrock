@@ -20,6 +20,7 @@ use bedrock_lib::placement::{Owner, State};
 use bedrock_lib::storage::StorageEngine;
 use bedrock_lib::storage::sim::{Fingerprint, SimEngine};
 use bedrock_lib::transport::{Peers, tls};
+use bedrock_lib::volume::volume_client::VolumeClient;
 use bedrock_lib::volume::volume_server::VolumeServer;
 use bedrock_lib::volume::{self as pb};
 use bedrock_volume::serve::Service;
@@ -151,12 +152,15 @@ async fn holder_crashes(fingerprint: &Fingerprint, next: &mut usize) {
                 let mut tx = Some(tx);
                 for n in 0..COMMITS {
                     let commit = async {
-                        if writer
-                            .commit(change(&format!("k{n}"), n), None, n)
-                            .await
-                            .is_ok()
-                        {
-                            recorded.lock().unwrap().push(n);
+                        match writer.commit(change(&format!("k{n}"), n), None, n).await {
+                            Ok(_) => recorded.lock().unwrap().push(n),
+                            // Only the commit the crash interrupts may fail.
+                            Err(error) => {
+                                assert_eq!(
+                                    n, boundary,
+                                    "commit {n} before the crash failed: {error}"
+                                )
+                            }
                         }
                     };
                     if n == boundary {
@@ -391,6 +395,78 @@ async fn stale_epoch(
     Handle::current().kill(second.id());
 }
 
+/// Two slots truncated through `flushed` (S-05's maintainer) and a third whose log ends exactly there: the next holder
+/// recovers a log that starts after `flushed`, and must send the lagging slot the entry after it, which needs the
+/// epoch of entry `flushed` from the recovery slot's answer.
+async fn flushed_point(
+    fingerprint: &Fingerprint,
+    next: &mut usize,
+    engines: &[Arc<SimEngine>],
+    nodes: &[NodeHandle],
+) {
+    let case = *next;
+    *next += 1;
+    let first = compute(2 * case);
+    let (id, lagging) = (first.id(), nodes[2].id());
+    let (truncated, wait_truncated) = oneshot::channel();
+    first.spawn(async move {
+        let writer = open(&host("flush-1"), actor(case)).await;
+        writer.commit(change("a", 1), None, 1).await.unwrap();
+        let flushed = writer.committed();
+        // Let slot 2 store entry `flushed` too, then cut it off.
+        sleep(Duration::from_millis(200)).await;
+        NetSim::current().clog_link(id, lagging);
+        NetSim::current().clog_link(lagging, id);
+        for n in 2..=4 {
+            writer.commit(change("a", n), None, n).await.unwrap();
+        }
+        for ip in &SLOT_IPS[..2] {
+            let mut client = VolumeClient::connect(format!("http://{ip}:7000"))
+                .await
+                .unwrap();
+            let request = pb::TruncateRequest {
+                actor: Some(actor(case)),
+                through: flushed,
+            };
+            let answer = client.truncate(request).await.unwrap().into_inner();
+            assert_eq!(answer.refused, pb::Refusal::None as i32);
+        }
+        let _ = truncated.send(flushed);
+        std::future::pending::<()>().await;
+    });
+    let flushed = wait_truncated.await.unwrap();
+    Handle::current().kill(first.id());
+    NetSim::current().unclog_link(id, lagging);
+    NetSim::current().unclog_link(lagging, id);
+    let second = compute(2 * case + 1);
+    let committed = second
+        .spawn(async move {
+            let writer = open(&host("flush-2"), actor(case)).await;
+            writer.commit(change("a", 5), None, 5).await.unwrap();
+            // Long enough for slot 2 to catch up and learn the commit point.
+            sleep(Duration::from_secs(2)).await;
+            writer.committed()
+        })
+        .await
+        .unwrap();
+    let key = store::claim_key(&store::Actor::new(&actor(case)).unwrap());
+    let claim = |i: usize| {
+        let bytes = engines[i].get(&key).unwrap().unwrap();
+        pb::ClaimRecord::decode(bytes.as_slice()).unwrap()
+    };
+    assert!(
+        flushed > 0 && claim(0).flushed == flushed,
+        "slot 0 truncated"
+    );
+    assert_eq!(
+        claim(2).end.unwrap_or_default().seq,
+        committed,
+        "the slot that ended at the flushed point caught up"
+    );
+    fingerprint.mix(("flushed point", flushed, committed));
+    Handle::current().kill(second.id());
+}
+
 /// Reads at the commit point while seeded cuts leave the nearest slot behind; the SQLite chunk read and scan follow.
 async fn reads(fingerprint: &Fingerprint, next: &mut usize, nodes: &[NodeHandle]) {
     let case = *next;
@@ -460,6 +536,7 @@ async fn scenario() -> u64 {
     cut_off(&fingerprint, &mut next).await;
     reads(&fingerprint, &mut next, &nodes).await;
     stale_epoch(&fingerprint, &mut next, &engines, &nodes).await;
+    flushed_point(&fingerprint, &mut next, &engines, &nodes).await;
     unreserved(&fingerprint, &mut next, &engines, &nodes).await;
     for node in &nodes {
         Handle::current().kill(node.id());

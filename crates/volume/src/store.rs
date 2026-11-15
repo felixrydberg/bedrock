@@ -178,6 +178,7 @@ fn answer(refused: Refusal, claim: &pb::ClaimRecord, voting: bool) -> pb::Answer
             committed: claim.committed,
             flushed: claim.flushed,
             released: claim.released,
+            flushed_epoch: claim.flushed_epoch,
         }),
     }
 }
