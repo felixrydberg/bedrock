@@ -13,7 +13,10 @@
 //!   for good once fewer than two of its slots acknowledged a heartbeat sent within [`FENCE`], or a slot promised a newer
 //!   epoch. Slots refuse another claim for 5 s after the host's last heartbeat, so the writer stops first.
 //! - **Reads** go to the nearest slot (the holder's cell first) with `min_seq` = the commit point, and to the next slot
-//!   when one is behind.
+//!   when one is behind. A slot's overlay also holds this writer's own appended but uncommitted entries, so a read may
+//!   see this writer's pending writes, never another holder's: a claim truncates an old epoch's tail before a slot takes
+//!   its appends. The actor host (S-07) keeps pending keys in its cache and holds output until their commits, so a
+//!   pending write that is later lost never leaves the host (user decision 2026-11-15).
 //! - **Placement.** [`slot_nodes`] maps an actor to its slots' nodes through each slot cell's `volume` routing table.
 //!   Fetching sibling cells' tables through `Relay.Routes` waits for S-07 (user decision 2026-11-15).
 //!
@@ -44,20 +47,25 @@ pub const FENCE: Duration = Duration::from_secs(4);
 /// Uncommitted entries a writer keeps in flight.
 // ponytail: fixed window; tune entries and bytes with S-18's measurements (§12.6).
 pub const WINDOW_ENTRIES: u64 = 128;
-/// Encoded bytes of uncommitted entries in flight. A larger single entry still goes alone.
+/// Encoded bytes of uncommitted entries in flight.
 pub const WINDOW_BYTES: usize = 8 << 20;
+/// The largest entry a writer admits, and the most one append carries: below the 4 MiB default decode limit of the
+/// volume server, with room for the request's other fields.
+pub const MAX_ENTRY_BYTES: usize = 3 << 20;
 /// Pages one SQLite read miss fetches, aligned (user decision 2026-11-15).
 pub const CHUNK_PAGES: u32 = 64;
 const CALL: Duration = Duration::from_secs(2);
 const RETRY: Duration = Duration::from_millis(100);
-/// Encoded bytes of one append, below tonic's 4 MiB default decode limit; one larger entry still goes alone.
-const BATCH_BYTES: usize = 3 << 20;
-/// Committed entries kept for a lagging slot. A slot further behind waits for S-06's repair.
-// ponytail: a slot down for good pins at most this many entries; S-05's truncation bounds what a slot needs.
+/// Committed entries, and their encoded bytes, kept for a lagging slot. A slot further behind waits for S-06's repair.
+// ponytail: a slot down for good pins at most this much; S-05's truncation bounds what a slot needs.
 const RETAIN: u64 = 4096;
+const RETAIN_BYTES: usize = 64 << 20;
 /// Reserve and claim rounds before [`Writer::open`] gives up.
 const ATTEMPTS: usize = 8;
-const LOG_PAGE: u32 = 1000;
+/// Log entries per recovery page. `Store::log` bounds a page by entries only, so the client's decode limit covers a
+/// page of the largest entries.
+const LOG_PAGE: u32 = 64;
+const LOG_PAGE_BYTES: usize = LOG_PAGE as usize * (MAX_ENTRY_BYTES + 1024) + (64 << 10);
 const VOLUME: &str = bedrock_lib::datasets::capabilities::VOLUME;
 
 #[derive(Debug)]
@@ -75,6 +83,8 @@ pub enum Error {
     Rpc(Status),
     /// The actor or the topology cannot be placed.
     Placement(actors::Error),
+    /// An entry of this many encoded bytes is larger than [`MAX_ENTRY_BYTES`].
+    TooLarge(usize),
 }
 
 impl std::fmt::Display for Error {
@@ -86,6 +96,9 @@ impl std::fmt::Display for Error {
             Self::Unavailable(detail) => write!(f, "unavailable: {detail}"),
             Self::Rpc(status) => write!(f, "slot failed: {status}"),
             Self::Placement(error) => write!(f, "placement: {error}"),
+            Self::TooLarge(bytes) => {
+                write!(f, "an entry of {bytes} bytes exceeds {MAX_ENTRY_BYTES}")
+            }
         }
     }
 }
@@ -273,21 +286,27 @@ impl Host {
         }
     }
 
-    /// Adds `slots` to the heartbeat set and heartbeats them once now.
-    async fn join(self: &Arc<Self>, slots: &[Slot]) {
-        {
-            let mut nodes = self.lock();
-            for slot in slots {
-                nodes
-                    .entry(slot.address.clone())
-                    .or_insert_with(|| Node {
-                        slot: slot.clone(),
-                        users: 0,
-                        acked: None,
-                    })
-                    .users += 1;
-            }
+    /// Adds `slots` to the heartbeat set. The guard leaves it on drop, also when the caller is cancelled.
+    fn join(self: &Arc<Self>, slots: &[Slot; SLOTS]) -> Joined {
+        let mut nodes = self.lock();
+        for slot in slots {
+            nodes
+                .entry(slot.address.clone())
+                .or_insert_with(|| Node {
+                    slot: slot.clone(),
+                    users: 0,
+                    acked: None,
+                })
+                .users += 1;
         }
+        Joined {
+            host: self.clone(),
+            slots: slots.clone(),
+        }
+    }
+
+    /// Heartbeats `slots` once now.
+    async fn beat_all(self: &Arc<Self>, slots: &[Slot]) {
         let beats = slots.iter().map(|slot| {
             let (host, slot) = (self.clone(), slot.clone());
             async move { host.beat(slot).await }
@@ -337,8 +356,9 @@ struct State {
     voting: [bool; SLOTS],
     told: [u64; SLOTS],
     commit: u64,
-    /// Encoded bytes of this writer's entries above the commit point.
+    /// Encoded bytes of this writer's entries above the commit point, and of committed entries still kept.
     pending: usize,
+    retained: usize,
     fenced: bool,
 }
 
@@ -376,20 +396,28 @@ impl State {
         if let Some(point) = quorum_point(&self.acked, &self.voting, self.noop)
             && point > self.commit
         {
-            for seq in (self.commit + 1).max(self.noop)..=point {
+            for seq in self.commit + 1..=point {
                 let size = self.entry(seq).map_or(0, Message::encoded_len);
-                self.pending -= size;
+                if seq >= self.noop {
+                    self.pending -= size;
+                }
+                self.retained += size;
             }
             self.commit = point;
         }
-        // Keep what a slot still lacks, but no more than RETAIN committed entries.
+        // Keep what a slot still lacks, including the entry it holds last, which a commit-only append resends; but no
+        // more than RETAIN committed entries or RETAIN_BYTES.
         let slowest = self.acked.iter().copied().min().unwrap_or(0);
         let floor = self
             .commit
-            .min(slowest)
+            .min(slowest.saturating_sub(1))
             .max(self.commit.saturating_sub(RETAIN));
-        while self.base < floor {
-            let entry = self.log.pop_front().expect("the floor lies within the log");
+        while self.base < self.commit && (self.base < floor || self.retained > RETAIN_BYTES) {
+            let entry = self
+                .log
+                .pop_front()
+                .expect("committed entries lie within the log");
+            self.retained -= entry.encoded_len();
             self.base = entry.seq;
             self.base_epoch = Some(entry.epoch);
         }
@@ -415,7 +443,7 @@ impl State {
         for seq in from..=last {
             let entry = self.entry(seq).expect("within the log");
             bytes += entry.encoded_len();
-            if !entries.is_empty() && (bytes > BATCH_BYTES || commit_only) {
+            if !entries.is_empty() && (bytes > MAX_ENTRY_BYTES || commit_only) {
                 break;
             }
             entries.push(entry.clone());
@@ -509,9 +537,27 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             },
         )
         .await;
-        let Ok(answer) = answer else {
-            sleep(RETRY).await;
-            continue;
+        let answer = match answer {
+            Ok(answer) => answer,
+            // The slot refuses this request itself, so a retry cannot help: stop rather than hold every commit.
+            Err(status)
+                if matches!(
+                    status.code(),
+                    Code::InvalidArgument
+                        | Code::ResourceExhausted
+                        | Code::OutOfRange
+                        | Code::Unimplemented
+                ) =>
+            {
+                shared.fence(&mut shared.lock());
+                return;
+            }
+            // A corrupt slot is dropped until it repairs.
+            Err(status) if status.code() == Code::DataLoss => return,
+            Err(_) => {
+                sleep(RETRY).await;
+                continue;
+            }
         };
         let slot = slot_of(&answer);
         let mut state = shared.lock();
@@ -566,12 +612,9 @@ impl Writer {
         slots: [Slot; SLOTS],
         version: u64,
     ) -> Result<Self, Error> {
-        host.join(&slots).await;
-        // Leaves the heartbeat set on every early return.
-        let joined = Joined {
-            host: host.clone(),
-            slots: slots.clone(),
-        };
+        // Leaves the heartbeat set on every early return and on cancellation.
+        let joined = host.join(&slots);
+        host.beat_all(&slots).await;
         if host.live(&slots) < 2 {
             return Err(Error::Unavailable(
                 "fewer than two slots answered a heartbeat".into(),
@@ -760,7 +803,11 @@ impl Writer {
             changes,
             alarm,
         });
-        let size = entry.as_ref().map_or(0, Message::encoded_len);
+        // The sequence adds at most ten bytes.
+        let size = entry.as_ref().map_or(0, Message::encoded_len) + 10;
+        if size > MAX_ENTRY_BYTES {
+            return Err(Error::TooLarge(size));
+        }
         let seq = self
             .wait(|state| {
                 let in_flight = state.last() - state.commit;
@@ -782,7 +829,8 @@ impl Writer {
             .await
     }
 
-    /// `keys` at the commit point from the nearest slot caught up with it; a missing key has no value.
+    /// `keys` at the commit point or later from the nearest slot caught up with it; a missing key has no value. A value
+    /// may come from this writer's own pending commit (see the module docs).
     pub async fn read(&self, keys: Vec<Vec<u8>>) -> Result<Vec<pb::Value>, Error> {
         let request = pb::ReadRequest {
             actor: Some(self.shared.actor.clone()),
@@ -810,7 +858,8 @@ impl Writer {
         self.read(keys).await
     }
 
-    /// Up to `limit` live keys from `start` in order at the commit point, and whether more follow.
+    /// Up to `limit` live keys from `start` in order at the commit point or later, and whether more follow. Like
+    /// [`Writer::read`], it may include this writer's own pending commits.
     pub async fn scan(&self, start: Vec<u8>, limit: u32) -> Result<(Vec<pb::Value>, bool), Error> {
         let request = pb::ScanRequest {
             actor: Some(self.shared.actor.clone()),
@@ -844,8 +893,13 @@ impl Writer {
         order.sort_by_key(|&i| shared.joined.slots[i].cell != shared.joined.host.holder.cell);
         let mut last = String::from("no slot answered");
         for i in order {
+            // A writer that stopped serving may be behind a newer holder.
+            if !self.serving() {
+                return Err(Error::Fenced);
+            }
             match call(&shared.joined.host.peers, &shared.joined.slots[i], &f).await {
                 Ok(reply) => match answer(&reply).map(refused) {
+                    Some(Refusal::None) if !self.serving() => return Err(Error::Fenced),
                     Some(Refusal::None) => return Ok(reply),
                     refusal => last = format!("slot {i} refused: {refusal:?}"),
                 },
@@ -877,6 +931,7 @@ impl State {
             told: [0; SLOTS],
             commit: 0,
             pending: 0,
+            retained: 0,
             fenced: false,
         }
     }
@@ -902,9 +957,13 @@ async fn recover(
             from,
             limit: LOG_PAGE,
         };
-        let reply = call(peers, slot, |mut c| async move { c.log(request).await })
-            .await
-            .map_err(|s| Error::Unavailable(format!("reading the log: {s}")))?;
+        let reply = call(peers, slot, |c| async move {
+            c.max_decoding_message_size(LOG_PAGE_BYTES)
+                .log(request)
+                .await
+        })
+        .await
+        .map_err(|s| Error::Unavailable(format!("reading the log: {s}")))?;
         if reply.answer.as_ref().map(refused) != Some(Refusal::None) {
             return Err(Error::Unavailable(
                 "the recovery slot took a newer claim".into(),

@@ -233,6 +233,11 @@ async fn cut_off(fingerprint: &Fingerprint, next: &mut usize) {
             matches!(late, Err(Error::Fenced)),
             "a fenced writer commits nothing"
         );
+        let read = writer.read(vec![b"k".to_vec()]).await;
+        assert!(
+            matches!(read, Err(Error::Fenced)),
+            "a fenced writer reads nothing"
+        );
         fenced
     });
     cut.await.unwrap();
