@@ -2,7 +2,8 @@
 //!
 //! Records live in a [`StorageEngine`]: RocksDB, or the in-memory engine in simulation builds. Every actor key starts
 //! with `s/` and the actor's big-endian hash, so a hash range is one scan and dropping it one `delete_range`:
-//! `s/{hash}{namespace}\0{id}\0` followed by `claim`, `log/{seq}` or `data/{key}` (the overlay). Released actors with an
+//! `s/{hash}{namespace}\0{id}\0` followed by `claim`, `log/{seq}`, `data/{key}` (the overlay) or `owed` (a flush's
+//! truncation the actor's other slots have not confirmed, kept by its maintainer). Released actors with an
 //! alarm are also indexed by time, `alarm/{when}{hash}{namespace}\0{id}`, removed with the claim's release.
 //!
 //! Each request is one atomic batch: log entries, overlay changes and the claim together. The engine syncs every batch
@@ -148,6 +149,10 @@ fn data_key(actor: &Actor, key: &[u8]) -> Vec<u8> {
     actor.key(&[b"data/".as_slice(), key].concat())
 }
 
+fn owed_key(actor: &Actor) -> Vec<u8> {
+    actor.key(b"owed")
+}
+
 /// The alarm index entry of a released actor with an alarm.
 fn alarm_key(actor: &Actor, claim: &pb::ClaimRecord) -> Option<Vec<u8>> {
     let at = claim.alarm_ms.filter(|_| claim.released)?;
@@ -193,6 +198,8 @@ pub struct Store {
     /// Log bytes beyond the flushed points, for backpressure.
     unflushed: AtomicI64,
     max_unflushed: u64,
+    /// Truncations the actors' other slots owe after a flush, by slot-store prefix; stored as `owed` records too.
+    owed: Mutex<BTreeMap<Vec<u8>, (pb::Actor, u64)>>,
 }
 
 /// What a flush writes for one actor: its keys as of `through` (its commit point), rebuilt from the log.
@@ -254,7 +261,50 @@ impl Store {
             dirty: Mutex::default(),
             unflushed: AtomicI64::new(0),
             max_unflushed: MAX_UNFLUSHED_BYTES,
+            owed: Mutex::default(),
         }
+    }
+
+    /// The truncations other slots still owe, in key order.
+    pub fn owed(&self) -> Vec<(pb::Actor, u64)> {
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn owe(&self, prefix: &[u8], kind: i32, through: u64) {
+        if let Some(parsed) = Actor::parse(prefix, kind) {
+            self.owed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(prefix.to_vec(), (parsed, through));
+        }
+    }
+
+    /// Drops the obligation to have `actor`'s other slots truncate through `through`, once they have; a newer one
+    /// raised meanwhile stays.
+    pub fn settle(&self, actor: &Actor, through: u64) -> Result<(), Error> {
+        let _lock = self.lock(actor);
+        if self
+            .owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&actor.prefix)
+            .is_none_or(|(_, owed)| *owed != through)
+        {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        batch.delete(owed_key(actor));
+        self.commit(batch)?;
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&actor.prefix);
+        Ok(())
     }
 
     /// Refuses appends once the node holds `bytes` of unflushed log.
@@ -544,16 +594,27 @@ impl Store {
         }
         fresh.extend(entries);
 
-        // A new epoch's recovery may still drop an old tail; only growth past the bounds waits for a flush.
-        let full = conflict.is_none()
+        // Only growth past the bounds waits for a flush: a new epoch's recovery that replaces an old tail with as much
+        // or less still goes through.
+        let added: i64 = fresh.iter().map(|e| log_bytes(actor, e)).sum();
+        let replaced: i64 = match conflict {
+            Some(from) => self
+                .entries(actor, from, old_end.seq)?
+                .iter()
+                .map(|e| log_bytes(actor, e))
+                .sum(),
+            None => 0,
+        };
+        let full = added > replaced
             && fresh.last().is_some_and(|last| {
                 last.seq - old.flushed > MAX_UNFLUSHED_ENTRIES
                     || self.unflushed().max(0) as u64 >= self.max_unflushed
             });
         if full {
-            // The log matches the holder's through its own end, so it still learns the commit point there: without it
-            // the slot could never truncate, and would stay full.
-            let commit = request.commit.min(last).min(old_end.seq);
+            // The log matches the holder's up to its own end, or up to the conflict, so it still learns the commit
+            // point there: without it the slot could never truncate, and would stay full.
+            let matched = conflict.map_or(old_end.seq, |from| from - 1);
+            let commit = request.commit.min(last).min(matched);
             if commit > old.committed {
                 let new = pb::ClaimRecord {
                     committed: commit,
@@ -690,21 +751,39 @@ impl Store {
     /// entries can be dropped, so a slot that knows less is committed truncates that far and answers `Behind`; its
     /// `flushed` says how far it got. Without that, a lagging slot whose log is full could never shrink.
     pub fn truncate(&self, actor: &Actor, through: u64) -> Result<Outcome, Error> {
+        self.truncate_and(actor, through, false)
+    }
+
+    /// [`Store::truncate`] by the actor's maintainer, which also records, in the same batch, that the actor's other
+    /// slots owe a truncation through `through` until [`Store::settle`]: the obligation survives a restart and moves
+    /// with the range.
+    pub fn truncate_owing(&self, actor: &Actor, through: u64) -> Result<Outcome, Error> {
+        self.truncate_and(actor, through, true)
+    }
+
+    fn truncate_and(&self, actor: &Actor, owed: u64, owe: bool) -> Result<Outcome, Error> {
         let _lock = self.lock(actor);
         let old = self.load(actor)?;
         let voting = !old.repaired;
-        let refused = if through > old.committed {
+        let refused = if owed > old.committed {
             Refusal::Behind
         } else {
             Refusal::None
         };
-        let through = through.min(old.committed);
+        let through = owed.min(old.committed);
+        let mut batch = WriteBatch::default();
+        if owe {
+            batch.put(owed_key(actor), owed.to_be_bytes().to_vec());
+        }
         if through <= old.flushed {
+            if owe {
+                self.commit(batch)?;
+                self.owe(&actor.prefix, old.kind, owed);
+            }
             return Ok(Outcome::new(answer(refused, &old, voting)));
         }
         let log = self.entries(actor, old.flushed + 1, through)?;
         let mut new = old.clone();
-        let mut batch = WriteBatch::default();
         batch.delete_range(KeyRange::new(
             log_key(actor, old.flushed + 1),
             log_key(actor, through + 1),
@@ -734,6 +813,9 @@ impl Store {
         let freed: i64 = log.iter().map(|e| log_bytes(actor, e)).sum();
         self.unflushed.fetch_sub(freed, Ordering::Relaxed);
         self.mark(&actor.prefix, &new);
+        if owe {
+            self.owe(&actor.prefix, new.kind, owed);
+        }
         Ok(Outcome {
             answer: answer(refused, &new, voting),
             overlay: delta,
@@ -918,7 +1000,8 @@ impl Store {
         })
     }
 
-    /// Rebuilds the in-memory flush state (unflushed actors and log bytes) and returns overlay bytes per actor kind, for
+    /// Rebuilds the in-memory flush state (unflushed actors, log bytes, owed truncations) and returns overlay bytes per
+    /// actor kind, for
     /// the gauge: one pass over every slot record at startup.
     // ponytail: a full scan at startup; keep running totals in a record if startup time matters.
     pub fn recover(&self) -> Result<BTreeMap<i32, i64>, Error> {
@@ -945,6 +1028,17 @@ impl Store {
                 *bytes.entry(kind).or_default() += (key.len() + value.len()) as i64;
             } else if name.starts_with(b"log/") {
                 logged += (key.len() + value.len()) as i64;
+            } else if name == b"owed" {
+                let through = <[u8; 8]>::try_from(value.as_slice()).map_err(|_| {
+                    Error::Storage(StorageError::Corruption(ErrorContext {
+                        engine: "volume",
+                        instance: "volume".into(),
+                        file: None,
+                        partition: None,
+                        detail: "an owed truncation is not 8 bytes".into(),
+                    }))
+                })?;
+                self.owe(&key[..at], kind, u64::from_be_bytes(through));
             }
         }
         self.unflushed.store(logged, Ordering::Relaxed);

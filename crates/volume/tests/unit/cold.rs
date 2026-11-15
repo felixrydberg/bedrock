@@ -615,7 +615,7 @@ mod slate {
                 assert_eq!(flushed(&n.store, i), 2);
             }
             let before = store.requests();
-            assert!(n.cold.size(0, 0).await > 0);
+            assert!(n.cold.size(0, 0) > 0);
             assert_eq!(store.requests(), before, "sizes come from the manifest");
         }
         assert_eq!(writes[0], writes[1]);
@@ -746,4 +746,58 @@ mod slate {
         old.cold.tick(&old.directory).await;
         assert_eq!(flushed(&old.store, 0), 1);
     }
+}
+
+/// A coalesced open that finishes after its handle was evicted reads through it, but never reinstalls it.
+#[tokio::test]
+async fn a_late_coalesced_open_does_not_reinstall_a_retired_handle() {
+    let bucket = Memory::default();
+    for name in ["a", "b"] {
+        bucket.open(name).await.unwrap();
+    }
+    let readers = Readers::new(Arc::new(bucket.clone()), 1, &Metrics::new(&Admin::new()));
+    let first = readers.get("cell-1", "a").await.unwrap().unwrap();
+    // Opening `b` evicts `a`, whose handle the late caller still holds.
+    readers.get("cell-1", "b").await.unwrap().unwrap();
+    let (late, evicted) = readers.install("a", first.clone());
+    assert!(Arc::ptr_eq(&late, &first) && !evicted);
+    assert_eq!(readers.len(), 1);
+    let fresh = readers.get("cell-1", "a").await.unwrap().unwrap();
+    assert!(!Arc::ptr_eq(&fresh, &first), "a retired handle came back");
+}
+
+/// A range busier than [`FLUSH_ROUNDS`] batches leaves the rest dirty for the next round.
+#[tokio::test]
+async fn one_round_flushes_at_most_flush_rounds_batches_per_range() {
+    let bucket = Memory::default();
+    let n = node(&bucket, "n1", u64::MAX);
+    let big = "v".repeat(FLUSH_BYTES as usize);
+    let actors = FLUSH_ROUNDS + 2;
+    for i in 0..actors {
+        claim(&n.store, i);
+        append(&n.store, i, 0, vec![entry(1, &[("k", Some(&big))])], 1).unwrap();
+    }
+    n.cold.tick(&n.directory).await;
+    assert_eq!(bucket.commits(), FLUSH_ROUNDS as u64);
+    assert_eq!(n.store.dirty(0, 0).len(), actors - FLUSH_ROUNDS);
+    n.cold.tick(&n.directory).await;
+    assert!(n.store.dirty(0, 0).is_empty());
+}
+
+#[test]
+fn a_merge_stopped_by_its_limit_resumes_after_the_last_key_it_consumed() {
+    let stored = vec![
+        (b"a".to_vec(), b"s".to_vec()),
+        (b"b".to_vec(), b"s".to_vec()),
+        (b"c".to_vec(), b"s".to_vec()),
+    ];
+    let deleted = pb::Value {
+        key: b"b".to_vec(),
+        value: None,
+    };
+    let (values, more, next) = merge(vec![deleted], false, stored, false, 1);
+    assert_eq!(values.len(), 1);
+    assert!(more);
+    // `b` was consumed (a delete); `c` was not returned, so the next page starts right after `b`.
+    assert_eq!(next, b"b\0");
 }

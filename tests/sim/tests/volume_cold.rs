@@ -182,14 +182,17 @@ async fn scenario() -> u64 {
     )]);
     let cold = Arc::new(Mutex::new(Arc::new(maintainer(&stores, &bucket))));
     let committed = Arc::new(Mutex::new(0u64));
+    // The flush task records a broken invariant here rather than panicking, so its abort cannot hide one.
+    let violation: Arc<Mutex<Option<String>>> = Arc::default();
 
     // The maintainer: flushes about every second, and S3 never holds more than the holder announced.
     let flushing = {
-        let (cold, bucket, committed, fingerprint) = (
+        let (cold, bucket, committed, fingerprint, violation) = (
             cold.clone(),
             bucket.clone(),
             committed.clone(),
             fingerprint.clone(),
+            violation.clone(),
         );
         let directory = directory.clone();
         tokio::spawn(async move {
@@ -198,10 +201,12 @@ async fn scenario() -> u64 {
                 let current = cold.lock().unwrap().clone();
                 current.tick(&directory).await;
                 let meta = stored_meta(&bucket);
-                assert!(
-                    meta <= *committed.lock().unwrap(),
-                    "S3 holds sequence {meta}, past the commit point"
-                );
+                let point = *committed.lock().unwrap();
+                if meta > point {
+                    violation.lock().unwrap().get_or_insert(format!(
+                        "S3 holds sequence {meta}, past the commit point {point}"
+                    ));
+                }
                 fingerprint.mix(("flush", meta, bucket.commits()));
             }
         })
@@ -272,6 +277,9 @@ async fn scenario() -> u64 {
     }
     sleep(Duration::from_secs(5)).await;
     flushing.abort();
+    if let Some(violation) = violation.lock().unwrap().take() {
+        panic!("{violation}");
+    }
     let current = cold.lock().unwrap().clone();
     for _ in 0..3 {
         current.tick(&directory).await;

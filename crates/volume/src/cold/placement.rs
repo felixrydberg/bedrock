@@ -116,8 +116,19 @@ impl Placement for Cells {
         let mut done = true;
         for cell in cells {
             let table = self.routes(&cell).await?;
+            // A slot cell always has an owner for the actor's range: a missing directory or owner is a table that is not
+            // there yet, never a slot with nothing to truncate.
             let directory = table.directories.get(VOLUME).cloned().unwrap_or_default();
-            for owner in placement::owners(&directory, hash) {
+            let owners = placement::owners(&directory, hash);
+            if !owners.iter().any(|o| o.state != State::Populating) {
+                self.stale
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(cell.clone(), table.revision);
+                done = false;
+                continue;
+            }
+            for owner in owners {
                 if owner.state == State::Populating || owner.node == self.node {
                     continue;
                 }
