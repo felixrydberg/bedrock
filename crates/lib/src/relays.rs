@@ -2286,7 +2286,12 @@ impl pb::relay_server::Relay for Hub {
         request: Request<pb::RoutesRequest>,
     ) -> Result<Response<pb::RoutesReply>, Status> {
         if let Some(caller) = Caller::of(&request) {
-            caller.require(&crate::membership::SERVICES, Some(self.cell()))?;
+            // Volume routes also serve sibling cells' volume nodes, which reach an actor's slots directly (§10
+            // decision 15). The certificate names no DC; sibling relay addresses are configured per DC.
+            let volume = request.get_ref().service == crate::datasets::capabilities::VOLUME;
+            let cell = (!volume || caller.service != crate::datasets::capabilities::VOLUME)
+                .then(|| self.cell());
+            caller.require(&crate::membership::SERVICES, cell)?;
         }
         let Some(control) = self.0.control.get() else {
             return Err(Status::unavailable("only a cell relay serves routes"));

@@ -68,6 +68,8 @@ pub struct Client {
     peers: Arc<Peers>,
     /// Cell relays, tried in order for table fetches.
     relays: Vec<String>,
+    /// Relays of sibling cells in the same DC, by cell, for `volume` routes (§10 decision 15, #113 / S-05).
+    siblings: BTreeMap<String, Vec<String>>,
     /// The caller's failure domain; holders in it are preferred.
     domain: String,
     tables: Mutex<BTreeMap<String, (Arc<Table>, Instant)>>,
@@ -86,6 +88,7 @@ impl Client {
         Self {
             peers,
             relays,
+            siblings: BTreeMap::new(),
             domain,
             tables: Mutex::default(),
             sources: Sources::default(),
@@ -93,15 +96,47 @@ impl Client {
         }
     }
 
+    /// Adds sibling cells' relays, by cell, for [`Client::routes_in`].
+    pub fn with_siblings(mut self, siblings: BTreeMap<String, Vec<String>>) -> Self {
+        self.siblings = siblings;
+        self
+    }
+
     /// `service`'s routing table: the cached one, or a fetched one when none is cached, it went idle, or the caller
     /// saw `stale` fail and needs one newer than that revision.
     pub async fn routes(&self, service: &str, stale: Option<u64>) -> Result<Arc<Table>, Status> {
+        self.routes_from(service.to_owned(), &self.relays, service, stale)
+            .await
+    }
+
+    /// [`Client::routes`] of sibling cell `cell`, from its relays.
+    pub async fn routes_in(
+        &self,
+        cell: &str,
+        service: &str,
+        stale: Option<u64>,
+    ) -> Result<Arc<Table>, Status> {
+        let relays = self
+            .siblings
+            .get(cell)
+            .ok_or_else(|| Status::failed_precondition(format!("no relays for cell {cell}")))?;
+        self.routes_from(format!("{service}.{cell}"), relays, service, stale)
+            .await
+    }
+
+    async fn routes_from(
+        &self,
+        key: String,
+        relays: &[String],
+        service: &str,
+        stale: Option<u64>,
+    ) -> Result<Arc<Table>, Status> {
         let now = crate::monotonic_now();
         let reason = {
             let mut tables = self.tables.lock().unwrap();
             // ponytail: swept on use, no background task; a process calls a handful of services.
             tables.retain(|_, (_, used)| now.duration_since(*used) < IDLE_TTL);
-            match tables.get_mut(service) {
+            match tables.get_mut(&key) {
                 Some((table, used)) if stale.is_none_or(|stale| table.revision > stale) => {
                     *used = now;
                     return Ok(table.clone());
@@ -116,11 +151,9 @@ impl Client {
                 reason,
             })
             .inc();
-        let fetched = self.fetch(service, stale).await?;
+        let fetched = self.fetch(relays, service, stale).await?;
         let mut tables = self.tables.lock().unwrap();
-        let entry = tables
-            .entry(service.into())
-            .or_insert_with(|| (fetched.clone(), now));
+        let entry = tables.entry(key).or_insert_with(|| (fetched.clone(), now));
         // A lagging relay must not replace a newer table another caller fetched meanwhile.
         if fetched.revision >= entry.0.revision {
             entry.0 = fetched;
@@ -131,10 +164,15 @@ impl Client {
 
     /// The first relay table newer than `stale`. Relays apply the cell's view separately, so one may lag another; when
     /// none is newer, the newest answer.
-    async fn fetch(&self, service: &str, stale: Option<u64>) -> Result<Arc<Table>, Status> {
+    async fn fetch(
+        &self,
+        relays: &[String],
+        service: &str,
+        stale: Option<u64>,
+    ) -> Result<Arc<Table>, Status> {
         let mut last = Status::unavailable("no cell relays configured");
         let mut best: Option<Arc<Table>> = None;
-        for relay in &self.relays {
+        for relay in relays {
             let request = pb::RoutesRequest {
                 service: service.into(),
             };

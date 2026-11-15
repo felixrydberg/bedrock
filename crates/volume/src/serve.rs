@@ -26,6 +26,7 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
+use crate::cold::{self, Cold};
 use crate::store::{self, Actor, Store};
 
 /// How long a holder's host stays live after its last heartbeat (§5 Lease).
@@ -94,6 +95,9 @@ pub struct Service {
     leases: Arc<Leases>,
     started: Instant,
     metrics: Metrics,
+    cell: String,
+    /// Reads of what S3 holds (S-05); without it a read that needs S3 is refused.
+    cold: Option<Arc<Cold>>,
 }
 
 /// When each holder host was last seen, by (cell, host).
@@ -112,7 +116,7 @@ fn live(leases: &Leases, started: Instant, holder: &pb::Holder) -> bool {
 
 /// Runs a store call on the blocking pool. Simulation runs it inline, as `bedrock_lib::relays` does, so the seed
 /// decides every step.
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Status> {
     #[cfg(not(madsim))]
@@ -127,11 +131,11 @@ async fn blocking<T: Send + 'static>(
     }
 }
 
-fn status(error: store::Error) -> Status {
+pub(crate) fn status(error: store::Error) -> Status {
     match error {
         store::Error::Invalid(detail) => Status::invalid_argument(detail),
-        store::Error::Cold => {
-            Status::unimplemented("reads from S3 arrive with the cold tier (S-05)")
+        store::Error::Backpressure => {
+            Status::resource_exhausted("too much is not yet flushed to S3; retry later")
         }
         store::Error::Storage(error) => match error {
             bedrock_lib::storage::StorageError::Corruption(_) => {
@@ -158,7 +162,7 @@ impl Service {
         dc: &str,
     ) -> Result<Self, Status> {
         let metrics = Metrics::new(admin, cell, dc);
-        for (kind, bytes) in store.overlay_bytes().map_err(status)? {
+        for (kind, bytes) in store.recover().map_err(status)? {
             metrics.overlay.get_or_create(&label(kind)).set(bytes);
         }
         Ok(Service {
@@ -168,7 +172,26 @@ impl Service {
             leases: Arc::default(),
             started: bedrock_lib::monotonic_now(),
             metrics,
+            cell: cell.to_owned(),
+            cold: None,
         })
+    }
+
+    /// Serves reads of what S3 holds through `cold`.
+    pub fn with_cold(mut self, cold: Arc<Cold>) -> Self {
+        self.cold = Some(cold);
+        self
+    }
+
+    fn cold(&self) -> Result<&Cold, Status> {
+        self.cold
+            .as_deref()
+            .ok_or_else(|| Status::unavailable("this node has no cold tier"))
+    }
+
+    /// The caller's cell, which bounds its share of S3 reads; this node's own without mutual TLS.
+    fn cell_of<T>(&self, request: &Request<T>) -> String {
+        Caller::of(request).map_or_else(|| self.cell.clone(), |c| c.cell.clone())
     }
 
     /// The actor, once this node serves the range holding it.
@@ -325,12 +348,24 @@ impl pb::volume_server::Volume for Service {
         request: Request<pb::ReadRequest>,
     ) -> Result<Response<pb::ReadReply>, Status> {
         check(&request, COMPUTE, None)?;
+        let cell = self.cell_of(&request);
         let request = request.into_inner();
         let actor = self.actor(request.actor.as_ref())?;
         let store = self.store.clone();
-        let (answer, values) = blocking(move || store.read(&actor, &request.keys, request.min_seq))
-            .await?
-            .map_err(status)?;
+        let keys = request.keys.clone();
+        let (answer, mut values, missing) =
+            blocking(move || store.read(&actor, &keys, request.min_seq))
+                .await?
+                .map_err(status)?;
+        if !missing.is_empty() {
+            let flushed = answer.slot.as_ref().map_or(0, |s| s.flushed);
+            let keys: Vec<_> = missing.iter().map(|&i| values[i].key.clone()).collect();
+            let actor = request.actor.as_ref().expect("checked by `actor`");
+            let found = self.cold()?.get(&cell, actor, flushed, &keys).await?;
+            for (i, value) in missing.into_iter().zip(found) {
+                values[i].value = value;
+            }
+        }
         Ok(Response::new(pb::ReadReply {
             answer: Some(answer),
             values,
@@ -342,18 +377,44 @@ impl pb::volume_server::Volume for Service {
         request: Request<pb::ScanRequest>,
     ) -> Result<Response<pb::ScanReply>, Status> {
         check(&request, COMPUTE, None)?;
+        let cell = self.cell_of(&request);
         let request = request.into_inner();
-        let actor = self.actor(request.actor.as_ref())?;
-        let store = self.store.clone();
-        let (answer, values, more) =
-            blocking(move || store.scan(&actor, &request.start, request.limit, request.min_seq))
-                .await?
-                .map_err(status)?;
-        Ok(Response::new(pb::ScanReply {
-            answer: Some(answer),
-            values,
-            more,
-        }))
+        let parsed = request.actor.as_ref();
+        let limit = request.limit.clamp(1, store::MAX_LIMIT);
+        let mut start = request.start;
+        // A page of overlay deletes can hide every S3 key up to where it ends; scan on past it.
+        loop {
+            let actor = self.actor(parsed)?;
+            let store = self.store.clone();
+            let from = start.clone();
+            let (answer, overlay, more) =
+                blocking(move || store.scan(&actor, &from, limit, request.min_seq))
+                    .await?
+                    .map_err(status)?;
+            let flushed = answer.slot.as_ref().map_or(0, |s| s.flushed);
+            if answer.refused != pb::Refusal::None as i32 || flushed == 0 {
+                return Ok(Response::new(pb::ScanReply {
+                    answer: Some(answer),
+                    values: overlay,
+                    more,
+                }));
+            }
+            let actor = parsed.expect("checked by `actor`");
+            let (stored, stored_more) = self
+                .cold()?
+                .scan(&cell, actor, flushed, &start, limit as usize)
+                .await?;
+            let (values, more, next) =
+                cold::merge(overlay, more, stored, stored_more, limit as usize);
+            if !values.is_empty() || !more {
+                return Ok(Response::new(pb::ScanReply {
+                    answer: Some(answer),
+                    values,
+                    more,
+                }));
+            }
+            start = next;
+        }
     }
 
     async fn log(

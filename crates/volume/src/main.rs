@@ -3,5 +3,5 @@
 #[tokio::main]
 async fn main() -> Result<(), bedrock_lib::node::ConfigError> {
     bedrock_lib::node::init_tracing();
-    bedrock_volume::run(bedrock_lib::node::load::<bedrock_lib::node::ServiceConfig>()?).await
+    bedrock_volume::run(bedrock_lib::node::load::<bedrock_volume::VolumeConfig>()?).await
 }

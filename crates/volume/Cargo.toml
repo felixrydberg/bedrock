@@ -5,12 +5,22 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bedrock-lib.workspace = true
 prometheus-client.workspace = true
 prost.workspace = true
+serde.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+
+# Range databases (S-05); simulation builds use the in-memory model instead.
+[target.'cfg(not(madsim))'.dependencies]
+# The SSD block cache (B-30); the version SlateDB's `foyer` feature builds against.
+foyer = "0.22.6"
+object_store.workspace = true
+slatedb = { workspace = true, features = ["foyer"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 bedrock-lib = { workspace = true, features = ["test-support"] }
