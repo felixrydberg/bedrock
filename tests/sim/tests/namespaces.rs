@@ -103,6 +103,7 @@ fn relay(ip: &str, cell: &str, relays: &[&str]) -> RelayConfig {
                 .collect(),
             bootstrap: true,
             grace_ms: 20_000,
+            volume_replicas: 3,
         }),
         write_token: Some(TOKEN.into()),
     }

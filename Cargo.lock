@@ -399,6 +399,7 @@ dependencies = [
  "bedrock-lib",
  "bedrock-quicksilver",
  "bedrock-relay",
+ "bedrock-volume",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -412,6 +413,18 @@ dependencies = [
  "serde_json",
  "tokio-stream",
  "tonic-prost",
+]
+
+[[package]]
+name = "bedrock-volume"
+version = "0.1.0"
+dependencies = [
+ "bedrock-lib",
+ "madsim-tokio",
+ "madsim-tonic",
+ "prometheus-client",
+ "prost",
+ "tracing",
 ]
 
 [[package]]

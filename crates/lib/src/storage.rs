@@ -358,6 +358,17 @@ pub trait StorageEngine: Send + Sync {
         self.write(batch)
     }
 
+    /// About how many bytes `range` holds, for balancing ranges on stored bytes (#111 / S-03). The default sums its keys
+    /// and values exactly; RocksDB answers from its file index instead.
+    fn approximate_size(&self, range: &KeyRange) -> StorageResult<u64> {
+        let mut bytes = 0;
+        for item in self.scan(range)? {
+            let (key, value) = item?;
+            bytes += (key.len() + value.len()) as u64;
+        }
+        Ok(bytes)
+    }
+
     /// Requests reclamation of space occupied by deleted keys in `range`, such as a revoked L2 range (#22 / B-21).
     /// The default implementation does nothing.
     fn compact(&self, _range: &KeyRange) -> StorageResult<()> {

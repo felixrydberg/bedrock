@@ -176,6 +176,17 @@ fn relay_membership_is_cell_local_and_requires_a_valid_voter_location() {
     wrong_identity.node.node_id = "another-relay".into();
     assert!(wrong_identity.validate().unwrap_err().0.contains("node_id"));
     assert_eq!(config.membership.as_ref().unwrap().grace_ms, 20_000);
+    assert_eq!(config.membership.as_ref().unwrap().volume_replicas, 3);
+    // No owners per volume range would hand every range away (#111 / S-03).
+    let mut no_owners = config.clone();
+    no_owners.membership.as_mut().unwrap().volume_replicas = 0;
+    assert!(
+        no_owners
+            .validate()
+            .unwrap_err()
+            .0
+            .contains("volume_replicas")
+    );
     assert!(!format!("{config:?}").contains("private-writer-token"));
     // A relay is never its own sibling.
     assert!(

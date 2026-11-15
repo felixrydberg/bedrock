@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+// Actor storage on `bedrock-volume` (#111 / S-03, `statefull/v2.md` §5, `docs/spec/volume.tla`). A holder (a Compute
+// host) reserves an epoch at a quorum of the actor's three slots, claims with it and appends; each slot fsyncs before
+// it answers. Slots compare a holder as (cell, host).
+package bedrock.volume;
+
+service Volume {
+  // Accepted only above the slot's highest reservation, and fsynced before the answer (#131 / S-02b).
+  rpc Reserve(ReserveRequest) returns (Answer);
+  // Accepted only above the slot's promise, at its topology version or newer, and while no other holder's lease is live.
+  rpc Claim(ClaimRequest) returns (Answer);
+  // Written only at the slot's promise (epoch and holder), after the slot's log matches up to `prev`.
+  rpc Append(AppendRequest) returns (Answer);
+  // An append whose last entry is the `RELEASE` entry. After it, a new claim needs no lease wait.
+  rpc Release(AppendRequest) returns (Answer);
+  // One per Compute host per second, not one per actor: the lease of every actor the host holds here.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+  rpc Read(ReadRequest) returns (ReadReply);
+  rpc Scan(ScanRequest) returns (ScanReply);
+  // The claimant's recovery read: the slot's log after its flushed point, only for the holder it promised.
+  rpc Log(LogRequest) returns (LogReply);
+  // From the maintainer once S3 holds everything through `through` (S-05).
+  rpc Truncate(TruncateRequest) returns (Answer);
+  // Another slot copies one hash range's records (S-06).
+  rpc Repair(RepairRequest) returns (RepairReply);
+}
+
+// `kind` is a `bedrock_lib::actors::Kind`, used only as a metrics label.
+message Actor { string namespace = 1; string id = 2; int32 kind = 3; }
+message Holder { string cell = 1; string host = 2; }
+
+message Change { bytes key = 1; optional bytes value = 2; }
+// Sets the actor's alarm, or clears it without `at_ms`.
+message Alarm { optional uint64 at_ms = 1; }
+
+// One commit. `committed_at` is the writer's, carried unchanged through every hop.
+message Entry {
+  enum Kind {
+    DATA = 0;
+    // A claim's first entry at its epoch (Raft's Figure 8 rule).
+    NOOP = 1;
+    RELEASE = 2;
+  }
+  uint64 seq = 1;
+  uint64 epoch = 2;
+  uint64 committed_at = 3;
+  Kind kind = 4;
+  // The `Changes` batch `NamespaceDatabase::write` takes; the slot never reads the keys.
+  repeated Change changes = 5;
+  optional Alarm alarm = 6;
+}
+
+message LogEnd { uint64 seq = 1; uint64 epoch = 2; }
+
+message ReserveRequest { Actor actor = 1; uint64 epoch = 2; uint64 version = 3; }
+message ClaimRequest { Actor actor = 1; Holder holder = 2; uint64 epoch = 3; uint64 version = 4; }
+// `entries` are consecutive from `prev + 1`; `prev_epoch` is the epoch of the holder's entry `prev` (0 when `prev` is 0).
+// `commit` is the holder's commit point: its last entry of its own epoch acknowledged at a quorum.
+message AppendRequest {
+  Actor actor = 1;
+  Holder holder = 2;
+  uint64 epoch = 3;
+  uint64 version = 4;
+  uint64 prev_epoch = 5;
+  repeated Entry entries = 6;
+  uint64 commit = 7;
+}
+
+// Why a slot refused; `NONE` means accepted.
+enum Refusal {
+  NONE = 0;
+  // The epoch is not above the slot's reservation (Reserve) or promise (Claim).
+  STALE_EPOCH = 1;
+  // The request's topology version is older than the slot's.
+  STALE_VERSION = 2;
+  // Another holder's lease is live; `slot.holder` names it.
+  LEASE_LIVE = 3;
+  // The append is not at the slot's promise.
+  NOT_PROMISED = 4;
+  // The slot's log does not hold the holder's entry `prev`; resend from `slot.end` or earlier.
+  LOG_GAP = 5;
+  // A repaired slot takes no reservation.
+  NOT_VOTING = 6;
+  // The slot has not caught up with `min_seq`, or `through` is past its commit point.
+  BEHIND = 7;
+}
+
+// The slot's state after the request.
+message Slot {
+  // False for a repaired slot: its answers count towards no reservation, claim or commit quorum.
+  bool voting = 1;
+  uint64 reserved = 2;
+  // The promise.
+  uint64 epoch = 3;
+  Holder holder = 4;
+  uint64 version = 5;
+  LogEnd end = 6;
+  uint64 committed = 7;
+  // The log starts after this sequence; S3 holds everything up to it.
+  uint64 flushed = 8;
+  bool released = 9;
+}
+
+message Answer { Refusal refused = 1; Slot slot = 2; }
+
+message HeartbeatRequest { Holder holder = 1; }
+message HeartbeatReply {}
+
+message ReadRequest { Actor actor = 1; repeated bytes keys = 2; uint64 min_seq = 3; }
+// `value` is absent when the key is deleted or was never written.
+message Value { bytes key = 1; optional bytes value = 2; }
+message ReadReply { Answer answer = 1; repeated Value values = 2; }
+
+message ScanRequest { Actor actor = 1; bytes start = 2; uint32 limit = 3; uint64 min_seq = 4; }
+message ScanReply { Answer answer = 1; repeated Value values = 2; bool more = 3; }
+// Entries from `from` (or the first one after the flushed point), at most `limit`.
+message LogRequest { Actor actor = 1; Holder holder = 2; uint64 epoch = 3; uint64 from = 4; uint32 limit = 5; }
+message LogReply { Answer answer = 1; repeated Entry entries = 2; bool more = 3; }
+
+message TruncateRequest { Actor actor = 1; uint64 through = 2; }
+
+// Records whose hash lies in `[start, end)`, `end` 0 meaning 2⁶⁴, after the raw key `after`.
+message RepairRequest { uint64 start = 1; uint64 end = 2; bytes after = 3; uint32 limit = 4; }
+message Record { bytes key = 1; bytes value = 2; }
+message RepairReply { repeated Record records = 1; bool more = 2; }
+
+// Stored records (`crates/volume/src/store.rs`).
+message ClaimRecord {
+  uint64 epoch = 1;
+  Holder holder = 2;
+  bool released = 3;
+  uint64 version = 4;
+  // The highest reserved epoch. A repaired slot votes again once a claim above it has committed.
+  uint64 reserved = 5;
+  bool repaired = 6;
+  uint64 committed = 7;
+  LogEnd end = 8;
+  uint64 flushed = 9;
+  uint64 flushed_epoch = 10;
+  optional uint64 alarm_ms = 11;
+  // The alarm as of `flushed`, which a log truncation falls back to.
+  optional uint64 flushed_alarm_ms = 12;
+  int32 kind = 13;
+}
+message OverlayRecord { uint64 seq = 1; optional bytes value = 2; }

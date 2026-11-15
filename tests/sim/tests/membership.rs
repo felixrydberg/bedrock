@@ -140,6 +140,7 @@ fn relay(name: &str, ip: &str, cell: &str, relays: &[&str]) -> RelayConfig {
                 .collect(),
             bootstrap: true,
             grace_ms: GRACE.as_millis() as u64,
+            volume_replicas: 3,
         }),
         write_token: Some(TOKEN.into()),
     }
@@ -286,6 +287,7 @@ fn spawn_member(
                 let namespace = membership::namespace(service, cell);
                 loop {
                     tokio::select! {
+                        biased;
                         () = state.drain.notified() => break,
                         () = sleep(Duration::from_millis(100)) => {
                             if let Some(revision) = session.applied(membership::DATASET, &namespace) {

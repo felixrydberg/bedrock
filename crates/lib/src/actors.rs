@@ -128,31 +128,14 @@ impl ActorId {
 
     /// Parses `{region}_{base32(128 bits)}`. The encoding is canonical, so every ID has one spelling.
     pub fn parse(regions: &Regions, text: &str) -> Result<Self, Error> {
-        let Some((region, encoded)) = text.rsplit_once('_') else {
-            return malformed("missing '_' between region and ID");
-        };
-        if encoded.len() != ENCODED {
-            return malformed(format!("ID must be {ENCODED} base32 characters"));
-        }
-        let mut bits = 0u128;
-        for (i, byte) in encoded.bytes().enumerate() {
-            let Some(value) = ALPHABET.iter().position(|a| *a == byte) else {
-                return malformed("ID has a character outside a-z and 2-7");
-            };
-            let value = value as u128;
-            if i + 1 < ENCODED {
-                bits = (bits << 5) | value;
-            } else if value & 0b11 != 0 {
-                // 26 characters hold 130 bits; the last two are padding.
-                return malformed("ID has nonzero padding bits");
-            } else {
-                bits = (bits << 3) | (value >> 2);
-            }
-        }
-        if !valid_region(region) {
-            return malformed("region must be 1 to 32 characters of a-z, 0-9 and '-'");
-        }
+        let (region, bits) = decode(text)?;
         Self::new(regions, region, bits)
+    }
+
+    /// The rendezvous and range hash of the ID `text`, checking its format but not its region. `bedrock-volume` keys and
+    /// routes by it without reading the topology; the holder has already checked the region.
+    pub fn hash_of(text: &str) -> Result<u64, Error> {
+        Ok((decode(text)?.1 >> 64) as u64)
     }
 
     /// `idFromName`: the first 128 bits of SHA-256(`namespace_id` ‖ `name`) in `region`, the binding's region. IDs of
@@ -205,6 +188,35 @@ impl std::fmt::Display for ActorId {
         }
         Ok(())
     }
+}
+
+/// Decodes `{region}_{base32(128 bits)}`. The encoding is canonical, so every ID has one spelling.
+fn decode(text: &str) -> Result<(&str, u128), Error> {
+    let Some((region, encoded)) = text.rsplit_once('_') else {
+        return malformed("missing '_' between region and ID");
+    };
+    if encoded.len() != ENCODED {
+        return malformed(format!("ID must be {ENCODED} base32 characters"));
+    }
+    let mut bits = 0u128;
+    for (i, byte) in encoded.bytes().enumerate() {
+        let Some(value) = ALPHABET.iter().position(|a| *a == byte) else {
+            return malformed("ID has a character outside a-z and 2-7");
+        };
+        let value = value as u128;
+        if i + 1 < ENCODED {
+            bits = (bits << 5) | value;
+        } else if value & 0b11 != 0 {
+            // 26 characters hold 130 bits; the last two are padding.
+            return malformed("ID has nonzero padding bits");
+        } else {
+            bits = (bits << 3) | (value >> 2);
+        }
+    }
+    if !valid_region(region) {
+        return malformed("region must be 1 to 32 characters of a-z, 0-9 and '-'");
+    }
+    Ok((region, bits))
 }
 
 fn valid_region(region: &str) -> bool {

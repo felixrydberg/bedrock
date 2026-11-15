@@ -352,7 +352,7 @@ fn all_ready(service: &str, directories: &Directories) -> siblings::Ready {
 fn settle(service: &str, actual: &Members, directories: &mut Directories) -> usize {
     for pass in 0..100 {
         let ready = all_ready(service, directories);
-        let changes = place(service, actual, directories, &ready, &[]);
+        let changes = place(service, actual, directories, &ready, &[], REPLICAS);
         if changes.is_empty() {
             return pass;
         }
@@ -401,7 +401,14 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
         node("qs-1", "quicksilver", "d"),
     ]);
     let mut directories = Directories::new();
-    let first = place("cdn", &actual, &directories, &siblings::Ready::new(), &[]);
+    let first = place(
+        "cdn",
+        &actual,
+        &directories,
+        &siblings::Ready::new(),
+        &[],
+        REPLICAS,
+    );
     let Some(Change::Range {
         dataset, owners, ..
     }) = first.first()
@@ -480,6 +487,7 @@ fn quicksilver_placement_ignores_auth_dataset_membership() {
         &Directories::new(),
         &siblings::Ready::new(),
         &[],
+        REPLICAS,
     );
     let assigned = |dataset: &str| -> BTreeSet<String> {
         changes
@@ -511,7 +519,8 @@ fn quicksilver_placement_ignores_auth_dataset_membership() {
             &actual,
             &Directories::new(),
             &siblings::Ready::new(),
-            &[]
+            &[],
+            REPLICAS
         )
         .is_empty()
     );
@@ -562,7 +571,7 @@ fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
         ),
     ]);
     assert_eq!(
-        place("quicksilver", &actual, &directories, &ready, &[]),
+        place("quicksilver", &actual, &directories, &ready, &[], REPLICAS),
         vec![Change::Range {
             service: "quicksilver".into(),
             dataset: "quicksilver".into(),
@@ -607,11 +616,25 @@ fn a_leaving_owner_stays_while_the_only_ready_owner_is_unhealthy() {
                 if !owners.iter().any(|owner| owner.node == "good"))
         })
     };
-    let changes = place("cdn", &actual, &directories, &siblings::Ready::new(), &[]);
+    let changes = place(
+        "cdn",
+        &actual,
+        &directories,
+        &siblings::Ready::new(),
+        &[],
+        REPLICAS,
+    );
     assert!(!leaves(changes), "the only healthy copy was let go");
 
     let actual = members(&[node("good", &[]), node("sick", &[])]);
-    let changes = place("cdn", &actual, &directories, &siblings::Ready::new(), &[]);
+    let changes = place(
+        "cdn",
+        &actual,
+        &directories,
+        &siblings::Ready::new(),
+        &[],
+        REPLICAS,
+    );
     assert!(leaves(changes), "a healthy ready owner lets it go");
 }
 

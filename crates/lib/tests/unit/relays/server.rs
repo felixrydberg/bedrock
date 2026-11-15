@@ -863,6 +863,17 @@ async fn members_track_sessions_status_updates_and_graceful_leaves() {
         hub.0.subscribers.lock().unwrap()[&2].member,
         Some(with(&["auth"], &["auth"]))
     );
+    // So do range sizes, for placement (#111 / S-03).
+    let sized = pb::Member {
+        sizes: vec![pb::RangeSize {
+            span: Some(pb::Span { start: 0, end: 0 }),
+            bytes: 7,
+            middle: 0,
+        }],
+        ..with(&["auth"], &["auth"])
+    };
+    assert!(hub.member(2, sized.clone()));
+    assert_eq!(hub.0.subscribers.lock().unwrap()[&2].member, Some(sized));
     hub.0
         .subscribers
         .lock()

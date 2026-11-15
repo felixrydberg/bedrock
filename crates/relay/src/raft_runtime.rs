@@ -39,6 +39,7 @@ pub(crate) async fn run<P: Policy>(
     policy.ready()?;
     loop {
         tokio::select! {
+            biased;
             _ = tick.tick() => {
                 policy.raw().tick();
                 policy.ready()?;

@@ -527,6 +527,7 @@ async fn watch_membership(chaos: Arc<Chaos>, peers: Arc<Peers>) {
                 let mut progress = tokio::time::interval(bedrock_lib::relays::PROGRESS);
                 loop {
                     let frame = tokio::select! {
+                        biased;
                         _ = progress.tick() => {
                             tx.send(pb::RelayRequest { kind: Some(pb::relay_request::Kind::Progress(true)) })
                                 .await.map_err(|_| tonic::Status::unavailable("observer requests closed"))?;
@@ -786,6 +787,7 @@ fn relay(name: &str, ip: &str, replay_max_bytes: Option<u64>) -> RelayConfig {
                 .collect(),
             bootstrap: true,
             grace_ms: GRACE.as_millis() as u64,
+            volume_replicas: 3,
         }),
         write_token: Some(TOKEN.into()),
     }

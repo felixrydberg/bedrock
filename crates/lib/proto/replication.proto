@@ -51,7 +51,12 @@ message Member {
   // B-14: enabled datasets whose local storage is quarantined or rebuilding. Such a member gets no new L2 ranges and is
   // skipped as a source for those datasets.
   repeated string unhealthy = 14;
+  // #111 / S-03: the approximate stored bytes of each range a `volume` node holds ready or leaving, ordered by start,
+  // for placement to balance on. Not metric labels: a cell has thousands of ranges.
+  repeated RangeSize sizes = 15;
 }
+// `middle` is a hash inside the span with about half of its bytes below it, or 0 when unknown.
+message RangeSize { Span span = 1; uint64 bytes = 2; uint64 middle = 3; }
 // B-16 L2 placement directory entry, under key `range/{dataset}/{start}` (16 lowercase hex digits) in the same
 // namespace as `Member`. The range ends where the dataset's next starts, or at 2^64.
 message Range {

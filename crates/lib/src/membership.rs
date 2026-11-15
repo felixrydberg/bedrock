@@ -53,7 +53,7 @@ pub fn token(identity: &str) -> bool {
 }
 
 /// An entry a node may announce: a known service, plain identities, `ready` or `draining`, and unhealthy datasets
-/// that are its own, in order and without repeats (so equal health compares equal).
+/// that are its own, in order and without repeats (so equal health compares equal), and range sizes in order.
 pub fn validate(member: &pb::Member) -> Result<(), Status> {
     let status = pb::member::Status::try_from(member.status);
     if !SERVICES.contains(&member.service.as_str())
@@ -65,6 +65,7 @@ pub fn validate(member: &pb::Member) -> Result<(), Status> {
         )
         || !member.unhealthy.is_sorted_by(|a, b| a < b)
         || !member.unhealthy.iter().all(|d| member.datasets.contains(d))
+        || !sizes_valid(&member.sizes)
     {
         return Err(Status::invalid_argument("invalid membership entry"));
     }
@@ -93,7 +94,26 @@ pub fn member(config: &ServiceConfig, service: &str) -> pb::Member {
         status: pb::member::Status::Ready as i32,
         address: node.advertised(),
         unhealthy: Vec::new(),
+        sizes: Vec::new(),
     }
+}
+
+/// Range sizes are disjoint, non-empty spans in order, each with its middle inside or 0.
+fn sizes_valid(sizes: &[pb::RangeSize]) -> bool {
+    let mut from = 0u128;
+    sizes.iter().all(|size| {
+        let Some(span) = &size.span else { return false };
+        let end = if span.end == 0 {
+            1 << 64
+        } else {
+            u128::from(span.end)
+        };
+        let start = u128::from(span.start);
+        let middle = u128::from(size.middle);
+        let ok = start >= from && end > start && (middle == 0 || (start < middle && middle < end));
+        from = end;
+        ok
+    })
 }
 
 /// One service's published members in a cell, held in memory; a restarted node bootstraps it again.
