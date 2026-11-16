@@ -25,6 +25,11 @@ after a disk wipe. Nothing here is implemented yet; S-03 (#111), S-04 (#112) and
   sees a live lease exactly while its promised holder is between `Recover` and `Fence` or `Release`.
 - **Maintainer.** Two slots (`a`, `b`) can each believe they are the maintainer. `OpenMaint` is SlateDB writer fencing:
   the newest opener fences the other. `Flush` appends one atomic batch to S3, up to the announced commit point.
+- **Backpressure and truncation** (S-05, #113; config `volume-truncate` only, so the other configs keep their state
+  spaces). Every slot tracks the commit point it knows. `Learn` is an append refused under backpressure: the slot
+  writes nothing, as with a lost message, but learns the announced commit point for the part of its log that matches
+  the holder's, so a full slot can still truncate. `Truncate` drops a slot's log through what S3 holds, but never
+  past the commit point the slot knows; the dropped prefix is then read from S3.
 - **Changes**, one per config (`Change`):
   - `handoff`: `c` becomes the leaving owner and seals. The populating owner `d` copies from the sealed `c`, reports
     ready, then votes in `c`'s slot position; `c` drops the range. Readiness is reported by the node and checked by
@@ -47,6 +52,7 @@ off, and a fenced holder's appends still arrive.
 | `OneWriter` | At most one holder serves the actor (is open). |
 | `NoStaleAppend` | Once a newer holder serves, an older epoch commits nothing that holder lacks. A late fsync may still complete the quorum of an entry the newer holder recovered. |
 | `S3Committed` | Every entry in S3 is committed, at its sequence. |
+| `TruncatedInS3` | What a slot truncated is what S3 holds at those sequences, so reads of it from S3 are the slot's log. |
 | `TypeOK` | Catches mistakes in the model only. |
 
 Each deliberate bug in `scripts/tlc.sh` breaks the invariant named beside it:
@@ -61,6 +67,8 @@ Each deliberate bug in `scripts/tlc.sh` breaks the invariant named beside it:
 | `volume-wipe` | `self-epoch` | `NoLostAck` | A holder claims at its own highest seen + 1, without reserving it |
 | `volume-wipe` | `early` | `NoLostAck` | A repaired slot votes at once |
 | `volume-topology` | `new-only` | `NoLostAck`, `OneWriter`, `NoStaleAppend` | During the transition a quorum of only the new slot set counts |
+| `volume-truncate` | `learn` | `S3Committed` | A refused append teaches the commit point past where the slot's log matches the holder's |
+| `volume-truncate` | `truncate` | `TruncatedInS3` | A slot truncates through what S3 holds, past the commit point it knows |
 
 ## Bounds
 
@@ -72,6 +80,7 @@ The third epoch multiplies the state space, so each config gets the bounds its c
 | `volume-handoff` | handoff | 2 | 2 | Two competing claims around the handoff |
 | `volume-wipe` | wipe | 2 | 2 | Two competing claims around the wipe |
 | `volume-topology` | topology | 2 | 1 | One claim per version is enough for the joint-majority checks |
+| `volume-truncate` | truncate | 2 | 2 | Two entries let a slot match the holder's log in part and truncate in part |
 
 Two hosts, symmetric. `MaxEpoch 3` with `MaxLen 2` grew past 38 million distinct states for `handoff` without
 finishing.
@@ -85,8 +94,34 @@ finishing.
   a rule, a version-1 commit on `{a, c}` and a version-3 claim on `{b, d}` share no slot.
 - **Slots learn a version from claims and appends.** Reading it from the topology record earlier only adds refusals,
   which a lost message already covers, so the model leaves that out.
-- **Log truncation after a flush** is not modeled; slots keep their whole log. Alarms, reads and the overlay are out
-  of scope.
+- **Log truncation after a flush** is modeled as a truncation point (`volume-truncate`); slots keep their whole log
+  beside it, and `TruncatedInS3` checks that the truncated prefix is S3's. Alarms, reads and the overlay are out of
+  scope. The next section says what the code needs so that this abstraction stays sound.
+
+## Truncation and `Slot.flushed_epoch` (#112 / S-04)
+
+The model's `Replicate` sends a slot the holder's whole log (`hlog`), so the holder always knows the epoch of the
+entry before anything it sends. That is how a slot's log is checked against the holder's at the append point, and
+how a slot holding an old epoch's tail gets it truncated. In the code, a slot answers `Log` only with entries after
+its flushed point (S-05 truncates the rest once S3 holds it). A holder that recovers from such a slot therefore lacks
+the entry at the flushed point, and without its epoch it cannot send a lagging slot the entry after it.
+
+`Slot.flushed_epoch` (`crates/lib/proto/volume.proto`, field 10) closes that gap. Every slot answer carries the epoch
+of the entry at its flushed point, from `ClaimRecord.flushed_epoch`. The claimant's recovery reads it with the first
+`Log` page and uses it as the epoch before its first recovered entry (`recover` in
+`crates/compute/src/actors/volume.rs`). The field adds no step and no state the model lacks: `Truncate` drops only
+what S3 already holds, so the epoch at the flushed point is known before a slot truncates, and the specification
+keeps no field for it. Two facts make it safe:
+
+- An entry at a slot's flushed point is committed, because S3 holds only committed entries (`S3Committed`). Its epoch
+  is the same on every slot that holds it.
+- A slot without that entry still refuses the append with `LOG_GAP`, as in the model. The holder then stops sending
+  to it until S-06 repairs it.
+
+The `flushed_point` scenario in `tests/sim/tests/volume_client.rs` checks this. Two slots are truncated, and a third
+whose log ends exactly at the flushed point catches up through the next holder. Without the field, it is stuck.
+S-05 models truncation itself with `Learn`, `Truncate` and `TruncatedInS3` (above); the code reads the dropped prefix
+from S3.
 
 ## Resolved: slot repair after a disk wipe (S-02b / #131)
 
@@ -141,10 +176,15 @@ On 2026-11-14 with TLC 2026.11.06 from `scripts/tla2tools.jar`, 2 workers and a 
 | `volume-handoff` | 223,648,667 | 54,367,452 | 42 | 1,258 s | Passed |
 | `volume-topology` | 136,316,807 | 32,069,792 | 40 | 648 s | Passed |
 | `volume-wipe` | 149,000,043 | 33,777,832 | 42 | 1,005 s | Passed |
+| `volume-truncate` | 99,206,671 | 20,565,946 | 40 | 725 s | Passed |
 
 All 10 volume bugs broke their invariants, and the other 50 still did (`scripts/tlc.sh bugs`, 2,231 s). Reservation
 adds a step to every claim, so the passing configs have 11 to 21 times as many distinct states as in S-02
 (`volume-base` had 3.5 million). Runs used 2 workers; an earlier S-02 run with 4 workers was interrupted when the machine went down.
+
+On 2026-11-16, after S-05 (#113) added `Learn`, `Truncate` and `TruncatedInS3`, every volume config was checked again
+with 2 workers and a 4 GB heap. The four earlier configs found exactly the state counts above, since the new actions
+run only in `volume-truncate`; all 12 volume bugs broke their invariants, including the new `learn` and `truncate`.
 
 ## Cold tier: range databases (S-05, #113)
 
