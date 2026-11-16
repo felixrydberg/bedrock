@@ -2,7 +2,8 @@
 //!
 //! Records live in a [`StorageEngine`]: RocksDB, or the in-memory engine in simulation builds. Every actor key starts
 //! with `s/` and the actor's big-endian hash, so a hash range is one scan and dropping it one `delete_range`:
-//! `s/{hash}{namespace}\0{id}\0` followed by `claim`, `log/{seq}` or `data/{key}` (the overlay). Released actors with an
+//! `s/{hash}{namespace}\0{id}\0` followed by `claim`, `log/{seq}`, `data/{key}` (the overlay) or `owed` (a flush's
+//! truncation the actor's other slots have not confirmed, kept by its maintainer). Released actors with an
 //! alarm are also indexed by time, `alarm/{when}{hash}{namespace}\0{id}`, removed with the claim's release.
 //!
 //! Each request is one atomic batch: log entries, overlay changes and the claim together. The engine syncs every batch
@@ -13,6 +14,7 @@
 //! votes again once an append shows that a claim above its reservation has committed.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -32,12 +34,18 @@ const STRIPES: u64 = 64;
 /// The most entries one `Scan` or `Repair` answer carries.
 pub const MAX_LIMIT: u32 = 1000;
 
+/// Log entries an actor may hold beyond its flushed point before its appends are refused (S-05 backpressure). It keeps
+/// one actor whose range database cannot flush from filling the node.
+pub const MAX_UNFLUSHED_ENTRIES: u64 = 100_000;
+/// Log bytes the node may hold beyond the flushed points before every append is refused.
+pub const MAX_UNFLUSHED_BYTES: u64 = 16 << 30;
+
 #[derive(Debug)]
 pub enum Error {
     Storage(StorageError),
     Invalid(String),
-    /// The overlay does not hold the key, and S3 might: cold reads arrive with S-05.
-    Cold,
+    /// Too much is not yet flushed to S3; the holder retries later. Nothing was written.
+    Backpressure,
 }
 
 impl From<StorageError> for Error {
@@ -106,6 +114,24 @@ impl Actor {
         self.kind
     }
 
+    /// `{hash}{namespace}\0{id}\0`: the actor's key prefix without the slot store's `s/`, as the range database keys it.
+    pub fn name(&self) -> &[u8] {
+        &self.prefix[2..]
+    }
+
+    /// The actor whose slot-store prefix `prefix` is, back from its bytes.
+    fn parse(prefix: &[u8], kind: i32) -> Option<pb::Actor> {
+        let rest = prefix.strip_prefix(b"s/")?.get(8..)?;
+        let mut parts = rest.split(|b| *b == 0);
+        let namespace = String::from_utf8(parts.next()?.to_vec()).ok()?;
+        let id = String::from_utf8(parts.next()?.to_vec()).ok()?;
+        Some(pb::Actor {
+            namespace,
+            id,
+            kind,
+        })
+    }
+
     fn key(&self, suffix: &[u8]) -> Vec<u8> {
         [self.prefix.as_slice(), suffix].concat()
     }
@@ -121,6 +147,10 @@ fn log_key(actor: &Actor, seq: u64) -> Vec<u8> {
 
 fn data_key(actor: &Actor, key: &[u8]) -> Vec<u8> {
     actor.key(&[b"data/".as_slice(), key].concat())
+}
+
+fn owed_key(actor: &Actor) -> Vec<u8> {
+    actor.key(b"owed")
 }
 
 /// The alarm index entry of a released actor with an alarm.
@@ -163,6 +193,39 @@ impl Outcome {
 pub struct Store {
     engine: Arc<dyn StorageEngine>,
     locks: Vec<Mutex<()>>,
+    /// Actors with committed entries not yet flushed, by slot-store prefix: the maintainer's flush candidates.
+    dirty: Mutex<BTreeMap<Vec<u8>, pb::Actor>>,
+    /// Log bytes beyond the flushed points, for backpressure.
+    unflushed: AtomicI64,
+    max_unflushed: u64,
+    /// Truncations the actors' other slots owe after a flush, by slot-store prefix; stored as `owed` records too.
+    owed: Mutex<BTreeMap<Vec<u8>, (pb::Actor, u64)>>,
+}
+
+/// What a flush writes for one actor: its keys as of `through` (its commit point), rebuilt from the log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pending {
+    pub actor: pb::Actor,
+    /// The slot's flushed point: the changes start after it.
+    pub flushed: u64,
+    pub through: u64,
+    pub epoch: u64,
+    pub alarm: Option<u64>,
+    /// The last write of each key in `(flushed, through]`, in key order; `None` deletes it.
+    pub changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+}
+
+impl Pending {
+    pub fn bytes(&self) -> u64 {
+        self.changes
+            .iter()
+            .map(|(k, v)| (k.len() + v.as_ref().map_or(0, Vec::len)) as u64)
+            .sum()
+    }
+}
+
+fn log_bytes(actor: &Actor, entry: &pb::Entry) -> i64 {
+    (log_key(actor, entry.seq).len() + entry.encoded_len()) as i64
 }
 
 fn answer(refused: Refusal, claim: &pb::ClaimRecord, voting: bool) -> pb::Answer {
@@ -196,7 +259,118 @@ impl Store {
         Store {
             engine,
             locks: (0..STRIPES).map(|_| Mutex::new(())).collect(),
+            dirty: Mutex::default(),
+            unflushed: AtomicI64::new(0),
+            max_unflushed: MAX_UNFLUSHED_BYTES,
+            owed: Mutex::default(),
         }
+    }
+
+    /// The truncations other slots still owe, in key order.
+    pub fn owed(&self) -> Vec<(pb::Actor, u64)> {
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn owe(&self, prefix: &[u8], kind: i32, through: u64) {
+        if let Some(parsed) = Actor::parse(prefix, kind) {
+            self.owed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(prefix.to_vec(), (parsed, through));
+        }
+    }
+
+    /// Drops the obligation to have `actor`'s other slots truncate through `through`, once they have; a newer one
+    /// raised meanwhile stays.
+    pub fn settle(&self, actor: &Actor, through: u64) -> Result<(), Error> {
+        let _lock = self.lock(actor);
+        if self
+            .owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&actor.prefix)
+            .is_none_or(|(_, owed)| *owed != through)
+        {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        batch.delete(owed_key(actor));
+        self.commit(batch)?;
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&actor.prefix);
+        Ok(())
+    }
+
+    /// Refuses appends once the node holds `bytes` of unflushed log.
+    pub fn with_max_unflushed(mut self, bytes: u64) -> Self {
+        self.max_unflushed = bytes;
+        self
+    }
+
+    /// Log bytes beyond the flushed points.
+    pub fn unflushed(&self) -> i64 {
+        self.unflushed.load(Ordering::Relaxed)
+    }
+
+    /// Notes whether `actor` has committed entries beyond its flushed point.
+    fn mark(&self, prefix: &[u8], claim: &pb::ClaimRecord) {
+        let mut dirty = self.dirty.lock().unwrap_or_else(PoisonError::into_inner);
+        if claim.committed <= claim.flushed {
+            dirty.remove(prefix);
+        } else if !dirty.contains_key(prefix)
+            && let Some(parsed) = Actor::parse(prefix, claim.kind)
+        {
+            dirty.insert(prefix.to_vec(), parsed);
+        }
+    }
+
+    /// The actors of `[start, end)` (`end` 0 meaning 2⁶⁴) with committed entries not yet flushed, in key order.
+    pub fn dirty(&self, start: u64, end: u64) -> Vec<pb::Actor> {
+        let span = span(start, end);
+        let bounds = span.bounds().expect("a hash span is never empty");
+        self.dirty
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .range::<[u8], _>(bounds)
+            .map(|(_, actor)| actor.clone())
+            .collect()
+    }
+
+    /// What a flush of `actor` writes: its keys as of its commit point, or `None` when nothing committed is unflushed.
+    /// Keys come from the log, not the overlay, which may already hold a newer, uncommitted value.
+    pub fn pending(&self, actor: &Actor) -> Result<Option<Pending>, Error> {
+        let _lock = self.lock(actor);
+        let claim = self.load(actor)?;
+        if claim.committed <= claim.flushed {
+            return Ok(None);
+        }
+        let log = self.entries(actor, claim.flushed + 1, claim.committed)?;
+        let mut changes = BTreeMap::new();
+        let mut alarm = claim.flushed_alarm_ms;
+        for entry in &log {
+            for change in &entry.changes {
+                changes.insert(change.key.clone(), change.value.clone());
+            }
+            if let Some(at) = &entry.alarm {
+                alarm = at.at_ms;
+            }
+        }
+        Ok(Some(Pending {
+            actor: Actor::parse(&actor.prefix, claim.kind)
+                .ok_or_else(|| Error::Invalid("an actor prefix does not parse".into()))?,
+            flushed: claim.flushed,
+            through: claim.committed,
+            epoch: self.epoch_at(actor, &claim, claim.committed)?,
+            alarm,
+            changes: changes.into_iter().collect(),
+        }))
     }
 
     fn lock(&self, actor: &Actor) -> MutexGuard<'_, ()> {
@@ -421,18 +595,53 @@ impl Store {
         }
         fresh.extend(entries);
 
+        // Only growth past the bounds waits for a flush: a new epoch's recovery that replaces an old tail with as much
+        // or less still goes through.
+        let added: i64 = fresh.iter().map(|e| log_bytes(actor, e)).sum();
+        let replaced: i64 = match conflict {
+            Some(from) => self
+                .entries(actor, from, old_end.seq)?
+                .iter()
+                .map(|e| log_bytes(actor, e))
+                .sum(),
+            None => 0,
+        };
+        let full = added > replaced
+            && fresh.last().is_some_and(|last| {
+                last.seq - old.flushed > MAX_UNFLUSHED_ENTRIES
+                    || self.unflushed().max(0) as u64 >= self.max_unflushed
+            });
+        if full {
+            // The log matches the holder's up to its own end, or up to the conflict, so it still learns the commit
+            // point there: without it the slot could never truncate, and would stay full.
+            let matched = conflict.map_or(old_end.seq, |from| from - 1);
+            let commit = request.commit.min(last).min(matched);
+            if commit > old.committed {
+                let new = pb::ClaimRecord {
+                    committed: commit,
+                    ..old.clone()
+                };
+                let mut batch = WriteBatch::default();
+                Self::save(&mut batch, actor, &old, &new);
+                self.commit(batch)?;
+                self.mark(&actor.prefix, &new);
+            }
+            return Err(Error::Backpressure);
+        }
         let mut new = pb::ClaimRecord {
             version: request.version,
             kind: actor.kind,
             ..old.clone()
         };
         let mut batch = WriteBatch::default();
+        let mut logged = 0;
         // Overlay records to write (`None` removes one, so reads fall back to S3).
         let mut overlay: BTreeMap<Vec<u8>, Option<pb::OverlayRecord>> = BTreeMap::new();
         if let Some(from) = conflict {
-            self.truncate_tail(actor, &mut new, from, &mut batch, &mut overlay)?;
+            logged -= self.truncate_tail(actor, &mut new, from, &mut batch, &mut overlay)?;
         }
         for entry in &fresh {
+            logged += log_bytes(actor, entry);
             batch.put(log_key(actor, entry.seq), entry.encode_to_vec());
             for change in &entry.changes {
                 overlay.insert(
@@ -478,6 +687,8 @@ impl Store {
         }
         Self::save(&mut batch, actor, &old, &new);
         let fsync = self.commit(batch)?;
+        self.unflushed.fetch_add(logged, Ordering::Relaxed);
+        self.mark(&actor.prefix, &new);
         Ok(Outcome {
             answer: answer(Refusal::None, &new, voting),
             overlay: delta,
@@ -486,7 +697,7 @@ impl Store {
     }
 
     /// Drops the log from `from` (an old epoch's uncommitted tail) and restores the overlay and alarm it changed from
-    /// the rest of the log, or from S3's state where the log no longer has them.
+    /// the rest of the log, or from S3's state where the log no longer has them. Returns the log bytes dropped.
     fn truncate_tail(
         &self,
         actor: &Actor,
@@ -494,7 +705,7 @@ impl Store {
         from: u64,
         batch: &mut WriteBatch,
         overlay: &mut BTreeMap<Vec<u8>, Option<pb::OverlayRecord>>,
-    ) -> Result<(), Error> {
+    ) -> Result<i64, Error> {
         let log = self.entries(actor, claim.flushed + 1, end(claim).seq)?;
         let (kept, dropped) = log.split_at(log.partition_point(|e| e.seq < from));
         batch.delete_range(KeyRange::new(
@@ -534,24 +745,46 @@ impl Store {
                 epoch: claim.flushed_epoch,
             },
         });
-        Ok(())
+        Ok(dropped.iter().map(|e| log_bytes(actor, e)).sum())
     }
 
     /// Drops the log and overlay through `through`, which S3 now holds (S-05's maintainer calls this). Only committed
-    /// entries can be dropped.
+    /// entries can be dropped, so a slot that knows less is committed truncates that far and answers `Behind`; its
+    /// `flushed` says how far it got. Without that, a lagging slot whose log is full could never shrink.
     pub fn truncate(&self, actor: &Actor, through: u64) -> Result<Outcome, Error> {
+        self.truncate_and(actor, through, false)
+    }
+
+    /// [`Store::truncate`] by the actor's maintainer, which also records, in the same batch, that the actor's other
+    /// slots owe a truncation through `through` until [`Store::settle`]: the obligation survives a restart and moves
+    /// with the range.
+    pub fn truncate_owing(&self, actor: &Actor, through: u64) -> Result<Outcome, Error> {
+        self.truncate_and(actor, through, true)
+    }
+
+    fn truncate_and(&self, actor: &Actor, owed: u64, owe: bool) -> Result<Outcome, Error> {
         let _lock = self.lock(actor);
         let old = self.load(actor)?;
         let voting = !old.repaired;
-        if through <= old.flushed {
-            return Ok(Outcome::new(answer(Refusal::None, &old, voting)));
+        let refused = if owed > old.committed {
+            Refusal::Behind
+        } else {
+            Refusal::None
+        };
+        let through = owed.min(old.committed);
+        let mut batch = WriteBatch::default();
+        if owe {
+            batch.put(owed_key(actor), owed.to_be_bytes().to_vec());
         }
-        if through > old.committed {
-            return Ok(Outcome::new(answer(Refusal::Behind, &old, voting)));
+        if through <= old.flushed {
+            if owe {
+                self.commit(batch)?;
+                self.owe(&actor.prefix, old.kind, owed);
+            }
+            return Ok(Outcome::new(answer(refused, &old, voting)));
         }
         let log = self.entries(actor, old.flushed + 1, through)?;
         let mut new = old.clone();
-        let mut batch = WriteBatch::default();
         batch.delete_range(KeyRange::new(
             log_key(actor, old.flushed + 1),
             log_key(actor, through + 1),
@@ -578,8 +811,14 @@ impl Store {
         new.flushed_epoch = self.epoch_at(actor, &old, through)?;
         Self::save(&mut batch, actor, &old, &new);
         let fsync = self.commit(batch)?;
+        let freed: i64 = log.iter().map(|e| log_bytes(actor, e)).sum();
+        self.unflushed.fetch_sub(freed, Ordering::Relaxed);
+        self.mark(&actor.prefix, &new);
+        if owe {
+            self.owe(&actor.prefix, new.kind, owed);
+        }
         Ok(Outcome {
-            answer: answer(Refusal::None, &new, voting),
+            answer: answer(refused, &new, voting),
             overlay: delta,
             fsync: Some(fsync),
         })
@@ -592,36 +831,46 @@ impl Store {
         claim.committed >= min_seq || (end.epoch == claim.epoch && end.seq >= min_seq)
     }
 
-    /// Values from the overlay. A key the overlay lacks is `None` while S3 holds nothing of the actor, and a cold read
-    /// otherwise.
+    /// Values from the overlay, and the positions of keys it lacks while S3 holds the actor (`answer.slot.flushed` > 0):
+    /// those are read from the range database at the flushed point or later. Without S3 state a missing key is `None`.
     pub fn read(
         &self,
         actor: &Actor,
         keys: &[Vec<u8>],
         min_seq: u64,
-    ) -> Result<(pb::Answer, Vec<pb::Value>), Error> {
+    ) -> Result<(pb::Answer, Vec<pb::Value>, Vec<usize>), Error> {
         let _lock = self.lock(actor);
         let claim = self.load(actor)?;
         let voting = !claim.repaired;
         if !Self::caught_up(&claim, min_seq) {
-            return Ok((answer(Refusal::Behind, &claim, voting), Vec::new()));
+            return Ok((
+                answer(Refusal::Behind, &claim, voting),
+                Vec::new(),
+                Vec::new(),
+            ));
         }
         let mut values = Vec::with_capacity(keys.len());
+        let mut cold = Vec::new();
         for key in keys {
             let value = match self.overlay(&data_key(actor, key))? {
                 Some(record) => record.value,
                 None if claim.flushed == 0 => None,
-                None => return Err(Error::Cold),
+                None => {
+                    cold.push(values.len());
+                    None
+                }
             };
             values.push(pb::Value {
                 key: key.clone(),
                 value,
             });
         }
-        Ok((answer(Refusal::None, &claim, voting), values))
+        Ok((answer(Refusal::None, &claim, voting), values, cold))
     }
 
-    /// Up to `limit` live keys from `start`, in order, and whether more follow.
+    /// Up to `limit` live keys from `start`, in order, and whether more follow. While S3 holds the actor
+    /// (`answer.slot.flushed` > 0) the overlay is only part of the answer, so its records come back with deletes
+    /// (`value` absent) for the caller to merge over the range database, `limit` counting both.
     pub fn scan(
         &self,
         actor: &Actor,
@@ -635,9 +884,7 @@ impl Store {
         if !Self::caught_up(&claim, min_seq) {
             return Ok((answer(Refusal::Behind, &claim, voting), Vec::new(), false));
         }
-        if claim.flushed > 0 {
-            return Err(Error::Cold);
-        }
+        let cold = claim.flushed > 0;
         let limit = limit.clamp(1, MAX_LIMIT) as usize;
         let prefix = data_key(actor, b"");
         let range = KeyRange {
@@ -649,13 +896,15 @@ impl Store {
             let (key, bytes) = item?;
             let record = pb::OverlayRecord::decode(bytes.as_slice())
                 .map_err(|e| corrupt("an overlay record", e))?;
-            let Some(value) = record.value else { continue };
+            if record.value.is_none() && !cold {
+                continue;
+            }
             if values.len() == limit {
                 return Ok((answer(Refusal::None, &claim, voting), values, true));
             }
             values.push(pb::Value {
                 key: key[prefix.len()..].to_vec(),
-                value: Some(value),
+                value: record.value,
             });
         }
         Ok((answer(Refusal::None, &claim, voting), values, false))
@@ -752,29 +1001,48 @@ impl Store {
         })
     }
 
-    /// Overlay bytes per actor kind, for the gauge at startup: one pass over every slot record.
+    /// Rebuilds the in-memory flush state (unflushed actors, log bytes, owed truncations) and returns overlay bytes per
+    /// actor kind, for
+    /// the gauge: one pass over every slot record at startup.
     // ponytail: a full scan at startup; keep running totals in a record if startup time matters.
-    pub fn overlay_bytes(&self) -> Result<BTreeMap<i32, i64>, Error> {
+    pub fn recover(&self) -> Result<BTreeMap<i32, i64>, Error> {
         let mut bytes = BTreeMap::new();
         let mut kind = 0;
+        let mut logged = 0;
         for item in self.engine.scan(&KeyRange::prefix(*b"s/"))? {
             let (key, value) = item?;
             // `s/`, the hash, then `{namespace}\0{id}\0` and the record's name.
-            let Some(name) = key.get(10..).and_then(|rest| {
+            let Some(at) = key.get(10..).and_then(|rest| {
                 let first = rest.iter().position(|b| *b == 0)?;
                 let second = rest[first + 1..].iter().position(|b| *b == 0)?;
-                rest.get(first + second + 2..)
+                Some(10 + first + second + 2)
             }) else {
                 continue;
             };
+            let name = &key[at..];
             if name == b"claim" {
-                kind = pb::ClaimRecord::decode(value.as_slice())
-                    .map_err(|e| corrupt("a claim", e))?
-                    .kind;
+                let claim =
+                    pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?;
+                kind = claim.kind;
+                self.mark(&key[..at], &claim);
             } else if name.starts_with(b"data/") {
                 *bytes.entry(kind).or_default() += (key.len() + value.len()) as i64;
+            } else if name.starts_with(b"log/") {
+                logged += (key.len() + value.len()) as i64;
+            } else if name == b"owed" {
+                let through = <[u8; 8]>::try_from(value.as_slice()).map_err(|_| {
+                    Error::Storage(StorageError::Corruption(ErrorContext {
+                        engine: "volume",
+                        instance: "volume".into(),
+                        file: None,
+                        partition: None,
+                        detail: "an owed truncation is not 8 bytes".into(),
+                    }))
+                })?;
+                self.owe(&key[..at], kind, u64::from_be_bytes(through));
             }
         }
+        self.unflushed.store(logged, Ordering::Relaxed);
         Ok(bytes)
     }
 }

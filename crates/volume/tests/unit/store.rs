@@ -83,7 +83,7 @@ fn claimed(store: &Store, holder: &pb::Holder, epoch: u64) {
 }
 
 fn read(store: &Store, key: &str) -> Option<Vec<u8>> {
-    let (answer, values) = store.read(&actor(), &[key.as_bytes().to_vec()], 0).unwrap();
+    let (answer, values, _) = store.read(&actor(), &[key.as_bytes().to_vec()], 0).unwrap();
     assert_eq!(refused(&answer), Refusal::None);
     values[0].value.clone()
 }
@@ -374,7 +374,7 @@ fn reads_refuse_a_slot_behind_min_seq_and_a_flushed_miss_is_cold() {
     let a = host("a");
     claimed(&store, &a, 1);
     append(&store, &a, 1, 0, vec![entry(1, 1, &[("k", Some("1"))])], 0);
-    let (answer, _) = store.read(&actor(), &[b"k".to_vec()], 2).unwrap();
+    let (answer, _, _) = store.read(&actor(), &[b"k".to_vec()], 2).unwrap();
     assert_eq!(refused(&answer), Refusal::Behind);
     assert_eq!(read(&store, "missing"), None);
     // Truncation needs the commit point.
@@ -386,10 +386,10 @@ fn reads_refuse_a_slot_behind_min_seq_and_a_flushed_miss_is_cold() {
     let truncated = store.truncate(&actor(), 1).unwrap();
     assert_eq!(slot(&truncated.answer).flushed, 1);
     assert!(truncated.overlay < 0);
-    assert!(matches!(
-        store.read(&actor(), &[b"k".to_vec()], 0),
-        Err(Error::Cold)
-    ));
+    let (_, _, cold) = store
+        .read(&actor(), &[b"k".to_vec(), b"j".to_vec()], 0)
+        .unwrap();
+    assert_eq!(cold, vec![0]);
     assert_eq!(read(&store, "j"), Some(b"2".to_vec()));
     // The log continues after the flushed point.
     assert_eq!(
@@ -649,4 +649,99 @@ fn sizes_are_republished_only_for_new_ranges_or_large_changes() {
     assert!(worth_publishing(&published, &[]));
     // Small ranges wait for a mebibyte of change.
     assert!(!worth_publishing(&[size(0, 1000)], &[size(0, 3000)]));
+}
+
+/// A full slot refuses new entries, but still learns the commit point for the log it holds, so a flush can truncate it
+/// (seed 4 of `tests/sim/tests/volume_cold.rs`: otherwise a lagging slot stays full for good).
+#[test]
+fn a_full_slot_still_learns_the_commit_point_and_can_be_truncated() {
+    let store = Store::new(Arc::new(MemoryEngine::new("volume"))).with_max_unflushed(100);
+    let a = host("a");
+    claimed(&store, &a, 1);
+    let request = |entries: Vec<pb::Entry>, prev_epoch: u64, commit: u64| pb::AppendRequest {
+        actor: None,
+        holder: Some(a.clone()),
+        epoch: 1,
+        version: 0,
+        prev_epoch,
+        entries,
+        commit,
+    };
+    let big = "v".repeat(200);
+    store
+        .append(
+            &actor(),
+            &request(vec![entry(1, 1, &[("k", Some(&big))])], 0, 0),
+        )
+        .unwrap();
+    let full = store.append(
+        &actor(),
+        &request(
+            vec![entry(1, 1, &[("k", Some(&big))]), entry(2, 1, &[])],
+            0,
+            1,
+        ),
+    );
+    assert!(matches!(full, Err(Error::Backpressure)));
+    // S3 holds more than this slot knows is committed: it truncates what it can and says it is behind.
+    let truncated = store.truncate(&actor(), 5).unwrap();
+    assert_eq!(refused(&truncated.answer), Refusal::Behind);
+    assert_eq!(slot(&truncated.answer).flushed, 1);
+    assert_eq!(store.unflushed(), 0);
+    store
+        .append(&actor(), &request(vec![entry(2, 1, &[])], 1, 1))
+        .unwrap();
+}
+
+/// While the node is full, a new epoch may replace an old uncommitted tail with as much or less, but not grow the log.
+#[test]
+fn a_full_slot_takes_a_replaced_tail_only_if_the_log_does_not_grow() {
+    let store = Store::new(Arc::new(MemoryEngine::new("volume"))).with_max_unflushed(100);
+    let (a, b) = (host("a"), host("b"));
+    claimed(&store, &a, 1);
+    let big = "v".repeat(200);
+    let tail = vec![entry(1, 1, &[("k", Some(&big))]), entry(2, 1, &[])];
+    append(&store, &a, 1, 0, tail, 0);
+    claimed(&store, &b, 2);
+    let request = |entries: Vec<pb::Entry>| pb::AppendRequest {
+        actor: None,
+        holder: Some(b.clone()),
+        epoch: 2,
+        version: 0,
+        prev_epoch: 1,
+        entries,
+        commit: 0,
+    };
+    let growing = vec![entry(2, 2, &[("k", Some(&big))]), entry(3, 2, &[])];
+    let refused = store.append(&actor(), &request(growing));
+    assert!(matches!(refused, Err(Error::Backpressure)));
+    let same = store
+        .append(&actor(), &request(vec![entry(2, 2, &[])]))
+        .unwrap();
+    assert_eq!(slot(&same.answer).end.unwrap().epoch, 2);
+}
+
+/// A maintainer's truncation records what the actor's other slots owe; the record survives a restart, and only the
+/// obligation it was raised for settles it.
+#[test]
+fn owed_truncations_survive_a_restart_until_settled() {
+    let engine = Arc::new(MemoryEngine::new("volume"));
+    let store = Store::new(engine.clone());
+    let a = host("a");
+    claimed(&store, &a, 1);
+    append(&store, &a, 1, 0, vec![entry(1, 1, &[("k", Some("1"))])], 1);
+    store.truncate_owing(&actor(), 1).unwrap();
+    let restarted = Store::new(engine);
+    restarted.recover().unwrap();
+    let owed = restarted.owed();
+    assert_eq!(owed.len(), 1);
+    assert_eq!((owed[0].0.id.as_str(), owed[0].1), (id('c').as_str(), 1));
+    // A settle for another point leaves the obligation.
+    restarted.settle(&actor(), 7).unwrap();
+    assert_eq!(restarted.owed().len(), 1);
+    restarted.settle(&actor(), 1).unwrap();
+    assert!(restarted.owed().is_empty());
+    let again = Store::new(Arc::new(MemoryEngine::new("volume")));
+    again.recover().unwrap();
+    assert!(again.owed().is_empty());
 }

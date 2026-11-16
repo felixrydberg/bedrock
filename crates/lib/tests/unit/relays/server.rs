@@ -1239,4 +1239,18 @@ async fn routes_return_a_services_published_namespace_to_callers_in_the_cell() {
         unknown.await.unwrap_err().code(),
         tonic::Code::InvalidArgument
     );
+    // A sibling cell's volume node reaches an actor's slots here, so it may fetch volume routes (#113 / S-05), and
+    // nothing else; another service from that cell may not.
+    let sibling = hub.routes(ask("volume", Some(caller("volume", "other", "volume-9"))));
+    assert_eq!(sibling.await.unwrap().into_inner().revision, 3);
+    let other = hub.routes(ask(
+        "quicksilver",
+        Some(caller("volume", "other", "volume-9")),
+    ));
+    assert_eq!(
+        other.await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    let kv = hub.routes(ask("volume", Some(caller("kv", "other", "kv-9"))));
+    assert_eq!(kv.await.unwrap_err().code(), tonic::Code::PermissionDenied);
 }

@@ -358,3 +358,59 @@ async fn a_list_page_ends_where_a_range_stopped_early() {
     assert_eq!(keys, [b"p/a".as_slice(), b"p/b"]);
     assert!(page.more);
 }
+
+/// A sibling cell's routes come from that cell's relays and are cached apart from this cell's (#113 / S-05).
+#[tokio::test]
+async fn sibling_routes_come_from_that_cells_relays() {
+    let owner = holder(Mode::Serve, 7, &[]).await;
+    let (own, sibling) = (Relay::default(), Relay::default());
+    *own.table.lock().unwrap() = table(1, &[(0, &[("a", &owner)])]);
+    *sibling.table.lock().unwrap() = table(9, &[(0, &[("b", &owner)])]);
+    let mut addresses = Vec::new();
+    for relay in [&own, &sibling] {
+        addresses.push(
+            serve(
+                tonic::transport::Server::builder()
+                    .add_service(pb::relay_server::RelayServer::new(relay.clone())),
+            )
+            .await,
+        );
+    }
+    let admin = Admin::new();
+    let client = Client::new(
+        &admin,
+        Arc::new(Peers::new(&admin)),
+        vec![addresses[0].clone()],
+        String::new(),
+    )
+    .with_siblings(BTreeMap::from([(
+        "cell-2".to_owned(),
+        vec![addresses[1].clone()],
+    )]));
+    assert_eq!(client.routes("volume", None).await.unwrap().revision, 1);
+    assert_eq!(
+        client
+            .routes_in("cell-2", "volume", None)
+            .await
+            .unwrap()
+            .revision,
+        9
+    );
+    assert_eq!(
+        client
+            .routes_in("cell-2", "volume", None)
+            .await
+            .unwrap()
+            .revision,
+        9
+    );
+    assert_eq!(
+        sibling.fetches.load(Ordering::Relaxed),
+        1,
+        "cached after the first fetch"
+    );
+    let Err(unknown) = client.routes_in("cell-3", "volume", None).await else {
+        panic!("a cell without relays has no routes");
+    };
+    assert_eq!(unknown.code(), tonic::Code::FailedPrecondition);
+}
