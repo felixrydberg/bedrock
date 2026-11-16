@@ -755,6 +755,20 @@ mod memory {
             sources: &[(String, u64, u64)],
         ) -> StorageResult<()> {
             let mut bucket = self.bucket();
+            // As SlateDB: a source path appears once, and projections do not overlap.
+            let mut seen = std::collections::BTreeSet::new();
+            let mut spans: Vec<(u128, u128)> = Vec::new();
+            for (source, start, end) in sources {
+                let top = if *end == 0 { 1 << 64 } else { u128::from(*end) };
+                let span = (u128::from(*start), top);
+                if !seen.insert(source) || spans.iter().any(|(s, e)| span.0 < *e && *s < span.1) {
+                    return Err(StorageError::IoError(context(
+                        name,
+                        "clone sources repeat or overlap",
+                    )));
+                }
+                spans.push(span);
+            }
             if bucket.databases.contains_key(name) {
                 return Ok(());
             }

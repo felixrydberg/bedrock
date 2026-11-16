@@ -145,3 +145,51 @@ On 2026-11-14 with TLC 2026.11.06 from `scripts/tla2tools.jar`, 2 workers and a 
 All 10 volume bugs broke their invariants, and the other 50 still did (`scripts/tlc.sh bugs`, 2,231 s). Reservation
 adds a step to every claim, so the passing configs have 11 to 21 times as many distinct states as in S-02
 (`volume-base` had 3.5 million). Runs used 2 workers; an earlier S-02 run with 4 workers was interrupted when the machine went down.
+
+## Cold tier: range databases (S-05, #113)
+
+`volume.tla` keeps one S3 sequence per actor, with SlateDB fencing between maintainers. `volume_cold.tla` checks that
+the range databases behind it keep that sequence across splits, merges and first-slot moves (statefull/v2.md §5 Cold
+tier). It is a separate model because adding databases and catalogs to `volume.tla` would multiply a state space that
+already takes about 25 minutes per config.
+
+One actor sits in the middle of three hash points. Each cell's catalog names the database serving each point.
+
+- **Maintainers** see their cell's directory and the actor's first cell, each possibly stale.
+- **Open:** a span that the catalog serves with one database of exactly that span, not retired, is opened as writer.
+  This fences any other writer.
+- **Create:** any other span gets a new database in steps that interleave with everything else. The maintainer fences
+  and marks retired every database serving part of the span, clones the new database from them, and replaces the
+  catalog only if it is unchanged since it read it.
+- **Flush:** writes the slot's entries after its flushed point, up to the commit point. Once the flush is durable, the
+  slots truncate. A database behind the slot first copies the actor from another cell's database that holds it that
+  far.
+
+| Invariant | Meaning |
+| --- | --- |
+| `Consistent` | Every database holds the actor without gaps, up to its meta. |
+| `S3Committed` | No database holds past the commit point. |
+| `NoLostFlush` | Everything the slots dropped is in a database that a read finds through a catalog. |
+
+Each guard has a bug that must break an invariant:
+
+| Config | Bug | Breaks | What the bug does |
+| --- | --- | --- | --- |
+| `volume_cold-split` | `no-retire` | `NoLostFlush` | A clone does not fence its sources, so a stale maintainer flushes after the clone's snapshot. |
+| `volume_cold-split` | `no-cas` | `NoLostFlush` | The catalog is replaced without the version check, so a concurrent clone's database is dropped after it was written. |
+| `volume_cold-move` | `no-adopt` | `Consistent` | The new first cell flushes without copying the actor, leaving a gap. |
+
+The model takes each clone source per point, so it does not check SlateDB's rule that a clone takes each source path
+once. The unit tests cover that rule (the interior split and full merge in `crates/volume/tests/unit/cold.rs`). Relay
+`Routes` access for sibling cells is an authorization rule and is not modeled.
+
+### Checks run
+
+On 2026-11-16 with `scripts/tla2tools.jar`, 4 workers and a 4 GB heap:
+
+| Config | Constants | Distinct states | Depth | Time | Result |
+| --- | --- | ---: | ---: | ---: | --- |
+| `volume_cold-split` | 2 maintainers in one cell, 3 directories, `MaxSeq` 2, `MaxGen` 2, `MaxEp` 2 | 23,844,105 | 38 | 785 s | Passed |
+| `volume_cold-move` | 2 cells with one maintainer each, `MaxSeq` 2, `MaxGen` 2, `MaxEp` 2 | 322 | 14 | 1 s | Passed |
+
+All three bugs broke their invariants (66,738, 12,287 and 314 distinct states).

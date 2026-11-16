@@ -471,8 +471,18 @@ fn create(plan: Plan) -> (Catalog, Generation, Vec<(Generation, u64, u64)>) {
             catalog,
             db,
             sources,
+            rest: None,
         } => (catalog, db, sources),
-        Plan::Open(db) => panic!("expected a new database, got {db:?}"),
+        other => panic!("expected a new database alone, got {other:?}"),
+    }
+}
+
+/// No database serves two spans of `catalog`, so a merge takes each source once.
+fn each_once(catalog: &Catalog) {
+    let mut seen = Vec::new();
+    for (_, db) in catalog.spans.values() {
+        assert!(!seen.contains(db), "{db:?} serves two spans of {catalog:?}");
+        seen.push(*db);
     }
 }
 
@@ -517,6 +527,41 @@ fn plans_open_split_merge_and_takeover() {
         (db, sources),
         (generation(0, 0, 4), vec![(generation(0, 0, 3), 0, 0)])
     );
+}
+
+/// A split inside one database's span clones the part above into its own database too, so a later merge of the whole
+/// span takes three distinct sources instead of one database twice.
+#[test]
+fn an_interior_split_leaves_no_database_serving_two_spans() {
+    let (low, high) = (1 << 62, 1 << 63);
+    let (one, ..) = create(plan(&Catalog::default(), 0, 0, false));
+    let Plan::Create {
+        catalog: inner,
+        db,
+        sources,
+        rest,
+    } = plan(&one, low, high, false)
+    else {
+        panic!("a split creates a database");
+    };
+    assert_eq!(db, generation(low, high, 1));
+    assert_eq!(sources, vec![(generation(0, 0, 0), low, high)]);
+    assert_eq!(
+        rest,
+        Some((generation(high, 0, 2), (generation(0, 0, 0), high, 0)))
+    );
+    each_once(&inner);
+    let (merged, db, sources) = create(plan(&inner, 0, 0, false));
+    assert_eq!(db, generation(0, 0, 3));
+    assert_eq!(
+        sources,
+        vec![
+            (generation(0, 0, 0), 0, low),
+            (generation(low, high, 1), low, high),
+            (generation(high, 0, 2), high, 0),
+        ]
+    );
+    each_once(&merged);
 }
 
 /// Retries a cold read once: the first read after a split may go to the database a cached catalog named, which is
@@ -640,6 +685,158 @@ async fn a_first_slot_move_copies_the_actor_into_the_new_cell() {
         .await
         .unwrap();
     assert_eq!(got, vec![Some(b"1".to_vec())]);
+}
+
+/// The same through the maintainer on the in-memory bucket, which refuses a repeated clone source as SlateDB does: an
+/// interior split, then a merge of the whole range, keep every actor readable.
+#[tokio::test(start_paused = true)]
+async fn an_interior_split_then_a_full_merge_keep_every_actor_readable() {
+    let bucket = Memory::default();
+    let mut n = node(&bucket, "n1", u64::MAX);
+    let actors = 6;
+    let whole = n.directory.clone();
+    let inner = interior(&whole, actors);
+    for i in 0..actors {
+        claim(&n.store, i);
+    }
+    for (round, directory) in [whole.clone(), inner, whole].into_iter().enumerate() {
+        n.directory = directory;
+        let seq = round as u64;
+        for i in 0..actors {
+            let value = format!("{i}-{round}");
+            let entries = vec![entry(seq + 1, &[("k", Some(&value))])];
+            append(&n.store, i, seq, entries, seq + 1).unwrap();
+        }
+        n.cold.tick(&n.directory).await;
+        for i in 0..actors {
+            // In the interior round only the middle range has a maintainer.
+            let middle = (2..4).contains(&i);
+            let at = if round == 1 && !middle { seq } else { seq + 1 };
+            assert_eq!(flushed(&n.store, i), at, "round {round}, actor {i}");
+        }
+    }
+    for i in 0..actors {
+        assert_eq!(
+            read(&n.cold, i, 3).await,
+            Some(format!("{i}-2").into_bytes())
+        );
+    }
+}
+
+/// `whole` split at actors `actors / 3` and `2 * actors / 3`, with a maintainer for the middle range only: the outer
+/// two keep reading the first database.
+fn interior(whole: &Directory, actors: usize) -> Directory {
+    let hash = |i: usize| Actor::new(&actor(i)).unwrap().hash();
+    let (low, high) = (hash(actors / 3), hash(2 * actors / 3));
+    let mut inner = whole.clone();
+    inner.insert(low, whole[&0].clone());
+    inner.insert(high, whole[&0].clone());
+    for (start, owners) in inner.iter_mut() {
+        if *start != low {
+            owners[0].state = State::Populating;
+        }
+    }
+    inner
+}
+
+/// A fenced writer found by reading an actor's meta, not only by a commit, leaves service and waits before reopening.
+#[tokio::test(start_paused = true)]
+async fn a_writer_fenced_on_a_meta_read_waits_before_reopening() {
+    let bucket = Memory::default();
+    let old = node(&bucket, "n1", u64::MAX);
+    let new = node(&bucket, "n2", u64::MAX);
+    claim(&old.store, 0);
+    append(&old.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    old.cold.tick(&old.directory).await;
+    // Another owner opens the database; then an actor this writer has not read yet changes.
+    new.cold.tick(&new.directory).await;
+    claim(&old.store, 1);
+    append(&old.store, 1, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    old.cold.tick(&old.directory).await;
+    assert_eq!(old.cold.size(0, 0), 0, "the fenced writer left service");
+    assert_eq!(flushed(&old.store, 1), 0);
+    tokio::time::sleep(FENCED_WAIT / 2).await;
+    old.cold.tick(&old.directory).await;
+    assert_eq!(old.cold.size(0, 0), 0, "no reopen within the wait");
+    tokio::time::sleep(FENCED_WAIT).await;
+    old.cold.tick(&old.directory).await;
+    assert_eq!(flushed(&old.store, 1), 1, "reopened after the wait");
+}
+
+/// A read before the range database exists fails; once the maintainer creates it, a retry reads it, because the
+/// empty catalog read first is not kept.
+#[tokio::test(start_paused = true)]
+async fn a_read_before_the_database_exists_succeeds_on_retry_once_it_does() {
+    let bucket = Memory::default();
+    let n = node(&bucket, "n1", u64::MAX);
+    let reader = node(&bucket, "n2", u64::MAX);
+    let keys = [b"k".to_vec()];
+    let early = reader.cold.get("cell-1", &actor(0), 1, &keys).await;
+    assert_eq!(early.unwrap_err().code(), tonic::Code::Unavailable);
+    claim(&n.store, 0);
+    append(&n.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    n.cold.tick(&n.directory).await;
+    let got = reader
+        .cold
+        .get("cell-1", &actor(0), 1, &keys)
+        .await
+        .unwrap();
+    assert_eq!(got, vec![Some(b"1".to_vec())]);
+}
+
+/// An actor that moved to another cell while idle has nothing to flush, so the new cell's database never copies it;
+/// cold reads find it in the database of the cell that holds it.
+#[tokio::test(start_paused = true)]
+async fn an_idle_actor_whose_first_slot_moved_stays_readable() {
+    let bucket = Memory::default();
+    let before = node_in(&bucket, "cell-1", "n1", u64::MAX);
+    let after = node_in(&bucket, "cell-2", "n2", u64::MAX);
+    for n in [&before, &after] {
+        claim(&n.store, 0);
+        append(&n.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    }
+    before.cold.tick(&before.directory).await;
+    let actor0 = Actor::new(&actor(0)).unwrap();
+    after.store.truncate(&actor0, 1).unwrap();
+    // The first slot is now in cell-2, and no entry 2 follows: cell-2 has no database for the actor.
+    after.cold.tick(&after.directory).await;
+    let got = after
+        .cold
+        .get("cell-2", &actor(0), 1, &[b"k".to_vec()])
+        .await
+        .unwrap();
+    assert_eq!(got, vec![Some(b"1".to_vec())]);
+    let (page, more) = after
+        .cold
+        .scan("cell-2", &actor(0), 1, b"", 10)
+        .await
+        .unwrap();
+    assert_eq!((page, more), (vec![(b"k".to_vec(), b"1".to_vec())], false));
+}
+
+/// Configured sibling relays must name exactly the other cells of this node's DC.
+#[test]
+fn sibling_relays_must_match_the_dc() {
+    use bedrock_lib::actors::{Dc, Topology};
+    let topology = Topology {
+        dcs: vec![Dc {
+            name: "dc-1".into(),
+            cells: vec!["cell-1".into(), "cell-2".into(), "cell-3".into()],
+        }],
+        ..Default::default()
+    };
+    let check = |dc: &str, cells: &[&str]| {
+        let configured = cells.iter().map(|c| c.to_string()).collect();
+        super::placement::sibling_mismatch(&topology, dc, "cell-1", &configured)
+    };
+    assert_eq!(check("dc-1", &["cell-2", "cell-3"]), None);
+    assert!(check("dc-1", &["cell-2"]).unwrap().contains("cell-3"));
+    assert!(
+        check("dc-1", &["cell-2", "cell-3", "cell-9"])
+            .unwrap()
+            .contains("cell-9")
+    );
+    assert!(check("dc-2", &[]).is_some());
 }
 
 #[cfg(not(madsim))]
@@ -818,6 +1015,27 @@ mod slate {
             }
         }
         assert_eq!(store.requests()[3], 0, "a clone copies no object");
+    }
+
+    /// On SlateDB, which refuses a repeated clone source: a split inside the range, then a merge of the whole range.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interior_split_then_a_full_merge_on_slatedb() {
+        let store = Arc::new(Counting::default());
+        let mut n = slate_node(&store, "n1");
+        let actors = 6;
+        let whole = n.directory.clone();
+        round(&n, &store, actors, 0).await;
+        n.directory = interior(&whole, actors);
+        n.cold.tick(&n.directory).await;
+        n.directory = whole;
+        round(&n, &store, actors, 1).await;
+        for i in 0..actors {
+            assert_eq!(flushed(&n.store, i), 2, "actor {i}");
+            assert_eq!(
+                read(&n.cold, i, 2).await,
+                Some(format!("{i}-1").into_bytes())
+            );
+        }
     }
 
     /// The acceptance check: S3 requests per flush do not grow with the actors in a range. One flush is one L0 file

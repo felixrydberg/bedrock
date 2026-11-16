@@ -17,7 +17,8 @@
 //!   everything flushed to it; of concurrent clones only the one that replaced the catalog is ever used.
 //! - **First-slot moves.** When a topology change moves an actor's first slot to this cell, the actor's slot is flushed
 //!   beyond what this cell's database holds. The maintainer then copies the actor's keys from the cell database that
-//!   holds it at the slot's flushed point or later, in the same batch as its pending changes.
+//!   holds it at the slot's flushed point or later, in the same batch as its pending changes. Until then (an idle
+//!   actor has nothing to flush), cold reads find the actor in that other cell's database.
 //!
 //! - **Exactly once.** An actor is written only beyond the sequence its `meta` holds, and the batch carries the keys as
 //!   of its commit point, rebuilt from the log. A crash between a flush and its truncation flushes the same keys again
@@ -107,11 +108,14 @@ pub enum Plan {
     /// The span has its own database.
     Open(Generation),
     /// A new database `db`, cloned from `sources` (each a database and the part of the span it serves; none for a new
-    /// span), committed by storing `catalog`.
+    /// span), committed by storing `catalog`. When the span lies inside one database's span, `rest` clones the part
+    /// above it into a database of its own, so no database ever serves two spans (a later merge could not take it
+    /// twice: a clone takes each source once).
     Create {
         catalog: Catalog,
         db: Generation,
         sources: Vec<(Generation, u64, u64)>,
+        rest: Option<(Generation, (Generation, u64, u64))>,
     },
 }
 
@@ -143,14 +147,26 @@ pub fn plan(catalog: &Catalog, start: u64, end: u64, retired: bool) -> Plan {
     let mut next = catalog.clone();
     next.next += 1;
     let mut sources = Vec::new();
+    let mut rest = None;
     for (s, e, served) in overlapping {
         next.spans.remove(&s);
-        // What lies outside the new span keeps reading the old database until its own range clones it.
+        // What lies outside the new span keeps reading the old database until its own range clones it, except a part
+        // above while a part below keeps it too.
         if s < start {
             next.spans.insert(s, (start, served));
         }
         if top(e) > top(end) {
-            next.spans.insert(end, (e, served));
+            let mut above = served;
+            if s < start {
+                above = Generation {
+                    start: end,
+                    end: e,
+                    generation: next.next,
+                };
+                next.next += 1;
+                rest = Some((above, (served, end, e)));
+            }
+            next.spans.insert(end, (e, above));
         }
         let to = if top(e) < top(end) { e } else { end };
         sources.push((served, s.max(start), to));
@@ -160,6 +176,7 @@ pub fn plan(catalog: &Catalog, start: u64, end: u64, retired: bool) -> Plan {
         catalog: next,
         db,
         sources,
+        rest,
     }
 }
 
@@ -335,15 +352,24 @@ impl Cold {
                     catalog,
                     db,
                     sources,
+                    rest,
                 } => {
                     let name = database(&self.cell, &db);
                     self.retire(&name, &sources).await?;
-                    if !sources.is_empty() {
-                        let sources: Vec<_> = sources
+                    let named = |sources: &[(Generation, u64, u64)]| -> Vec<(String, u64, u64)> {
+                        sources
                             .iter()
                             .map(|(source, s, e)| (database(&self.cell, source), *s, *e))
-                            .collect();
-                        self.databases.create_clone(&name, &sources).await?;
+                            .collect()
+                    };
+                    if !sources.is_empty() {
+                        self.databases.create_clone(&name, &named(&sources)).await?;
+                    }
+                    if let Some((above, source)) = rest {
+                        // Its source is among `sources`, so it is retired already.
+                        self.databases
+                            .create_clone(&database(&self.cell, &above), &named(&[source]))
+                            .await?;
                     }
                     if !self
                         .databases
@@ -405,13 +431,12 @@ impl Cold {
         db: &dyn Writer,
         known: &mut BTreeMap<Vec<u8>, Meta>,
         actor: &[u8],
-    ) -> Result<Meta, Status> {
+    ) -> Result<Meta, StorageError> {
         if let Some(meta) = known.get(actor) {
             return Ok(*meta);
         }
-        let meta = match db.get(&meta_key(actor)).await.map_err(storage)? {
-            Some(bytes) => Meta::decode(&bytes)
-                .ok_or_else(|| Status::data_loss("an actor meta does not decode"))?,
+        let meta = match db.get(&meta_key(actor)).await? {
+            Some(bytes) => Meta::decode(&bytes).ok_or_else(undecodable)?,
             None => Meta::default(),
         };
         known.insert(actor.to_vec(), meta);
@@ -449,14 +474,29 @@ impl Cold {
         self.readers.discard(name, db);
     }
 
-    /// The actor's keys and meta from the database of another cell that holds it at `flushed` or later, as changes that
-    /// make `target`'s keys of the actor equal to them. `None` when no cell holds it that far.
+    /// Takes the writer of `span` out of service when `error` says it was fenced, so the span waits [`FENCED_WAIT`]
+    /// before it opens again.
+    fn failed(&self, span: (u64, u64), error: StorageError) -> Status {
+        if matches!(error, StorageError::Fenced(_)) {
+            self.writers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&span);
+            self.fenced
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(span, bedrock_lib::monotonic_now() + FENCED_WAIT);
+        }
+        storage(error)
+    }
+
+    /// The actor's meta and keys from the database of another cell that holds it at `flushed` or later. `None` when no
+    /// cell holds it that far.
     async fn adopt(
         &self,
-        target: &dyn Writer,
         actor: &Actor,
         flushed: u64,
-    ) -> Result<Option<(Meta, Changes)>, Status> {
+    ) -> Result<Option<(Meta, Vec<Entry>)>, Status> {
         let mut best: Option<(Meta, Vec<Entry>)> = None;
         for cell in self.databases.cells().await.map_err(storage)? {
             if cell == self.cell {
@@ -483,24 +523,14 @@ impl Cold {
                 }
             }
         }
-        let Some((meta, keys)) = best else {
+        if best.is_none() {
             // A catalog read before the move may name a database the actor has left: read them again next time.
             self.catalogs
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clear();
-            return Ok(None);
-        };
-        // Start from deletes of what the target holds, so keys the source no longer has go.
-        let mut changes: BTreeMap<Vec<u8>, Option<Vec<u8>>> = all(target, actor.name())
-            .await
-            .map_err(storage)?
-            .into_iter()
-            .map(|(key, _)| (key, None))
-            .collect();
-        changes.extend(keys.into_iter().map(|(key, value)| (key, Some(value))));
-        changes.insert(meta_key(actor.name()), Some(meta.encode()));
-        Ok(Some((meta, changes.into_iter().collect())))
+        }
+        Ok(best)
     }
 
     /// Flushes one batch of range `[start, end)` into `name` and truncates what it holds. Returns whether more actors
@@ -545,15 +575,17 @@ impl Cold {
                     .map_err(status)?
             };
             let Some(pending) = pending else { continue };
-            let mut known =
-                Self::known(maintained.db.as_ref(), &mut known_points, parsed.name()).await?;
+            let mut known = Self::known(maintained.db.as_ref(), &mut known_points, parsed.name())
+                .await
+                .map_err(|e| self.failed(span, e))?;
             if pending.flushed > known.seq {
                 // Flushed in another cell's database: its first slot moved here. Copy it from there first.
-                match self
-                    .adopt(maintained.db.as_ref(), &parsed, pending.flushed)
-                    .await?
-                {
-                    Some((meta, copied)) => {
+                match self.adopt(&parsed, pending.flushed).await? {
+                    Some((meta, keys)) => {
+                        let held = all(maintained.db.as_ref(), parsed.name())
+                            .await
+                            .map_err(|e| self.failed(span, e))?;
+                        let copied = replace(held, keys, meta, parsed.name());
                         bytes += copied
                             .iter()
                             .map(|(k, v)| (k.len() + v.as_ref().map_or(0, Vec::len)) as u64)
@@ -590,17 +622,7 @@ impl Cold {
         }
         if !batch.is_empty() {
             if let Err(error) = maintained.db.commit(batch).await {
-                if matches!(error, StorageError::Fenced(_)) {
-                    self.writers
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&span);
-                    self.fenced
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(span, bedrock_lib::monotonic_now() + FENCED_WAIT);
-                }
-                return Err(storage(error));
+                return Err(self.failed(span, error));
             }
             for (key, meta, actor, through) in written {
                 known_points.insert(key, meta);
@@ -649,15 +671,14 @@ impl Cold {
         }
     }
 
-    /// The database handle for `actor`'s reads: this node's writer when it maintains it, a reader otherwise. Returns the
-    /// first slot's cell too.
+    /// The database handle of `first`'s range database for `actor`'s reads: this node's writer when it maintains it, a
+    /// reader otherwise. While the database is not created yet, the cached catalog is dropped, so a retry reads it again.
     async fn handle(
         &self,
         cell: &str,
-        actor: &pb::Actor,
-    ) -> Result<(String, String, Arc<dyn Database>), Status> {
-        let first = self.placement.first_cell(actor).await?;
-        let hash = Actor::new(actor).map_err(status)?.hash();
+        first: &str,
+        hash: u64,
+    ) -> Result<(String, Arc<dyn Database>), Status> {
         if first == self.cell {
             let maintained = self
                 .writers
@@ -669,37 +690,34 @@ impl Cold {
                 .map(|(_, maintained)| maintained.clone());
             if let Some(maintained) = maintained {
                 return Ok((
-                    first,
                     maintained.name.clone(),
                     maintained.db.clone() as Arc<dyn Database>,
                 ));
             }
         }
-        let not_yet = || Status::unavailable("the range database is not created yet");
-        let name = self
-            .serving(&first, hash)
-            .await
-            .map_err(storage)?
-            .ok_or_else(not_yet)?;
-        match self.readers.get(cell, &name).await.map_err(storage)? {
-            Some(db) => Ok((first, name, db)),
-            None => Err(not_yet()),
-        }
+        let opened = match self.serving(first, hash).await.map_err(storage)? {
+            Some(name) => self
+                .readers
+                .get(cell, &name)
+                .await
+                .map_err(storage)?
+                .map(|db| (name, db)),
+            None => None,
+        };
+        opened.ok_or_else(|| {
+            self.catalogs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(first);
+            Status::unavailable("the range database is not created yet")
+        })
     }
 
     /// Waits up to [`BEHIND_WAIT`] for `db` to hold the actor at `flushed` or later.
     async fn caught_up(&self, db: &dyn Database, actor: &[u8], flushed: u64) -> Result<(), Status> {
         let deadline = bedrock_lib::monotonic_now() + BEHIND_WAIT;
         loop {
-            let seq = match db.get(&meta_key(actor)).await.map_err(storage)? {
-                Some(bytes) => {
-                    Meta::decode(&bytes)
-                        .ok_or_else(|| Status::data_loss("an actor meta does not decode"))?
-                        .seq
-                }
-                None => 0,
-            };
-            if seq >= flushed {
+            if seq_in(db, actor).await?.unwrap_or(0) >= flushed {
                 return Ok(());
             }
             if bedrock_lib::monotonic_now() >= deadline {
@@ -711,6 +729,77 @@ impl Cold {
         }
     }
 
+    /// A database holding the actor at `flushed` or later, for a caller in `cell`, with its cell and name: its first slot
+    /// cell's, waited for up to [`BEHIND_WAIT`] while it holds an older point. After a first-slot move, until the
+    /// actor's next flush copies it, that database lacks it: then another cell's that holds it is read instead.
+    async fn holding(
+        &self,
+        cell: &str,
+        actor: &pb::Actor,
+        parsed: &Actor,
+        flushed: u64,
+    ) -> Result<(String, String, Arc<dyn Database>), Status> {
+        let first = self.placement.first_cell(actor).await?;
+        let opened = self.handle(cell, &first, parsed.hash()).await;
+        if let Ok((name, db)) = &opened {
+            let held = match seq_in(db.as_ref(), parsed.name()).await {
+                Ok(held) => held,
+                Err(error) => {
+                    self.forget(&first, name, db);
+                    return Err(error);
+                }
+            };
+            // An older point is most likely a reader that has not seen the last flush yet.
+            if held.is_some_and(|seq| seq >= flushed)
+                || (held.is_some()
+                    && self
+                        .caught_up(db.as_ref(), parsed.name(), flushed)
+                        .await
+                        .is_ok())
+            {
+                return Ok((first, name.clone(), db.clone()));
+            }
+            self.forget(&first, name, db);
+        }
+        if let Some(found) = self.elsewhere(cell, &first, parsed, flushed).await? {
+            return Ok(found);
+        }
+        opened?;
+        Err(Status::unavailable(
+            "the range database reader is behind this slot",
+        ))
+    }
+
+    /// A database of a cell other than `skip` holding the actor at `flushed` or later, with its cell and name.
+    async fn elsewhere(
+        &self,
+        cell: &str,
+        skip: &str,
+        actor: &Actor,
+        flushed: u64,
+    ) -> Result<Option<(String, String, Arc<dyn Database>)>, Status> {
+        for other in self.databases.cells().await.map_err(storage)? {
+            if other == skip {
+                continue;
+            }
+            let Some(name) = self.serving(&other, actor.hash()).await.map_err(storage)? else {
+                continue;
+            };
+            let Some(db) = self.readers.get(cell, &name).await.map_err(storage)? else {
+                continue;
+            };
+            match seq_in(db.as_ref(), actor.name()).await {
+                Ok(Some(seq)) if seq >= flushed => return Ok(Some((other, name, db))),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::debug!(%error, database = %name, "reading a moved actor failed");
+                    self.forget(&other, &name, &db);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Values of `keys` from the range database, at the slot's flushed point or later, for a caller in `cell`.
     pub async fn get(
         &self,
@@ -720,9 +809,8 @@ impl Cold {
         keys: &[Vec<u8>],
     ) -> Result<Vec<Option<Vec<u8>>>, Status> {
         let parsed = Actor::new(actor).map_err(status)?;
-        let (first, name, db) = self.handle(cell, actor).await?;
+        let (first, name, db) = self.holding(cell, actor, &parsed, flushed).await?;
         let read = async {
-            self.caught_up(db.as_ref(), parsed.name(), flushed).await?;
             let mut values = Vec::with_capacity(keys.len());
             for key in keys {
                 values.push(
@@ -750,10 +838,9 @@ impl Cold {
         limit: usize,
     ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool), Status> {
         let parsed = Actor::new(actor).map_err(status)?;
-        let (first, name, db) = self.handle(cell, actor).await?;
+        let (first, name, db) = self.holding(cell, actor, &parsed, flushed).await?;
         let prefix = data_key(parsed.name(), b"");
         let read = async {
-            self.caught_up(db.as_ref(), parsed.name(), flushed).await?;
             let end = KeyRange::prefix(prefix.clone())
                 .end
                 .expect("an actor prefix ends in NUL, so it has an end");
@@ -775,6 +862,18 @@ impl Cold {
             self.forget(&first, &name, &db);
         }
         result
+    }
+}
+
+/// The sequence `db` holds the actor at, or `None` when it does not hold it.
+async fn seq_in(db: &dyn Database, actor: &[u8]) -> Result<Option<u64>, Status> {
+    match db.get(&meta_key(actor)).await.map_err(storage)? {
+        Some(bytes) => Ok(Some(
+            Meta::decode(&bytes)
+                .ok_or_else(|| Status::data_loss("an actor meta does not decode"))?
+                .seq,
+        )),
+        None => Ok(None),
     }
 }
 
@@ -848,6 +947,26 @@ fn add(batch: &mut Changes, actor: &[u8], pending: &Pending) {
     batch.push((meta_key(actor), Some(meta(pending).encode())));
 }
 
+/// Changes that make the actor's keys in a database, `held`, equal to `keys` at `meta`: keys the source no longer has
+/// are deleted.
+fn replace(held: Vec<Entry>, keys: Vec<Entry>, meta: Meta, actor: &[u8]) -> Changes {
+    let mut changes: BTreeMap<Vec<u8>, Option<Vec<u8>>> =
+        held.into_iter().map(|(key, _)| (key, None)).collect();
+    changes.extend(keys.into_iter().map(|(key, value)| (key, Some(value))));
+    changes.insert(meta_key(actor), Some(meta.encode()));
+    changes.into_iter().collect()
+}
+
+fn undecodable() -> StorageError {
+    StorageError::Corruption(bedrock_lib::storage::ErrorContext {
+        engine: "volume",
+        instance: String::new(),
+        file: None,
+        partition: None,
+        detail: "an actor meta does not decode".into(),
+    })
+}
+
 /// Every key of `actor` in `db`.
 async fn all(db: &dyn Database, actor: &[u8]) -> Result<Vec<Entry>, StorageError> {
     let end = KeyRange::prefix(actor.to_vec())
@@ -875,15 +994,7 @@ async fn copy(db: &dyn Database, actor: &[u8]) -> Result<Option<(Meta, Vec<Entry
         };
         let keys = all(db, actor).await?;
         if db.get(&meta).await?.as_ref() == Some(&before) {
-            let decoded = Meta::decode(&before).ok_or_else(|| {
-                StorageError::Corruption(bedrock_lib::storage::ErrorContext {
-                    engine: "volume",
-                    instance: String::new(),
-                    file: None,
-                    partition: None,
-                    detail: "an actor meta does not decode".into(),
-                })
-            })?;
+            let decoded = Meta::decode(&before).ok_or_else(undecodable)?;
             return Ok(Some((
                 decoded,
                 keys.into_iter().filter(|(k, _)| *k != meta).collect(),
