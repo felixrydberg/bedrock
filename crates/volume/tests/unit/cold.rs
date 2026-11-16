@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use bedrock_lib::admin::Admin;
 use bedrock_lib::health::protection::Metrics;
 use bedrock_lib::placement::{Owner, State};
+use bedrock_lib::storage::StorageResult;
 use bedrock_lib::storage::memory::MemoryEngine;
 
 use super::db::Memory;
@@ -41,6 +42,37 @@ impl Placement for Here {
             .lock()
             .unwrap()
             .push((actor.id.clone(), through));
+        Ok(true)
+    }
+
+    async fn first_cell(&self, _: &pb::Actor) -> Result<String, Status> {
+        Ok(self.cell.clone())
+    }
+}
+
+/// The `i` [`actor`] was built from.
+fn index(actor: &pb::Actor) -> usize {
+    actor.id[3..7].bytes().fold(0, |i, byte| {
+        (i << 5) | ALPHABET.iter().position(|c| *c == byte).unwrap()
+    })
+}
+
+/// Every actor's first slot is here; the truncations of the first [`SETTLE_CONCURRENCY`] actors never finish.
+#[derive(Default)]
+struct Hanging {
+    cell: String,
+}
+
+#[async_trait]
+impl Placement for Hanging {
+    async fn first_here(&self, _: &pb::Actor) -> Result<bool, Status> {
+        Ok(true)
+    }
+
+    async fn truncate_others(&self, actor: &pb::Actor, _: u64) -> Result<bool, Status> {
+        if index(actor) < SETTLE_CONCURRENCY {
+            std::future::pending().await
+        }
         Ok(true)
     }
 
@@ -610,6 +642,49 @@ async fn a_split_or_merge_by_clone_leaves_every_actor_readable() {
     assert_eq!(bucket.commits(), 1 + (2 + 2) + (2 + 1));
 }
 
+/// A cached catalog can name a database a split has already retired; it never catches up, so a read reloads the
+/// catalog and reads the database that serves the range now instead of waiting on the retired one.
+#[tokio::test(start_paused = true)]
+async fn a_stale_catalog_after_a_split_is_reloaded_not_waited_on() {
+    let bucket = Memory::default();
+    let mut n = node(&bucket, "n1", u64::MAX);
+    let reader = node(&bucket, "n2", u64::MAX);
+    let keys = [b"k".to_vec()];
+    claim(&n.store, 0);
+    append(&n.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    n.cold.tick(&n.directory).await;
+    // The reader caches the whole range's catalog.
+    assert_eq!(
+        reader
+            .cold
+            .get("cell-1", &actor(0), 1, &keys)
+            .await
+            .unwrap(),
+        vec![Some(b"1".to_vec())]
+    );
+    // A split retires that database while the reader keeps its catalog: later flushes go to the clone.
+    let middle = Actor::new(&actor(4)).unwrap().hash();
+    let mut split = n.directory.clone();
+    split.insert(middle, n.directory[&0].clone());
+    n.directory = split;
+    n.cold.tick(&n.directory).await;
+    append(&n.store, 0, 1, vec![entry(2, &[("k", Some("2"))])], 2).unwrap();
+    n.cold.tick(&n.directory).await;
+    let started = bedrock_lib::monotonic_now();
+    assert_eq!(
+        reader
+            .cold
+            .get("cell-1", &actor(0), 2, &keys)
+            .await
+            .unwrap(),
+        vec![Some(b"2".to_vec())]
+    );
+    assert!(
+        started.elapsed() < BEHIND_WAIT,
+        "the read waited on the retired database"
+    );
+}
+
 /// A maintainer that has not seen a split yet cannot lose a flush: the clone fenced and retired its database, so its
 /// flush fails and its slot keeps the entry until a database that every read finds holds it.
 #[tokio::test(start_paused = true)]
@@ -685,6 +760,106 @@ async fn a_first_slot_move_copies_the_actor_into_the_new_cell() {
         .await
         .unwrap();
     assert_eq!(got, vec![Some(b"1".to_vec())]);
+}
+
+/// The in-memory bucket with one cell's catalog unreadable.
+struct Broken {
+    bucket: Memory,
+    cell: &'static str,
+}
+
+#[async_trait]
+impl Databases for Broken {
+    async fn open(&self, name: &str) -> StorageResult<Arc<dyn Writer>> {
+        self.bucket.open(name).await
+    }
+
+    async fn open_reader(&self, name: &str) -> StorageResult<Option<Arc<dyn Database>>> {
+        self.bucket.open_reader(name).await
+    }
+
+    async fn catalog(&self, cell: &str) -> StorageResult<(Catalog, Option<String>)> {
+        if cell == self.cell {
+            return Err(StorageError::Unavailable(
+                bedrock_lib::storage::ErrorContext {
+                    engine: "test",
+                    instance: cell.into(),
+                    file: None,
+                    partition: None,
+                    detail: "the catalog is unreadable".into(),
+                },
+            ));
+        }
+        self.bucket.catalog(cell).await
+    }
+
+    async fn put_catalog(
+        &self,
+        cell: &str,
+        catalog: &Catalog,
+        version: Option<String>,
+    ) -> StorageResult<bool> {
+        self.bucket.put_catalog(cell, catalog, version).await
+    }
+
+    async fn create_clone(&self, name: &str, sources: &[(String, u64, u64)]) -> StorageResult<()> {
+        self.bucket.create_clone(name, sources).await
+    }
+
+    async fn cells(&self) -> StorageResult<Vec<String>> {
+        self.bucket.cells().await
+    }
+}
+
+/// A cell that cannot be read does not hide another cell's copy of a moved actor; the failure only matters when no
+/// cell qualified, so the caller retries instead of concluding that none holds the actor.
+#[tokio::test]
+async fn adopt_skips_a_cell_it_cannot_read_and_fails_only_when_no_cell_qualified() {
+    let bucket = Memory::default();
+    let parsed = Actor::new(&actor(0)).unwrap();
+    let db = generation(0, 0, 0);
+    let name = database("cell-3", &db);
+    let meta = Meta {
+        seq: 1,
+        epoch: 1,
+        alarm: None,
+    };
+    let changes = vec![
+        (meta_key(parsed.name()), Some(meta.encode())),
+        (data_key(parsed.name(), b"k"), Some(b"v".to_vec())),
+    ];
+    let writer = bucket.open(&name).await.unwrap();
+    writer.commit(changes).await.unwrap();
+    writer.close().await.unwrap();
+    // cell-2's catalog cannot be read; cell-3 holds the actor at sequence 1.
+    bucket
+        .put_catalog("cell-2", &Catalog::default(), None)
+        .await
+        .unwrap();
+    let catalog = Catalog {
+        next: 1,
+        spans: BTreeMap::from([(0, (0, db))]),
+    };
+    bucket.put_catalog("cell-3", &catalog, None).await.unwrap();
+    let databases: Arc<dyn Databases> = Arc::new(Broken {
+        bucket: bucket.clone(),
+        cell: "cell-2",
+    });
+    let readers = Readers::new(databases.clone(), 4, &Metrics::new(&Admin::new()));
+    let cold = Cold::new(
+        Arc::new(Store::new(Arc::new(MemoryEngine::new("volume")))),
+        databases,
+        Arc::new(Here::default()),
+        readers,
+        "cell-1",
+        "n1",
+    );
+    let (found, keys) = cold.adopt(&parsed, 1).await.unwrap().unwrap();
+    assert_eq!(found, meta);
+    assert_eq!(keys, vec![(data_key(parsed.name(), b"k"), b"v".to_vec())]);
+    // Nothing holds it at sequence 2: whether the unreadable cell does cannot be decided, so the caller retries.
+    let missed = cold.adopt(&parsed, 2).await.unwrap_err();
+    assert_eq!(missed.code(), tonic::Code::Unavailable);
 }
 
 /// The same through the maintainer on the in-memory bucket, which refuses a repeated clone source as SlateDB does: an
@@ -1225,6 +1400,55 @@ async fn one_round_flushes_at_most_flush_rounds_batches_per_range() {
     assert_eq!(n.store.dirty(0, 0).len(), actors - FLUSH_ROUNDS);
     n.cold.tick(&n.directory).await;
     assert!(n.store.dirty(0, 0).is_empty());
+}
+
+/// A hanging slot owner holds a tick up for at most the settlement budget, and the next tick starts after the hung
+/// actors, so the ones behind them still get settled.
+#[tokio::test(start_paused = true)]
+async fn a_hanging_owner_is_bounded_and_later_actors_are_still_settled() {
+    let bucket = Memory::default();
+    let store =
+        Arc::new(Store::new(Arc::new(MemoryEngine::new("volume"))).with_max_unflushed(u64::MAX));
+    let databases: Arc<dyn Databases> = Arc::new(bucket.clone());
+    let readers = Readers::new(databases.clone(), 4, &Metrics::new(&Admin::new()));
+    let cold = Cold::new(
+        store.clone(),
+        databases,
+        Arc::new(Hanging {
+            cell: "cell-1".into(),
+        }),
+        readers,
+        "cell-1",
+        "n1",
+    );
+    let directory = BTreeMap::from([(
+        0,
+        vec![Owner {
+            node: "n1".into(),
+            state: State::Ready,
+        }],
+    )]);
+    let actors: usize = 1_000;
+    for i in 0..actors {
+        claim(&store, i);
+        append(&store, i, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    }
+    let budget = SETTLE_WAIT + Duration::from_secs(1);
+    assert!(
+        tokio::time::timeout(budget, cold.tick(&directory))
+            .await
+            .is_ok(),
+        "a hanging owner held up the tick"
+    );
+    assert_eq!(store.owed().len(), actors, "the hung ones are still owed");
+    // `actor(i)` puts `i` in the hash's most significant digits, so key order is index order: the hung actors are the
+    // first ones owed, and the next tick's batch is exactly the ones after them.
+    cold.tick(&directory).await;
+    assert_eq!(store.owed().len(), actors - SETTLE_ACTORS);
+    assert!(
+        store.owed().iter().any(|(owed, _)| owed.id == actor(0).id),
+        "the hung actors are still retried"
+    );
 }
 
 #[test]

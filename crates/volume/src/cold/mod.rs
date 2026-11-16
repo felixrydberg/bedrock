@@ -57,10 +57,23 @@ pub const FLUSH_ROUNDS: usize = 8;
 pub const FENCED_WAIT: Duration = Duration::from_secs(5);
 /// How long a cold read waits for its reader to see the slot's flushed point.
 pub const BEHIND_WAIT: Duration = Duration::from_secs(2);
+/// Owed slot truncations one tick asks for, and how many it asks at once, so a busier range cannot make a flush wait
+/// on all of them in turn.
+pub const SETTLE_ACTORS: usize = 64;
+pub const SETTLE_CONCURRENCY: usize = 4;
+/// [`Cold::settle`] joins exactly [`SETTLE_CONCURRENCY`] calls at a time.
+const _: () = assert!(SETTLE_CONCURRENCY == 4, "the settlement join is four-wide");
+/// How long one tick waits for its owed truncations: one call may spend `placement::TIMEOUT` on each of the actor's
+/// slot cells, so a slow-but-healthy actor finishes here instead of being retried from the start every tick. The rest
+/// wait for the next tick.
+pub const SETTLE_WAIT: Duration =
+    Duration::from_secs(placement::TIMEOUT.as_secs() * bedrock_lib::actors::SLOTS as u64);
 /// How often one open tries again after a concurrent catalog change.
 const OPEN_ATTEMPTS: usize = 3;
 /// How often a first-slot move rereads a source whose actor changed during the copy.
 const COPY_ATTEMPTS: usize = 3;
+/// How many actors' flushed points one writer keeps in memory before starting its cache over, about a million.
+const KNOWN: usize = 1 << 20;
 
 /// What a range database holds for an actor besides its keys: the sequence they are at, its epoch, and the alarm.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -233,6 +246,9 @@ pub struct Cold {
     fenced: Mutex<BTreeMap<(u64, u64), Instant>>,
     /// Catalogs cold reads and copies used, by cell; dropped when a read through one fails.
     catalogs: Mutex<BTreeMap<String, Arc<Catalog>>>,
+    /// The last owed actor [`Cold::settle`] tried, by key: the next tick starts after it, so an actor whose truncation
+    /// keeps failing does not starve the ones after it.
+    settle_cursor: Mutex<Option<Vec<u8>>>,
     /// Unflushed bytes at the last flush, for the early trigger.
     mark: Mutex<i64>,
 }
@@ -264,6 +280,7 @@ impl Cold {
             writers: Mutex::default(),
             fenced: Mutex::default(),
             catalogs: Mutex::default(),
+            settle_cursor: Mutex::default(),
             mark: Mutex::new(0),
         }
     }
@@ -439,6 +456,10 @@ impl Cold {
             Some(bytes) => Meta::decode(&bytes).ok_or_else(undecodable)?,
             None => Meta::default(),
         };
+        if known.len() >= KNOWN {
+            // The cache only saves a read per actor; starting it over costs that read, not unbounded memory.
+            known.clear();
+        }
         known.insert(actor.to_vec(), meta);
         Ok(meta)
     }
@@ -465,12 +486,17 @@ impl Cold {
         Ok(serving(&catalog, hash).map(|db| database(cell, &db)))
     }
 
-    /// Forgets `cell`'s catalog and `name`'s reader after a read through them failed.
-    fn forget(&self, cell: &str, name: &str, db: &Arc<dyn Database>) {
+    /// Forgets `cell`'s catalog after reading it or a database it names failed.
+    fn forget_catalog(&self, cell: &str) {
         self.catalogs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(cell);
+    }
+
+    /// Forgets `cell`'s catalog and `name`'s reader after a read through them failed.
+    fn forget(&self, cell: &str, name: &str, db: &Arc<dyn Database>) {
+        self.forget_catalog(cell);
         self.readers.discard(name, db);
     }
 
@@ -491,22 +517,38 @@ impl Cold {
     }
 
     /// The actor's meta and keys from the database of another cell that holds it at `flushed` or later. `None` when no
-    /// cell holds it that far.
+    /// cell holds it that far. A cell that cannot be read is logged and forgotten, and does not hide the others; only
+    /// when no cell qualified at all does a failure make the caller retry instead of concluding that none holds it.
     async fn adopt(
         &self,
         actor: &Actor,
         flushed: u64,
     ) -> Result<Option<(Meta, Vec<Entry>)>, Status> {
         let mut best: Option<(Meta, Vec<Entry>)> = None;
+        let mut failed: Option<Status> = None;
         for cell in self.databases.cells().await.map_err(storage)? {
             if cell == self.cell {
                 continue;
             }
-            let Some(name) = self.serving(&cell, actor.hash()).await.map_err(storage)? else {
-                continue;
+            let name = match self.serving(&cell, actor.hash()).await {
+                Ok(Some(name)) => name,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::debug!(%error, %cell, "reading a moved actor's catalog failed");
+                    self.forget_catalog(&cell);
+                    failed = Some(storage(error));
+                    continue;
+                }
             };
-            let Some(db) = self.readers.get(&self.cell, &name).await.map_err(storage)? else {
-                continue;
+            let db = match self.readers.get(&self.cell, &name).await {
+                Ok(Some(db)) => db,
+                Ok(None) => continue,
+                Err(error) => {
+                    tracing::debug!(%error, database = %name, "opening a moved actor's database failed");
+                    self.forget_catalog(&cell);
+                    failed = Some(storage(error));
+                    continue;
+                }
             };
             let copied = copy(db.as_ref(), actor.name()).await;
             match copied {
@@ -523,14 +565,18 @@ impl Cold {
                 }
             }
         }
-        if best.is_none() {
-            // A catalog read before the move may name a database the actor has left: read them again next time.
-            self.catalogs
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clear();
+        if let Some(found) = best {
+            return Ok(Some(found));
         }
-        Ok(best)
+        if let Some(failed) = failed {
+            return Err(failed);
+        }
+        // A catalog read before the move may name a database the actor has left: read them again next time.
+        self.catalogs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        Ok(None)
     }
 
     /// Flushes one batch of range `[start, end)` into `name` and truncates what it holds. Returns whether more actors
@@ -650,24 +696,96 @@ impl Cold {
         Ok(())
     }
 
-    /// Retries the truncations other slots still owe; one done is settled unless a newer flush raised it meanwhile.
+    /// Retries the truncations other slots still owe. One tick asks at most [`SETTLE_ACTORS`] of them,
+    /// [`SETTLE_CONCURRENCY`] at a time and for at most [`SETTLE_WAIT`], so a slow or hanging slot holds up the flush for
+    /// at most one call's worth of time. The next tick starts after the last actor asked, so an actor that keeps failing
+    /// does not starve the ones after it; one that succeeded is settled unless a newer flush raised the obligation
+    /// meanwhile.
     async fn settle(&self) {
-        for (actor, through) in self.store.owed() {
-            match self.placement.truncate_others(&actor, through).await {
-                Ok(true) => {
-                    let Ok(parsed) = Actor::new(&actor) else {
-                        continue;
-                    };
-                    let store = self.store.clone();
-                    let settled =
-                        crate::serve::blocking(move || store.settle(&parsed, through)).await;
-                    if let Ok(Err(error)) = settled {
-                        tracing::warn!(error = ?error, "settling a slot truncation failed");
+        let mut owed = self.store.owed();
+        if owed.is_empty() {
+            return;
+        }
+        let cursor = self
+            .settle_cursor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let start = cursor.as_deref().map_or(0, |cursor| {
+            owed.partition_point(|(actor, _)| {
+                owed_key(actor).is_some_and(|key| key.as_slice() <= cursor)
+            })
+        });
+        let len = owed.len();
+        owed.rotate_left(start % len);
+        let mut owed = owed.into_iter().take(SETTLE_ACTORS);
+        let deadline = bedrock_lib::monotonic_now() + SETTLE_WAIT;
+        let mut tried = None;
+        loop {
+            let remaining = deadline.saturating_duration_since(bedrock_lib::monotonic_now());
+            if remaining.is_zero() {
+                break;
+            }
+            let chunk: Vec<(pb::Actor, u64)> = owed.by_ref().take(SETTLE_CONCURRENCY).collect();
+            let Some(last) = chunk.last() else {
+                break;
+            };
+            // These actors count as tried even when a call hangs: the cursor moves past them, so later ones are served.
+            tried = owed_key(&last.0);
+            let mut chunk = chunk.into_iter();
+            let joined = async {
+                tokio::join!(
+                    self.ask(chunk.next()),
+                    self.ask(chunk.next()),
+                    self.ask(chunk.next()),
+                    self.ask(chunk.next()),
+                )
+            };
+            match tokio::time::timeout(remaining, joined).await {
+                Ok((a, b, c, d)) => {
+                    for (actor, through, asked) in [a, b, c, d].into_iter().flatten() {
+                        self.settle_actor(actor, through, asked).await;
                     }
                 }
-                Ok(false) => {}
-                Err(error) => tracing::debug!(%error, "a slot truncation is still owed"),
+                Err(_) => {
+                    tracing::debug!("owed slot truncations did not finish within the tick");
+                    break;
+                }
             }
+        }
+        if let Some(tried) = tried {
+            *self
+                .settle_cursor
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(tried);
+        }
+    }
+
+    /// Asks an owed actor's other slots to truncate; `None` when the chunk ran out before the join's slots did.
+    async fn ask(
+        &self,
+        owed: Option<(pb::Actor, u64)>,
+    ) -> Option<(pb::Actor, u64, Result<bool, Status>)> {
+        let (actor, through) = owed?;
+        let asked = self.placement.truncate_others(&actor, through).await;
+        Some((actor, through, asked))
+    }
+
+    /// Settles an owed truncation once the actor's other slots reported it done; otherwise it stays owed.
+    async fn settle_actor(&self, actor: pb::Actor, through: u64, asked: Result<bool, Status>) {
+        match asked {
+            Ok(true) => {
+                let Ok(parsed) = Actor::new(&actor) else {
+                    return;
+                };
+                let store = self.store.clone();
+                let settled = crate::serve::blocking(move || store.settle(&parsed, through)).await;
+                if let Ok(Err(error)) = settled {
+                    tracing::warn!(error = ?error, "settling a slot truncation failed");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => tracing::debug!(%error, "a slot truncation is still owed"),
         }
     }
 
@@ -731,7 +849,9 @@ impl Cold {
 
     /// A database holding the actor at `flushed` or later, for a caller in `cell`, with its cell and name: its first slot
     /// cell's, waited for up to [`BEHIND_WAIT`] while it holds an older point. After a first-slot move, until the
-    /// actor's next flush copies it, that database lacks it: then another cell's that holds it is read instead.
+    /// actor's next flush copies it, that database lacks it: then another cell's that holds it is read instead. A cached
+    /// catalog may name a database that a split or merge retired, so an older point is read again before it is waited
+    /// for: only the database the catalog names now is polled, never the one it replaced.
     async fn holding(
         &self,
         cell: &str,
@@ -749,17 +869,37 @@ impl Cold {
                     return Err(error);
                 }
             };
-            // An older point is most likely a reader that has not seen the last flush yet.
-            if held.is_some_and(|seq| seq >= flushed)
-                || (held.is_some()
-                    && self
-                        .caught_up(db.as_ref(), parsed.name(), flushed)
-                        .await
-                        .is_ok())
-            {
+            if held.is_some_and(|seq| seq >= flushed) {
                 return Ok((first, name.clone(), db.clone()));
             }
             self.forget(&first, name, db);
+            if held.is_some()
+                && let Ok(Some(fresh)) = self.serving(&first, parsed.hash()).await
+                && let Ok(Some(reopened)) = self.readers.get(cell, &fresh).await
+            {
+                // An older point on the database the catalog still names is most likely a reader that has not seen the
+                // last flush yet.
+                if fresh == *name {
+                    if self
+                        .caught_up(reopened.as_ref(), parsed.name(), flushed)
+                        .await
+                        .is_ok()
+                    {
+                        return Ok((first, fresh, reopened));
+                    }
+                    self.forget(&first, &fresh, &reopened);
+                } else {
+                    // The catalog moved: the database it replaced is never written again, but this one may hold it.
+                    match seq_in(reopened.as_ref(), parsed.name()).await {
+                        Ok(Some(seq)) if seq >= flushed => return Ok((first, fresh, reopened)),
+                        Ok(_) => self.forget(&first, &fresh, &reopened),
+                        Err(error) => {
+                            self.forget(&first, &fresh, &reopened);
+                            return Err(error);
+                        }
+                    }
+                }
+            }
         }
         if let Some(found) = self.elsewhere(cell, &first, parsed, flushed).await? {
             return Ok(found);
@@ -863,6 +1003,11 @@ impl Cold {
         }
         result
     }
+}
+
+/// The key [`Store::owed`] orders an actor by, as its range database keys it.
+fn owed_key(actor: &pb::Actor) -> Option<Vec<u8>> {
+    Actor::new(actor).ok().map(|actor| actor.name().to_vec())
 }
 
 /// The sequence `db` holds the actor at, or `None` when it does not hold it.

@@ -26,7 +26,8 @@ use super::Placement;
 
 /// The topology record is static config; a node rereads it this often.
 const TOPOLOGY_TTL: Duration = Duration::from_secs(10 * 60);
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one slot truncation call may take.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Cells {
     client: Arc<Client>,
