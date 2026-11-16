@@ -727,6 +727,7 @@ fn a_full_slot_takes_a_replaced_tail_only_if_the_log_does_not_grow() {
 fn owed_truncations_survive_a_restart_until_settled() {
     let engine = Arc::new(MemoryEngine::new("volume"));
     let store = Store::new(engine.clone());
+    let kept = engine.clone();
     let a = host("a");
     claimed(&store, &a, 1);
     append(&store, &a, 1, 0, vec![entry(1, 1, &[("k", Some("1"))])], 1);
@@ -741,7 +742,25 @@ fn owed_truncations_survive_a_restart_until_settled() {
     assert_eq!(restarted.owed().len(), 1);
     restarted.settle(&actor(), 1).unwrap();
     assert!(restarted.owed().is_empty());
-    let again = Store::new(Arc::new(MemoryEngine::new("volume")));
+    // The settle's deletion is durable: a second restart finds nothing owed.
+    let again = Store::new(kept);
     again.recover().unwrap();
     assert!(again.owed().is_empty());
+}
+
+/// A lower truncation leaves a higher obligation in place, in memory and on disk, so settling the lower one keeps it.
+#[test]
+fn an_owed_truncation_only_rises() {
+    let engine = Arc::new(MemoryEngine::new("volume"));
+    let store = Store::new(engine.clone());
+    let a = host("a");
+    claimed(&store, &a, 1);
+    store.truncate_owing(&actor(), 10).unwrap();
+    store.truncate_owing(&actor(), 5).unwrap();
+    assert_eq!(store.owed()[0].1, 10);
+    store.settle(&actor(), 5).unwrap();
+    assert_eq!(store.owed()[0].1, 10);
+    let restarted = Store::new(engine);
+    restarted.recover().unwrap();
+    assert_eq!(restarted.owed()[0].1, 10);
 }

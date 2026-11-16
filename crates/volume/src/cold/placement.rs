@@ -3,8 +3,12 @@
 //! An actor's slots are in the cells [`actors::slots`] names; in each, the range holding its hash has the owners. A
 //! truncation goes to every owner of those ranges that is not populating: an owner that holds no slot of the actor
 //! answers with an empty slot, which needs nothing truncated, so no slot index rule is needed here.
+//!
+//! Sibling cells are reached through the relays configured for them (`sibling_relays`). Each read of this node's own
+//! region's topology checks that configuration against this DC's cells; while it does not match, calls to other cells
+//! fail closed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -27,20 +31,36 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Cells {
     client: Arc<Client>,
     peers: Arc<Peers>,
+    region: String,
+    dc: String,
     cell: String,
     node: String,
+    /// The sibling cells relays are configured for.
+    siblings: BTreeSet<String>,
+    /// Why the configured siblings do not match this DC's cells, as of the last topology read.
+    mismatch: Mutex<Option<String>>,
     topology: Mutex<BTreeMap<String, (Arc<Topology>, Instant)>>,
     /// Route revisions a failed truncation saw, by cell: the next fetch must be newer.
     stale: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Cells {
-    pub fn new(client: Arc<Client>, peers: Arc<Peers>, cell: &str, node: &str) -> Self {
+    pub fn new(
+        client: Arc<Client>,
+        peers: Arc<Peers>,
+        location: &bedrock_lib::node::Location,
+        node: &str,
+        siblings: BTreeSet<String>,
+    ) -> Self {
         Cells {
             client,
             peers,
-            cell: cell.to_owned(),
+            region: location.region.clone(),
+            dc: location.dc.clone(),
+            cell: location.cell.clone(),
             node: node.to_owned(),
+            siblings,
+            mismatch: Mutex::default(),
             topology: Mutex::default(),
             stale: Mutex::default(),
         }
@@ -61,6 +81,13 @@ impl Cells {
             .await
             .map_err(|e| Status::unavailable(format!("topology of {region}: {e:?}")))?;
         let topology = Arc::new(topology);
+        if region == self.region {
+            let mismatch = sibling_mismatch(&topology, &self.dc, &self.cell, &self.siblings);
+            if let Some(mismatch) = &mismatch {
+                tracing::error!(%mismatch, "sibling cell relays do not match the topology");
+            }
+            *self.mismatch.lock().unwrap_or_else(PoisonError::into_inner) = mismatch;
+        }
         self.topology
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -91,11 +118,37 @@ impl Cells {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(cell);
         if cell == self.cell {
-            self.client.routes(VOLUME, stale).await
-        } else {
-            self.client.routes_in(cell, VOLUME, stale).await
+            return self.client.routes(VOLUME, stale).await;
         }
+        let mismatch = self
+            .mismatch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(mismatch) = mismatch {
+            return Err(Status::failed_precondition(mismatch));
+        }
+        self.client.routes_in(cell, VOLUME, stale).await
     }
+}
+
+/// Why `configured` sibling cells differ from the other cells of `dc` in `topology`, or `None` when they match.
+pub fn sibling_mismatch(
+    topology: &Topology,
+    dc: &str,
+    cell: &str,
+    configured: &BTreeSet<String>,
+) -> Option<String> {
+    let Some(found) = topology.dcs.iter().find(|d| d.name == dc) else {
+        return Some(format!("the topology has no DC {dc}"));
+    };
+    let expected: BTreeSet<&String> = found.cells.iter().filter(|c| *c != cell).collect();
+    let configured: BTreeSet<&String> = configured.iter().collect();
+    let unknown: Vec<_> = configured.difference(&expected).collect();
+    let missing: Vec<_> = expected.difference(&configured).collect();
+    (!unknown.is_empty() || !missing.is_empty()).then(|| {
+        format!("sibling_relays of DC {dc}: not in the DC {unknown:?}, without relays {missing:?}")
+    })
 }
 
 fn hash(actor: &pb::Actor) -> Result<u64, Status> {
@@ -114,8 +167,18 @@ impl Placement for Cells {
         cells.sort();
         cells.dedup();
         let mut done = true;
+        let (mut reached, mut failure) = (false, None);
         for cell in cells {
-            let table = self.routes(&cell).await?;
+            let table = match self.routes(&cell).await {
+                Ok(table) => table,
+                Err(error) => {
+                    tracing::debug!(%error, %cell, "no routes for a slot cell");
+                    done = false;
+                    failure = Some(error);
+                    continue;
+                }
+            };
+            reached = true;
             // A slot cell always has an owner for the actor's range: a missing directory or owner is a table that is not
             // there yet, never a slot with nothing to truncate.
             let directory = table.directories.get(VOLUME).cloned().unwrap_or_default();
@@ -133,6 +196,10 @@ impl Placement for Cells {
                     continue;
                 }
                 let Some(member) = table.members.get(&owner.node) else {
+                    self.stale
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(cell.clone(), table.revision);
                     done = false;
                     continue;
                 };
@@ -178,7 +245,10 @@ impl Placement for Cells {
                 done &= finished;
             }
         }
-        Ok(done)
+        match failure {
+            Some(error) if !reached => Err(error),
+            _ => Ok(done),
+        }
     }
 
     async fn first_cell(&self, actor: &pb::Actor) -> Result<String, Status> {
