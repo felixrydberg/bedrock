@@ -301,6 +301,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bedrock-compute"
+version = "0.1.0"
+dependencies = [
+ "bedrock-lib",
+ "madsim-tokio",
+ "madsim-tonic",
+ "prost",
+]
+
+[[package]]
 name = "bedrock-crash"
 version = "0.1.0"
 dependencies = [
@@ -407,6 +417,7 @@ version = "0.1.0"
 dependencies = [
  "bedrock-api",
  "bedrock-cdn",
+ "bedrock-compute",
  "bedrock-kv",
  "bedrock-lib",
  "bedrock-quicksilver",

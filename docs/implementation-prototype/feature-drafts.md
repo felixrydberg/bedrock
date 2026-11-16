@@ -66,7 +66,7 @@ crates/
 ├── quicksilver/  # bedrock/quicksilver — quicksilver storage and namespaces → binary `bedrock-quicksilver`
 ├── kv/           # bedrock/kv  — customer KV: value caches, REST API, namespace management → binary `bedrock-kv`
 ├── cdn/          # bedrock/cdn — artifact_storage, artifact_transfer, paths, retention → binary `bedrock-cdn`
-├── compute/      # bedrock/compute — actor host, sandbox, built-in d1/kv/queue/cron     → binary `bedrock-compute` (track O)
+├── compute/      # bedrock/compute — one execution layer, actor host, Worker invocation, built-in d1/kv/queue/cron → binary `bedrock-compute` (track O)
 └── volume/       # bedrock/volume  — actor claims, quorum log, overlay, cold tier, alarms → binary `bedrock-volume` (track O)
 ```
 
@@ -85,7 +85,7 @@ server runs every service, each service is its own process, and code is shared a
 | `bedrock-kv` | Customer `kv` read side: value caches, the REST API and namespace management; no hash ranges or buckets (§4 decisions 12, 16) | `l1`, `l2` (only logged until B-39) |
 | `bedrock-cdn` | Dataset `cdn` (path rows and ref keys) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
 | `bedrock-gateway` (planned, B-57) | Public entry point, internal routing between cells, API-key checks and the local `auth` copy (§4 decision 15); actor routing (S-08) | — (follows its relay's tier) |
-| `bedrock-compute` (planned, S-07) | Actor host: Workers sandbox, Durable Objects and the built-in `d1`, `kv`, `queue` and `cron` handlers (§4 decision 16) | — |
+| `bedrock-compute` (planned, S-07) | One execution layer: sandboxed customer code (Workers, Durable Objects) and built-in `d1`, `kv`, `queue` and `cron` handlers in Rust; actor host; stateless Worker invocation (§4 decision 16) | — |
 | `bedrock-volume` (S-03; cold tier S-05) | Actor storage: claims, leases, quorum log, overlay, flushes to S3, alarm index; `volume` hash ranges per cell (§4 decision 16) | — |
 
 Rules this implies:
@@ -218,10 +218,10 @@ Rules this implies:
 | [S-04](https://github.com/felixrydberg/bedrock/issues/112) | Volume client in Compute: claim, recovery, append window, reads | Actors | `compute/actors` | S-03 |
 | [S-05](https://github.com/felixrydberg/bedrock/issues/113) | Cold tier: one SlateDB per range, maintainer flush, truncation, split and merge by clone, SSD cache, S3 reader handles | Actors | `volume/cold` | S-03, B-11, B-39 |
 | [S-06](https://github.com/felixrydberg/bedrock/issues/114) | Slot repair and node-reported range readiness | Actors | `volume/repair`, `lib/relays` | S-02b, S-03, B-68 |
-| [S-07](https://github.com/felixrydberg/bedrock/issues/115) | `bedrock-compute` actor host: acquire, wake, sleep, leases, SQLite VFS, gates | Actors | `compute` bin | S-04 |
+| [S-07](https://github.com/felixrydberg/bedrock/issues/115) | `bedrock-compute` actor host: acquire, wake, sleep, leases, SQLite VFS, gates and the execution seam | Actors | `compute/actors` | S-04 |
 | [S-08](https://github.com/felixrydberg/bedrock/issues/116) | Gateway actor routing and location cache | Actors | `gateway/actors` | B-57, S-07 |
 | [S-09](https://github.com/felixrydberg/bedrock/issues/117) | Alarms: holder timers and volume index wake | Actors | `compute/actors`, `volume/alarms` | S-07, S-08 |
-| [S-10](https://github.com/felixrydberg/bedrock/issues/118) | Durable Objects API | Compute | `compute` | S-07 … S-09, sandbox decision |
+| [S-10](https://github.com/felixrydberg/bedrock/issues/118) | Shared execution layer: Sandbox contract + one adapter, Worker runtime and Durable Objects API | Actors | `compute/runtime`, `compute/sandbox`, `compute` | S-07 … S-09, sandbox adapter choice |
 | [S-11](https://github.com/felixrydberg/bedrock/issues/119) | D1 | Compute | `compute/builtin` | S-10 |
 | [S-12](https://github.com/felixrydberg/bedrock/issues/120) | Queues | Compute | `compute/builtin` | S-09, S-10 |
 | [S-13](https://github.com/felixrydberg/bedrock/issues/121) | Cron Triggers | Compute | `compute/builtin` | S-09, B-50 |
@@ -809,7 +809,9 @@ Created: [#96](https://github.com/felixrydberg/bedrock/issues/96) — Feature �
 
 KV, CDN and (later) Compute are backing services. Everything that knows about Workers, Pages, deployments or revisions lives here,
 as a client of those services. Nothing in tracks A-K depends on this track. Worker execution runs in `bedrock-compute`
-(track O); the deploy control plane's crate is decided when the track starts.
+through S-10's shared execution layer: a Worker request is a stateless sandbox invocation of a CDN artifact, not an
+actor. B-51 routes it to a compute host, and B-52/B-60 exercise it. The deploy control plane's crate is decided when
+the track starts.
 
 ---
 
@@ -978,9 +980,10 @@ issue, its body is written from those sections in the usual template. All are cr
 - **Storage first.** S-01 … S-06 build actor storage. S-02 updates the specification before any protocol code, and
   S-03 waits for it.
 - **Hosting.** S-07 … S-09 host actors in `bedrock-compute`, route to them through the Gateway (needs B-57) and fire
-  alarms.
-- **Products.** S-10 … S-15 and S-18 wait for the #25 / B-23 gate like the other product tracks. S-10 also waits for
-  the sandbox runtime decision (leaning towards sandboxed workerd).
+  alarms. S-07 also lands the host's execution seam; S-10 adds the sandbox implementation and the stateless Worker path.
+- **Products.** S-10 … S-15 and S-18 wait for the #25 / B-23 gate like the other product tracks. S-10 owns the sandbox
+  contract and ships one adapter; the adapter choice (workerd, workerd in Firecracker) is a deployment decision.
+  Workers are stateless executions of CDN artifacts, not actors; Durable Objects and the built-in handlers stay actors.
 - **Hardening and operations.** S-16 adds the actor workload to the simulation and crash tests; S-17 covers planned DC
   changes and DC-loss restore.
 - **Later.** S-19's load-based splitting starts only once measurements show hot volume nodes with similar range sizes.
@@ -1249,6 +1252,7 @@ issue, its body is written from those sections in the usual template. All are cr
     plan is [`statefull/v2.md`](statefull/v2.md), implemented by track O (S-01 … S-19).
     - **Actors** are the single primitive for Durable Objects, D1, Queues, Cron, Workflows and customer-KV writers. An
       actor ID is `{region}_{128 bits}`. The DC, cells and wake host are computed from it, so no directory lookup is needed.
+      Workers are not actors: their bundles are CDN artifacts and their invocations are stateless.
     - **Storage:** `bedrock-volume` keeps each actor's claim, quorum log and key/value overlay on three slots in different
       cells of one DC. A commit is acknowledged at 2 of 3 fsyncs; S3 is never on the write path. A maintainer flushes to
       the actor's SlateDB database every second or 4 MiB. Epochs fence writers, and a host lease protects in-memory state.
@@ -1257,8 +1261,11 @@ issue, its body is written from those sections in the usual template. All are cr
       bytes, not with the number of actors. SlateDB's own WAL is off. Splits and merges use SlateDB clones. Balancing
       on stored bytes moves into S-03; S-19 adds load and flush-lag signals. Details in `statefull/v2.md` §5 Cold tier
       and §11.
-    - **Hosting:** `bedrock-compute` holds awake actors, sleeps idle ones and wakes them on request or alarm. Gateways
-      route region → DC → cell → host with a location cache.
+    - **Hosting:** `bedrock-compute` holds awake actors, sleeps idle ones and wakes them on request or alarm, and invokes
+      stateless Workers from CDN artifacts. Gateways route actors region → DC → cell → host with a location cache, and
+      Worker requests to any healthy host in the region. One execution layer runs built-in actors as Rust handlers and
+      customer code (Workers, Durable Objects) in a sandbox; the sandbox adapter (workerd, workerd in Firecracker) is a
+      deployment choice.
     - **Failure model:** losing a cell loses no acknowledged write. Losing a whole DC means downtime for its actors, and
       losing it for good can lose up to about 1 second of acknowledged writes.
     - **Changes to earlier decisions:** 4 (lease heartbeats for actors), 5 (slots span a DC's cells), 11 (the writer is a
@@ -1272,7 +1279,7 @@ issue, its body is written from those sections in the usual template. All are cr
 2. **SlateDB fork and patch set (B-11, S-05).** Pin the source/format baseline and upstream-update policy; prove
    Bedrock's I/O, simulation, range-integrity, checkpoint and recovery contracts before selecting engine features to
    remove. Which of Rivet's vendored SlateDB patches to carry is not decided.
-3. **Stateful actor questions.** Sandbox runtime, range-database details (clone API, prefix delete, naming, KV),
+3. **Stateful actor questions.** Sandbox adapter, range-database details (clone API, prefix delete, naming, KV),
    page or chunk granularity, DC choice, a KV
    durability option, large KV values and heartbeat volume: see `statefull/v2.md` §12. An unavailable source is an
    error, never proof that a key is missing.

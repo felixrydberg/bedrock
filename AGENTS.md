@@ -11,13 +11,15 @@
 
 ## Architecture boundaries
 
-- Put the shared distributed core in `crates/lib`. `quicksilver`, `kv`, `cdn`, `volume`, `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
+- Put the shared distributed core in `crates/lib`. `quicksilver`, `kv`, `cdn`, `volume`, `compute` (planned, track O), `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
 - `bedrock-quicksilver` hosts `quicksilver`; `auth` serving awaits the future Gateway binary. `bedrock-kv` hosts customer `kv` only, with no virtual buckets and no dataset subscriptions; `bedrock-cdn` hosts `cdn` retention metadata and artifact bytes. Each subscribes only to its own datasets.
 - `bedrock-volume` stores actor slots (claims, quorum logs, overlays, alarm index) in relay-assigned `volume` hash ranges, which relays place but never stream. Its holders are Compute hosts; it subscribes to no dataset.
 - The write API and relays are generic over datasets. Retention is ordinary SET/DELETE replication interpreted only by CDN apply hooks.
 - `StorageEngine` and its adapters belong in `lib/storage`; Quicksilver keyspaces and eviction belong in `quicksilver/storage`, customer-KV reader residency in `kv/storage`. Keep CDN artifact caching behind its separate `CacheStorage` contract.
 - Membership comes from relay subscriber streams; peer reachability comes from real traffic. Do not introduce a separate heartbeat/gossip protocol or membership/placement epoch. Writer fencing is a separate concern.
-- KV and CDN are backing services. Workers, Pages, activation and rollback belong to the future Compute/deploy control plane.
+- KV and CDN are backing services. Worker and Pages execution runs in `compute`; activation, rollback and deployment records belong to the future Compute/deploy control plane.
+- `compute` has one execution layer. Built-in actors run as Rust handlers in the host; customer code (Workers and Durable Objects) runs only through the `Sandbox` contract. Worker invocation and actor execution share `Executor`/`Instance`; do not add a second invoke path or a product-specific sandbox. The sandbox adapter (workerd, workerd in a Firecracker microVM) is a deployment choice.
+- Workers are not actors. A Worker is a stateless execution of a CDN artifact routed to any healthy `compute` host, with no claim, lease, actor ID or SQLite VFS. Durable Objects, D1, KV, Queues and Cron are actors and keep the claim/lease and volume path.
 - Keep metrics labels low-cardinality. Expose namespace/key/hash/subscriber detail through introspection or the agreed top-N mechanism. Preserve the writer's `committed_at` through every hop.
 
 ## Correctness and validation

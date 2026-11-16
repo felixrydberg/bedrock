@@ -100,6 +100,9 @@ message Slot {
   // The log starts after this sequence; S3 holds everything up to it.
   uint64 flushed = 8;
   bool released = 9;
+  // The epoch of entry `flushed`, so a claimant that recovers from this slot can send a lagging slot the entry after it
+  // (#112 / S-04).
+  uint64 flushed_epoch = 10;
 }
 
 message Answer { Refusal refused = 1; Slot slot = 2; }
