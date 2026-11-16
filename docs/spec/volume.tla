@@ -8,16 +8,21 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \*   "handoff"  : the range at slot c moves to d in c's cell (c seals, d copies from c, then votes);
 \*   "wipe"     : c loses its data, copies from both peers, then stays repaired (no vote) until a
 \*                claim above the highest reservation it copied has committed;
-\*   "topology" : the slot set {a, b, c} becomes {a, b, d} through a joint version.
+\*   "topology" : the slot set {a, b, c} becomes {a, b, d} through a joint version;
+\*   "truncate" : no change of votes; every slot tracks its commit point, refuses appends under
+\*                backpressure while still learning the commit point, and truncates what S3 holds
+\*                (S-05, #113).
 \* Messages are abstract. A grant the holder has received stays counted after the slot that sent
 \* it changes; a fenced holder's appends still arrive. A commit is acknowledged in the step whose
 \* fsync completes its quorum.
 \* Bug names a deliberate bug for the check that must catch it (scripts/tlc.sh); "none" is the protocol.
 CONSTANTS Hosts, NoHost, MaxEpoch, MaxLen, Change, Bug
-VARIABLES promise, log, st, sv, copied, reserved, \* slots
+VARIABLES promise, log, st, sv, copied, reserved, fl, \* slots
           phase, epoch, hv, granted, hlog, ackd, \* holders
           acked, cp, s3, maint, tv, jointDone
-slots == <<promise, log, st, sv, copied, reserved>>
+\* fl: how far a slot truncated its log after a flush; cp: the commit point a slot knows (only the
+\* maintainers track it outside "truncate", which keeps the other configs' state spaces).
+slots == <<promise, log, st, sv, copied, reserved, fl>>
 holders == <<phase, epoch, hv, granted, hlog, ackd>>
 vars == <<slots, holders, acked, cp, s3, maint, tv, jointDone>>
 
@@ -56,14 +61,20 @@ CommitPoint(h, acks) ==
         C == {i \in 1..Len(hlog[h]) : ok(i)}
     IN IF C = {} THEN 0 ELSE CHOOSE i \in C : \A j \in C : j <= i
 Committed(h) == {<<j, hlog[h][j]>> : j \in 1..CommitPoint(h, ackd[h])}
+\* How far two logs agree from the start.
+Matched(L, M) == LET C == {i \in 0..Min(Len(L), Len(M)) : \A j \in 1..i : L[j] = M[j]}
+                 IN CHOOSE i \in C : \A k \in C : k <= i
+\* Whether slot n tracks its commit point.
+Tracks(n) == n \in Maintainers \/ Change = "truncate"
 
 Init == /\ promise = [n \in Nodes |-> None] /\ log = [n \in Nodes |-> <<>>]
         /\ sv = [n \in Nodes |-> 1] /\ copied = [n \in Nodes |-> {}] /\ reserved = [n \in Nodes |-> 0]
+        /\ fl = [n \in Nodes |-> 0]
         /\ st = [n \in Nodes |-> IF n = "d" THEN "off" ELSE "vote"]
         /\ phase = [h \in Hosts |-> "idle"] /\ epoch = [h \in Hosts |-> 0] /\ hv = [h \in Hosts |-> 1]
         /\ granted = [h \in Hosts |-> {}] /\ hlog = [h \in Hosts |-> <<>>]
         /\ ackd = [h \in Hosts |-> [n \in Nodes |-> 0]]
-        /\ acked = {} /\ cp = [n \in Maintainers |-> 0] /\ s3 = <<>> /\ maint = "a"
+        /\ acked = {} /\ cp = [n \in Nodes |-> 0] /\ s3 = <<>> /\ maint = "a"
         /\ tv = 1 /\ jointDone = FALSE
 
 \* ---- Holder ----
@@ -84,7 +95,7 @@ Reserve(n, h) == /\ phase[h] = "reserving" /\ Voting(n)
                  /\ epoch[h] > reserved[n] /\ hv[h] >= sv[n]
                  /\ reserved' = [reserved EXCEPT ![n] = epoch[h]] /\ sv' = [sv EXCEPT ![n] = hv[h]]
                  /\ granted' = [granted EXCEPT ![h] = @ \cup {n}]
-                 /\ UNCHANGED <<promise, log, st, copied, phase, epoch, hv, hlog, ackd,
+                 /\ UNCHANGED <<promise, log, st, copied, fl, phase, epoch, hv, hlog, ackd,
                                 acked, cp, s3, maint, tv, jointDone>>
 Reserved(h) == /\ phase[h] = "reserving" /\ Quorum(hv[h], granted[h])
                /\ phase' = [phase EXCEPT ![h] = "claiming"] /\ granted' = [granted EXCEPT ![h] = {}]
@@ -101,7 +112,7 @@ Grant(n, h) == /\ phase[h] \notin {"idle", "reserving", "fenced"} /\ Takes(n)
                        /\ hlog' = [hlog EXCEPT ![h] =
                               IF Bug = "appoint" \/ Adv(log[n], hlog[h]) THEN log[n] ELSE @]
                   ELSE UNCHANGED <<granted, hlog>>
-               /\ UNCHANGED <<log, st, copied, reserved, phase, epoch, hv, ackd, acked, cp, s3, maint, tv, jointDone>>
+               /\ UNCHANGED <<log, st, copied, reserved, fl, phase, epoch, hv, ackd, acked, cp, s3, maint, tv, jointDone>>
 \* Acceptances at a quorum of every config of the version: the recovered log is fixed.
 Recover(h) == /\ phase[h] = "claiming" /\ Quorum(hv[h], granted[h])
               /\ phase' = [phase EXCEPT ![h] = "recover"] /\ granted' = [granted EXCEPT ![h] = {}]
@@ -141,9 +152,29 @@ Replicate(n, h) ==
        /\ acked' = acked \cup {<<j, hlog[h][j], Ballot(h)>> :
                                  j \in {i \in 1..point : ~\E x \in acked : x[1] = i /\ x[2] = hlog[h][i]}}
        /\ phase' = [phase EXCEPT ![h] = IF @ = "claimed" /\ point = Len(hlog[h]) THEN "open" ELSE @]
-       /\ cp' = IF n \in Maintainers /\ point > cp[n] THEN [cp EXCEPT ![n] = point] ELSE cp
+       /\ cp' = IF Tracks(n) /\ point > cp[n] THEN [cp EXCEPT ![n] = point] ELSE cp
        /\ jointDone' = (jointDone \/ (hv[h] = 2 /\ point > 0))
-       /\ UNCHANGED <<promise, copied, reserved, epoch, hv, granted, hlog, s3, maint, tv>>
+       /\ UNCHANGED <<promise, copied, reserved, fl, epoch, hv, granted, hlog, s3, maint, tv>>
+
+\* Backpressure (S-05): a slot holding too much unflushed log refuses an append and writes nothing,
+\* as a lost message would. It still learns the announced commit point for the part of its log that
+\* matches the holder's, or it could never truncate. Bug "learn" skips the match.
+Learn(n, h) ==
+    LET k == Min(CommitPoint(h, ackd[h]),
+                 IF Bug = "learn" THEN Len(log[n]) ELSE Matched(log[n], hlog[h]))
+    IN /\ Change = "truncate"
+       /\ phase[h] \notin {"idle", "reserving", "claiming", "fenced"} /\ Takes(n)
+       /\ promise[n] = Ballot(h) /\ hv[h] >= sv[n]
+       /\ k > cp[n] /\ cp' = [cp EXCEPT ![n] = k]
+       /\ UNCHANGED <<slots, holders, acked, s3, maint, tv, jointDone>>
+
+\* After a flush the maintainer asks the slots to truncate through what S3 holds; a slot drops only
+\* what it knows is committed. Bug "truncate" drops through S3's length regardless.
+Truncate(n) ==
+    LET t == IF Bug = "truncate" THEN Len(s3) ELSE Min(Len(s3), cp[n])
+    IN /\ Change = "truncate" /\ Takes(n) /\ t > fl[n]
+       /\ fl' = [fl EXCEPT ![n] = t]
+       /\ UNCHANGED <<promise, log, st, sv, copied, reserved, holders, acked, cp, s3, maint, tv, jointDone>>
 
 \* ---- Maintainer ----
 \* SlateDB writer fencing: opening the database fences the other maintainer.
@@ -159,15 +190,16 @@ Flush(n) == /\ maint = n /\ Voting(n)
 \* Handoff: c becomes the leaving owner and d the populating one.
 StartHandoff == /\ Change = "handoff" /\ st["d"] = "off" /\ st["c"] = "vote"
                 /\ st' = [st EXCEPT !["c"] = "leave", !["d"] = "pop"]
-                /\ UNCHANGED <<promise, log, sv, copied, reserved, holders, acked, cp, s3, maint, tv, jointDone>>
+                /\ UNCHANGED <<promise, log, sv, copied, reserved, fl, holders, acked, cp, s3, maint, tv, jointDone>>
 \* The leaving owner seals: from now on it refuses claims and appends.
 Seal == /\ st["c"] = "leave" /\ st' = [st EXCEPT !["c"] = "seal"]
-        /\ UNCHANGED <<promise, log, sv, copied, reserved, holders, acked, cp, s3, maint, tv, jointDone>>
+        /\ UNCHANGED <<promise, log, sv, copied, reserved, fl, holders, acked, cp, s3, maint, tv, jointDone>>
 \* The slot loses its data (crash or wipe), reservations included, and comes back populating.
 Wipe == /\ Change = "wipe" /\ st["c"] = "vote" /\ copied["c"] = {}
         /\ st' = [st EXCEPT !["c"] = "pop"] /\ promise' = [promise EXCEPT !["c"] = None]
         /\ log' = [log EXCEPT !["c"] = <<>>] /\ reserved' = [reserved EXCEPT !["c"] = 0]
-        /\ UNCHANGED <<sv, copied, holders, acked, cp, s3, maint, tv, jointDone>>
+        /\ fl' = [fl EXCEPT !["c"] = 0] /\ cp' = [cp EXCEPT !["c"] = 0]
+        /\ UNCHANGED <<sv, copied, holders, acked, s3, maint, tv, jointDone>>
 \* A populating node copies the claim and log of one source: the sealed leaving owner, or a
 \* voting peer. It keeps the higher promise and reservation, and the more advanced log.
 Copy(n, m) == /\ st[n] = "pop" /\ m \in Sources \ copied[n]
@@ -177,7 +209,7 @@ Copy(n, m) == /\ st[n] = "pop" /\ m \in Sources \ copied[n]
               /\ log' = [log EXCEPT ![n] = IF Adv(log[m], @) THEN log[m] ELSE @]
               /\ reserved' = [reserved EXCEPT ![n] = IF reserved[m] > @ THEN reserved[m] ELSE @]
               /\ copied' = [copied EXCEPT ![n] = @ \cup {m}]
-              /\ UNCHANGED <<st, sv, holders, acked, cp, s3, maint, tv, jointDone>>
+              /\ UNCHANGED <<st, sv, fl, holders, acked, cp, s3, maint, tv, jointDone>>
 \* The node reports ready after copying from every source, and its relay checks the report
 \* (the B-21 change for volume ranges). In a handoff the leaving owner then drops the range and the
 \* new owner votes: the sealed source gave no promise or reservation after the copy. A repaired
@@ -185,19 +217,20 @@ Copy(n, m) == /\ st[n] = "pop" /\ m \in Sources \ copied[n]
 Ready(n) == /\ st[n] = "pop" /\ copied[n] = Sources
             /\ st' = IF Change = "handoff" THEN [st EXCEPT ![n] = "vote", !["c"] = "off"]
                      ELSE [st EXCEPT ![n] = "repaired"]
-            /\ UNCHANGED <<promise, log, sv, copied, reserved, holders, acked, cp, s3, maint, tv, jointDone>>
+            /\ UNCHANGED <<promise, log, sv, copied, reserved, fl, holders, acked, cp, s3, maint, tv, jointDone>>
 \* Topology: the version moves to the joint sets, then to the new set once an entry has committed
 \* under joint majorities. A slot learns a newer version from a claim or append and then refuses
 \* older ones. Reading it from the topology record sooner only adds refusals, which a lost message
 \* already covers.
 Begin == /\ Change = "topology" /\ tv = 1 /\ tv' = 2 /\ st' = [st EXCEPT !["d"] = "vote"]
-         /\ UNCHANGED <<promise, log, sv, copied, reserved, holders, acked, cp, s3, maint, jointDone>>
+         /\ UNCHANGED <<promise, log, sv, copied, reserved, fl, holders, acked, cp, s3, maint, jointDone>>
 End == /\ tv = 2 /\ jointDone /\ tv' = 3
        /\ UNCHANGED <<slots, holders, acked, cp, s3, maint, jointDone>>
 
 Next == \/ \E h \in Hosts : \/ Start(h) \/ Reserved(h)
                             \/ Recover(h) \/ Write(h) \/ Release(h) \/ Fence(h)
-        \/ \E n \in Nodes, h \in Hosts : Reserve(n, h) \/ Grant(n, h) \/ Replicate(n, h)
+        \/ \E n \in Nodes, h \in Hosts : Reserve(n, h) \/ Grant(n, h) \/ Replicate(n, h) \/ Learn(n, h)
+        \/ \E n \in Nodes : Truncate(n)
         \/ \E n \in Maintainers : OpenMaint(n) \/ Flush(n)
         \/ \E n \in Nodes : Ready(n) \/ \E m \in Nodes : Copy(n, m)
         \/ StartHandoff \/ Seal \/ Wipe \/ Begin \/ End
@@ -210,6 +243,7 @@ TypeOK == /\ promise \in [Nodes -> Entries] /\ reserved \in [Nodes -> 0..MaxEpoc
           /\ st \in [Nodes -> {"vote", "leave", "seal", "pop", "repaired", "off"}] /\ sv \in [Nodes -> 1..3]
           /\ phase \in [Hosts -> {"idle", "reserving", "claiming", "recover", "claimed", "open", "released", "fenced"}]
           /\ \A h \in Hosts : Len(hlog[h]) <= MaxLen
+          /\ fl \in [Nodes -> 0..MaxLen] /\ cp \in [Nodes -> 0..MaxLen]
 \* acked holds <<sequence, entry, first ballot that committed it>>. No two entries commit at one
 \* sequence, and every acknowledged entry is in the recovered log of every holder that won a later
 \* claim, and of any other holder that won the same epoch (which must not happen).
@@ -227,4 +261,7 @@ NoStaleAppend == [][\A x \in acked' \ acked, h \in Hosts :
                            => Len(hlog[h]) >= x[1] /\ hlog[h][x[1]] = x[2]]_vars
 \* S3 holds only committed entries, in order.
 S3Committed == \A i \in 1..Len(s3) : \E x \in acked : x[1] = i /\ x[2] = s3[i]
+\* What a slot truncated is what S3 holds: reads of it go to S3 instead.
+TruncatedInS3 == \A n \in Nodes : /\ fl[n] <= Len(s3) /\ fl[n] <= Len(log[n])
+                                   /\ \A i \in 1..fl[n] : log[n][i] = s3[i]
 =============================================================================
