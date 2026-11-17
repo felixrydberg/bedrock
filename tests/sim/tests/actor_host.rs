@@ -3,6 +3,7 @@
 //! - A request to a sleeping actor wakes it, with its key/value and SQLite state; an idle actor sleeps after 10 s.
 //! - Two `Acquire`s on one host join one wake; two hosts racing to wake an actor leave exactly one serving.
 //! - A holder cut off from its slots stops answering, even from memory, within 4 s; another host then takes over.
+//! - An event cancelled mid-commit stops the actor; the next call wakes it from its slots.
 //! - A built-in actor and a stub execution backend run through the same `Executor`/`Instance` seam, and built-in kinds
 //!   never call the sandbox.
 //! - A seed replays its trace.
@@ -394,6 +395,40 @@ async fn cut_off(
     Handle::current().kill(second.id());
 }
 
+/// An event cancelled during its commit stops the actor, whose memory may no longer match its slots; the next call
+/// wakes it again and counts on from what the slots hold. The cancelled event left the busy count, so it sleeps.
+async fn cancelled(fingerprint: &Fingerprint, next: &mut usize, sandbox: &Arc<AtomicUsize>) {
+    let target = actor(*next, Kind::Kv);
+    *next += 1;
+    let node = compute(*next);
+    *next += 1;
+    let s = sandbox.clone();
+    let trace = node
+        .spawn(async move {
+            let host = host("cancel", s);
+            let first = number(&call(&host, &target, b"incr").await);
+            let awake = host.acquire(&target).await.unwrap();
+            let cut =
+                tokio::time::timeout(Duration::from_micros(1), awake.invoke(b"incr".to_vec()))
+                    .await;
+            assert!(cut.is_err(), "the commit answered within a microsecond");
+            assert!(!awake.serving(), "a cancelled event left the actor serving");
+            let after = number(&call(&host, &target, b"incr").await);
+            let again = number(&call(&host, &target, b"incr").await);
+            assert!(
+                (2..=3).contains(&after) && again == after + 1,
+                "counted {first}, {after}, {again}"
+            );
+            sleep(Duration::from_secs(12)).await;
+            assert_eq!(host.awake().await, 0, "the actor did not sleep");
+            (first, after, again)
+        })
+        .await
+        .unwrap();
+    fingerprint.mix(("cancelled", trace));
+    Handle::current().kill(node.id());
+}
+
 /// A customer-code actor starts in the sandbox stub through the same seam; an unregistered built-in kind fails without
 /// reaching it.
 async fn seam(fingerprint: &Fingerprint, next: &mut usize, sandbox: &Arc<AtomicUsize>) {
@@ -437,6 +472,7 @@ async fn scenario() -> u64 {
     wake_and_sleep(&fingerprint, &mut next, &sandbox).await;
     race(&fingerprint, &mut next, &sandbox).await;
     cut_off(&fingerprint, &mut next, &sandbox, &slots).await;
+    cancelled(&fingerprint, &mut next, &sandbox).await;
     seam(&fingerprint, &mut next, &sandbox).await;
     for node in &slots {
         Handle::current().kill(node.id());
@@ -447,7 +483,10 @@ async fn scenario() -> u64 {
 #[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
 fn run(seed: u64) -> u64 {
     std::thread::spawn(move || {
-        Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(scenario())
+        let mut runtime = Runtime::with_seed_and_config(seed, madsim::Config::default());
+        // A stalled scenario fails with its seed instead of hanging.
+        runtime.set_time_limit(Duration::from_secs(300));
+        runtime.block_on(scenario())
     })
     .join()
     .unwrap_or_else(|failure| {

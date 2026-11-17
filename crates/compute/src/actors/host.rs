@@ -139,7 +139,11 @@ impl ActorHost {
         let result = {
             let mut awake = cell.lock().await;
             match awake.as_ref() {
-                Some(running) if running.serving() => Ok(running.clone()),
+                Some(running) if running.serving() => {
+                    // Under the wake lock, so the watcher sees it before it can sleep the actor.
+                    running.touch();
+                    Ok(running.clone())
+                }
                 _ => {
                     if let Some(stopped) = awake.take() {
                         self.0.expired(&stopped).await;
@@ -295,7 +299,11 @@ impl Awake {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .is_some_and(|s| s.writer().serving())
+            .is_some_and(Storage::serving)
+    }
+
+    fn touch(&self) {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = bedrock_lib::monotonic_now();
     }
 
     fn idle(&self) -> bool {
@@ -308,9 +316,15 @@ impl Awake {
                 >= IDLE
     }
 
-    /// Runs one event; its response leaves only after its commits and while this holder serves.
+    /// Runs one event; its response leaves only after its commits and while this holder serves. An event whose caller
+    /// is cancelled, or whose handler panics, may leave the instance's memory ahead of or behind its commits, so the
+    /// actor stops and the next `Acquire` wakes it again from its slots.
     pub async fn invoke(&self, request: Vec<u8>) -> Result<Vec<u8>, Error> {
         self.busy.fetch_add(1, Ordering::Relaxed);
+        let mut busy = Busy {
+            awake: self,
+            done: false,
+        };
         let result = {
             let mut instance = self.instance.lock().await;
             let result = match instance.as_mut() {
@@ -322,11 +336,11 @@ impl Awake {
                 other => other,
             }
         };
+        busy.done = true;
         if matches!(result, Err(Error::Volume(_))) {
             self.stop().await;
         }
-        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = bedrock_lib::monotonic_now();
-        self.busy.fetch_sub(1, Ordering::Relaxed);
+        drop(busy);
         result
     }
 
@@ -338,5 +352,28 @@ impl Awake {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+}
+
+/// One running event: on every exit it leaves the busy count and marks the actor used. An event that did not finish
+/// takes the storage, so the actor stops serving.
+struct Busy<'a> {
+    awake: &'a Awake,
+    done: bool,
+}
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            drop(
+                self.awake
+                    .storage
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take(),
+            );
+        }
+        self.awake.touch();
+        self.awake.busy.fetch_sub(1, Ordering::Relaxed);
     }
 }

@@ -13,7 +13,8 @@
 // ponytail: each storage call awaits its own quorum, one at a time; pipeline commits behind the output gate if
 // per-event latency matters (S-10, S-18 measurements).
 //! - **Pending pages.** A transaction's pages enter the cache before their entry commits. A commit that fails drops the
-//!   database (cache and connection), and the actor host drops the instance on any volume error it sees.
+//!   database (cache and connection). A commit whose caller is cancelled may still commit later, so it fences the
+//!   storage instead: every later call fails and the actor host claims the actor again, recovering from the slots.
 // ponytail: the page cache is unbounded while the actor is awake and dropped when it sleeps; evict when a large
 // database's working set must fit (S-11 measurements).
 //!
@@ -21,7 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Once, PoisonError};
 
 use bedrock_lib::volume as pb;
@@ -46,6 +47,17 @@ pub struct Storage(Arc<Inner>);
 struct Inner {
     writer: Writer,
     db: Mutex<Option<Db>>,
+    /// Set once a commit's outcome is unknown to this storage (its caller was cancelled).
+    fenced: AtomicBool,
+}
+
+/// Fences the storage when dropped armed: a commit future cancelled before its quorum answered.
+struct Barrier<'a>(&'a AtomicBool);
+
+impl Drop for Barrier<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Storage {
@@ -53,11 +65,20 @@ impl Storage {
         Storage(Arc::new(Inner {
             writer,
             db: Mutex::new(None),
+            fenced: AtomicBool::new(false),
         }))
     }
 
-    pub(crate) fn writer(&self) -> &Writer {
-        &self.0.writer
+    /// Whether this storage may still be read and written: not fenced, and its writer serving.
+    pub(crate) fn serving(&self) -> bool {
+        !self.0.fenced.load(Ordering::Relaxed) && self.0.writer.serving()
+    }
+
+    fn check(&self) -> Result<(), Error> {
+        if self.0.fenced.load(Ordering::Relaxed) {
+            return Err(Error::Fenced);
+        }
+        Ok(())
     }
 
     /// The writer, once no other clone is left.
@@ -67,12 +88,18 @@ impl Storage {
 
     /// `keys` at the commit point or later; a missing key has no value.
     pub async fn get(&self, keys: Vec<Vec<u8>>) -> Result<Vec<pb::Value>, Error> {
+        self.check()?;
         self.0.writer.read(keys).await
     }
 
     /// Commits `changes` as one entry; returns its sequence once two voting slots hold it.
+    /// If the caller is cancelled before the answer, the storage fences: the entry may still commit.
     pub async fn commit(&self, changes: Vec<pb::Change>) -> Result<u64, Error> {
-        self.0.writer.commit(changes, None, now_ms()).await
+        self.check()?;
+        let barrier = Barrier(&self.0.fenced);
+        let committed = self.0.writer.commit(changes, None, now_ms()).await;
+        std::mem::forget(barrier);
+        committed
     }
 
     /// Runs `f` in a SQLite transaction and commits what it wrote as one entry; returns once that entry has its
@@ -81,6 +108,7 @@ impl Storage {
         &self,
         f: impl Fn(&Transaction<'_>) -> rusqlite::Result<R>,
     ) -> Result<rusqlite::Result<R>, Error> {
+        self.check()?;
         if self.lock().is_none() {
             let size = self.get(vec![SIZE_KEY.to_vec()]).await?;
             let size = match size.first().and_then(|v| v.value.as_deref()) {
