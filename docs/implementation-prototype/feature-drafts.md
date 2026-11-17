@@ -218,6 +218,7 @@ Rules this implies:
 | [S-04](https://github.com/felixrydberg/bedrock/issues/112) | Volume client in Compute: claim, recovery, append window, reads | Actors | `compute/actors` | S-03 |
 | [S-05](https://github.com/felixrydberg/bedrock/issues/113) | Cold tier: one SlateDB per range, maintainer flush, truncation, split and merge by clone, SSD cache, S3 reader handles | Actors | `volume/cold` | S-03, B-11, B-39 |
 | [S-06](https://github.com/felixrydberg/bedrock/issues/114) | Slot repair and node-reported range readiness | Actors | `volume/repair`, `lib/relays` | S-02b, S-03, B-68 |
+| [S-05b](https://github.com/felixrydberg/bedrock/issues/137) | Actor deletion: claim tombstone and key-prefix delete in the range database | Actors | `volume/store`, `volume/cold`, `compute/actors` | S-05, S-06 |
 | [S-07](https://github.com/felixrydberg/bedrock/issues/115) | `bedrock-compute` actor host: acquire, wake, sleep, leases, SQLite VFS, gates and the execution seam | Actors | `compute/actors` | S-04 |
 | [S-08](https://github.com/felixrydberg/bedrock/issues/116) | Gateway actor routing and location cache | Actors | `gateway/actors` | B-57, S-07 |
 | [S-09](https://github.com/felixrydberg/bedrock/issues/117) | Alarms: holder timers and volume index wake | Actors | `compute/actors`, `volume/alarms` | S-07, S-08 |
