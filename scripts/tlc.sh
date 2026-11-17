@@ -83,6 +83,9 @@ volume-topology new-only OneWriter
 volume-topology new-only NoStaleAppend
 volume-truncate learn S3Committed
 volume-truncate truncate TruncatedInS3
+volume_cold-split no-retire NoLostFlush
+volume_cold-split no-cas NoLostFlush
+volume_cold-move no-adopt Consistent
 '
 
 tlc() {
@@ -122,7 +125,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership service_isolation handoff cell volume-base volume-handoff volume-wipe volume-topology volume-truncate"
+models="relays follows merge materialized publisher membership service_isolation handoff cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

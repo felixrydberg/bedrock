@@ -6,6 +6,7 @@ The cell's relays now own this control authority through embedded Raft; `cell.tl
 `service_isolation.tla` checks that an unreadable service freezes independently, including recovery clocks and conditional writes.
 Actor storage on `bedrock-volume` (claims, quorum appends, lease, release, slot repair, range handoff and topology
 changes): [S-02 / #110](volume.md).
+Its cold tier (range databases split and merged by clone, first-slot moves): [S-05 / #113](volume.md#cold-tier-range-databases-s-05-113), `volume_cold.tla`.
 
 The standalone writer persists directly to SlateDB in S3. See
 [the atomic namespace protocol model](materialized.md) for its bounded checks and

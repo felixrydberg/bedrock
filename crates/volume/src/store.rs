@@ -757,7 +757,7 @@ impl Store {
 
     /// [`Store::truncate`] by the actor's maintainer, which also records, in the same batch, that the actor's other
     /// slots owe a truncation through `through` until [`Store::settle`]: the obligation survives a restart and moves
-    /// with the range.
+    /// with the range. An obligation only rises: a lower one leaves a higher one in place.
     pub fn truncate_owing(&self, actor: &Actor, through: u64) -> Result<Outcome, Error> {
         self.truncate_and(actor, through, true)
     }
@@ -772,6 +772,13 @@ impl Store {
             Refusal::None
         };
         let through = owed.min(old.committed);
+        // The actor's stripe lock is held, so the obligation cannot change under this check.
+        let owed = self
+            .owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&actor.prefix)
+            .map_or(owed, |(_, held)| owed.max(*held));
         let mut batch = WriteBatch::default();
         if owe {
             batch.put(owed_key(actor), owed.to_be_bytes().to_vec());

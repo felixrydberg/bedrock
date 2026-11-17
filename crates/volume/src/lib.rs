@@ -99,6 +99,7 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     let (members, target) = membership::View::new(VOLUME, &node.location.cell);
     let tls = bedrock_lib::transport::tls::start(node, VOLUME, &admin).await?;
     let peers = Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(tls.clone()));
+    let siblings = sibling_relays.keys().cloned().collect();
     let client = Arc::new(
         bedrock_lib::client::Client::new(
             &admin,
@@ -111,8 +112,9 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     let placement = Arc::new(cold::placement::Cells::new(
         client,
         peers.clone(),
-        &node.location.cell,
+        &node.location,
         &node.node_id,
+        siblings,
     ));
     let metrics = bedrock_lib::health::protection::Metrics::new(&admin);
     let readers = cold::readers::Readers::new(
