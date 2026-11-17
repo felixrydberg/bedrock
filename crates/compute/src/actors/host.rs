@@ -323,12 +323,16 @@ impl Awake {
         self.busy.fetch_add(1, Ordering::Relaxed);
         let mut busy = Busy {
             awake: self,
-            done: false,
+            armed: false,
         };
         let result = {
             let mut instance = self.instance.lock().await;
             let result = match instance.as_mut() {
-                Some(instance) if self.serving() => instance.invoke(request).await,
+                Some(instance) if self.serving() => {
+                    // Only once the event runs: a caller cancelled while queued at the gate leaves the actor alone.
+                    busy.armed = true;
+                    instance.invoke(request).await
+                }
                 _ => Err(Error::Volume(volume::Error::Fenced)),
             };
             match result {
@@ -336,10 +340,10 @@ impl Awake {
                 other => other,
             }
         };
-        busy.done = true;
         if matches!(result, Err(Error::Volume(_))) {
             self.stop().await;
         }
+        busy.armed = false;
         drop(busy);
         result
     }
@@ -355,16 +359,16 @@ impl Awake {
     }
 }
 
-/// One running event: on every exit it leaves the busy count and marks the actor used. An event that did not finish
-/// takes the storage, so the actor stops serving.
+/// One event: on every exit it leaves the busy count and marks the actor used. An event dropped while armed (started
+/// but not finished and cleaned up) takes the storage, so the actor stops serving.
 struct Busy<'a> {
     awake: &'a Awake,
-    done: bool,
+    armed: bool,
 }
 
 impl Drop for Busy<'_> {
     fn drop(&mut self) {
-        if !self.done {
+        if self.armed {
             drop(
                 self.awake
                     .storage
