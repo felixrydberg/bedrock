@@ -28,6 +28,10 @@ object_store = { version = "0.14.2", features = ["aws"] }
 # B-05; compiled out under madsim. Building it needs libclang (bindgen).
 rocksdb = { version = "0.25", default-features = false, features = ["lz4", "bindgen-runtime"] }
 tempfile = "3"
+# Actor SQLite (#115 / S-07, user decision 2026-11-17): SQLite compiled from source by `bundled`, and a VFS over the
+# volume client through sqlite-plugin, which links against that SQLite. sqlite-plugin's build runs bindgen (libclang).
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+sqlite-plugin = "0.11"
 tracing = "0.1"
 # B-03 admin endpoint: hyper runs over madsim-tokio sockets, so it is simulated too.
 # Served through hyper rather than `axum::serve`, which does not run under madsim (#9).
