@@ -910,7 +910,11 @@ impl Cold {
         ))
     }
 
-    /// A database of a cell other than `skip` holding the actor at `flushed` or later, with its cell and name.
+    /// A database of a cell other than `skip` holding the actor at `flushed` or later, with its cell and name. A cell
+    /// that cannot be read is logged and forgotten, and does not hide the later ones; only when no cell qualified at
+    /// all does a failure make the caller retry instead of concluding that none holds it, as in [`Cold::adopt`]. A
+    /// cached catalog may name a database a split or merge retired, which never catches up: before a cell is passed
+    /// over, its catalog is read again and the database it names now is checked for the sequence.
     async fn elsewhere(
         &self,
         cell: &str,
@@ -918,24 +922,52 @@ impl Cold {
         actor: &Actor,
         flushed: u64,
     ) -> Result<Option<(String, String, Arc<dyn Database>)>, Status> {
+        let mut failed: Option<Status> = None;
         for other in self.databases.cells().await.map_err(storage)? {
             if other == skip {
                 continue;
             }
-            let Some(name) = self.serving(&other, actor.hash()).await.map_err(storage)? else {
-                continue;
-            };
-            let Some(db) = self.readers.get(cell, &name).await.map_err(storage)? else {
-                continue;
-            };
-            match seq_in(db.as_ref(), actor.name()).await {
-                Ok(Some(seq)) if seq >= flushed => return Ok(Some((other, name, db))),
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::debug!(%error, database = %name, "reading a moved actor failed");
-                    self.forget(&other, &name, &db);
+            let mut refreshed = false;
+            loop {
+                let name = match self.serving(&other, actor.hash()).await {
+                    Ok(Some(name)) => name,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::debug!(%error, %other, "reading a moved actor's catalog failed");
+                        self.forget_catalog(&other);
+                        failed = Some(storage(error));
+                        break;
+                    }
+                };
+                let db = match self.readers.get(cell, &name).await {
+                    Ok(Some(db)) => db,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::debug!(%error, database = %name, "opening a moved actor's database failed");
+                        self.forget_catalog(&other);
+                        failed = Some(storage(error));
+                        break;
+                    }
+                };
+                match seq_in(db.as_ref(), actor.name()).await {
+                    Ok(Some(seq)) if seq >= flushed => return Ok(Some((other, name, db))),
+                    Ok(_) if refreshed => break,
+                    Ok(_) => {
+                        // It may be only the catalog that is behind: read the cell's current one before counting
+                        // this cell out.
+                        self.forget(&other, &name, &db);
+                        refreshed = true;
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, database = %name, "reading a moved actor failed");
+                        self.forget(&other, &name, &db);
+                        break;
+                    }
                 }
             }
+        }
+        if let Some(failed) = failed {
+            return Err(failed);
         }
         Ok(None)
     }

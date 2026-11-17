@@ -862,6 +862,63 @@ async fn adopt_skips_a_cell_it_cannot_read_and_fails_only_when_no_cell_qualified
     assert_eq!(missed.code(), tonic::Code::Unavailable);
 }
 
+/// The same for a read: a cell that cannot be read does not hide another cell's copy of a moved actor; the failure
+/// only matters when no cell qualified, so the caller retries instead of concluding that none holds the actor.
+#[tokio::test]
+async fn a_moved_actor_read_skips_a_cell_it_cannot_read() {
+    let bucket = Memory::default();
+    let parsed = Actor::new(&actor(0)).unwrap();
+    let db = generation(0, 0, 0);
+    let name = database("cell-3", &db);
+    let meta = Meta {
+        seq: 1,
+        epoch: 1,
+        alarm: None,
+    };
+    let writer = bucket.open(&name).await.unwrap();
+    writer
+        .commit(vec![
+            (meta_key(parsed.name()), Some(meta.encode())),
+            (data_key(parsed.name(), b"k"), Some(b"v".to_vec())),
+        ])
+        .await
+        .unwrap();
+    writer.close().await.unwrap();
+    // cell-2's catalog cannot be read; cell-3 holds the actor at sequence 1.
+    bucket
+        .put_catalog("cell-2", &Catalog::default(), None)
+        .await
+        .unwrap();
+    let catalog = Catalog {
+        next: 1,
+        spans: BTreeMap::from([(0, (0, db))]),
+    };
+    bucket.put_catalog("cell-3", &catalog, None).await.unwrap();
+    let databases: Arc<dyn Databases> = Arc::new(Broken {
+        bucket: bucket.clone(),
+        cell: "cell-2",
+    });
+    let readers = Readers::new(databases.clone(), 4, &Metrics::new(&Admin::new()));
+    let here = Arc::new(Here {
+        cell: "cell-1".into(),
+        ..Here::default()
+    });
+    let cold = Cold::new(
+        Arc::new(Store::new(Arc::new(MemoryEngine::new("volume")))),
+        databases,
+        here,
+        readers,
+        "cell-1",
+        "n1",
+    );
+    let keys = [b"k".to_vec()];
+    let got = cold.get("cell-1", &actor(0), 1, &keys).await.unwrap();
+    assert_eq!(got, vec![Some(b"v".to_vec())]);
+    // Nothing holds it at sequence 2: whether the unreadable cell does cannot be decided, so the caller retries.
+    let missed = cold.get("cell-1", &actor(0), 2, &keys).await.unwrap_err();
+    assert_eq!(missed.code(), tonic::Code::Unavailable);
+}
+
 /// The same through the maintainer on the in-memory bucket, which refuses a repeated clone source as SlateDB does: an
 /// interior split, then a merge of the whole range, keep every actor readable.
 #[tokio::test(start_paused = true)]
@@ -987,6 +1044,72 @@ async fn an_idle_actor_whose_first_slot_moved_stays_readable() {
         .await
         .unwrap();
     assert_eq!((page, more), (vec![(b"k".to_vec(), b"1".to_vec())], false));
+}
+
+/// The cell of the actor's first slot, which the test moves.
+struct Moving {
+    cell: Mutex<String>,
+}
+
+#[async_trait]
+impl Placement for Moving {
+    async fn first_here(&self, _: &pb::Actor) -> Result<bool, Status> {
+        Ok(true)
+    }
+
+    async fn truncate_others(&self, _: &pb::Actor, _: u64) -> Result<bool, Status> {
+        Ok(true)
+    }
+
+    async fn first_cell(&self, _: &pb::Actor) -> Result<String, Status> {
+        Ok(self.cell.lock().unwrap().clone())
+    }
+}
+
+/// A catalog cached before a split names the database that split retired, which never catches up. When an idle actor's
+/// first slot then moves, the new cell holds no copy: a read has to reread the source cell's catalog and find the clone
+/// the split left holding the newer sequence, not give up on the retired database.
+#[tokio::test(start_paused = true)]
+async fn a_read_after_an_idle_move_rereads_a_catalog_cached_before_a_split() {
+    let bucket = Memory::default();
+    let mut before = node_in(&bucket, "cell-1", "n1", u64::MAX);
+    claim(&before.store, 0);
+    append(&before.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    before.cold.tick(&before.directory).await;
+    // A read in cell-2 caches cell-1's catalog while the actor's first slot is still there.
+    let placement = Arc::new(Moving {
+        cell: Mutex::new("cell-1".into()),
+    });
+    let databases: Arc<dyn Databases> = Arc::new(bucket.clone());
+    let readers = Readers::new(databases.clone(), 4, &Metrics::new(&Admin::new()));
+    let moved = Cold::new(
+        Arc::new(Store::new(Arc::new(MemoryEngine::new("volume")))),
+        databases,
+        placement.clone(),
+        readers,
+        "cell-2",
+        "n2",
+    );
+    let keys = [b"k".to_vec()];
+    assert_eq!(
+        moved.get("cell-2", &actor(0), 1, &keys).await.unwrap(),
+        vec![Some(b"1".to_vec())]
+    );
+    // The source range splits and its clone flushes a newer sequence.
+    let middle = Actor::new(&actor(4)).unwrap().hash();
+    let mut split = before.directory.clone();
+    split.insert(middle, before.directory[&0].clone());
+    before.directory = split;
+    before.cold.tick(&before.directory).await;
+    append(&before.store, 0, 1, vec![entry(2, &[("k", Some("2"))])], 2).unwrap();
+    before.cold.tick(&before.directory).await;
+    // The first slot moves while the actor is idle, so cell-2 holds no copy: only cell-1's clone now has it, while
+    // the catalog cell-2 cached still names the database the split retired.
+    *placement.cell.lock().unwrap() = "cell-2".into();
+    assert_eq!(
+        moved.get("cell-2", &actor(0), 2, &keys).await.unwrap(),
+        vec![Some(b"2".to_vec())]
+    );
 }
 
 /// Configured sibling relays must name exactly the other cells of this node's DC.
