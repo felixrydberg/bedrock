@@ -304,10 +304,15 @@ dependencies = [
 name = "bedrock-compute"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bedrock-lib",
  "madsim-tokio",
  "madsim-tonic",
+ "prometheus-client",
  "prost",
+ "rusqlite",
+ "sqlite-plugin",
+ "tracing",
 ]
 
 [[package]]
@@ -415,6 +420,7 @@ dependencies = [
 name = "bedrock-sim"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bedrock-api",
  "bedrock-cdn",
  "bedrock-compute",
@@ -970,6 +976,18 @@ dependencies = [
  "rand 0.9.5",
  "tokio",
 ]
+
+[[package]]
+name = "fallible-iterator"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2acce4a10f12dc2fb14a218589d4f1f62ef011b2d0cc4b3cb1bba8e94da14649"
+
+[[package]]
+name = "fallible-streaming-iterator"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fastant"
@@ -1864,6 +1882,17 @@ dependencies = [
  "libz-sys",
  "lz4-sys",
  "rustflags",
+]
+
+[[package]]
+name = "libsqlite3-sys"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b06e69070b7e12262b0cd90832f0a7396f142a2b330181255562decf9f0c6215"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
 ]
 
 [[package]]
@@ -3035,6 +3064,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusqlite"
+version = "0.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f172c4812a19b26d1c23cdb0070e69db335503dfa378b910eb857386e5b8beba"
+dependencies = [
+ "bitflags 2.13.2",
+ "fallible-iterator",
+ "fallible-streaming-iterator",
+ "libsqlite3-sys",
+ "smallvec",
+]
+
+[[package]]
 name = "rust_decimal"
 version = "1.43.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3521,6 +3563,15 @@ name = "spin"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+
+[[package]]
+name = "sqlite-plugin"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fcd2cdd9d0ff6b949fb491073c79c38401374a8a34f327be1f29f5386ad2dd6"
+dependencies = [
+ "bindgen",
+]
 
 [[package]]
 name = "stable_deref_trait"

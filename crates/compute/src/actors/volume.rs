@@ -17,10 +17,12 @@
 //! - **Reads** go to the nearest slot (the holder's cell first) with `min_seq` = the commit point, and to the next slot
 //!   when one is behind or not promised to this writer's epoch. A slot's overlay also holds this writer's own appended
 //!   but uncommitted entries, so a read may see this writer's pending writes, never another holder's: a claim truncates
-//!   an old epoch's tail before a slot takes its appends. The actor host (S-07) keeps pending keys in its cache and holds output until their commits, so a
+//!   an old epoch's tail before a slot takes its appends. The actor host keeps pending pages in its cache, returns no
+//!   storage call before its commit, and drops an instance whose commit failed (`super::storage`, #115 / S-07), so a
 //!   pending write that is later lost never leaves the host (user decision 2026-11-15).
 //! - **Placement.** [`slot_nodes`] maps an actor to its slots' nodes through each slot cell's `volume` routing table.
-//!   Fetching sibling cells' tables through `Relay.Routes` waits for S-07 (user decision 2026-11-15).
+//!   Fetching sibling cells' tables through `Relay.Routes` comes with the `bedrock-compute` binary's relay membership,
+//!   after #114 / S-06 (user decision 2026-11-17).
 //!
 //! Topology transitions (joint majorities of two slot sets) are not here yet: a writer uses one slot set and carries its
 //! topology version (user decision 2026-11-15).

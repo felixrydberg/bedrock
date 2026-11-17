@@ -26,6 +26,7 @@ protoc-bin-vendored = "3"
 tonic-build = { package = "madsim-tonic-build", version = "0.6" }
 
 [dev-dependencies]
+async-trait.workspace = true
 bedrock-api = { path = "../../crates/api" }
 # Both builds: `tests/volume_client_limits.rs` needs real tonic's message limits.
 bedrock-compute = { path = "../../crates/compute" }
