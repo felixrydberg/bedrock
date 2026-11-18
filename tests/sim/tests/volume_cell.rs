@@ -587,6 +587,7 @@ async fn scenario(follow: bool) -> Vec<String> {
                 .map(|n| format!("k{n:04}").into_bytes())
                 .collect();
             let values = writer.read(keys).await.unwrap();
+            assert_eq!(values.len(), acked.len(), "a read answers every key");
             for (n, value) in acked.iter().zip(&values) {
                 assert_eq!(
                     value.value.as_deref(),

@@ -144,13 +144,13 @@ impl Repair {
         let copied = self.fill(start, end, owners, mine).await;
         self.store.copying(start, end, generation, false);
         copied?;
-        if self.store.forgotten() != forgotten {
-            return Ok(false);
-        }
         let store = self.store.clone();
-        blocking(move || store.hold(start, end, generation))
+        let held = blocking(move || store.hold_unless_forgotten(start, end, generation, forgotten))
             .await?
             .map_err(status)?;
+        if !held {
+            return Ok(false);
+        }
         tracing::info!(start = %format!("{start:016x}"), "holding a volume range");
         Ok(true)
     }
@@ -379,18 +379,28 @@ impl Holdings for Held {
         spans: &[Span],
         generations: &[u64],
     ) -> Result<Vec<(Span, u64)>, Status> {
-        let kept: Vec<(u64, u64, u64)> = spans
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (s.start, s.end, generations.get(i).copied().unwrap_or(0)))
-            .collect();
-        let held = self.0.keep(&kept).map_err(status)?;
-        Ok(held
-            .entries()
-            .into_iter()
-            .map(|(start, end, generation)| (Span { start, end }, generation))
-            .collect())
+        let held = self.0.keep(&kept(spans, generations)).map_err(status)?;
+        Ok(report(&held))
     }
+
+    fn held(&self, _dataset: &str, spans: &[Span], generations: &[u64]) -> Vec<(Span, u64)> {
+        report(&self.0.holding(&kept(spans, generations)))
+    }
+}
+
+fn kept(spans: &[Span], generations: &[u64]) -> Vec<(u64, u64, u64)> {
+    spans
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.start, s.end, generations.get(i).copied().unwrap_or(0)))
+        .collect()
+}
+
+fn report(held: &store::Spans) -> Vec<(Span, u64)> {
+    held.entries()
+        .into_iter()
+        .map(|(start, end, generation)| (Span { start, end }, generation))
+        .collect()
 }
 
 /// Decides, once, whether the store started fresh: empty while `directory` (its cell's `volume` directory, read before

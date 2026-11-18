@@ -76,6 +76,9 @@ pub trait Holdings: Send + Sync {
         spans: &[pb::Span],
         generations: &[u64],
     ) -> Result<Vec<(pb::Span, u64)>, Status>;
+    /// The held ranges inside the set already settled, for a report after a copy. Forgets nothing: the member's view
+    /// may already be ahead of that set, and a copy it made for the newer assignment must stay held.
+    fn held(&self, dataset: &str, spans: &[pb::Span], generations: &[u64]) -> Vec<(pb::Span, u64)>;
 }
 
 fn span(range: Option<(u64, u64)>) -> Option<pb::Span> {
@@ -1452,7 +1455,7 @@ async fn connected(
                     seen = reports.wait_until(|v| *v != reported) => {
                         reported = seen;
                         for frame in pushed.applied.values() {
-                            let ack = holdings(pushed, frame);
+                            let ack = holdings(pushed, frame, false);
                             send(&requests, pb::RelayRequest {
                                 kind: Some(pb::relay_request::Kind::Ranges(ack)),
                             }).await?;
@@ -1755,7 +1758,7 @@ async fn settle(
                 .await?;
             }
         }
-        let report = holdings(pushed, &frame);
+        let report = holdings(pushed, &frame, true);
         if pushed.holdings.contains_key(&dataset) {
             pushed.applied.insert(dataset.clone(), frame.clone());
         }
@@ -1778,17 +1781,24 @@ async fn settle(
 }
 
 /// The report on what the member holds of `frame`'s dataset, as the `ready` and `generations` of an acknowledgement:
-/// nothing for a dataset relays stream, or when its record cannot be read or written.
-fn holdings(pushed: &Pushed, frame: &pb::Ranges) -> pb::RangesAck {
+/// nothing for a dataset relays stream, or when its record cannot be written. `settle` for a newly applied set; a later
+/// report only reads.
+fn holdings(pushed: &Pushed, frame: &pb::Ranges, settle: bool) -> pb::RangesAck {
     let Some(holdings) = pushed.holdings.get(&frame.dataset) else {
         return pb::RangesAck::default();
     };
-    let held = holdings
-        .settle(&frame.dataset, &frame.spans, &frame.generations)
-        .unwrap_or_else(|error| {
-            tracing::warn!(dataset = %frame.dataset, %error, "held ranges unknown; reporting none");
-            Vec::new()
-        });
+    let held = if settle {
+        // Reporting none keeps every range of the set unready. A later report reads the marks, inside this set and for its
+        // generations only, so a span this failed to forget is still not reported.
+        holdings
+            .settle(&frame.dataset, &frame.spans, &frame.generations)
+            .unwrap_or_else(|error| {
+                tracing::warn!(dataset = %frame.dataset, %error, "held ranges unknown; reporting none");
+                Vec::new()
+            })
+    } else {
+        holdings.held(&frame.dataset, &frame.spans, &frame.generations)
+    };
     pb::RangesAck {
         dataset: frame.dataset.clone(),
         revision: frame.revision,

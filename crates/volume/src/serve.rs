@@ -335,7 +335,10 @@ impl pb::volume_server::Volume for Service {
         // A slot whose log ends below what S3 holds skips to it, so a holder that recovered from a slot that truncated
         // can append here (S-06, `Skip` in volume.tla). The answer then names the new end, from which the holder
         // resends.
-        let prev = request.entries.first().map_or(0, |e| e.seq - 1);
+        let prev = request
+            .entries
+            .first()
+            .map_or(0, |e| e.seq.saturating_sub(1));
         let end = outcome
             .answer
             .slot

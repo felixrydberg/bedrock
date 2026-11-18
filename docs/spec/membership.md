@@ -124,9 +124,14 @@ ranges; when it reconnects, the pushed set no longer lists them and it drops the
 
 No relay stream carries a `volume` range, so step 3 cannot see the copy. The node copies the range itself
 ([volume.md](volume.md)) and reports which spans of its pushed set it holds. Every `RangesAck` carries that report as of
-after the set it acknowledges, and the node sends a new one when a copy finishes. Steps 2, 4 and 5 are unchanged. Step
-1 has one exception: the first write of an empty `volume` directory makes its owners `ready` at once, since no data
-exists anywhere yet to copy (`Write` with `rev = 0`).
+after the set it acknowledges, and the node sends a new one when a copy finishes; that later report only reads what
+the node holds. Steps 2 and 4 are unchanged. Step 1 has one exception: the first write of an empty `volume` directory
+makes its owners `ready` at once, since no data exists anywhere yet to copy (`Write` with `rev = 0`).
+
+Step 5 differs, since no stream follows the range. When the node applies a pushed set, `Holdings::settle` calls
+`Store::keep`: it forgets the held mark of every span outside the set, or held for another generation, and reports
+the marks that remain. The node then refuses calls for a forgotten span. It deletes the data later, in its repair
+pass, once its view lists the range without it and with another `ready` owner.
 
 Nothing keeps a node's copy current once it stops owning the range. Relays and nodes read the directory as snapshots,
 and an unchanged span set is not pushed again. So a node removed from a range and given it again could otherwise

@@ -288,9 +288,19 @@ pub fn place(
                 }
             }
         }
-        // Merges wait for a pass with nothing else to write, so they never share a plan with a split.
+        // Merges wait for a pass with nothing else to write, so they never share a plan with a split. The merged range
+        // keeps the earlier entry's generations, so only ranges whose owners have the same generation in both merge:
+        // otherwise an owner would forget its copy of the later part and copy it again.
         let merges = if entries.is_empty() {
             placement::merges(directory)
+                .into_iter()
+                .filter(|start| {
+                    let before = bedrock_lib::placement::start_of(directory, start - 1);
+                    directory[start]
+                        .iter()
+                        .all(|o| generation(before, &o.node) == generation(*start, &o.node))
+                })
+                .collect()
         } else {
             Vec::new()
         };

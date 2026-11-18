@@ -113,14 +113,13 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     // Whether an empty store is a new node's or a lost disk is decided before joining, while no range can be given to
     // this node yet (S-06).
     while store.fresh().is_none() {
-        match client.routes(VOLUME, None).await {
-            Ok(table) => {
-                let current = table.directories.get(VOLUME).cloned().unwrap_or_default();
-                repair::decide(&store, &current, &node.node_id)
-                    .map_err(|e| ConfigError(format!("recording the store's start: {e:?}")))?;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "volume routes unavailable; retrying before joining");
+        match newest_directory(&peers, &config.relays, &node.location.failure_domain).await {
+            Some(current) => repair::decide(&store, &current, &node.node_id)
+                .map_err(|e| ConfigError(format!("recording the store's start: {e:?}")))?,
+            None => {
+                tracing::warn!(
+                    "volume routes unavailable from a majority of relays; retrying before joining"
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
@@ -216,6 +215,39 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     session.drain().await;
     tracing::info!("shutting down");
     Ok(())
+}
+
+/// The newest `volume` directory among the answers of a majority of the cell's `relays`, or `None` without a majority.
+/// A directory write commits on a majority of them, so one relay that lags it, or lost its state, cannot pass for a
+/// cell where this node owns nothing.
+// ponytail: newest of a majority's applied views; read from the Raft leader if a follower may apply long after commit.
+async fn newest_directory(
+    peers: &Arc<bedrock_lib::transport::Peers>,
+    relays: &[String],
+    failure_domain: &str,
+) -> Option<Directory> {
+    let mut answers = 0;
+    let mut newest: Option<Arc<bedrock_lib::client::Table>> = None;
+    for relay in relays {
+        // Its own registry: these one-off clients' refresh counts are not the node's.
+        let client = bedrock_lib::client::Client::new(
+            &bedrock_lib::admin::Admin::new(),
+            peers.clone(),
+            vec![relay.clone()],
+            failure_domain.to_owned(),
+        );
+        if let Ok(table) = client.routes(VOLUME, None).await {
+            answers += 1;
+            if newest.as_ref().is_none_or(|n| table.revision > n.revision) {
+                newest = Some(table);
+            }
+        }
+    }
+    (answers * 2 > relays.len()).then(|| {
+        newest
+            .and_then(|t| t.directories.get(VOLUME).cloned())
+            .unwrap_or_default()
+    })
 }
 
 /// How often a node measures the ranges it holds for placement (#111 / S-03).

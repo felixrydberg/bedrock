@@ -937,3 +937,76 @@ fn spans_coalesce_and_cut() {
     assert!(spans.overlaps(0, 11) && !spans.overlaps(15, 45));
     assert_eq!(spans.within(12, 50).list(), [(12, 15), (45, 50)]);
 }
+
+#[test]
+fn copied_log_bytes_count_once_and_a_copy_cut_short_clears_to_zero() {
+    let a = host("a");
+    let source = store();
+    claimed(&source, &a, 1);
+    append(
+        &source,
+        &a,
+        1,
+        0,
+        vec![entry(1, 1, &[("k", Some("v"))]), entry(2, 1, &[])],
+        0,
+    );
+    let logged = source.unflushed();
+    assert!(logged > 0);
+    let target = store();
+    target.install(&records(&source), true).unwrap();
+    assert_eq!(target.unflushed(), logged, "counted when installed");
+    target.install(&records(&source), true).unwrap();
+    assert_eq!(
+        target.unflushed(),
+        logged,
+        "a log no more advanced is not taken"
+    );
+    target.adopt(0, 0).unwrap();
+    assert_eq!(target.unflushed(), logged, "adopting counts nothing again");
+    let cut = store();
+    cut.install(&records(&source), true).unwrap();
+    cut.clear(0, 0).unwrap();
+    assert_eq!(
+        cut.unflushed(),
+        0,
+        "a copy cut short and cleared leaves nothing counted"
+    );
+}
+
+#[test]
+fn a_copy_finished_after_a_set_forgot_it_is_not_held_and_reports_forget_nothing() {
+    let store = store();
+    store.initialize(true).unwrap();
+    let forgotten = store.forgotten();
+    store.copying(0, 0, 3, true);
+    store.keep(&[(0, 0, 4)]).unwrap();
+    store.copying(0, 0, 3, false);
+    assert!(!store.hold_unless_forgotten(0, 0, 3, forgotten).unwrap());
+    assert!(store.held().list().is_empty());
+    assert!(
+        store
+            .hold_unless_forgotten(0, 0, 4, store.forgotten())
+            .unwrap()
+    );
+    assert_eq!(store.holding(&[(0, 0, 4)]).list(), [(0, 0)]);
+    assert!(store.holding(&[(0, 0, 5)]).list().is_empty());
+    assert_eq!(
+        store.held().list(),
+        [(0, 0)],
+        "reading a report forgets nothing"
+    );
+}
+
+#[test]
+fn a_sealed_slot_does_not_skip_to_s3() {
+    let store = store();
+    claimed(&store, &host("a"), 1);
+    store.seal(0, 0).unwrap();
+    // A second seal of the same span still waits for writes in flight, and the seal refuses the skip.
+    store.seal(0, 0).unwrap();
+    assert!(matches!(
+        store.skip(&actor(), 5, 1, None),
+        Err(Error::Sealed)
+    ));
+}

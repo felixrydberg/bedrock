@@ -205,11 +205,14 @@ Wipe == /\ Change = "wipe" /\ st["c"] = "vote" /\ copied["c"] = {}
 \* log through the flush and its commit point. S3 holds only committed entries, so whatever the slot
 \* had there is either the same or could never commit. The slot skips on an append from its promised
 \* holder, which appends only once it has recovered, and only to an S3 point no newer than that
-\* promise: the holder's recovered log then holds it, so its appends continue S3's state. A holder a
-\* newer one fenced may lack it (bug "skip-any"). Bug "skip-keep" keeps the slot's own prefix and
-\* only appends S3's tail.
+\* promise: the holder's recovered log then holds it, so its appends continue S3's state. A late
+\* append of a holder fenced after it wrote at its epoch also counts; one fenced before it recovered
+\* never appends in the code. A holder a newer one fenced may lack the S3 point (bug "skip-any").
+\* Bug "skip-keep" keeps the slot's own prefix and only appends S3's tail.
 Skip(n) == /\ Change = "truncate" /\ Takes(n) /\ Len(log[n]) < Len(s3)
-           /\ \E h \in Hosts : promise[n] = Ballot(h) /\ phase[h] \in {"recover", "claimed", "open", "released"}
+           /\ \E h \in Hosts : /\ promise[n] = Ballot(h)
+                              /\ \/ phase[h] \in {"recover", "claimed", "open", "released"}
+                                 \/ phase[h] = "fenced" /\ \E i \in DOMAIN hlog[h] : hlog[h][i] = Ballot(h)
            /\ LastE(s3) <= promise[n].e \/ Bug = "skip-any"
            /\ log' = [log EXCEPT ![n] = IF Bug = "skip-keep" THEN @ \o SubSeq(s3, Len(@) + 1, Len(s3))
                                          ELSE s3]

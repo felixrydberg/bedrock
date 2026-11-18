@@ -841,8 +841,58 @@ fn a_volume_owner_is_ready_only_for_its_current_assignment() {
         &[],
         1,
     );
-    let Some(Change::Range { generations, .. }) = first.into_iter().next() else {
+    let Some(Change::Range {
+        generations,
+        owners,
+        ..
+    }) = first.into_iter().next()
+    else {
         panic!("the first owners are placed");
     };
-    assert!(generations.values().all(|g| *g == 10));
+    let expected: BTreeMap<String, u64> = owners.iter().map(|o| (o.node.clone(), 10)).collect();
+    assert_eq!(generations, expected);
+}
+
+#[test]
+fn volume_ranges_merge_only_when_their_owners_generations_agree() {
+    let node = |id: &str| pb::Member {
+        service: VOLUME.into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: vec![VOLUME.into()],
+        ..ready(id)
+    };
+    let actual = members(&[node("v1")]);
+    let owners = vec![Owner {
+        node: "v1".into(),
+        state: State::Ready,
+    }];
+    let directories = Directories::from([(
+        VOLUME.to_owned(),
+        Directory::from([(0, owners.clone()), (1 << 63, owners)]),
+    )]);
+    let merges = |later: u64| {
+        let generations = Generations::from([(
+            VOLUME.to_owned(),
+            BTreeMap::from([
+                (0, BTreeMap::from([("v1".to_owned(), 3)])),
+                (1 << 63, BTreeMap::from([("v1".to_owned(), later)])),
+            ]),
+        )]);
+        place(
+            VOLUME,
+            &actual,
+            &directories,
+            &generations,
+            9,
+            &siblings::Ready::new(),
+            &[],
+            1,
+        )
+        .into_iter()
+        .filter(|c| matches!(c, Change::Merge { .. }))
+        .count()
+    };
+    assert_eq!(merges(3), 1);
+    assert_eq!(merges(5), 0, "v1 would forget its copy of the later range");
 }

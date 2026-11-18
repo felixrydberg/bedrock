@@ -103,8 +103,9 @@ On 2026-11-09, the new `cell` integration model passed 1,975,881 generated state
 negative controls. It abstracts Raft consensus and checks Bedrock's persistence, publication and conditional-apply boundary;
 this result does not establish the full hardening gate.
 
-A model with several configs names each `model-variant.cfg`. `volume` has four: `volume-base`, `volume-handoff` and
-`volume-topology` pass, and `volume-wipe` fails `NoLostAck` on an open design finding ([volume.md](volume.md)).
+A model with several configs names each `model-variant.cfg`. `volume` has five, which all passed on 2026-11-18:
+`volume-base`, `volume-handoff`, `volume-wipe`, `volume-topology`, and `volume-truncate`, which also checks `Skip`
+([volume.md](volume.md)).
 `handoff` has three more configs for readiness of `volume` ranges, which the node reports and its relay checks (#114 /
 S-06, [membership.md](membership.md#node-reported-readiness-volume-114--s-06)): `handoff-volume`, `handoff-volume-split`
 with two points, and `handoff-volume-faulty` with partitions and faulty revokes.

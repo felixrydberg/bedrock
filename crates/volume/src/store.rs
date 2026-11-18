@@ -316,6 +316,27 @@ pub fn prefix_len(key: &[u8]) -> Option<usize> {
     Some(10 + first + second + 2)
 }
 
+fn spans_of(kept: &[(u64, u64, u64)]) -> Spans {
+    let mut spans = Spans::default();
+    for (start, end, generation) in kept {
+        spans.add_generation(*start, *end, *generation);
+    }
+    spans
+}
+
+/// The parts of `held` inside `inside` with the same generation.
+fn kept_of(held: &Spans, inside: &Spans) -> Spans {
+    let mut stays = Spans::default();
+    for (start, end, generation) in held.entries() {
+        for (s, e, g) in inside.within(start, end).entries() {
+            if g == generation {
+                stays.add_generation(s, e, g);
+            }
+        }
+    }
+    stays
+}
+
 /// The range marks, as stored under `m/`.
 #[derive(Default)]
 struct Marks {
@@ -474,6 +495,7 @@ impl Store {
         };
         change(&mut next);
         let mut batch = WriteBatch::default();
+        let mut written = false;
         for (key, old, new) in [
             (HELD, &marks.held, &next.held),
             (SEALED, &marks.sealed, &next.sealed),
@@ -481,12 +503,16 @@ impl Store {
         ] {
             if old != new {
                 batch.put(key.to_vec(), new.encode());
+                written = true;
             }
         }
         if (marks.initialized, marks.fresh) != (next.initialized, next.fresh) {
             batch.put(FRESH.to_vec(), vec![u8::from(next.fresh)]);
+            written = true;
         }
-        self.commit(batch)?;
+        if written {
+            self.commit(batch)?;
+        }
         *marks = next;
         Ok(())
     }
@@ -504,40 +530,54 @@ impl Store {
         self.remark(|m| m.held.add_generation(start, end, generation))
     }
 
+    /// [`Store::hold`], unless a held span or a copy was forgotten since [`Store::forgotten`] returned `forgotten`: the
+    /// copy may then be stale. Checked under the marks lock, so a [`Store::keep`] cannot slip in between. Returns
+    /// whether it holds.
+    pub fn hold_unless_forgotten(
+        &self,
+        start: u64,
+        end: u64,
+        generation: u64,
+        forgotten: u64,
+    ) -> Result<bool, Error> {
+        let mut held = false;
+        self.remark(|m| {
+            if m.forgotten == forgotten {
+                m.held.add_generation(start, end, generation);
+                held = true;
+            }
+        })?;
+        Ok(held)
+    }
+
+    /// The held spans inside `kept` (a pushed range set, each span with this node's generation of it), held for that
+    /// generation. Changes nothing.
+    pub fn holding(&self, kept: &[(u64, u64, u64)]) -> Spans {
+        kept_of(&self.marks().held, &spans_of(kept))
+    }
+
     /// Forgets held spans outside `kept` (a pushed range set, each span with this node's generation of it) or held for
     /// another generation, and returns what stays held. A store that forgets one is
-    /// no longer fresh: a range it is given `ready` again needs a repair, not trust.
+    /// no longer fresh: a range it is given `ready` again needs a repair, not trust. It reads and writes the marks
+    /// under their lock, so a copy held meanwhile is judged against this set too.
     pub fn keep(&self, kept: &[(u64, u64, u64)]) -> Result<Spans, Error> {
-        let mut inside = Spans::default();
-        for (start, end, generation) in kept {
-            inside.add_generation(*start, *end, *generation);
-        }
-        let held = self.held();
+        let inside = spans_of(kept);
         let mut stays = Spans::default();
-        for (start, end, generation) in held.entries() {
-            for (s, e, g) in inside.within(start, end).entries() {
-                if g == generation {
-                    stays.add_generation(s, e, g);
-                }
-            }
-        }
-        {
-            let mut marks = self.marks();
-            let copying = marks.copying.entries();
-            if copying
+        self.remark(|m| {
+            stays = kept_of(&m.held, &inside);
+            if m.copying
+                .entries()
                 .iter()
                 .any(|(s, e, g)| inside.generation(*s, *e) != Some(*g))
             {
-                marks.forgotten += 1;
+                m.forgotten += 1;
             }
-        }
-        if stays != held {
-            self.remark(|m| {
+            if stays != m.held {
                 m.held = stays.clone();
                 m.fresh = false;
                 m.forgotten += 1;
-            })?;
-        }
+            }
+        })?;
         Ok(stays)
     }
 
@@ -554,11 +594,11 @@ impl Store {
     /// Seals `[start, end)` for a range handoff: once this returns, no reservation, claim or append there is in flight or
     /// accepted later, so a copy made after it holds every promise this slot gave.
     pub fn seal(&self, start: u64, end: u64) -> Result<(), Error> {
-        if self.marks().sealed.covers(start, end) {
-            return Ok(());
+        if !self.marks().sealed.covers(start, end) {
+            self.remark(|m| m.sealed.add(start, end))?;
         }
-        self.remark(|m| m.sealed.add(start, end))?;
         // Writes check the seal under their actor's stripe lock: taking each lock once waits out those already past it.
+        // Every call waits, even one that finds the span sealed: a concurrent first seal may still be waiting.
         for lock in &self.locks {
             drop(lock.lock().unwrap_or_else(PoisonError::into_inner));
         }
@@ -664,11 +704,11 @@ impl Store {
         Ok((logged, actors))
     }
 
-    /// Takes a copied span into the flush state: its log bytes, its actors with committed entries not yet flushed and
-    /// its owed truncations. The span is not served while it is copied, so nothing else changes it meanwhile.
+    /// Takes a copied span into the flush state: its actors with committed entries not yet flushed and its owed
+    /// truncations. [`Store::install`] already counted its log bytes. The span is not served while it is copied, so
+    /// nothing else changes it meanwhile.
     pub fn adopt(&self, start: u64, end: u64) -> Result<(), Error> {
-        let (logged, actors) = self.tally(start, end)?;
-        self.unflushed.fetch_add(logged, Ordering::Relaxed);
+        let (_, actors) = self.tally(start, end)?;
         for (prefix, claim, owed) in actors {
             let Some(claim) = claim else { continue };
             self.mark(&prefix, &claim);
@@ -718,7 +758,22 @@ impl Store {
         };
         let mut batch = WriteBatch::default();
         let take = here.as_ref().is_none_or(|h| last(&copied) > last(h));
+        // Log bytes count towards backpressure from when they are on disk, as `recover` counts them: those replaced
+        // leave, those copied enter. A copy cut short is then cleared without miscounting.
+        let mut logged = 0;
         let mut new = if take {
+            let is_log = |key: &[u8]| key[at..].starts_with(b"log/");
+            for item in self.engine.scan(&KeyRange::prefix(prefix.to_vec()))? {
+                let (key, value) = item?;
+                if is_log(&key) {
+                    logged -= (key.len() + value.len()) as i64;
+                }
+            }
+            logged += records
+                .iter()
+                .filter(|r| is_log(&r.key))
+                .map(|r| (r.key.len() + r.value.len()) as i64)
+                .sum::<i64>();
             batch.delete_range(KeyRange::prefix(prefix.to_vec()));
             for record in records {
                 if record.key != claim.key && !(repair && record.key[at..] == *b"owed") {
@@ -739,6 +794,7 @@ impl Store {
             new.holder = promise.holder.clone();
             new.released = promise.released && new.end == promise.end;
             new.reserved = here.reserved.max(copied.reserved);
+            new.version = here.version.max(copied.version);
         }
         if repair {
             new.repaired = true;
@@ -746,6 +802,7 @@ impl Store {
         let old = here.unwrap_or_default();
         Self::save(&mut batch, &actor, &old, &new);
         self.commit(batch)?;
+        self.unflushed.fetch_add(logged, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1345,6 +1402,7 @@ impl Store {
         alarm: Option<u64>,
     ) -> Result<Option<Outcome>, Error> {
         let _lock = self.lock(actor);
+        self.check_sealed(actor)?;
         let old = self.load(actor)?;
         let old_end = end(&old);
         if old_end.seq >= seq || epoch > old.epoch {

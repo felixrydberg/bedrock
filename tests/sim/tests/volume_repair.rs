@@ -433,7 +433,7 @@ fn run<F: Future<Output = u64> + Send + 'static>(seed: u64, scenario: fn(Cluster
     .join()
     .unwrap_or_else(|failure| {
         eprintln!(
-            "Replay: seed {seed}, RUSTFLAGS=\"--cfg madsim\" cargo test -p bedrock-sim --test volume_repair"
+            "Replay: BEDROCK_VOLUME_REPAIR_SEED={seed} RUSTFLAGS=\"--cfg madsim\" cargo test -p bedrock-sim --test volume_repair"
         );
         std::panic::resume_unwind(failure)
     })
@@ -515,9 +515,13 @@ async fn early(cluster: Cluster) -> u64 {
     let gate = Gate::at(A);
     let c = cluster.repair(C, Some(gate.clone()));
     let directory = cluster.view(C);
-    let repairing = tokio::spawn(async move { c.tick(&directory, &BTreeMap::new()).await });
-    // c has copied b and waits before a.
-    gate.reached.notified().await;
+    let mut repairing = tokio::spawn(async move { c.tick(&directory, &BTreeMap::new()).await });
+    // c has copied b and waits before a; a repair that fails first is reported, not waited on.
+    tokio::select! {
+        () = gate.reached.notified() => {}
+        ended = &mut repairing => panic!("the repair ended before reaching a: {ended:?}"),
+        () = sleep(Duration::from_secs(60)) => panic!("the repair did not reach a"),
+    }
     h2.claim(B).await;
     assert!(h1.recover().await);
     assert!(h2.recover().await);
@@ -652,18 +656,30 @@ async fn wipe_then_handoff(cluster: Cluster) -> u64 {
     let mut h2 = Holder::new("h2", 2);
     for i in [A, B, third] {
         h2.reserve(i).await;
-        h2.claim(i).await;
+        let claimed = h2.claim(i).await;
+        if i == third {
+            assert!(
+                claimed.is_some_and(|a| refused(&a) == Refusal::None && !slot_of(&a).voting),
+                "the repaired slot takes the claim without voting"
+            );
+        }
     }
     assert!(h2.recover().await);
     h2.check(&committed);
-    for _ in 0..2 {
-        for i in [A, B, third] {
-            h2.append(i, &mut committed).await;
-        }
+    // Before a and b commit the no-op, the slot takes it without voting; once it learns the commit, it votes.
+    let early = h2.append(third, &mut committed).await;
+    assert!(
+        early.is_some_and(|a| refused(&a) == Refusal::None && !slot_of(&a).voting),
+        "the repaired slot takes the no-op without voting before it commits"
+    );
+    for i in [A, B] {
+        h2.append(i, &mut committed).await;
     }
+    // The append that teaches the commit answers as the slot was; the next shows its vote.
+    h2.append(third, &mut committed).await;
     let answer = h2.append(third, &mut committed).await;
     assert!(
-        answer.is_some_and(|a| slot_of(&a).voting),
+        answer.is_some_and(|a| refused(&a) == Refusal::None && slot_of(&a).voting),
         "the slot votes again once a claim above its floor committed"
     );
     fingerprint.mix((committed.len(), h2.log.len()));
@@ -675,20 +691,28 @@ async fn wipe_then_handoff(cluster: Cluster) -> u64 {
 
 #[test]
 fn a_wiped_slot_repairs_and_hands_off_without_losing_commits_and_seeds_replay() {
-    // `BEDROCK_VOLUME_REPAIR_SEEDS=500` sweeps seeds 1..=500.
-    let last: u64 = std::env::var("BEDROCK_VOLUME_REPAIR_SEEDS").map_or(4, |n| n.parse().unwrap());
-    let traces: Vec<u64> = (1..=last)
-        .map(|seed| run(seed, wipe_then_handoff))
+    // `BEDROCK_VOLUME_REPAIR_SEEDS=500` sweeps seeds 1..=500; `BEDROCK_VOLUME_REPAIR_SEED=42` runs one.
+    let seeds: Vec<u64> = match std::env::var("BEDROCK_VOLUME_REPAIR_SEED") {
+        Ok(seed) => vec![seed.parse().unwrap()],
+        Err(_) => {
+            let last =
+                std::env::var("BEDROCK_VOLUME_REPAIR_SEEDS").map_or(4, |n| n.parse().unwrap());
+            (1..=last).collect()
+        }
+    };
+    let traces: Vec<u64> = seeds
+        .iter()
+        .map(|seed| run(*seed, wipe_then_handoff))
         .collect();
-    for (seed, trace) in (1..=last).zip(&traces) {
+    for (seed, trace) in seeds.iter().zip(&traces) {
         assert_eq!(
-            run(seed, wipe_then_handoff),
+            run(*seed, wipe_then_handoff),
             *trace,
             "seed {seed} did not replay its trace"
         );
     }
     assert!(
-        traces.windows(2).any(|w| w[0] != w[1]),
+        traces.len() < 2 || traces.windows(2).any(|w| w[0] != w[1]),
         "seeds should differ"
     );
 }

@@ -197,16 +197,18 @@ relay checks it, is `handoff.tla` with `Reported` ([membership.md](membership.md
   for it.
 - **A slot left behind.** A new writer keeps the log only from the flushed point of the slot it recovered from, so it
   cannot resend what S3 already holds. A voting slot whose log ends below that, such as one that copied a sealed
-  owner's log while the holder kept committing on the other two, answers its append with `LOG_GAP`. The slot then
-  reads the actor's meta from the range database and skips to it (`Store::skip`, `Skip` in the model): it drops its
-  log and overlay there and keeps its vote, since it lost no promise. It does so only when S3's point is no newer than
-  its promise. A slot behind entries that S3 does not hold yet stays behind until a flush reaches them.
+  owner's log while the holder kept committing on the other two, finds the gap when it applies the append. Before it
+  answers, it reads the actor's meta from the range database and skips to it (`Store::skip`, `Skip` in the model): it
+  drops its log and overlay there and keeps its vote, since it lost no promise. It then applies the append again, and
+  the holder gets that answer. It skips only when S3's point is no newer than its promise and its range is not
+  sealed. A slot behind entries that S3 does not hold yet answers `LOG_GAP` and stays behind until a flush reaches
+  them.
   `tests/sim/tests/volume_cell.rs` runs this through the real relays and binaries: without it, the actor's next
   claim can never commit once another slot is wiped.
-- **Merges.** A merge keeps the earlier entry's generation for every owner. An owner that held the later part under
-  another generation forgets that part, refuses it briefly, and holds it again for the kept generation: a fresh node
-  without copying, since its data there is its own, and a node that lost its disk once by repairing. `handoff.tla` has
-  splits but no merges.
+- **Merges.** A merge keeps the earlier entry's generation for every owner, so the publisher merges two `volume`
+  ranges only when each owner has the same generation in both. Otherwise that owner would forget its copy of the
+  later part, and a node that is not fresh would repair it, as `repaired`, from its peers. Ranges whose generations
+  differ stay apart. `handoff.tla` has splits but no merges.
 - **Fresh or wiped.** Before it joins its cell, a node whose store has not decided reads its cell's `volume`
   directory. It is fresh if the directory lists it nowhere; otherwise its disk was lost.
 
