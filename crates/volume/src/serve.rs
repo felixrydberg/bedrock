@@ -1,8 +1,10 @@
 //! The `Volume` gRPC service: owner checks, leases and metrics around [`Store`] (#111 / S-03).
 //!
 //! - **Owner check.** A node serves an actor only while its cell's `volume` directory lists it as a `ready` or
-//!   `leaving` owner of the range holding the actor's hash. A `populating` owner may lack the data and refuses (S-06
-//!   makes it ready).
+//!   `leaving` owner of the range holding the actor's hash, and, once [`Service::with_repair`] gates it, while it holds a
+//!   complete copy of that range (#114 / S-06): a `populating` owner, or one that lost its disk, may lack the data.
+//! - **Repair.** `Repair` serves a copy only of a range this node holds. With `seal` it must be the range's `leaving`
+//!   owner, and it seals the span before the first record goes out.
 //! - **Leases.** Each Compute host heartbeats once per second; an actor's lease is live while its holder's host was seen
 //!   within [`LEASE`]. A restarted node has seen no one yet, so for its first [`LEASE`] it treats every holder as live.
 //! - **Callers.** Over mutual TLS, holder calls must come from that holder's Compute host, and `Truncate` and `Repair`
@@ -98,6 +100,8 @@ pub struct Service {
     cell: String,
     /// Reads of what S3 holds (S-05); without it a read that needs S3 is refused.
     cold: Option<Arc<Cold>>,
+    /// Serve only ranges the store holds a complete copy of (S-06).
+    gated: bool,
 }
 
 /// When each holder host was last seen, by (cell, host).
@@ -137,6 +141,9 @@ pub(crate) fn status(error: store::Error) -> Status {
         store::Error::Backpressure => {
             Status::resource_exhausted("too much is not yet flushed to S3; retry later")
         }
+        store::Error::Sealed => Status::unavailable(
+            "a range handoff sealed this slot; its new owner serves it once ready",
+        ),
         store::Error::Storage(error) => match error {
             bedrock_lib::storage::StorageError::Corruption(_) => {
                 Status::data_loss(error.to_string())
@@ -174,12 +181,19 @@ impl Service {
             metrics,
             cell: cell.to_owned(),
             cold: None,
+            gated: false,
         })
     }
 
     /// Serves reads of what S3 holds through `cold`.
     pub fn with_cold(mut self, cold: Arc<Cold>) -> Self {
         self.cold = Some(cold);
+        self
+    }
+
+    /// Serves only ranges the store holds a complete copy of, as [`crate::repair`] records them.
+    pub fn with_repair(mut self) -> Self {
+        self.gated = true;
         self
     }
 
@@ -207,13 +221,29 @@ impl Service {
             .directory
             .read()
             .unwrap_or_else(PoisonError::into_inner);
-        if placement::serves(&directory, &self.node, hash) {
+        if placement::serves(&directory, &self.node, hash)
+            && (!self.gated || self.store.held().contains(hash))
+        {
             return Ok(());
         }
         Err(Status::failed_precondition(format!(
             "{} is not a ready or leaving owner of the range holding {hash:016x}",
             self.node
         )))
+    }
+
+    async fn append_once(
+        &self,
+        request: &Arc<pb::AppendRequest>,
+    ) -> Result<store::Outcome, Status> {
+        let actor = self.actor(request.actor.as_ref())?;
+        let kind = actor.kind();
+        let (store, request) = (self.store.clone(), request.clone());
+        let outcome = blocking(move || store.append(&actor, &request))
+            .await?
+            .map_err(status)?;
+        self.record(kind, &outcome);
+        Ok(outcome)
     }
 
     fn record(&self, kind: i32, outcome: &store::Outcome) {
@@ -300,14 +330,39 @@ impl pb::volume_server::Volume for Service {
             COMPUTE,
             Some(holder(request.get_ref().holder.as_ref())?),
         )?;
-        let request = request.into_inner();
-        let actor = self.actor(request.actor.as_ref())?;
-        let kind = actor.kind();
-        let store = self.store.clone();
-        let outcome = blocking(move || store.append(&actor, &request))
-            .await?
-            .map_err(status)?;
-        self.record(kind, &outcome);
+        let request = Arc::new(request.into_inner());
+        let outcome = self.append_once(&request).await?;
+        // A slot whose log ends below what S3 holds skips to it, so a holder that recovered from a slot that truncated
+        // can append here (S-06, `Skip` in volume.tla). The answer then names the new end, from which the holder
+        // resends.
+        let prev = request.entries.first().map_or(0, |e| e.seq - 1);
+        let end = outcome
+            .answer
+            .slot
+            .as_ref()
+            .map_or(0, |s| s.end.unwrap_or_default().seq);
+        let behind = outcome.answer.refused == pb::Refusal::LogGap as i32 && end < prev;
+        if let (true, Some(cold)) = (behind, &self.cold) {
+            let Some(pb_actor) = request.actor.as_ref() else {
+                return Ok(Response::new(outcome.answer));
+            };
+            match cold.meta(&self.cell, pb_actor, end + 1).await {
+                Ok(meta) => {
+                    let actor = self.actor(Some(pb_actor))?;
+                    let kind = actor.kind();
+                    let store = self.store.clone();
+                    let skipped =
+                        blocking(move || store.skip(&actor, meta.seq, meta.epoch, meta.alarm))
+                            .await?
+                            .map_err(status)?;
+                    if let Some(skipped) = skipped {
+                        self.record(kind, &skipped);
+                        return Ok(Response::new(self.append_once(&request).await?.answer));
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "S3 does not hold what this slot lacks yet"),
+            }
+        }
         Ok(Response::new(outcome.answer))
     }
 
@@ -488,13 +543,34 @@ impl pb::volume_server::Volume for Service {
                 "the span crosses a range boundary",
             ));
         }
+        // A range handoff copies only from the sealed leaving owner (`docs/spec/volume.tla`, `Copy`).
+        if request.seal {
+            let leaving = placement::owners(&directory, request.start)
+                .iter()
+                .any(|o| o.node == self.node && o.state == placement::State::Leaving);
+            if !leaving {
+                return Err(Status::failed_precondition(format!(
+                    "{} is not the leaving owner of the range holding {:016x}",
+                    self.node, request.start
+                )));
+            }
+            let store = self.store.clone();
+            blocking(move || store.seal(start, placement::end_of(&directory, start)))
+                .await?
+                .map_err(status)?;
+        }
         let store = self.store.clone();
         let (records, more) = blocking(move || {
             store.records(request.start, request.end, &request.after, request.limit)
         })
         .await?
         .map_err(|e| status(e.into()))?;
-        Ok(Response::new(pb::RepairReply { records, more }))
+        let repaired = Store::messages(&self.store.repaired().within(request.start, request.end));
+        Ok(Response::new(pb::RepairReply {
+            records,
+            more,
+            repaired,
+        }))
     }
 }
 

@@ -66,6 +66,12 @@ handoff absent NewOwnersPublished
 handoff early-drop NoDropBeforeReady
 handoff any-ready KeepsHealthyHolder
 handoff minority-write Freeze
+handoff-volume early-report ReadyCopied
+handoff-volume no-gen ReadyCopied
+handoff-volume-split early-report ReadyCopied
+handoff-volume-split no-gen ReadyCopied
+handoff-volume-faulty early-report ReadyCopied
+handoff-volume-faulty no-gen ReadyCopied
 follows untagged NoFalseGap
 follows ahead HeldBeforeNext
 merge lower GapFreeApply
@@ -83,6 +89,8 @@ volume-topology new-only OneWriter
 volume-topology new-only NoStaleAppend
 volume-truncate learn S3Committed
 volume-truncate truncate TruncatedInS3
+volume-truncate skip-keep TruncatedInS3
+volume-truncate skip-any TruncatedInS3
 volume_cold-split no-retire NoLostFlush
 volume_cold-split no-cas NoLostFlush
 volume_cold-move no-adopt Consistent
@@ -90,8 +98,10 @@ volume_cold-move no-adopt Consistent
 
 tlc() {
     local name="$1" config="$2" model="${3%%-*}"
-    java -Xmx4g -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers 2 -noGenerateSpecTE -metadir "$work/$name" \
-        -config "$config" "$model.tla" 2>&1
+    # TLC_WORKERS and TLC_HEAP override the defaults; progress goes to $work/$name.log while TLC runs.
+    mkdir -p "$work"
+    java -Xmx"${TLC_HEAP:-4g}" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-2}" -noGenerateSpecTE \
+        -metadir "$work/$name" -config "$config" "$model.tla" 2>&1 | tee "$work/$name.log"
 }
 
 failed=0
@@ -125,7 +135,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership service_isolation handoff cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move"
+models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-split handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

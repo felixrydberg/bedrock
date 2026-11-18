@@ -1,0 +1,173 @@
+use std::sync::Mutex;
+
+use bedrock_lib::placement::Owner;
+use bedrock_lib::storage::memory::MemoryEngine;
+
+use super::*;
+
+fn actor() -> pb::Actor {
+    pb::Actor {
+        namespace: "ns".into(),
+        id: format!("eu_{}a", "c".repeat(25)),
+        kind: 0,
+    }
+}
+
+fn holder() -> pb::Holder {
+    pb::Holder {
+        cell: "cell-a".into(),
+        host: "h".into(),
+    }
+}
+
+/// A leaving owner's store, read in pages of two records. Before the second page it truncates the actor (as its
+/// maintainer may while sealed), or a pushed set drops the range being copied.
+struct Leaving {
+    source: Arc<Store>,
+    target: Arc<Store>,
+    pages: Mutex<u32>,
+    revoke: bool,
+}
+
+#[async_trait]
+impl Peers for Leaving {
+    async fn sources(&self, _: u64, _: u64) -> Result<Vec<Source>, Status> {
+        unreachable!("a handoff copies from the leaving owner")
+    }
+
+    async fn slots(&self, _: &pb::Actor) -> Result<[String; actors::SLOTS], Status> {
+        unreachable!("a handoff copies every actor")
+    }
+
+    async fn page(
+        &self,
+        _: &Source,
+        request: pb::RepairRequest,
+    ) -> Result<pb::RepairReply, Status> {
+        let page = {
+            let mut pages = self.pages.lock().unwrap();
+            *pages += 1;
+            *pages
+        };
+        if page == 2 {
+            if self.revoke {
+                self.target.keep(&[]).unwrap();
+            } else {
+                let actor = store::Actor::new(&actor()).unwrap();
+                self.source.truncate(&actor, 2).unwrap();
+            }
+        }
+        let (records, more) = self
+            .source
+            .records(request.start, request.end, &request.after, 2)
+            .unwrap();
+        Ok(pb::RepairReply {
+            records,
+            more,
+            repaired: Vec::new(),
+        })
+    }
+}
+
+fn source() -> Arc<Store> {
+    let store = Store::new(Arc::new(MemoryEngine::new("volume")));
+    let actor = store::Actor::new(&actor()).unwrap();
+    store.claim(&actor, &holder(), 1, 0, |_| false).unwrap();
+    let entries = (1..=3)
+        .map(|seq| pb::Entry {
+            seq,
+            epoch: 1,
+            changes: vec![pb::Change {
+                key: format!("k{seq}").into_bytes(),
+                value: Some(vec![1]),
+            }],
+            ..Default::default()
+        })
+        .collect();
+    store
+        .append(
+            &actor,
+            &pb::AppendRequest {
+                holder: Some(holder()),
+                epoch: 1,
+                entries,
+                commit: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    Arc::new(store)
+}
+
+fn handoff() -> Directory {
+    Directory::from([(
+        0,
+        vec![
+            Owner {
+                node: "c".into(),
+                state: State::Leaving,
+            },
+            Owner {
+                node: "d".into(),
+                state: State::Populating,
+            },
+        ],
+    )])
+}
+
+async fn copied(revoke: bool) -> (Arc<Store>, bool) {
+    let target = Arc::new(Store::new(Arc::new(MemoryEngine::new("volume"))));
+    decide(&target, &Directory::new(), "d").unwrap();
+    let peers = Arc::new(Leaving {
+        source: source(),
+        target: target.clone(),
+        pages: Mutex::new(0),
+        revoke,
+    });
+    let held = Repair::new(target.clone(), peers, "d", "cell-c")
+        .tick(&handoff(), &BTreeMap::new())
+        .await
+        .unwrap();
+    (target, held)
+}
+
+#[tokio::test]
+async fn an_actor_truncated_between_pages_is_read_again_whole() {
+    let (target, held) = copied(false).await;
+    assert!(held);
+    let actor = store::Actor::new(&actor()).unwrap();
+    let (answer, entries, _) = target.log(&actor, &holder(), 1, 0, 10).unwrap();
+    let slot = answer.slot.unwrap();
+    assert_eq!((slot.flushed, slot.flushed_epoch), (2, 1));
+    assert_eq!(entries.iter().map(|e| e.seq).collect::<Vec<_>>(), [3]);
+}
+
+#[tokio::test]
+async fn a_copy_whose_range_a_pushed_set_dropped_is_not_held() {
+    let (target, held) = copied(true).await;
+    assert!(!held);
+    assert!(!target.held().overlaps(0, 0));
+}
+
+#[tokio::test]
+async fn a_copy_made_for_another_assignment_is_made_again() {
+    let target = Arc::new(Store::new(Arc::new(MemoryEngine::new("volume"))));
+    decide(&target, &Directory::new(), "d").unwrap();
+    // A copy from an earlier assignment of the range, at generation 1.
+    target.hold(0, 0, 1).unwrap();
+    let peers = Arc::new(Leaving {
+        source: source(),
+        target: target.clone(),
+        pages: Mutex::new(5),
+        revoke: false,
+    });
+    let repair = Repair::new(target.clone(), peers, "d", "cell-c");
+    let generations = BTreeMap::from([(0, BTreeMap::from([("d".to_owned(), 2)]))]);
+    assert!(repair.tick(&handoff(), &generations).await.unwrap());
+    assert_eq!(target.held().generation(0, 0), Some(2));
+    let actor = store::Actor::new(&actor()).unwrap();
+    let (_, entries, _) = target.log(&actor, &holder(), 1, 0, 10).unwrap();
+    assert_eq!(entries.len(), 3, "the copy is the leaving owner's");
+    // The same assignment's copy is not made again.
+    assert!(!repair.tick(&handoff(), &generations).await.unwrap());
+}

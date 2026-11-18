@@ -16,6 +16,7 @@ async fn stop_joins_the_task_before_local_storage_can_be_replaced() {
             std::future::pending::<()>().await;
         }),
         member: None,
+        reports: Default::default(),
     };
     ready.await.unwrap();
     session.stop().await;
@@ -33,6 +34,7 @@ async fn drain_returns_once_the_draining_task_has_finished() {
         rebuilds: Rebuilds::default(),
         task: tokio::spawn(async {}),
         member: Some(Arc::new(Watched::new(pb::Member::default()))),
+        reports: Default::default(),
     };
     // Polling the finished task again would panic.
     session.drain().await;
@@ -62,6 +64,7 @@ async fn storage_health_is_announced_and_quarantined_scopes_do_not_block_readine
         rebuilds: Rebuilds::default(),
         task: tokio::spawn(async {}),
         member: Some(member.clone()),
+        reports: Default::default(),
     };
     let quarantined = BTreeSet::from(["auth".to_string(), "cdn".to_string()]);
     // A dataset the member never announced is dropped, or the relay would refuse the update.
@@ -519,6 +522,9 @@ fn splitting_unconfirmed_coverage_requires_the_kept_range_to_recover() {
         pending: BTreeMap::new(),
         retired: BTreeSet::new(),
         merges: BTreeMap::new(),
+        holdings: BTreeMap::new(),
+        applied: BTreeMap::new(),
+        reports: Default::default(),
     };
     let progress = Mutex::new(Progress::default());
     let changes = Watched::new(0);
@@ -618,6 +624,7 @@ async fn installed_bootstrap_and_tail_wait_for_source_confirmation_before_reads_
         rebuilds: Rebuilds::default(),
         task: tokio::spawn(std::future::pending()),
         member: None,
+        reports: Default::default(),
     };
     assert!(!session.ready());
     assert!(
@@ -770,6 +777,7 @@ async fn scoped_remote_error_keeps_other_dataset_delivering_and_minimum_reads_av
         rebuilds: Rebuilds::default(),
         task: tokio::spawn(std::future::pending()),
         member: None,
+        reports: Default::default(),
     };
     assert!(!session.ready());
     assert!(session.error().is_some());
@@ -933,6 +941,7 @@ fn view(applied: u64, entries: &[(u64, &[(&str, pb::range::owner::State)])]) -> 
             owners: owners
                 .iter()
                 .map(|(node, state)| pb::range::Owner {
+                    generation: 0,
                     node_id: (*node).into(),
                     state: *state as i32,
                 })
@@ -959,6 +968,7 @@ fn view(applied: u64, entries: &[(u64, &[(&str, pb::range::owner::State)])]) -> 
 
 fn pushed_ranges(revision: u64, spans: &[(u64, u64)]) -> pb::Ranges {
     pb::Ranges {
+        generations: Vec::new(),
         dataset: "quicksilver".into(),
         revision,
         spans: spans
@@ -1039,6 +1049,7 @@ async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets()
         let membership = view(7, &[]);
         let moved = pb::Range {
             owners: vec![pb::range::Owner {
+                generation: 0,
                 node_id: "other".into(),
                 state: pb::range::owner::State::Ready as i32,
             }],
@@ -1072,6 +1083,7 @@ async fn unreadable_held_ranges_refuse_the_set_without_stopping_other_datasets()
         pushed.pending.insert(
             "auth".into(),
             pb::Ranges {
+                generations: Vec::new(),
                 dataset: "auth".into(),
                 ..pushed_ranges(7, &spans)
             },
@@ -1196,6 +1208,9 @@ async fn pushed_revokes_wait_for_the_view_are_refused_unless_it_confirms_then_dr
         pending: BTreeMap::new(),
         retired: BTreeSet::new(),
         merges: BTreeMap::new(),
+        holdings: BTreeMap::new(),
+        applied: BTreeMap::new(),
+        reports: Default::default(),
     };
     let progress = Mutex::new(Progress::default());
     let changes = Watched::new(0);
@@ -1293,6 +1308,7 @@ async fn pushed_revokes_wait_for_the_view_are_refused_unless_it_confirms_then_dr
     pushed.pending.insert(
         "auth".into(),
         pb::Ranges {
+            generations: Vec::new(),
             dataset: "auth".into(),
             ..pushed_ranges(8, &[(0, 0)])
         },
@@ -1339,6 +1355,7 @@ async fn rebuild_counts_only_after_a_fresh_verified_bootstrap() {
         rebuilds: Rebuilds::default(),
         task: tokio::spawn(std::future::pending()),
         member: None,
+        reports: Default::default(),
     };
     let rebuilder = session.rebuilder("auth");
     let rebuilding = tokio::spawn(async move { rebuilder.rebuild().await });
@@ -1510,6 +1527,9 @@ fn revoke_state(engine: &Arc<dyn StorageEngine>, whole: Range) -> Pushed {
         pending: BTreeMap::new(),
         retired: BTreeSet::new(),
         merges: BTreeMap::new(),
+        holdings: BTreeMap::new(),
+        applied: BTreeMap::new(),
+        reports: Default::default(),
     }
 }
 
@@ -1819,6 +1839,9 @@ fn merged_ranges_join_only_at_one_revision() {
         pending: BTreeMap::new(),
         retired: BTreeSet::new(),
         merges: BTreeMap::from([("auth".into(), vec![merge])]),
+        holdings: BTreeMap::new(),
+        applied: BTreeMap::new(),
+        reports: Default::default(),
     };
     let progress = Mutex::new(Progress::default());
     let changes = Watched::new(0);

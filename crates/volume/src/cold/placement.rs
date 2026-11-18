@@ -23,6 +23,7 @@ use tokio::time::Instant;
 use tonic::Status;
 
 use super::Placement;
+use crate::repair::Source;
 
 /// The topology record is static config; a node rereads it this often.
 const TOPOLOGY_TTL: Duration = Duration::from_secs(10 * 60);
@@ -254,5 +255,109 @@ impl Placement for Cells {
 
     async fn first_cell(&self, actor: &pb::Actor) -> Result<String, Status> {
         Ok(self.slots(actor).await?[0].clone())
+    }
+}
+
+/// `[start, end)` cut to `[from, to)`, `end` and `to` 0 meaning 2⁶⁴.
+fn clip(start: u64, end: u64, from: u64, to: u64) -> (u64, u64) {
+    let wide = |e: u64| if e == 0 { 1u128 << 64 } else { u128::from(e) };
+    let end = wide(end).min(wide(to));
+    (start.max(from), if end == 1 << 64 { 0 } else { end as u64 })
+}
+
+#[async_trait]
+impl crate::repair::Peers for Cells {
+    async fn sources(&self, start: u64, end: u64) -> Result<Vec<Source>, Status> {
+        let topology = self.topology(&self.region).await?;
+        let dc = topology
+            .dcs
+            .iter()
+            .find(|d| d.name == self.dc)
+            .ok_or_else(|| {
+                Status::failed_precondition(format!("the topology has no DC {}", self.dc))
+            })?;
+        let mut sources = Vec::new();
+        for cell in &dc.cells {
+            let table = self.routes(cell).await?;
+            let directory = table.directories.get(VOLUME).cloned().unwrap_or_default();
+            let first = placement::start_of(&directory, start);
+            let stop = if end == 0 { u128::MAX } else { u128::from(end) };
+            for (&from, owners) in directory
+                .range(first..)
+                .take_while(|(s, _)| u128::from(**s) < stop)
+            {
+                let (part_start, part_end) =
+                    clip(start, end, from, placement::end_of(&directory, from));
+                let found: Vec<_> = owners
+                    .iter()
+                    .filter(|o| o.state != State::Populating && o.node != self.node)
+                    .map(|o| Source {
+                        cell: cell.clone(),
+                        node: o.node.clone(),
+                        start: part_start,
+                        end: part_end,
+                    })
+                    .collect();
+                // This cell's other owners matter only where the DC has fewer than three cells.
+                if found.is_empty() && *cell != self.cell {
+                    self.stale
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(cell.clone(), table.revision);
+                    return Err(Status::unavailable(format!(
+                        "cell {cell} has no ready owner of {part_start:016x}"
+                    )));
+                }
+                sources.extend(found);
+            }
+            if directory.is_empty() && *cell != self.cell {
+                return Err(Status::unavailable(format!(
+                    "cell {cell} has no volume directory yet"
+                )));
+            }
+        }
+        Ok(sources)
+    }
+
+    async fn slots(&self, actor: &pb::Actor) -> Result<[String; actors::SLOTS], Status> {
+        Cells::slots(self, actor).await
+    }
+
+    async fn page(
+        &self,
+        source: &Source,
+        request: pb::RepairRequest,
+    ) -> Result<pb::RepairReply, Status> {
+        let table = self.routes(&source.cell).await?;
+        let Some(member) = table.members.get(&source.node) else {
+            self.stale
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(source.cell.clone(), table.revision);
+            return Err(Status::unavailable(format!(
+                "{} is not in its cell's routes",
+                source.node
+            )));
+        };
+        let identity = tls::Identity {
+            service: member.service.clone(),
+            cell: member.cell.clone(),
+            node_id: member.node_id.clone(),
+            host: bedrock_lib::transport::host_of(&member.address).into(),
+        };
+        let channel = self
+            .peers
+            .pinned(&member.address, Class::Control, identity)
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        let call = async move {
+            pb::volume_client::VolumeClient::new(channel)
+                .repair(request)
+                .await
+        };
+        Ok(self
+            .peers
+            .call(&member.address, Class::Control, TIMEOUT, call)
+            .await?
+            .into_inner())
     }
 }

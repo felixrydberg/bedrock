@@ -4,6 +4,7 @@
 //! stream.
 
 pub mod cold;
+pub mod repair;
 pub mod serve;
 pub mod store;
 
@@ -109,6 +110,21 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
         )
         .with_siblings(sibling_relays),
     );
+    // Whether an empty store is a new node's or a lost disk is decided before joining, while no range can be given to
+    // this node yet (S-06).
+    while store.fresh().is_none() {
+        match client.routes(VOLUME, None).await {
+            Ok(table) => {
+                let current = table.directories.get(VOLUME).cloned().unwrap_or_default();
+                repair::decide(&store, &current, &node.node_id)
+                    .map_err(|e| ConfigError(format!("recording the store's start: {e:?}")))?;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "volume routes unavailable; retrying before joining");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
     let placement = Arc::new(cold::placement::Cells::new(
         client,
         peers.clone(),
@@ -125,20 +141,23 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     let cold = Arc::new(cold::Cold::new(
         store.clone(),
         databases,
-        placement,
+        placement.clone(),
         readers,
         &node.location.cell,
         &node.node_id,
     ));
-    let service = service.with_cold(cold.clone());
+    let service = service.with_cold(cold.clone()).with_repair();
+    let repair = repair::Repair::new(store.clone(), placement, &node.node_id, &node.location.cell);
     let mut member = membership::member(&config, VOLUME);
     member.datasets = vec![VOLUME.into()];
-    let session = bedrock_lib::relays::client::Session::join(
+    let held: Arc<dyn bedrock_lib::relays::client::Holdings> =
+        Arc::new(repair::Held(store.clone()));
+    let session = bedrock_lib::relays::client::Session::join_reporting(
         peers.clone(),
         config.relays.clone(),
         vec![target],
         member,
-        Default::default(),
+        BTreeMap::from([(VOLUME.to_owned(), held)]),
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let router = bedrock_lib::transport::server(tls.as_ref()).add_service(
@@ -148,12 +167,19 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut measure = tokio::time::interval(SIZES);
     let mut flushing = std::pin::pin!(flush(cold.clone(), directory.clone()));
+    // The repair loop copies only from a validated directory view, with its generations; it says when a range became
+    // held.
+    let assignments = Arc::new(std::sync::RwLock::new(None));
+    let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut repairing = std::pin::pin!(repairs(repair, assignments.clone(), held_tx));
     let mut published = Vec::new();
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
         tokio::select! {biased;
             ()=&mut shutdown=>break,
             ()=&mut flushing=>unreachable!("the flush loop runs until shutdown"),
+            ()=&mut repairing=>unreachable!("the repair loop runs until shutdown"),
+            Some(())=held_rx.recv()=>session.report(),
             served=&mut serving=>{
                 served.map_err(|e| ConfigError(format!("listen {}: {e}", node.listen)))?;
                 break;
@@ -164,8 +190,12 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
                     tracing::warn!(%error,"membership view unreadable");
                 }
                 // A directory that cannot be read keeps the last one.
-                match members.directory(VOLUME) {
-                    Ok(current)=>*directory.write().unwrap_or_else(PoisonError::into_inner)=current,
+                match members.assignments(VOLUME) {
+                    Ok(current)=>{
+                        *directory.write().unwrap_or_else(PoisonError::into_inner)=current.0.clone();
+                        *assignments.write().unwrap_or_else(PoisonError::into_inner)=
+                            session.ready().then_some(current);
+                    }
                     Err(error)=>tracing::warn!(%error,"volume directory unreadable"),
                 }
             },
@@ -205,6 +235,32 @@ async fn flush(cold: Arc<cold::Cold>, directory: Arc<std::sync::RwLock<Directory
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         cold.tick(&current).await;
+    }
+}
+
+/// Copies and repairs ranges (S-06) from the last validated directory view and its generations, and sends a note when
+/// a range became held.
+async fn repairs(
+    repair: repair::Repair,
+    assignments: Arc<std::sync::RwLock<Option<membership::Assignments>>>,
+    held: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let current = assignments
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some((directory, generations)) = current else {
+            continue;
+        };
+        match repair.tick(&directory, &generations).await {
+            Ok(true) => {
+                let _ = held.send(());
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "volume range repair failed"),
+        }
     }
 }
 
@@ -265,7 +321,7 @@ fn sizes(
 }
 
 /// The slot store: RocksDB in `data_dir/volume`, or in memory in simulation builds (B-23a). Unlike a relay-fed dataset,
-/// a store that cannot open is not deleted: a slot that lost its data must repair before it votes (S-06).
+/// a store that cannot open is not deleted: a slot that lost its data repairs before it votes ([`repair`]).
 fn open(node: &NodeConfig) -> Result<Arc<dyn StorageEngine>, ConfigError> {
     #[cfg(not(madsim))]
     {

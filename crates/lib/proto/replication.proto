@@ -64,6 +64,9 @@ message Range {
     enum State { POPULATING = 0; READY = 1; LEAVING = 2; }
     string node_id = 1;
     State state = 2;
+    // For a dataset no relay streams (`volume`, #114 / S-06): the assignment's generation, above the directory revision
+    // the plan that gave this node the range read. A copy counts only for the generation it was made for. 0 otherwise.
+    uint64 generation = 3;
   }
   repeated Owner owners = 1;
 }
@@ -144,13 +147,20 @@ message Ranges {
   string dataset = 1;
   uint64 revision = 2;
   repeated Span spans = 3;
+  // For a dataset no relay streams: the member's generation of each span, in order (#114 / S-06).
+  repeated uint64 generations = 4;
 }
 // The member processed `Ranges` up to `revision`. `refused` lists revokes that did not match its own directory view.
+// For a dataset no relay streams (`volume`), `ready` lists the spans of the set the member holds a complete copy of
+// (#114 / S-06, `docs/spec/handoff.tla` with `Reported`); the member sends the ack again when a copy finishes.
 message RangesAck {
   string dataset = 1;
   uint64 revision = 2;
   repeated Span refused = 3;
   string reason = 4;
+  repeated Span ready = 5;
+  // The generation each `ready` span was copied for, in order.
+  repeated uint64 generations = 6;
 }
 message RelayFrame {
   oneof kind {
@@ -198,6 +208,9 @@ message Ready {
   string node_id = 2;
   string dataset = 3;
   repeated Span spans = 4;
+  // For a dataset no relay streams: the generation each span was copied for, in order; the publisher counts a span
+  // only for the owner's current generation (#114 / S-06).
+  repeated uint64 generations = 5;
 }
 service Siblings { rpc Watch(SiblingWatch) returns (stream SiblingUpdate); }
 

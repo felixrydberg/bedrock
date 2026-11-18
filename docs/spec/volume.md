@@ -4,7 +4,7 @@
 [statefull/v2.md §5](../implementation-prototype/statefull/v2.md#5-storage-bedrock-volume): an appointed holder claims
 with epochs and appends, three slots in different cells promise and fsync, and a maintainer flushes committed entries
 to S3. It also models the three changes that move votes. S-02b (#131) adds epoch reservation and the repaired state
-after a disk wipe. Nothing here is implemented yet; S-03 (#111), S-04 (#112) and S-06 (#114) build on it.
+after a disk wipe. S-03 (#111), S-04 (#112) and S-06 (#114) implement it.
 
 ## What is modeled
 
@@ -29,7 +29,9 @@ after a disk wipe. Nothing here is implemented yet; S-03 (#111), S-04 (#112) and
   spaces). Every slot tracks the commit point it knows. `Learn` is an append refused under backpressure: the slot
   writes nothing, as with a lost message, but learns the announced commit point for the part of its log that matches
   the holder's, so a full slot can still truncate. `Truncate` drops a slot's log through what S3 holds, but never
-  past the commit point the slot knows; the dropped prefix is then read from S3.
+  past the commit point the slot knows; the dropped prefix is then read from S3. `Skip` (S-06, #114) lets a slot
+  whose log ends below S3 take S3's state as its log, keeping its vote, but only when S3's last entry is no newer than
+  the slot's promise.
 - **Changes**, one per config (`Change`):
   - `handoff`: `c` becomes the leaving owner and seals. The populating owner `d` copies from the sealed `c`, reports
     ready, then votes in `c`'s slot position; `c` drops the range. Readiness is reported by the node and checked by
@@ -69,6 +71,8 @@ Each deliberate bug in `scripts/tlc.sh` breaks the invariant named beside it:
 | `volume-topology` | `new-only` | `NoLostAck`, `OneWriter`, `NoStaleAppend` | During the transition a quorum of only the new slot set counts |
 | `volume-truncate` | `learn` | `S3Committed` | A refused append teaches the commit point past where the slot's log matches the holder's |
 | `volume-truncate` | `truncate` | `TruncatedInS3` | A slot truncates through what S3 holds, past the commit point it knows |
+| `volume-truncate` | `skip-keep` | `TruncatedInS3` | A slot behind S3 keeps its own prefix and only appends S3's tail |
+| `volume-truncate` | `skip-any` | `TruncatedInS3` | A slot skips to an S3 point newer than its promise, so its fenced holder's appends land on it |
 
 ## Bounds
 
@@ -166,6 +170,51 @@ Rule 3 alone, with holders still picking their own epoch, also fails `NoLostAck`
 A claim that starts after the repair need not have a higher epoch. With rule 1, epoch 2 is reserved on `a` or `b`, so
 `h2` picks a higher epoch and the repaired `c` copies 2 as its floor.
 
+## Slot repair and range handoff in the code (S-06, #114)
+
+`crates/volume/src/repair.rs` implements `Copy` and `Ready`. The relay side, where the node reports readiness and its
+relay checks it, is `handoff.tla` with `Reported` ([membership.md](membership.md#node-reported-readiness-volume-114--s-06)).
+
+- **Seal.** A new owner copies its range from the `leaving` owner with `Repair` requests that carry `seal`. The first
+  one seals the span durably on the leaving owner, which then refuses `Reserve`, `Claim` and `Append`. Each write checks
+  the seal under its actor's lock, and sealing takes every lock once, so no write is in flight when the copy starts.
+  The leaving owner thus has given every promise it will give (`Copy` in a handoff requires `st[m] = "seal"`).
+- **Which path.** A `populating` owner copies from the range's `leaving` owner when there is one. Otherwise the last
+  owner was removed, and it repairs as after a wipe. A `ready` or `leaving` owner whose store started empty while it
+  owned ranges lost its disk, and it also repairs. A store that started empty while its node owned nothing is `fresh`:
+  a range it is first given `ready` (a cell's first owners) has nothing to copy.
+- **Repair** copies from every `ready` or `leaving` owner of the range in every cell of the DC, keeping only actors
+  with a slot both there and here. Per actor it keeps the more advanced log with its overlay, and the higher promise
+  and reservation, which is `Copy`'s rule. It then marks the actor `repaired`. A source copy that is itself repaired
+  is skipped, since it is no voting peer.
+- **Unknown actors.** The range is also marked repaired, so an actor that neither peer had a record of when the copy
+  ran starts `repaired` with floor 0. A reservation still in flight to a peer can reach it after the copy, which is the
+  `early` trace. The mark stays until the range leaves the node.
+- **Readiness.** The node holds a range only once the copy is complete, and only for the assignment generation it
+  copied for. It reports what it holds. A pushed set that no longer lists the range, or lists it for another
+  generation, makes the node forget the copy, and a copy that saw such a set while it ran is not held. This makes the
+  copy atomic in the sense of `handoff.tla`'s `Copy` and `Receive`. Until it holds a range, the node refuses every call
+  for it.
+- **A slot left behind.** A new writer keeps the log only from the flushed point of the slot it recovered from, so it
+  cannot resend what S3 already holds. A voting slot whose log ends below that, such as one that copied a sealed
+  owner's log while the holder kept committing on the other two, answers its append with `LOG_GAP`. The slot then
+  reads the actor's meta from the range database and skips to it (`Store::skip`, `Skip` in the model): it drops its
+  log and overlay there and keeps its vote, since it lost no promise. It does so only when S3's point is no newer than
+  its promise. A slot behind entries that S3 does not hold yet stays behind until a flush reaches them.
+  `tests/sim/tests/volume_cell.rs` runs this through the real relays and binaries: without it, the actor's next
+  claim can never commit once another slot is wiped.
+- **Merges.** A merge keeps the earlier entry's generation for every owner. An owner that held the later part under
+  another generation forgets that part, refuses it briefly, and holds it again for the kept generation: a fresh node
+  without copying, since its data there is its own, and a node that lost its disk once by repairing. `handoff.tla` has
+  splits but no merges.
+- **Fresh or wiped.** Before it joins its cell, a node whose store has not decided reads its cell's `volume`
+  directory. It is fresh if the directory lists it nowhere; otherwise its disk was lost.
+
+`tests/sim/tests/volume_repair.rs` replays the four TLC counterexamples (`populating`, `unsealed`, `early`,
+`self-epoch`) against the real services and repair, and checks that none loses an acknowledged commit. Its seeded
+scenario wipes a slot and then hands its range off while a holder commits, and checks that the slot votes only once a
+newer claim has committed.
+
 ## Checks run
 
 On 2026-11-14 with TLC 2026.11.06 from `scripts/tla2tools.jar`, 2 workers and a 4 GB heap (`scripts/tlc.sh`):
@@ -181,6 +230,14 @@ On 2026-11-14 with TLC 2026.11.06 from `scripts/tla2tools.jar`, 2 workers and a 
 All 10 volume bugs broke their invariants, and the other 50 still did (`scripts/tlc.sh bugs`, 2,231 s). Reservation
 adds a step to every claim, so the passing configs have 11 to 21 times as many distinct states as in S-02
 (`volume-base` had 3.5 million). Runs used 2 workers; an earlier S-02 run with 4 workers was interrupted when the machine went down.
+
+On 2026-11-18, after `Skip` (S-06), with 3 workers and an 8 GB heap: `volume-truncate` passed 108,935,493 generated and
+22,458,014 distinct states, depth 39 (486 s), and `learn`, `truncate`, `skip-keep` and `skip-any` broke their
+invariants. Two earlier `Skip` rules failed `TruncatedInS3`. Without the promise check, a holder fenced by a newer one
+appended over a skip to the newer holder's flush. Without the recovered-holder check, a holder fenced before it
+recovered did the same. The model lets such a holder replicate, while the code's holder appends only once recovered.
+The same day `volume-base`, `volume-handoff`, `volume-wipe` and `volume-topology` passed again with the distinct state
+counts in the table, since `Skip` runs only in `volume-truncate`, and each of their bugs broke its invariants.
 
 On 2026-11-16, after S-05 (#113) added `Learn`, `Truncate` and `TruncatedInS3`, every volume config was checked again
 with 2 workers and a 4 GB heap. The four earlier configs found exactly the state counts above, since the new actions

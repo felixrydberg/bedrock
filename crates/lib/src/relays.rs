@@ -141,6 +141,9 @@ struct Recent {
     bytes: usize,
 }
 
+/// A held span `(start, end, generation)` a member reported.
+type Held = (u64, u64, u64);
+
 struct Subscriber {
     tx: mpsc::Sender<Result<pb::RelayFrame, Status>>,
     bytes: Arc<AtomicUsize>,
@@ -154,6 +157,9 @@ struct Subscriber {
     /// The range set last pushed to this leaf member per dataset, and the latest one it acknowledged (#22 / B-21).
     pushed: BTreeMap<String, pb::Ranges>,
     ranges_acked: BTreeMap<String, u64>,
+    /// For a dataset no relay streams (`volume`), the spans the member reported holding with its latest
+    /// acknowledgement, each with the generation it was copied for, and that acknowledgement's revision (#114 / S-06).
+    reported: BTreeMap<String, (u64, Vec<Held>)>,
     /// When a session that replaced one on another relay opened (#41 / B-12b).
     moved: Option<tokio::time::Instant>,
 }
@@ -408,11 +414,9 @@ impl Hub {
                 return;
             };
             let sub = subscribers.get_mut(&id).unwrap();
-            if sub
-                .pushed
-                .get(&frame.dataset)
-                .is_some_and(|pushed| pushed.spans == frame.spans)
-            {
+            if sub.pushed.get(&frame.dataset).is_some_and(|pushed| {
+                pushed.spans == frame.spans && pushed.generations == frame.generations
+            }) {
                 return;
             }
             sub.pushed.insert(frame.dataset.clone(), frame.clone());
@@ -443,6 +447,21 @@ impl Hub {
                 sub.pushed.remove(&ack.dataset);
             }
         }
+        if !pushed(&ack.dataset) {
+            let reported = sub.reported.entry(ack.dataset.clone()).or_default();
+            if ack.revision >= reported.0 {
+                *reported = (
+                    ack.revision,
+                    ack.ready
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            (s.start, s.end, ack.generations.get(i).copied().unwrap_or(0))
+                        })
+                        .collect(),
+                );
+            }
+        }
         let acked = sub.ranges_acked.entry(ack.dataset).or_default();
         *acked = (*acked).max(ack.revision);
     }
@@ -451,7 +470,10 @@ impl Hub {
     /// `ReadyFor`): the member acknowledged the latest set pushed to it, and in every namespace this relay knows the
     /// range's stream finished any bootstrap and was acknowledged through the head seen once that held. The member
     /// sends its stream changes before `RangesAck`, so a stream it dropped is gone by then and stale acknowledgements
-    /// never count. A pushed dataset whose namespaces the relay has not learned yet is not ready.
+    /// never count. A pushed dataset whose namespaces the relay has not learned yet is not ready. A dataset no relay
+    /// streams (`volume`) has no stream to finish: its range is ready, for a generation, once the member's latest
+    /// acknowledgement, of the latest set, reports holding a copy for that generation (#114 / S-06,
+    /// `docs/spec/handoff.tla` with `Reported`). The publisher counts it only for the owner's current generation.
     pub fn ready(&self) -> siblings::Ready {
         let datasets: BTreeSet<String> = self
             .0
@@ -460,8 +482,6 @@ impl Hub {
             .unwrap()
             .values()
             .flat_map(|sub| sub.pushed.keys().cloned())
-            // An unpushed ranged dataset (`volume`) has no stream to finish. Its owners report readiness themselves
-            // (S-06); until then they stay populating and never vote.
             .filter(|dataset| pushed(dataset))
             .collect();
         let heads: BTreeMap<String, Vec<(String, u64)>> = datasets
@@ -484,10 +504,38 @@ impl Hub {
             let Subscriber {
                 pushed: frames,
                 ranges_acked,
+                reported,
                 follows,
                 ..
             } = subscribers.get_mut(&id).unwrap();
             for (dataset, frame) in frames.iter() {
+                if !pushed(dataset) {
+                    let Some((revision, held)) = reported.get(dataset) else {
+                        continue;
+                    };
+                    let spans: Vec<(u64, u64, u64)> = frame
+                        .spans
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            (
+                                s.start,
+                                s.end,
+                                frame.generations.get(i).copied().unwrap_or(0),
+                            )
+                        })
+                        .filter(|(start, end, generation)| {
+                            *revision >= frame.revision
+                                && held.iter().any(|(s, e, g)| {
+                                    g == generation && ranges::within((*start, *end), (*s, *e))
+                                })
+                        })
+                        .collect();
+                    if !spans.is_empty() {
+                        ready.insert((member.clone(), dataset.clone()), spans);
+                    }
+                    continue;
+                }
                 // A dataset pushed since `heads` was read is not ready this pass.
                 let Some(namespaces) = heads.get(dataset) else {
                     continue;
@@ -498,14 +546,17 @@ impl Hub {
                 {
                     continue;
                 }
-                let spans: Vec<(u64, u64)> = frame
+                let spans: Vec<(u64, u64, u64)> = frame
                     .spans
                     .iter()
-                    .map(|s| (s.start, s.end))
-                    .filter(|range| {
+                    .map(|s| (s.start, s.end, 0))
+                    .filter(|&(start, end, _)| {
                         namespaces.iter().all(|(namespace, head)| {
                             follows
-                                .get_mut(&((dataset.clone(), namespace.clone()), Some(*range)))
+                                .get_mut(&(
+                                    (dataset.clone(), namespace.clone()),
+                                    Some((start, end)),
+                                ))
                                 .is_some_and(|interest| {
                                     !interest.confirming
                                         && interest.acked >= *interest.target.get_or_insert(*head)
@@ -2369,6 +2420,7 @@ impl pb::relay_server::Relay for Hub {
                 member,
                 pushed: BTreeMap::new(),
                 ranges_acked: BTreeMap::new(),
+                reported: BTreeMap::new(),
                 moved: moved.then(crate::monotonic_now),
             },
         );

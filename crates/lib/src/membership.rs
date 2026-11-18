@@ -35,6 +35,11 @@ pub use crate::datasets::capabilities::SERVICES;
 pub const RANGE: &str = "range/";
 /// Dataset → its placement directory.
 pub type Directories = BTreeMap<String, Directory>;
+/// Dataset → range start → owner → the generation of its assignment, for datasets no relay streams (`volume`, #114 /
+/// S-06). Owners without one are absent.
+pub type Generations = BTreeMap<String, BTreeMap<u64, BTreeMap<String, u64>>>;
+/// One dataset's directory, and range start → owner → generation.
+pub type Assignments = (Directory, BTreeMap<u64, BTreeMap<String, u64>>);
 
 pub fn namespace(service: &str, cell: &str) -> String {
     format!("{service}.{cell}")
@@ -128,6 +133,7 @@ pub type ServiceSnapshot = (
     Directories,
     Vec<(String, Drain)>,
     Option<u64>,
+    Generations,
 );
 
 impl Published {
@@ -162,7 +168,7 @@ impl Published {
             .engine
             .snapshot()
             .map_err(|error| Status::internal(error.to_string()))?;
-        let (members, directory) = read_snapshot(&*snapshot, &self.prefix)?;
+        let (members, directory, generations) = read_snapshot(&*snapshot, &self.prefix)?;
         let records = read_drains(&*snapshot, &self.prefix)?;
         for (id, record) in &records {
             validate_drain(cell, service, id, record)?;
@@ -176,7 +182,20 @@ impl Published {
             None,
         )
         .map_err(|error| Status::internal(error.to_string()))?;
-        Ok((members, directory, records, revision))
+        Ok((members, directory, records, revision, generations))
+    }
+
+    /// One dataset's directory and its assignment generations, from one snapshot (#114 / S-06).
+    pub fn assignments(&self, dataset: &str) -> Result<Assignments, Status> {
+        let snapshot = self
+            .engine
+            .snapshot()
+            .map_err(|error| Status::internal(error.to_string()))?;
+        let (_, mut directories, mut generations) = read_snapshot(&*snapshot, &self.prefix)?;
+        Ok((
+            directories.remove(dataset).unwrap_or_default(),
+            generations.remove(dataset).unwrap_or_default(),
+        ))
     }
 
     pub fn directory(&self, dataset: &str) -> Result<Directory, String> {
@@ -250,17 +269,17 @@ pub(crate) fn read(
     let snapshot = engine
         .snapshot()
         .map_err(|error| Status::internal(error.to_string()))?;
-    read_snapshot(&*snapshot, prefix)
+    let (members, directories, _) = read_snapshot(&*snapshot, prefix)?;
+    Ok((members, directories))
 }
 
-fn read_snapshot(
-    snapshot: &dyn Snapshot,
-    prefix: &[u8],
-) -> Result<(BTreeMap<String, pb::Member>, Directories), Status> {
+type Parsed = (BTreeMap<String, pb::Member>, Directories, Generations);
+
+fn read_snapshot(snapshot: &dyn Snapshot, prefix: &[u8]) -> Result<Parsed, Status> {
     let scan = snapshot
         .scan(&KeyRange::prefix(prefix.to_vec()))
         .map_err(|e| Status::internal(e.to_string()))?;
-    parse(scan.map(|entry| {
+    parse_generations(scan.map(|entry| {
         let (key, value) = entry.map_err(|e| Status::internal(e.to_string()))?;
         Ok((key[prefix.len()..].to_vec(), value))
     }))
@@ -271,8 +290,17 @@ fn read_snapshot(
 pub fn parse(
     entries: impl IntoIterator<Item = Result<(Vec<u8>, Vec<u8>), Status>>,
 ) -> Result<(BTreeMap<String, pb::Member>, Directories), Status> {
+    let (members, directories, _) = parse_generations(entries)?;
+    Ok((members, directories))
+}
+
+/// [`parse`], with the assignment generations.
+pub fn parse_generations(
+    entries: impl IntoIterator<Item = Result<(Vec<u8>, Vec<u8>), Status>>,
+) -> Result<Parsed, Status> {
     let mut members = BTreeMap::new();
     let mut directories = Directories::new();
+    let mut generations = Generations::new();
     for entry in entries {
         let (key, value) = entry?;
         let key =
@@ -293,23 +321,32 @@ pub fn parse(
                 .ok_or_else(|| Status::data_loss("invalid range key"))?;
             let start = u64::from_str_radix(start, 16)
                 .map_err(|_| Status::data_loss("invalid range key"))?;
+            let (owners, owned) = decode(&value)?;
             directories
                 .entry(dataset.to_owned())
                 .or_default()
-                .insert(start, decode(&value)?);
+                .insert(start, owners);
+            if !owned.is_empty() {
+                generations
+                    .entry(dataset.to_owned())
+                    .or_default()
+                    .insert(start, owned);
+            }
             continue;
         }
         let member =
             pb::Member::decode(value.as_slice()).map_err(|e| Status::data_loss(e.to_string()))?;
         members.insert(key, member);
     }
-    Ok((members, directories))
+    Ok((members, directories, generations))
 }
 
-fn decode(value: &[u8]) -> Result<Vec<Owner>, Status> {
+/// An entry's owners, and the generations of those that have one.
+fn decode(value: &[u8]) -> Result<(Vec<Owner>, BTreeMap<String, u64>), Status> {
     use pb::range::owner::State as Pb;
     let range = pb::Range::decode(value).map_err(|e| Status::data_loss(e.to_string()))?;
-    range
+    let mut generations = BTreeMap::new();
+    let owners = range
         .owners
         .into_iter()
         .map(|owner| {
@@ -319,15 +356,24 @@ fn decode(value: &[u8]) -> Result<Vec<Owner>, Status> {
                 Ok(Pb::Leaving) => State::Leaving,
                 Err(_) => return Err(Status::data_loss("unknown range owner state")),
             };
+            if owner.generation != 0 {
+                generations.insert(owner.node_id.clone(), owner.generation);
+            }
             Ok(Owner {
                 node: owner.node_id,
                 state,
             })
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok((owners, generations))
 }
 
 pub fn encode(owners: &[Owner]) -> Vec<u8> {
+    encode_generations(owners, &BTreeMap::new())
+}
+
+/// [`encode`], with each owner's assignment generation from `generations` (#114 / S-06).
+pub fn encode_generations(owners: &[Owner], generations: &BTreeMap<String, u64>) -> Vec<u8> {
     use pb::range::owner::State as Pb;
     let owners = owners.iter().map(|owner| pb::range::Owner {
         node_id: owner.node.clone(),
@@ -336,6 +382,7 @@ pub fn encode(owners: &[Owner]) -> Vec<u8> {
             State::Ready => Pb::Ready,
             State::Leaving => Pb::Leaving,
         } as i32,
+        generation: generations.get(&owner.node).copied().unwrap_or(0),
     });
     pb::Range {
         owners: owners.collect(),
@@ -372,6 +419,11 @@ impl View {
     /// the first write. Scan and decoding errors from the membership view are returned to the caller.
     pub fn directory(&self, dataset: &str) -> Result<Directory, Status> {
         Ok(self.published.read()?.1.remove(dataset).unwrap_or_default())
+    }
+
+    /// [`View::directory`] and the generation of each owner's assignment, for a dataset no relay streams (#114 / S-06).
+    pub fn assignments(&self, dataset: &str) -> Result<Assignments, Status> {
+        self.published.assignments(dataset)
     }
 
     /// When the view has advanced, drops connections and breakers of members that left.

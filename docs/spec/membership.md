@@ -120,6 +120,59 @@ pushes the full set again and the publisher continues from published state. With
 written, so no range becomes `ready` or is revoked. A member cut off past the grace period is removed from its
 ranges; when it reconnects, the pushed set no longer lists them and it drops them.
 
+### Node-reported readiness (`volume`, #114 / S-06)
+
+No relay stream carries a `volume` range, so step 3 cannot see the copy. The node copies the range itself
+([volume.md](volume.md)) and reports which spans of its pushed set it holds. Every `RangesAck` carries that report as of
+after the set it acknowledges, and the node sends a new one when a copy finishes. Steps 2, 4 and 5 are unchanged. Step
+1 has one exception: the first write of an empty `volume` directory makes its owners `ready` at once, since no data
+exists anywhere yet to copy (`Write` with `rev = 0`).
+
+Nothing keeps a node's copy current once it stops owning the range. Relays and nodes read the directory as snapshots,
+and an unchanged span set is not pushed again. So a node removed from a range and given it again could otherwise
+report its old copy, and vote with stale state. Each assignment therefore has a **generation**:
+
+- When the publisher gives a node a range, it stamps the owner with one more than the directory revision its plan
+  read. An owner keeps its generation through splits and state changes. The generation is stored with the owner in the
+  directory entry (`Range.Owner.generation`).
+- A pushed `Ranges` carries the member's generation of each span, and a set whose generations changed is pushed again.
+- The node holds a copy for the generation it copied for. When a pushed set lists a span for another generation, or
+  no longer lists it, the node forgets that copy. Its report (`RangesAck.ready` and `generations`) names the
+  generation of each held span.
+- The holding relay counts a span ready only for the reported generation, and shares it with its siblings in `Ready`.
+  The publisher counts it only when it equals the owner's current generation.
+
+`handoff.tla` models this with `Reported = TRUE` (`handoff-volume.cfg`). Owners have generations (`gen`). The relay
+keeps the generation it last pushed (`sent`) and the node's latest report (`rep`). The node keeps the generation of the
+last frame it processed (`known`) and the one it holds a copy for (`held`). `copy` is a ghost there: the node's data is
+current, which a write that drops the node, or gives it the range anew, ends whatever the node believes. `Wipe` empties
+a node's disk while it is down. `ReadyCopied` checks that an owner becomes `ready` only while its data is current.
+`ReadyHasData` is left out, because a wipe breaks it on purpose: a wiped `ready` owner repairs before it serves. The
+config bounds directory revisions to four and disconnects to one (`Capped`) and has no partitions (`handoff.cfg`
+checks those). With the generations, an unbounded run passed 6 GB of state without finishing, and `MaxRev = 6` with
+two disconnects passed 4.7 GB in 2 h 40 min without finishing.
+
+| `Bug` | Breaks | What it does |
+| --- | --- | --- |
+| `early-report` | `ReadyCopied` | The node reports a range it is still copying |
+| `no-gen` | `ReadyCopied` | Reports and pushes ignore the generation, so a node removed and given the range again in revisions its relay skipped is ready with its old copy |
+
+Keeping the report across a disconnect is safe: the next relay pushes the set again, and its acknowledgement replaces
+the report before the member can count as ready.
+
+TLC 1.8.0, 2026-11-17, `handoff-volume.cfg` (`Points = {0}`, `MaxRev = 4`, `MaxCuts = 1`): 61,589,313 generated and
+5,588,055 distinct states, depth 37, no violation (10 min 12 s, 2 workers). `early-report` and `no-gen` each break
+`ReadyCopied`.
+
+`handoff-volume-faulty.cfg` adds faulty revokes and partitions (`Faulty`, `MaxFlips = 2`, `MaxRev = 3`, `MaxCuts = 1`):
+1,449,467,879 generated and 108,769,092 distinct states, depth 45, no violation (1 h 47 min, 3 workers, 8 GB heap,
+2026-11-17). Both bugs break `ReadyCopied`. `MaxRev = 4` passed 62 million distinct states in 45 min (5 workers)
+without finishing. At `MaxRev = 3` a single point already reaches both bugs' counterexamples.
+
+`handoff-volume-split.cfg` (`Points = {0, 1}`, `MaxRev = 3`, `MaxCuts = 1`, no faults) has not finished: on 2026-11-18
+it was stopped after 5 h 18 min (3 workers, 10 GB heap) at depth 20, with 1,978,844,310 generated and 215,517,654
+distinct states, 86 million left on the queue and no violation. Each depth took about twice as long as the last.
+
 ## Drain records
 
 #68 / B-21b. An operator drains a node or a cell by writing the entry `drain/{id}` into the cell's membership namespace
