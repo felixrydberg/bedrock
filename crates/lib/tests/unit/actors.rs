@@ -15,6 +15,7 @@ fn topology(dcs: Vec<Dc>) -> Topology {
         region: "eu".into(),
         version: 1,
         dcs,
+        previous_dcs: Vec::new(),
     }
 }
 
@@ -382,4 +383,35 @@ fn kinds_have_stable_names() {
         assert_eq!(Kind::parse(name).unwrap().as_str(), name);
     }
     assert_eq!(Kind::parse("worker"), None);
+}
+
+/// S-17: while a DC joins, `dc_before` ranks the old list, and only the actors the new DC ranks first move to it.
+#[test]
+fn a_dc_change_moves_only_the_actors_the_new_dc_ranks_first() {
+    let before = eu();
+    assert_eq!(dc_before(&named("alice"), &before).unwrap(), None);
+    let mut after = eu();
+    after.dcs.push(dc("eu-d", &["d1"]));
+    after.previous_dcs = before.dcs.clone();
+    let after = Topology::decode_record("eu", &after.encode_to_vec()).unwrap();
+    let mut moved = 0;
+    for i in 0..1000 {
+        let id = named(&i.to_string());
+        let old = dc_of(&id, &before).unwrap();
+        assert_eq!(dc_before(&id, &after).unwrap(), Some(old));
+        let new = dc_of(&id, &after).unwrap();
+        if new != old {
+            assert_eq!(new.name, "eu-d", "an actor moves only to the new DC");
+            moved += 1;
+        }
+    }
+    // About a quarter of the actors move to the fourth DC.
+    assert!((180..320).contains(&moved), "moved {moved}");
+
+    let mut broken = after.clone();
+    broken.previous_dcs.push(dc("eu-a", &["x1"]));
+    assert!(matches!(
+        Topology::decode_record("eu", &broken.encode_to_vec()),
+        Err(Error::Malformed(_))
+    ));
 }

@@ -29,6 +29,7 @@
 pub mod db;
 pub mod placement;
 pub mod readers;
+pub mod restore;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
