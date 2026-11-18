@@ -518,6 +518,7 @@ async fn early(cluster: Cluster) -> u64 {
     let mut repairing = tokio::spawn(async move { c.tick(&directory, &BTreeMap::new()).await });
     // c has copied b and waits before a; a repair that fails first is reported, not waited on.
     tokio::select! {
+        biased;
         () = gate.reached.notified() => {}
         ended = &mut repairing => panic!("the repair ended before reaching a: {ended:?}"),
         () = sleep(Duration::from_secs(60)) => panic!("the repair did not reach a"),

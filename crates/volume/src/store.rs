@@ -605,11 +605,6 @@ impl Store {
         Ok(())
     }
 
-    /// Lifts a seal, when the range stays here after all.
-    pub fn unseal(&self, start: u64, end: u64) -> Result<(), Error> {
-        self.remark(|m| m.sealed.remove(start, end))
-    }
-
     pub fn mark_repaired(&self, start: u64, end: u64) -> Result<(), Error> {
         self.remark(|m| m.repaired.add(start, end))
     }

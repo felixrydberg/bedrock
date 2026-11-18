@@ -798,7 +798,7 @@ fn records(store: &Store) -> Vec<pb::Record> {
 }
 
 #[test]
-fn a_sealed_range_refuses_reservations_claims_and_appends_until_unsealed() {
+fn a_sealed_range_refuses_reservations_claims_and_appends() {
     let store = store();
     let actor = actor();
     let a = host("a");
@@ -820,11 +820,6 @@ fn a_sealed_range_refuses_reservations_claims_and_appends_until_unsealed() {
     let reopened = Store::new(store.engine.clone());
     reopened.recover().unwrap();
     assert!(matches!(reopened.reserve(&actor, 2, 0), Err(Error::Sealed)));
-    reopened.unseal(0, 0).unwrap();
-    assert_eq!(
-        refused(&reopened.reserve(&actor, 2, 0).unwrap()),
-        Refusal::None
-    );
 }
 
 #[test]

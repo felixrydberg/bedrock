@@ -128,15 +128,9 @@ impl Repair {
                 return Ok(false);
             }
             // A copy made for another assignment of the range is stale: others may have written since.
-            Some(_) if held.generation(start, end) == Some(generation) => {
-                if mine == Some(State::Ready) && self.store.sealed().overlaps(start, end) {
-                    let store = self.store.clone();
-                    blocking(move || store.unseal(start, end))
-                        .await?
-                        .map_err(status)?;
-                }
-                return Ok(false);
-            }
+            // A seal is never lifted: a leaving owner never becomes ready again (`docs/spec/handoff.tla`, `Write`), and a
+            // node whose view still says ready when sealed is only behind the copier that sealed it.
+            Some(_) if held.generation(start, end) == Some(generation) => return Ok(false),
             _ => {}
         }
         self.store.copying(start, end, generation, true);
@@ -342,7 +336,7 @@ impl Repair {
 }
 
 /// Whether one actor's records agree with its claim: its log holds exactly the entries after the flushed point through
-/// the log end, and no overlay record is newer than the log end.
+/// the log end, with nondecreasing epochs and the log end's epoch last, and no overlay record is newer than the log end.
 fn consistent(records: &[pb::Record]) -> Result<bool, Status> {
     let Some(at) = records.first().and_then(|r| store::prefix_len(&r.key)) else {
         return Ok(true);
@@ -355,9 +349,15 @@ fn consistent(records: &[pb::Record]) -> Result<bool, Status> {
     let claim = pb::ClaimRecord::decode(claim.value.as_slice()).map_err(corrupt)?;
     let end = claim.end.map_or(claim.flushed, |e| e.seq);
     let mut seqs = Vec::new();
+    let mut epoch = 0;
     for record in records {
         let name = &record.key[at..];
         if let Some(seq) = name.strip_prefix(b"log/") {
+            let entry = pb::Entry::decode(record.value.as_slice()).map_err(corrupt)?;
+            if entry.epoch < epoch {
+                return Ok(false);
+            }
+            epoch = entry.epoch;
             seqs.push(u64::from_be_bytes(seq.try_into().unwrap_or_default()));
         } else if name.starts_with(b"data/") {
             let overlay = pb::OverlayRecord::decode(record.value.as_slice()).map_err(corrupt)?;
@@ -366,7 +366,9 @@ fn consistent(records: &[pb::Record]) -> Result<bool, Status> {
             }
         }
     }
-    Ok(seqs.into_iter().eq(claim.flushed + 1..=end))
+    // A log rewritten between pages can keep its seqs; the last entry then has another epoch than the copied claim's end.
+    let last = claim.end.filter(|_| end > claim.flushed).map(|e| e.epoch);
+    Ok(seqs.into_iter().eq(claim.flushed + 1..=end) && last.is_none_or(|e| e == epoch))
 }
 
 /// What this node holds of the `volume` dataset, for the reports its relay counts readiness from.

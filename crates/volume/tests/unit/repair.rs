@@ -171,3 +171,19 @@ async fn a_copy_made_for_another_assignment_is_made_again() {
     // The same assignment's copy is not made again.
     assert!(!repair.tick(&handoff(), &generations).await.unwrap());
 }
+
+#[test]
+fn a_log_rewritten_at_the_same_seqs_is_torn() {
+    let (records, _) = source().records(0, 0, &[], store::MAX_LIMIT).unwrap();
+    assert!(consistent(&records).unwrap());
+    // Another holder replaced the last entry after the claim's page: its seqs still run to the claim's end.
+    let mut torn = records.clone();
+    let last = torn
+        .iter_mut()
+        .rfind(|r| r.key.ends_with(&3u64.to_be_bytes()))
+        .unwrap();
+    let mut entry = pb::Entry::decode(last.value.as_slice()).unwrap();
+    entry.epoch = 2;
+    last.value = entry.encode_to_vec();
+    assert!(!consistent(&torn).unwrap());
+}
