@@ -973,17 +973,18 @@ fn copied_log_bytes_count_once_and_a_copy_cut_short_clears_to_zero() {
 fn a_copy_finished_after_a_set_forgot_it_is_not_held_and_reports_forget_nothing() {
     let store = store();
     store.initialize(true).unwrap();
-    let forgotten = store.forgotten();
-    store.copying(0, 0, 3, true);
+    let forgotten = store.start_copy(0, 0, 3);
     store.keep(&[(0, 0, 4)]).unwrap();
-    store.copying(0, 0, 3, false);
-    assert!(!store.hold_unless_forgotten(0, 0, 3, forgotten).unwrap());
+    assert!(!store.finish_copy(0, 0, 3, forgotten, true).unwrap());
     assert!(store.held().list().is_empty());
-    assert!(
-        store
-            .hold_unless_forgotten(0, 0, 4, store.forgotten())
-            .unwrap()
-    );
+    // A copy that failed is no longer being made, so a set without it forgets nothing.
+    let forgotten = store.start_copy(0, 0, 4);
+    assert!(!store.finish_copy(0, 0, 4, forgotten, false).unwrap());
+    let before = store.forgotten();
+    store.keep(&[]).unwrap();
+    assert_eq!(store.forgotten(), before);
+    let forgotten = store.start_copy(0, 0, 4);
+    assert!(store.finish_copy(0, 0, 4, forgotten, true).unwrap());
     assert_eq!(store.holding(&[(0, 0, 4)]).list(), [(0, 0)]);
     assert!(store.holding(&[(0, 0, 5)]).list().is_empty());
     assert_eq!(

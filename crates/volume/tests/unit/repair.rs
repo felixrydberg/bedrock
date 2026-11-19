@@ -187,3 +187,49 @@ fn a_log_rewritten_at_the_same_seqs_is_torn() {
     last.value = entry.encode_to_vec();
     assert!(!consistent(&torn).unwrap());
 }
+
+/// No other slot holds anything: a repair copies nothing and leaves the range repaired.
+struct Nobody;
+
+#[async_trait]
+impl Peers for Nobody {
+    async fn sources(&self, _: u64, _: u64) -> Result<Vec<Source>, Status> {
+        Ok(Vec::new())
+    }
+
+    async fn slots(&self, _: &pb::Actor) -> Result<[String; actors::SLOTS], Status> {
+        unreachable!("nothing is copied")
+    }
+
+    async fn page(&self, _: &Source, _: pb::RepairRequest) -> Result<pb::RepairReply, Status> {
+        unreachable!("there are no sources")
+    }
+}
+
+#[tokio::test]
+async fn a_fresh_store_given_a_range_again_repairs_its_old_copy() {
+    // A cell's first owner holds its range at generation 1, with an actor in it.
+    let target = source();
+    decide(&target, &Directory::new(), "d").unwrap();
+    target.hold(0, 0, 1).unwrap();
+    let ready = Directory::from([(
+        0,
+        vec![Owner {
+            node: "d".into(),
+            state: State::Ready,
+        }],
+    )]);
+    let generations = BTreeMap::from([(0, BTreeMap::from([("d".to_owned(), 2)]))]);
+    let held = Repair::new(target.clone(), Arc::new(Nobody), "d", "cell-c")
+        .tick(&ready, &generations)
+        .await
+        .unwrap();
+    assert!(held);
+    assert_eq!(target.held().generation(0, 0), Some(2));
+    assert!(
+        target.repaired().overlaps(0, 0),
+        "the range is repaired, not trusted"
+    );
+    let (records, _) = target.records(0, 0, &[], store::MAX_LIMIT).unwrap();
+    assert!(records.is_empty(), "the stale copy is gone");
+}

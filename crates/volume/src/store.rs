@@ -530,19 +530,22 @@ impl Store {
         self.remark(|m| m.held.add_generation(start, end, generation))
     }
 
-    /// [`Store::hold`], unless a held span or a copy was forgotten since [`Store::forgotten`] returned `forgotten`: the
-    /// copy may then be stale. Checked under the marks lock, so a [`Store::keep`] cannot slip in between. Returns
-    /// whether it holds.
-    pub fn hold_unless_forgotten(
+    /// Ends the copy of `[start, end)` that [`Store::start_copy`] began, and holds it for `generation` if it `copied` and
+    /// no held span or copy was forgotten since `start_copy` returned `forgotten`: the copy may then be stale. Both happen
+    /// under the marks lock, so a [`Store::keep`] either sees the copy being made or the span held. Returns whether it
+    /// holds.
+    pub fn finish_copy(
         &self,
         start: u64,
         end: u64,
         generation: u64,
         forgotten: u64,
+        copied: bool,
     ) -> Result<bool, Error> {
         let mut held = false;
         self.remark(|m| {
-            if m.forgotten == forgotten {
+            m.copying.remove(start, end);
+            if copied && m.forgotten == forgotten {
                 m.held.add_generation(start, end, generation);
                 held = true;
             }
@@ -581,14 +584,12 @@ impl Store {
         Ok(stays)
     }
 
-    /// Notes that a copy is filling `[start, end)`, or no longer is: a pushed set without it makes the copy stale.
-    pub fn copying(&self, start: u64, end: u64, generation: u64, on: bool) {
+    /// Notes that a copy is filling `[start, end)` for `generation`, and returns how often a held span was forgotten, read
+    /// under the same lock: a pushed set without the span from now on makes the copy stale ([`Store::finish_copy`]).
+    pub fn start_copy(&self, start: u64, end: u64, generation: u64) -> u64 {
         let mut marks = self.marks();
-        if on {
-            marks.copying.add_generation(start, end, generation);
-        } else {
-            marks.copying.remove(start, end);
-        }
+        marks.copying.add_generation(start, end, generation);
+        marks.forgotten
     }
 
     /// Seals `[start, end)` for a range handoff: once this returns, no reservation, claim or append there is in flight or

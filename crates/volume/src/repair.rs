@@ -133,15 +133,13 @@ impl Repair {
             Some(_) if held.generation(start, end) == Some(generation) => return Ok(false),
             _ => {}
         }
-        self.store.copying(start, end, generation, true);
-        let forgotten = self.store.forgotten();
+        let forgotten = self.store.start_copy(start, end, generation);
         let copied = self.fill(start, end, owners, mine).await;
-        self.store.copying(start, end, generation, false);
-        copied?;
-        let store = self.store.clone();
-        let held = blocking(move || store.hold_unless_forgotten(start, end, generation, forgotten))
+        let (store, ok) = (self.store.clone(), copied.is_ok());
+        let held = blocking(move || store.finish_copy(start, end, generation, forgotten, ok))
             .await?
             .map_err(status)?;
+        copied?;
         if !held {
             return Ok(false);
         }
@@ -176,7 +174,11 @@ impl Repair {
                 }
             }
             _ => {
-                if self.store.fresh() != Some(true) || self.store.repaired().overlaps(start, end) {
+                // A fresh store trusts only what it never held: a copy of another assignment is stale.
+                if self.store.fresh() != Some(true)
+                    || self.store.repaired().overlaps(start, end)
+                    || self.store.held().overlaps(start, end)
+                {
                     self.repair(start, end).await?;
                 }
             }
