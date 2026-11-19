@@ -67,7 +67,7 @@ Reuse the shared L2 range placement (`kv.md` §9–10, `feature-drafts.md` §4 d
 Reuse KV's replication and sequencing system (§8).
 
 - Introduce a `cdn` dataset with global retention namespaces, replicated to every region. The deploy control plane uses
-  `workers` and `pages`; the CDN treats namespace names and deployment IDs as opaque. Its records are never evicted.
+  one, `deployments` (`feature-drafts.md` §4 decision 17); the CDN treats namespace names and deployment IDs as opaque. Its records are never evicted.
 - There are no manifests. A deployment is two kinds of keys, written in bulk (B-09c) and split into several bulks when it
   exceeds the size cap. Callers reference the deployment only after the last bulk succeeds (`feature-drafts.md` §4
   decision 14, B-33):
@@ -87,7 +87,7 @@ The CDN is a backing service and knows nothing about deployments. It provides:
 - Retrieval of a path row by key and of an artifact by hash.
 - Prewarming on publish, readiness for a set of artifacts, and artifact garbage collection.
 
-Workers, Pages, deployments, activation and rollbacks belong to the Compute and deploy control plane, a client of the CDN and of
+Workers, their static assets, deployments, activation and rollbacks belong to the Compute and deploy control plane, a client of the CDN and of
 Quicksilver. It publishes before it activates. Its Gateway resolves a host or project name to a deployment UUID in Quicksilver,
 then reads the path row and the artifact from the CDN.
 
@@ -101,7 +101,7 @@ then reads the path row and the artifact from the CDN.
 - `CacheStorage` abstraction and Foyer adapter.
 - Artifact transfer and checksum verification.
 - Path rows, ref keys and the publish client.
-- Hash-addressed artifact retrieval (Worker and Pages front ends are part of the deploy control plane).
+- Hash-addressed artifact retrieval (Worker and asset front ends are part of the deploy control plane).
 
 ### Phase 2 — Distributed CDN
 

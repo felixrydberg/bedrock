@@ -181,7 +181,7 @@ Rules this implies:
 | [B-38](https://github.com/felixrydberg/bedrock/issues/86) | Full cache lifecycle and eviction | KV | `kv/storage` | B-29 |
 | [B-40](https://github.com/felixrydberg/bedrock/issues/87) | `full_replica` placement and completeness | KV | `quicksilver/storage`, `lib/buckets` | B-24, B-21 |
 | [B-41](https://github.com/felixrydberg/bedrock/issues/88) | Adaptive cache promotion and regional load balancing | KV | `kv/operations`, `lib/relays` | B-38 |
-| [B-42](https://github.com/felixrydberg/bedrock/issues/90) | Auth dataset | Shared infrastructure | `gateway` | B-57 |
+| [B-42](https://github.com/felixrydberg/bedrock/issues/90) | Auth dataset | Shared infrastructure | `gateway` | B-57, B-57b |
 | ~~B-53~~ | ~~Namespace residency fairness and cold-open tuning~~ (replaced by S-05's per-actor database measurements) | — | — | — |
 | **K — CDN refinements** (parallel with J) |||||
 | [B-43](https://github.com/felixrydberg/bedrock/issues/91) | Artifact replica repair and range migration | CDN | `cdn/retention` | B-36 |
@@ -201,7 +201,8 @@ Rules this implies:
 | [B-54](https://github.com/felixrydberg/bedrock/issues/44) | Deployment guide: private networking and node certificates (Kubernetes, Docker, bare metal) | Foundation (docs) | `docs/deployment/` + `deploy/` | B-02, B-55 |
 | **N — Shared platform infrastructure (future)** |||||
 | [B-56](https://github.com/felixrydberg/bedrock/issues/102) | Shared API rate-limit infrastructure | Shared infrastructure | shared contracts in `lib`; API integration | To be agreed; does not gate initial KV |
-| [B-57](https://github.com/felixrydberg/bedrock/issues/89) | Gateway binary and shared cluster client | Shared infrastructure | `gateway`, `lib` client, `lib/relays` | B-19, B-22, B-55 |
+| [B-57](https://github.com/felixrydberg/bedrock/issues/89) | Gateway binary and routing between cells (part 1) | Shared infrastructure | `gateway`, `lib` client, `lib/relays` | B-19, B-22, B-55 |
+| [B-57b](https://github.com/felixrydberg/bedrock/issues/140) | Gateway public listener and relay freshness request (part 2) | Shared infrastructure | `gateway`, `lib/relays` | B-57 |
 | [B-61](https://github.com/felixrydberg/bedrock/issues/66) | Simulation speed: more simulated seconds per real second | Shared infrastructure | `tests/sim`, `scripts/vopr.sh` | B-23 |
 | [B-62](https://github.com/felixrydberg/bedrock/issues/103) | Partial quarantine: rebuild only the damaged range | Shared core | `lib/health` + `lib/reconciliation` + `lib/relays` | B-14, B-21, B-22, B-23 |
 | [B-63](https://github.com/felixrydberg/bedrock/issues/104) | Operational scenarios: scale out, drain, cancel and rolling restart under load | Shared core | `tests/sim`, `tests/crash` | B-23, B-21b |
@@ -808,8 +809,8 @@ Created: [#96](https://github.com/felixrydberg/bedrock/issues/96) — Feature �
 
 ### L — Compute and deploy control plane (future)
 
-KV, CDN and (later) Compute are backing services. Everything that knows about Workers, Pages, deployments or revisions lives here,
-as a client of those services. Nothing in tracks A-K depends on this track. Worker execution runs in `bedrock-compute`
+KV, CDN and (later) Compute are backing services. Everything that knows about Workers, deployments, assets or revisions lives
+here (decision 17: "Pages" is API wording only), as a client of those services. Nothing in tracks A-K depends on this track. Worker execution runs in `bedrock-compute`
 through S-10's shared execution layer: a Worker request is a stateless sandbox invocation of a CDN artifact, not an
 actor. B-51 routes it to a compute host, and B-52/B-60 exercise it. The deploy control plane's crate is decided when
 the track starts.
@@ -909,6 +910,12 @@ Created: [#102](https://github.com/felixrydberg/bedrock/issues/102) — Feature 
 #### B-57 — Gateway binary and shared cluster client
 
 Created: [#89](https://github.com/felixrydberg/bedrock/issues/89) — Feature 🚀: Gateway binary and shared client for routing between nodes and cells
+
+---
+
+#### B-57b — Gateway public listener and relay freshness request
+
+Created: [#140](https://github.com/felixrydberg/bedrock/issues/140) — Feature 🚀: Gateway public listener and relay freshness request
 
 ---
 
@@ -1172,21 +1179,22 @@ issue, its body is written from those sections in the usual template. All are cr
         and the whole-range follow of `cdn` (decision 14).
 14. **CDN: path rows and ref keys instead of manifests.** Decided 2026-11-02.
     Replaces the manifest file, the `RETAIN_*`/`RELEASE_*` operations and the manifest reference counts in B-32, B-33 and B-35.
-    - **Records** in the `cdn` dataset. The namespace is the caller's retention namespace (`workers`, `pages`), opaque to the CDN.
-      - `path/{deployment_id}/{path}` → `{sha256, content type, size}`: which bytes a URL path serves. Pages only.
+    - **Records** in the `cdn` dataset. The namespace is the caller's retention namespace (`deployments`, decision 17), opaque to the CDN.
+      - `path/{deployment_id}/{path}` → `{sha256, content type, size}`: which bytes a URL path serves: the deployment's static assets.
       - `ref/{sha256}/{deployment_id}` → empty: keeps the artifact. An artifact is retained while any `ref/{sha256}/…` key exists
         in any namespace; two deployments sharing a file write two ref keys and hold one copy.
     - **Deployment IDs** are immutable UUIDs. A project name resolves to a UUID in Quicksilver, never in a CDN key, so rows never
       change and every cache keeps them without invalidation. To the CDN the ID is an opaque string.
     - **Placement:** `ref/` keys by the first 8 bytes of their sha256, ignoring the namespace, so an artifact's holders receive
-      exactly its ref keys and `workers` and `pages` share one holder set. Path rows use the normal `(dataset, namespace, key)` hash.
+      exactly its ref keys and every namespace shares one holder set. Path rows use the normal `(dataset, namespace, key)` hash.
     - **Writes:** a publish uploads the bytes to S3 by sha256, then writes every path row and ref key of the deployment in bulk
       (B-09c): one revision for all of them. A deployment larger than one bulk is split; the caller records the last bulk's
       revision. Release starts only after the control plane removed its references to the deployment, then deletes the same
       keys in bulks under the cap, retrying any that fail. Rerunning either converges.
-    - **Reads (Gateway, B-51):** host or project → `deployment_id` → `deployment/{id}` in Quicksilver says Worker or Pages. A Worker
-      goes to compute, and its record holds the bundle's sha256. Pages reads `path/{id}/{path}` at the recorded minimum revision,
-      then the artifact from its sha256's holders. Both are point reads of immutable data, so a warm Gateway does neither.
+    - **Reads (Gateway, B-51):** host or project → `deployment_id` → `deployment/{id}` in Quicksilver. The Gateway reads
+      `path/{id}/{path}` at the recorded minimum revision and serves a hit from its sha256's holders; a miss, or a route that
+      runs the Worker first, goes to compute with the bundle's sha256 (decision 17). Both are point reads of immutable data,
+      so a warm Gateway does neither.
     - **No derived state.** Holders keep path rows and ref keys as ordinary L2 range data, rebuilt by range bootstrap (B-21).
       Ref keys arriving trigger prewarming (B-34); the last ref key of an artifact leaving makes it a GC candidate (B-44).
     - **Storage tiers.** L2 owners keep path rows and ref keys on disk and never evict them; they hold artifact bytes until idle
@@ -1272,6 +1280,20 @@ issue, its body is written from those sections in the usual template. All are cr
     - **Changes to earlier decisions:** 4 (lease heartbeats for actors), 5 (slots span a DC's cells), 11 (the writer is a
       `kv` actor; PR #74 closed, #58 amended), 12 (`bedrock-kv` is the read side), 15 (sibling-cell routing tables), plus
       B-21 (node-reported readiness for `volume` ranges, a protocol change) and B-50 (cron schedules on activation).
+17. **One deployment kind: a Worker with static assets.** Decided 2026-11-19. Follows Cloudflare's Workers Static Assets.
+    - **Model:** a deployment has an optional Worker bundle, an optional asset set (path rows, decision 14) and a routing
+      config: which routes run the Worker first, and what a missing asset does (404, a fallback page, or the Worker). There
+      is no separate Pages kind in the backend.
+    - **Serving:** the Gateway serves assets itself, never through compute. It forwards to a compute host only on an asset
+      miss with a Worker, or on a route that runs the Worker first. Inside the sandbox, an `ASSETS` binding reads the same
+      path rows and artifacts through the CDN, checked outside the sandbox like other bindings.
+    - **Naming:** "Workers" and "Pages" are API wording of the Cloudflare compatibility layer only. Backend records, crates,
+      CDN retention namespaces (one namespace, `deployments`) and metrics use "deployment", "Worker bundle" and "assets".
+    - **Pages compatibility** (later, `future-development.md`): a Pages publish translates into a deployment at publish
+      time. Nothing Pages-specific exists after publish.
+    - **Changes to earlier decisions:** 14 (one retention namespace; path rows are a deployment's assets; the Gateway read
+      order), B-50 (one deployment record), B-51 (assets at the Gateway, Worker on miss), S-10 (`ASSETS` binding), B-60
+      (deployment load, not Worker and Pages load).
 
 ### Still open
 
