@@ -94,6 +94,10 @@ volume-truncate skip-any TruncatedInS3
 volume_cold-split no-retire NoLostFlush
 volume_cold-split no-cas NoLostFlush
 volume_cold-move no-adopt Consistent
+volume_dc no-import NoLostAck
+volume_dc early-import NoLostAck
+volume_dc serve-moved OneWriter
+volume_dc flush S3Committed
 '
 
 tlc() {
@@ -135,7 +139,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move"
+models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move volume_dc"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

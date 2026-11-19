@@ -7,6 +7,10 @@ The cell's relays now own this control authority through embedded Raft; `cell.tl
 Actor storage on `bedrock-volume` (claims, quorum appends, lease, release, slot repair, range handoff and topology
 changes): [S-02 / #110](volume.md).
 Its cold tier (range databases split and merged by clone, first-slot moves): [S-05 / #113](volume.md#cold-tier-range-databases-s-05-113), `volume_cold.tla`.
+Moving an actor to another DC (a committed MOVE entry fences the old DC, the new DC's slots are imported from S3
+through it, and only imported slots take claims): S-17 / #125, `volume_dc.tla`. Its full config has not yet finished
+a run: on 2026-11-19 it passed 19 million distinct states at 2 workers without a violation before it was stopped, to be
+run on a larger machine (`scripts/tlc.sh volume_dc`).
 
 The standalone writer persists directly to SlateDB in S3. See
 [the atomic namespace protocol model](materialized.md) for its bounded checks and
