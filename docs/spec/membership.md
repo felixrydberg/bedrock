@@ -177,6 +177,10 @@ without finishing. At `MaxRev = 3` a single point already reaches both bugs' cou
 `handoff-volume-split.cfg` (`Points = {0, 1}`, `MaxRev = 3`, `MaxCuts = 1`, no faults) has not finished: on 2026-11-18
 it was stopped after 5 h 18 min (3 workers, 10 GB heap) at depth 20, with 1,978,844,310 generated and 215,517,654
 distinct states, 86 million left on the queue and no violation. Each depth took about twice as long as the last.
+At `MaxRev = 2` it did not finish either: stopped the same day after 7 h 24 min (3 workers, 10 GB heap) at depth 25,
+with 2,580,868,106 generated and 192,578,110 distinct states, 41 million left on the queue and no violation. Its two
+bugs were not run. It is therefore not among `scripts/tlc.sh`'s default models; `scripts/tlc.sh handoff-volume-split`
+runs it and its bugs alone.
 
 ## Drain records
 

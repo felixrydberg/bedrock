@@ -108,7 +108,8 @@ A model with several configs names each `model-variant.cfg`. `volume` has five, 
 ([volume.md](volume.md)).
 `handoff` has three more configs for readiness of `volume` ranges, which the node reports and its relay checks (#114 /
 S-06, [membership.md](membership.md#node-reported-readiness-volume-114--s-06)): `handoff-volume`, `handoff-volume-split`
-with two points, and `handoff-volume-faulty` with partitions and faulty revokes.
+with two points, which has not finished and is left out of the default run, and `handoff-volume-faulty` with partitions
+and faulty revokes.
 
 On 2026-11-09, `service_isolation` passed 2,640,649 generated states / 182,408 distinct states; its six deliberate
 fault checks also detected their intended violations. The model checks independent enabling, not eventual progress.

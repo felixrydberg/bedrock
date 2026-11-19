@@ -135,7 +135,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-split handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move"
+models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;
