@@ -43,8 +43,8 @@ const CAPABILITIES: &[Capability] = &[
         namespaces: &[],
         ranged_service: None,
     },
-    // Actor slots (#111 / S-03): relay-assigned hash ranges with no relay data. The owner, not a relay stream, decides
-    // when it is ready (S-06).
+    // Actor slots (#111 / S-03): relay-assigned hash ranges with no relay data. The owner copies a range itself and
+    // reports holding it, which its relay checks before it counts the owner ready (#114 / S-06).
     Capability {
         dataset: VOLUME,
         pushed: false,

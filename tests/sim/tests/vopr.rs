@@ -1319,6 +1319,7 @@ async fn rogue(run: Arc<Run>, kind: Rogue) {
     let owner = |node: &str, state: Pb| pb::range::Owner {
         node_id: node.to_owned(),
         state: state as i32,
+        generation: 0,
     };
     let range = |owners: Vec<pb::range::Owner>| pb::Range { owners }.encode_to_vec();
     let sick = members

@@ -10,8 +10,13 @@
 //! before it returns, and RocksDB group-commits concurrent batches into one fsync, so an answer always follows its fsync.
 //!
 //! The rules are the model's: [`Store::reserve`] is `Reserve`, [`Store::claim`] is `Grant` and [`Store::append`] is
-//! `Replicate`. A `repaired` slot (S-06 marks it) takes claims and appends, but its answers say it does not vote; it
-//! votes again once an append shows that a claim above its reservation has committed.
+//! `Replicate`. A `repaired` slot takes claims and appends, but its answers say it does not vote; it votes again once an
+//! append shows that a claim above its reservation has committed.
+//!
+//! Range marks (#114 / S-06, `crate::repair`) sit outside the actor keys, each one record of hash spans: `m/held` (spans
+//! this node holds a complete copy of), `m/sealed` (spans a range handoff sealed: no reservation, claim or append),
+//! `m/repaired` (spans where an actor with no claim record here starts `repaired`, with floor 0) and `m/fresh` (the
+//! store started empty while this node owned no range, so a range it is first given `ready` has nothing to copy).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -46,6 +51,8 @@ pub enum Error {
     Invalid(String),
     /// Too much is not yet flushed to S3; the holder retries later. Nothing was written.
     Backpressure,
+    /// A range handoff sealed the actor's range here (S-06); its new owner serves it once ready.
+    Sealed,
 }
 
 impl From<StorageError> for Error {
@@ -120,7 +127,7 @@ impl Actor {
     }
 
     /// The actor whose slot-store prefix `prefix` is, back from its bytes.
-    fn parse(prefix: &[u8], kind: i32) -> Option<pb::Actor> {
+    pub fn parse(prefix: &[u8], kind: i32) -> Option<pb::Actor> {
         let rest = prefix.strip_prefix(b"s/")?.get(8..)?;
         let mut parts = rest.split(|b| *b == 0);
         let namespace = String::from_utf8(parts.next()?.to_vec()).ok()?;
@@ -171,6 +178,194 @@ pub fn span(start: u64, end: u64) -> KeyRange {
     }
 }
 
+/// Hash spans `[start, end)`, each with a generation (0 where it has none): start → (end, generation), with 2⁶⁴ as the
+/// end of the hash space. Touching spans of one generation coalesce.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Spans(BTreeMap<u64, (u128, u64)>);
+
+fn end_of(end: u64) -> u128 {
+    if end == 0 { 1 << 64 } else { u128::from(end) }
+}
+
+impl Spans {
+    pub fn contains(&self, hash: u64) -> bool {
+        self.0
+            .range(..=hash)
+            .next_back()
+            .is_some_and(|(_, (end, _))| u128::from(hash) < *end)
+    }
+
+    /// The generation of the one span that covers `[start, end)` (`end` 0 meaning 2⁶⁴).
+    pub fn generation(&self, start: u64, end: u64) -> Option<u64> {
+        self.0
+            .range(..=start)
+            .next_back()
+            .filter(|(_, (e, _))| end_of(end) <= *e)
+            .map(|(_, (_, generation))| *generation)
+    }
+
+    /// Whether `[start, end)` lies inside one span.
+    pub fn covers(&self, start: u64, end: u64) -> bool {
+        self.generation(start, end).is_some()
+    }
+
+    pub fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.0
+            .iter()
+            .any(|(s, (e, _))| u128::from(*s) < end_of(end) && *e > u128::from(start))
+    }
+
+    pub fn add(&mut self, start: u64, end: u64) {
+        self.add_generation(start, end, 0);
+    }
+
+    /// Adds `[start, end)` for `generation`, replacing what it overlaps.
+    pub fn add_generation(&mut self, start: u64, end: u64, generation: u64) {
+        self.remove(start, end);
+        let (mut from, mut to) = (u128::from(start), end_of(end));
+        let touching: Vec<u64> = self
+            .0
+            .iter()
+            .filter(|(s, (e, g))| *g == generation && (u128::from(**s) == to || *e == from))
+            .map(|(s, _)| *s)
+            .collect();
+        for s in touching {
+            let (e, _) = self.0.remove(&s).unwrap();
+            from = from.min(u128::from(s));
+            to = to.max(e);
+        }
+        self.0.insert(from as u64, (to, generation));
+    }
+
+    pub fn remove(&mut self, start: u64, end: u64) {
+        let (from, to) = (u128::from(start), end_of(end));
+        let cut: Vec<(u64, (u128, u64))> = self
+            .0
+            .iter()
+            .filter(|(s, (e, _))| u128::from(**s) < to && *e > from)
+            .map(|(s, e)| (*s, *e))
+            .collect();
+        for (s, (e, g)) in cut {
+            self.0.remove(&s);
+            if u128::from(s) < from {
+                self.0.insert(s, (from, g));
+            }
+            if e > to {
+                self.0.insert(to as u64, (e, g));
+            }
+        }
+    }
+
+    /// The spans as `(start, end)`, `end` 0 meaning 2⁶⁴.
+    pub fn list(&self) -> Vec<(u64, u64)> {
+        self.entries().into_iter().map(|(s, e, _)| (s, e)).collect()
+    }
+
+    /// The spans as `(start, end, generation)`.
+    pub fn entries(&self) -> Vec<(u64, u64, u64)> {
+        self.0
+            .iter()
+            .map(|(s, (e, g))| (*s, if *e == 1 << 64 { 0 } else { *e as u64 }, *g))
+            .collect()
+    }
+
+    /// The parts of these spans inside `[start, end)`.
+    pub fn within(&self, start: u64, end: u64) -> Spans {
+        let mut inside = self.clone();
+        if start > 0 {
+            inside.remove(0, start);
+        }
+        if end != 0 {
+            inside.remove(end, 0);
+        }
+        inside
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        self.entries()
+            .into_iter()
+            .flat_map(|(s, e, g)| [s.to_be_bytes(), e.to_be_bytes(), g.to_be_bytes()].concat())
+            .collect()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let (triples, rest) = bytes.as_chunks::<24>();
+        if !rest.is_empty() {
+            return Err(Error::Storage(StorageError::Corruption(ErrorContext {
+                engine: "volume",
+                instance: "volume".into(),
+                file: None,
+                partition: None,
+                detail: "a range mark is not whole spans".into(),
+            })));
+        }
+        let mut spans = Spans::default();
+        for triple in triples {
+            let word = |i: usize| u64::from_be_bytes(triple[i * 8..i * 8 + 8].try_into().unwrap());
+            if word(1) != 0 && word(1) <= word(0) {
+                return Err(Error::Storage(StorageError::Corruption(ErrorContext {
+                    engine: "volume",
+                    instance: "volume".into(),
+                    file: None,
+                    partition: None,
+                    detail: "a range mark holds an empty span".into(),
+                })));
+            }
+            spans.add_generation(word(0), word(1), word(2));
+        }
+        Ok(spans)
+    }
+}
+
+/// The length of an actor key's prefix, `s/{hash}{namespace}\0{id}\0`, or `None` for another key.
+pub fn prefix_len(key: &[u8]) -> Option<usize> {
+    let rest = key.strip_prefix(b"s/")?.get(8..)?;
+    let first = rest.iter().position(|b| *b == 0)?;
+    let second = rest[first + 1..].iter().position(|b| *b == 0)?;
+    Some(10 + first + second + 2)
+}
+
+fn spans_of(kept: &[(u64, u64, u64)]) -> Spans {
+    let mut spans = Spans::default();
+    for (start, end, generation) in kept {
+        spans.add_generation(*start, *end, *generation);
+    }
+    spans
+}
+
+/// The parts of `held` inside `inside` with the same generation.
+fn kept_of(held: &Spans, inside: &Spans) -> Spans {
+    let mut stays = Spans::default();
+    for (start, end, generation) in held.entries() {
+        for (s, e, g) in inside.within(start, end).entries() {
+            if g == generation {
+                stays.add_generation(s, e, g);
+            }
+        }
+    }
+    stays
+}
+
+/// The range marks, as stored under `m/`.
+#[derive(Default)]
+struct Marks {
+    held: Spans,
+    sealed: Spans,
+    repaired: Spans,
+    initialized: bool,
+    fresh: bool,
+    /// Bumped whenever a held span, or one being copied, is forgotten: a copy that saw it change may be stale.
+    forgotten: u64,
+    /// Spans a copy is filling (in memory only: a copy cut short starts over).
+    copying: Spans,
+}
+
+const HELD: &[u8] = b"m/held";
+const SEALED: &[u8] = b"m/sealed";
+const REPAIRED: &[u8] = b"m/repaired";
+/// Present once the node has decided whether its store started fresh; holds 1 while it is fresh.
+const FRESH: &[u8] = b"m/fresh";
+
 /// What an append or truncation did besides its answer, for metrics.
 pub struct Outcome {
     pub answer: pb::Answer,
@@ -200,6 +395,7 @@ pub struct Store {
     max_unflushed: u64,
     /// Truncations the actors' other slots owe after a flush, by slot-store prefix; stored as `owed` records too.
     owed: Mutex<BTreeMap<Vec<u8>, (pb::Actor, u64)>>,
+    marks: Mutex<Marks>,
 }
 
 /// What a flush writes for one actor: its keys as of `through` (its commit point), rebuilt from the log.
@@ -263,7 +459,378 @@ impl Store {
             unflushed: AtomicI64::new(0),
             max_unflushed: MAX_UNFLUSHED_BYTES,
             owed: Mutex::default(),
+            marks: Mutex::default(),
         }
+    }
+
+    fn marks(&self) -> MutexGuard<'_, Marks> {
+        self.marks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The spans this node holds a complete copy of.
+    pub fn held(&self) -> Spans {
+        self.marks().held.clone()
+    }
+
+    pub fn sealed(&self) -> Spans {
+        self.marks().sealed.clone()
+    }
+
+    /// Spans where an actor with no claim record here starts `repaired`.
+    pub fn repaired(&self) -> Spans {
+        self.marks().repaired.clone()
+    }
+
+    /// Whether the node decided yet if its store started fresh, and whether it did.
+    pub fn fresh(&self) -> Option<bool> {
+        let marks = self.marks();
+        marks.initialized.then_some(marks.fresh)
+    }
+
+    /// How often a held span was forgotten.
+    pub fn forgotten(&self) -> u64 {
+        self.marks().forgotten
+    }
+
+    /// Changes the marks durably, then in memory: `change` edits a copy, which is written in one batch.
+    fn remark(&self, change: impl FnOnce(&mut Marks)) -> Result<(), Error> {
+        let mut marks = self.marks();
+        let mut next = Marks {
+            held: marks.held.clone(),
+            sealed: marks.sealed.clone(),
+            repaired: marks.repaired.clone(),
+            copying: marks.copying.clone(),
+            ..*marks
+        };
+        change(&mut next);
+        let mut batch = WriteBatch::default();
+        let mut written = false;
+        for (key, old, new) in [
+            (HELD, &marks.held, &next.held),
+            (SEALED, &marks.sealed, &next.sealed),
+            (REPAIRED, &marks.repaired, &next.repaired),
+        ] {
+            if old != new {
+                batch.put(key.to_vec(), new.encode());
+                written = true;
+            }
+        }
+        if (marks.initialized, marks.fresh) != (next.initialized, next.fresh) {
+            batch.put(FRESH.to_vec(), vec![u8::from(next.fresh)]);
+            written = true;
+        }
+        if written {
+            self.commit(batch)?;
+        }
+        *marks = next;
+        Ok(())
+    }
+
+    /// Records whether the store started fresh, once.
+    pub fn initialize(&self, fresh: bool) -> Result<(), Error> {
+        self.remark(|m| {
+            m.initialized = true;
+            m.fresh = fresh;
+        })
+    }
+
+    /// Holds a complete copy of `[start, end)`, made for the assignment `generation`.
+    pub fn hold(&self, start: u64, end: u64, generation: u64) -> Result<(), Error> {
+        self.remark(|m| m.held.add_generation(start, end, generation))
+    }
+
+    /// Ends the copy of `[start, end)` that [`Store::start_copy`] began, and holds it for `generation` if it `copied` and
+    /// no held span or copy was forgotten since `start_copy` returned `forgotten`: the copy may then be stale. Both happen
+    /// under the marks lock, so a [`Store::keep`] either sees the copy being made or the span held. A copy it does not
+    /// hold may have left part of a stale copy behind, so the store is no longer fresh. Returns whether it holds.
+    pub fn finish_copy(
+        &self,
+        start: u64,
+        end: u64,
+        generation: u64,
+        forgotten: u64,
+        copied: bool,
+    ) -> Result<bool, Error> {
+        let mut held = false;
+        self.remark(|m| {
+            m.copying.remove(start, end);
+            if copied && m.forgotten == forgotten {
+                m.held.add_generation(start, end, generation);
+                held = true;
+            } else {
+                m.fresh = false;
+            }
+        })?;
+        Ok(held)
+    }
+
+    /// The held spans inside `kept` (a pushed range set, each span with this node's generation of it), held for that
+    /// generation. Changes nothing.
+    pub fn holding(&self, kept: &[(u64, u64, u64)]) -> Spans {
+        kept_of(&self.marks().held, &spans_of(kept))
+    }
+
+    /// Forgets held spans outside `kept` (a pushed range set, each span with this node's generation of it) or held for
+    /// another generation, and returns what stays held. A store that forgets one is
+    /// no longer fresh: a range it is given `ready` again needs a repair, not trust. It reads and writes the marks
+    /// under their lock, so a copy held meanwhile is judged against this set too.
+    pub fn keep(&self, kept: &[(u64, u64, u64)]) -> Result<Spans, Error> {
+        let inside = spans_of(kept);
+        let mut stays = Spans::default();
+        self.remark(|m| {
+            stays = kept_of(&m.held, &inside);
+            if m.copying
+                .entries()
+                .iter()
+                .any(|(s, e, g)| inside.generation(*s, *e) != Some(*g))
+            {
+                m.forgotten += 1;
+            }
+            if stays != m.held {
+                m.held = stays.clone();
+                m.fresh = false;
+                m.forgotten += 1;
+            }
+        })?;
+        Ok(stays)
+    }
+
+    /// Notes that a copy is filling `[start, end)` for `generation`, and returns how often a held span was forgotten, read
+    /// under the same lock: a pushed set without the span from now on makes the copy stale ([`Store::finish_copy`]).
+    pub fn start_copy(&self, start: u64, end: u64, generation: u64) -> u64 {
+        let mut marks = self.marks();
+        marks.copying.add_generation(start, end, generation);
+        marks.forgotten
+    }
+
+    /// Seals `[start, end)` for a range handoff: once this returns, no reservation, claim or append there is in flight or
+    /// accepted later, so a copy made after it holds every promise this slot gave.
+    pub fn seal(&self, start: u64, end: u64) -> Result<(), Error> {
+        if !self.marks().sealed.covers(start, end) {
+            self.remark(|m| m.sealed.add(start, end))?;
+        }
+        // Writes check the seal under their actor's stripe lock: taking each lock once waits out those already past it.
+        // Every call waits, even one that finds the span sealed: a concurrent first seal may still be waiting.
+        for lock in &self.locks {
+            drop(lock.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+        Ok(())
+    }
+
+    pub fn mark_repaired(&self, start: u64, end: u64) -> Result<(), Error> {
+        self.remark(|m| m.repaired.add(start, end))
+    }
+
+    fn check_sealed(&self, actor: &Actor) -> Result<(), Error> {
+        if self.marks().sealed.contains(actor.hash) {
+            return Err(Error::Sealed);
+        }
+        Ok(())
+    }
+
+    /// Drops every record and mark of `[start, end)`, in one batch: a range this node no longer owns, or one it is about
+    /// to copy again. It holds every stripe lock meanwhile, so no write admitted before it lands after the delete.
+    pub fn clear(&self, start: u64, end: u64) -> Result<(), Error> {
+        // ponytail: blocks every actor's writes for one clear; lock only the span's stripes if clears get frequent.
+        let _stripes: Vec<_> = self
+            .locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(PoisonError::into_inner))
+            .collect();
+        let mut batch = WriteBatch::default();
+        batch.delete_range(span(start, end));
+        let (freed, _) = self.tally(start, end)?;
+        // ponytail: scans the whole alarm index; keep alarms per range if clears get frequent.
+        for item in self.engine.scan(&KeyRange::prefix(*b"alarm/"))? {
+            let (key, _) = item?;
+            let hash = key
+                .get(14..22)
+                .map(|h| u64::from_be_bytes(h.try_into().unwrap()));
+            if hash.is_some_and(|h| h >= start && (end == 0 || h < end)) {
+                batch.delete(key);
+            }
+        }
+        let mut marks = self.marks();
+        let mut next = Marks {
+            held: marks.held.clone(),
+            sealed: marks.sealed.clone(),
+            repaired: marks.repaired.clone(),
+            copying: marks.copying.clone(),
+            ..*marks
+        };
+        next.held.remove(start, end);
+        next.sealed.remove(start, end);
+        next.repaired.remove(start, end);
+        batch.put(HELD.to_vec(), next.held.encode());
+        batch.put(SEALED.to_vec(), next.sealed.encode());
+        batch.put(REPAIRED.to_vec(), next.repaired.encode());
+        self.commit(batch)?;
+        *marks = next;
+        drop(marks);
+        self.unflushed.fetch_sub(freed, Ordering::Relaxed);
+        let outside = |prefix: &Vec<u8>| {
+            let hash = u64::from_be_bytes(prefix[2..10].try_into().unwrap());
+            hash < start || (end != 0 && hash >= end)
+        };
+        self.dirty
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|k, _| outside(k));
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|k, _| outside(k));
+        Ok(())
+    }
+
+    /// The log bytes of `[start, end)` and its claims and owed truncations, by actor prefix.
+    #[allow(clippy::type_complexity)]
+    fn tally(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<(i64, Vec<(Vec<u8>, Option<pb::ClaimRecord>, Option<u64>)>), Error> {
+        let mut logged = 0;
+        let mut actors: Vec<(Vec<u8>, Option<pb::ClaimRecord>, Option<u64>)> = Vec::new();
+        for item in self.engine.scan(&span(start, end))? {
+            let (key, value) = item?;
+            let Some(at) = prefix_len(&key) else {
+                continue;
+            };
+            if actors.last().is_none_or(|(p, _, _)| p[..] != key[..at]) {
+                actors.push((key[..at].to_vec(), None, None));
+            }
+            let actor = actors.last_mut().unwrap();
+            let name = &key[at..];
+            if name == b"claim" {
+                actor.1 = Some(
+                    pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?,
+                );
+            } else if name.starts_with(b"log/") {
+                logged += (key.len() + value.len()) as i64;
+            } else if name == b"owed" {
+                actor.2 = <[u8; 8]>::try_from(value.as_slice())
+                    .ok()
+                    .map(u64::from_be_bytes);
+            }
+        }
+        Ok((logged, actors))
+    }
+
+    /// Takes a copied span into the flush state: its actors with committed entries not yet flushed and its owed
+    /// truncations. [`Store::install`] already counted its log bytes. The span is not served while it is copied, so
+    /// nothing else changes it meanwhile.
+    pub fn adopt(&self, start: u64, end: u64) -> Result<(), Error> {
+        let (_, actors) = self.tally(start, end)?;
+        for (prefix, claim, owed) in actors {
+            let Some(claim) = claim else { continue };
+            self.mark(&prefix, &claim);
+            if let Some(through) = owed {
+                self.owe(&prefix, claim.kind, through);
+            }
+        }
+        Ok(())
+    }
+
+    /// Installs one actor's records, copied from another slot. A range handoff (`repair` false) copies the sealed leaving
+    /// owner as it is. A repair keeps the more advanced log of the slot here and the copy, with its overlay, and the
+    /// higher promise and reservation, and marks the actor `repaired`; a copy that is itself repaired is no voting peer
+    /// and is skipped, as are its maintainer obligations (`owed`), which belong to the cell copied from. Call
+    /// [`Store::adopt`] once the copy is done, to rebuild flush state.
+    pub fn install(&self, records: &[pb::Record], repair: bool) -> Result<(), Error> {
+        let Some(at) = records.first().and_then(|r| prefix_len(&r.key)) else {
+            return Ok(());
+        };
+        let prefix = &records[0].key[..at];
+        let claim_at = [prefix, b"claim".as_slice()].concat();
+        let Some(claim) = records.iter().find(|r| r.key == claim_at) else {
+            return Ok(());
+        };
+        if records.iter().any(|r| !r.key.starts_with(prefix)) {
+            return invalid("copied records span more than one actor");
+        }
+        let copied =
+            pb::ClaimRecord::decode(claim.value.as_slice()).map_err(|e| corrupt("a claim", e))?;
+        if repair && copied.repaired {
+            return Ok(());
+        }
+        let parsed = Actor::parse(prefix, copied.kind)
+            .ok_or_else(|| Error::Invalid("a copied actor prefix does not parse".into()))?;
+        let actor = Actor::new(&parsed)?;
+        let _lock = self.lock(&actor);
+        let here = self
+            .engine
+            .get(&claim_key(&actor))?
+            .map(|bytes| {
+                pb::ClaimRecord::decode(bytes.as_slice()).map_err(|e| corrupt("a claim", e))
+            })
+            .transpose()?;
+        let last = |c: &pb::ClaimRecord| {
+            let end = end(c);
+            (end.epoch, end.seq)
+        };
+        let mut batch = WriteBatch::default();
+        let take = here.as_ref().is_none_or(|h| last(&copied) > last(h));
+        // Log bytes count towards backpressure from when they are on disk, as `recover` counts them: those replaced
+        // leave, those copied enter. A copy cut short is then cleared without miscounting.
+        let mut logged = 0;
+        let mut new = if take {
+            let is_log = |key: &[u8]| key[at..].starts_with(b"log/");
+            for item in self.engine.scan(&KeyRange::prefix(prefix.to_vec()))? {
+                let (key, value) = item?;
+                if is_log(&key) {
+                    logged -= (key.len() + value.len()) as i64;
+                }
+            }
+            logged += records
+                .iter()
+                .filter(|r| is_log(&r.key))
+                .map(|r| (r.key.len() + r.value.len()) as i64)
+                .sum::<i64>();
+            batch.delete_range(KeyRange::prefix(prefix.to_vec()));
+            for record in records {
+                if record.key != claim.key && !(repair && record.key[at..] == *b"owed") {
+                    batch.put(record.key.clone(), record.value.clone());
+                }
+            }
+            copied.clone()
+        } else {
+            let mut kept = here.clone().unwrap();
+            // Logs that end at the same entry are the same log (Raft's log matching), so the further commit point holds.
+            if last(&copied) == last(&kept) {
+                kept.committed = kept.committed.max(copied.committed);
+            }
+            kept
+        };
+        if let Some(here) = &here {
+            let promise = if copied.epoch > here.epoch {
+                &copied
+            } else {
+                here
+            };
+            new.epoch = promise.epoch;
+            new.holder = promise.holder.clone();
+            new.released = promise.released && new.end == promise.end;
+            new.reserved = here.reserved.max(copied.reserved);
+            new.version = here.version.max(copied.version);
+        }
+        if repair {
+            new.repaired = true;
+        }
+        let old = here.unwrap_or_default();
+        Self::save(&mut batch, &actor, &old, &new);
+        self.commit(batch)?;
+        self.unflushed.fetch_add(logged, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Spans as protocol messages.
+    pub fn messages(spans: &Spans) -> Vec<pb::HashSpan> {
+        spans
+            .list()
+            .into_iter()
+            .map(|(start, end)| pb::HashSpan { start, end })
+            .collect()
     }
 
     /// The truncations other slots still owe, in key order.
@@ -379,12 +946,16 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The actor's claim; without one, an empty claim, `repaired` where a repair left the range marked so (S-06).
     fn load(&self, actor: &Actor) -> Result<pb::ClaimRecord, Error> {
         match self.engine.get(&claim_key(actor))? {
             Some(bytes) => {
                 pb::ClaimRecord::decode(bytes.as_slice()).map_err(|e| corrupt("a claim", e))
             }
-            None => Ok(pb::ClaimRecord::default()),
+            None => Ok(pb::ClaimRecord {
+                repaired: self.marks().repaired.contains(actor.hash),
+                ..Default::default()
+            }),
         }
     }
 
@@ -468,6 +1039,7 @@ impl Store {
     /// S-02b). The reservation is synced before the answer.
     pub fn reserve(&self, actor: &Actor, epoch: u64, version: u64) -> Result<pb::Answer, Error> {
         let _lock = self.lock(actor);
+        self.check_sealed(actor)?;
         let old = self.load(actor)?;
         let voting = !old.repaired;
         let refused = if !voting {
@@ -505,6 +1077,7 @@ impl Store {
         live: impl Fn(&pb::Holder) -> bool,
     ) -> Result<(pb::Answer, bool), Error> {
         let _lock = self.lock(actor);
+        self.check_sealed(actor)?;
         let old = self.load(actor)?;
         let voting = !old.repaired;
         let other = old
@@ -560,6 +1133,7 @@ impl Store {
         let last = first.seq + request.entries.len() as u64 - 1;
 
         let _lock = self.lock(actor);
+        self.check_sealed(actor)?;
         let old = self.load(actor)?;
         let voting = !old.repaired;
         if old.epoch != request.epoch || old.holder.as_ref() != Some(holder) {
@@ -831,6 +1405,74 @@ impl Store {
         })
     }
 
+    /// Takes S3's state of the actor at `seq`, whose entry has `epoch`, with the alarm `alarm` there, as this slot's
+    /// flushed point when its log ends below it (S-06, `Skip` in `volume.tla`). A holder that recovered from a slot
+    /// that truncated cannot resend what S3 holds, while this slot kept every promise and reservation, so it keeps its
+    /// vote. S3 holds only committed entries, so what the slot had up to there is either the same or could never commit.
+    /// Only to an S3 point no newer than the slot's promise: the promised holder's log then holds it, so its appends
+    /// continue S3's state, while a holder a newer one fenced may lack it. The answer is `None` when the log already
+    /// reaches `seq` or `epoch` is above the promise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn skip(
+        &self,
+        actor: &Actor,
+        holder: &pb::Holder,
+        promise: u64,
+        seq: u64,
+        epoch: u64,
+        alarm: Option<u64>,
+    ) -> Result<Option<Outcome>, Error> {
+        let _lock = self.lock(actor);
+        self.check_sealed(actor)?;
+        let old = self.load(actor)?;
+        let old_end = end(&old);
+        // Only for the holder whose append found the gap, while the slot still promises it: another claim may have come
+        // in since.
+        let promised = old.holder.as_ref() == Some(holder) && old.epoch == promise;
+        if !promised || old_end.seq >= seq || epoch > old.epoch {
+            return Ok(None);
+        }
+        let log = self.entries(actor, old.flushed + 1, old_end.seq)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_range(KeyRange::new(
+            log_key(actor, old.flushed + 1),
+            log_key(actor, old_end.seq + 1),
+        ));
+        // Every overlay record is older than `seq`: reads of those keys go to S3.
+        let mut delta = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &log {
+            for change in &entry.changes {
+                let key = data_key(actor, &change.key);
+                if seen.insert(key.clone())
+                    && let Some(record) = self.overlay(&key)?
+                {
+                    delta -= overlay_size(&key, Some(&record));
+                    batch.delete(key);
+                }
+            }
+        }
+        let new = pb::ClaimRecord {
+            end: Some(pb::LogEnd { seq, epoch }),
+            committed: old.committed.max(seq),
+            flushed: seq,
+            flushed_epoch: epoch,
+            alarm_ms: alarm,
+            flushed_alarm_ms: alarm,
+            ..old.clone()
+        };
+        Self::save(&mut batch, actor, &old, &new);
+        let fsync = self.commit(batch)?;
+        let freed: i64 = log.iter().map(|e| log_bytes(actor, e)).sum();
+        self.unflushed.fetch_sub(freed, Ordering::Relaxed);
+        self.mark(&actor.prefix, &new);
+        Ok(Some(Outcome {
+            answer: answer(Refusal::None, &new, !new.repaired),
+            overlay: delta,
+            fsync: Some(fsync),
+        }))
+    }
+
     /// The slot can answer for `min_seq` when it knows that far is committed, or its log ends in the promise's epoch
     /// (so it matches the holder's) at `min_seq` or later.
     fn caught_up(claim: &pb::ClaimRecord, min_seq: u64) -> bool {
@@ -1013,17 +1655,30 @@ impl Store {
     /// the gauge: one pass over every slot record at startup.
     // ponytail: a full scan at startup; keep running totals in a record if startup time matters.
     pub fn recover(&self) -> Result<BTreeMap<i32, i64>, Error> {
+        {
+            let mut guard = self.marks();
+            let marks = &mut *guard;
+            for (key, spans) in [
+                (HELD, &mut marks.held),
+                (SEALED, &mut marks.sealed),
+                (REPAIRED, &mut marks.repaired),
+            ] {
+                if let Some(bytes) = self.engine.get(key)? {
+                    *spans = Spans::decode(&bytes)?;
+                }
+            }
+            if let Some(fresh) = self.engine.get(FRESH)? {
+                marks.initialized = true;
+                marks.fresh = fresh == [1];
+            }
+        }
         let mut bytes = BTreeMap::new();
         let mut kind = 0;
         let mut logged = 0;
         for item in self.engine.scan(&KeyRange::prefix(*b"s/"))? {
             let (key, value) = item?;
             // `s/`, the hash, then `{namespace}\0{id}\0` and the record's name.
-            let Some(at) = key.get(10..).and_then(|rest| {
-                let first = rest.iter().position(|b| *b == 0)?;
-                let second = rest[first + 1..].iter().position(|b| *b == 0)?;
-                Some(10 + first + second + 2)
-            }) else {
+            let Some(at) = prefix_len(&key) else {
                 continue;
             };
             let name = &key[at..];

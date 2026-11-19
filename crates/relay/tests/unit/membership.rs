@@ -1,4 +1,5 @@
 use super::*;
+use bedrock_lib::membership::Generations;
 use bedrock_lib::placement::State;
 use std::sync::Mutex;
 
@@ -96,17 +97,20 @@ fn pushed_ranges_keep_the_revision_of_their_captured_directory() {
             "quicksilver".into(),
             Directory::from([(0, vec![owner])]),
         )]),
+        generations: Generations::new(),
     };
     let newer = DirectoryAt {
         revision: 8,
         directories: Directories::new(),
+        generations: Generations::new(),
     };
     assert_eq!(
         old.ranges("quicksilver", "qs-1"),
         pb::Ranges {
             dataset: "quicksilver".into(),
             revision: 7,
-            spans: vec![pb::Span { start: 0, end: 0 }]
+            spans: vec![pb::Span { start: 0, end: 0 }],
+            generations: Vec::new(),
         }
     );
     assert_eq!(newer.ranges("quicksilver", "qs-1").revision, 8);
@@ -340,7 +344,7 @@ fn all_ready(service: &str, directories: &Directories) -> siblings::Ready {
                 ready
                     .entry(((service.into(), owner.node.clone()), dataset.clone()))
                     .or_default()
-                    .push((*start, 0));
+                    .push((*start, 0, 0));
             }
         }
     }
@@ -352,7 +356,16 @@ fn all_ready(service: &str, directories: &Directories) -> siblings::Ready {
 fn settle(service: &str, actual: &Members, directories: &mut Directories) -> usize {
     for pass in 0..100 {
         let ready = all_ready(service, directories);
-        let changes = place(service, actual, directories, &ready, &[], REPLICAS);
+        let changes = place(
+            service,
+            actual,
+            directories,
+            &Generations::new(),
+            0,
+            &ready,
+            &[],
+            REPLICAS,
+        );
         if changes.is_empty() {
             return pass;
         }
@@ -405,6 +418,8 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
         "cdn",
         &actual,
         &directories,
+        &Generations::new(),
+        0,
         &siblings::Ready::new(),
         &[],
         REPLICAS,
@@ -485,6 +500,8 @@ fn quicksilver_placement_ignores_auth_dataset_membership() {
         "quicksilver",
         &actual,
         &Directories::new(),
+        &Generations::new(),
+        0,
         &siblings::Ready::new(),
         &[],
         REPLICAS,
@@ -518,6 +535,8 @@ fn quicksilver_placement_ignores_auth_dataset_membership() {
             "kv",
             &actual,
             &Directories::new(),
+            &Generations::new(),
+            0,
             &siblings::Ready::new(),
             &[],
             REPLICAS
@@ -559,19 +578,28 @@ fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
     let ready = siblings::Ready::from([
         (
             (("quicksilver".into(), "a".into()), "quicksilver".into()),
-            vec![(0, 0)],
+            vec![(0, 0, 0)],
         ),
         (
             (("cdn".into(), "b".into()), "quicksilver".into()),
-            vec![(0, 0)],
+            vec![(0, 0, 0)],
         ),
         (
             (("quicksilver".into(), "c".into()), "quicksilver".into()),
-            vec![(1, 0)],
+            vec![(1, 0, 0)],
         ),
     ]);
     assert_eq!(
-        place("quicksilver", &actual, &directories, &ready, &[], REPLICAS),
+        place(
+            "quicksilver",
+            &actual,
+            &directories,
+            &Generations::new(),
+            0,
+            &ready,
+            &[],
+            REPLICAS
+        ),
         vec![Change::Range {
             service: "quicksilver".into(),
             dataset: "quicksilver".into(),
@@ -582,6 +610,7 @@ fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
                 owner("b", State::Populating),
                 owner("c", State::Populating),
             ],
+            generations: BTreeMap::new(),
         }]
     );
 }
@@ -620,6 +649,8 @@ fn a_leaving_owner_stays_while_the_only_ready_owner_is_unhealthy() {
         "cdn",
         &actual,
         &directories,
+        &Generations::new(),
+        0,
         &siblings::Ready::new(),
         &[],
         REPLICAS,
@@ -631,6 +662,8 @@ fn a_leaving_owner_stays_while_the_only_ready_owner_is_unhealthy() {
         "cdn",
         &actual,
         &directories,
+        &Generations::new(),
+        0,
         &siblings::Ready::new(),
         &[],
         REPLICAS,
@@ -647,6 +680,7 @@ async fn a_failed_write_abandons_the_rest_of_its_services_plan() {
         dataset: service.into(),
         start,
         owners: Vec::new(),
+        generations: BTreeMap::new(),
     };
     let plan = vec![
         range("a", 0),
@@ -679,4 +713,186 @@ async fn a_failed_write_abandons_the_rest_of_its_services_plan() {
         written,
         BTreeMap::from([("a".to_string(), 6), ("b".to_string(), 9)])
     );
+}
+
+#[test]
+fn a_cells_first_volume_owners_start_ready_and_later_ones_populate() {
+    let node = |id: &str| pb::Member {
+        service: VOLUME.into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: vec![VOLUME.into()],
+        ..ready(id)
+    };
+    let states = |changes: &[Change]| -> Vec<State> {
+        changes
+            .iter()
+            .filter_map(|change| match change {
+                Change::Range { owners, .. } => Some(owners),
+                _ => None,
+            })
+            .flatten()
+            .map(|owner| owner.state)
+            .collect()
+    };
+    let actual = members(&[node("v1")]);
+    let first = place(
+        VOLUME,
+        &actual,
+        &Directories::new(),
+        &Generations::new(),
+        0,
+        &siblings::Ready::new(),
+        &[],
+        1,
+    );
+    // No data exists anywhere yet, so there is nothing to copy (#114 / S-06).
+    assert_eq!(states(&first), [State::Ready]);
+    // Once the directory has an entry, a new owner copies and reports before it is ready.
+    let directory = Directory::from([(0, Vec::new())]);
+    let later = place(
+        VOLUME,
+        &actual,
+        &Directories::from([(VOLUME.to_owned(), directory)]),
+        &Generations::new(),
+        0,
+        &siblings::Ready::new(),
+        &[],
+        1,
+    );
+    assert_eq!(states(&later), [State::Populating]);
+}
+
+#[test]
+fn a_volume_owner_is_ready_only_for_its_current_assignment() {
+    let node = |id: &str| pb::Member {
+        service: VOLUME.into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: vec![VOLUME.into()],
+        ..ready(id)
+    };
+    let actual = members(&[node("v1"), node("v2")]);
+    let populating = Directory::from([(
+        0,
+        vec![
+            Owner {
+                node: "v1".into(),
+                state: State::Leaving,
+            },
+            Owner {
+                node: "v2".into(),
+                state: State::Populating,
+            },
+        ],
+    )]);
+    let directories = Directories::from([(VOLUME.to_owned(), populating)]);
+    let generations = Generations::from([(
+        VOLUME.to_owned(),
+        BTreeMap::from([(
+            0,
+            BTreeMap::from([("v1".to_owned(), 2), ("v2".to_owned(), 5)]),
+        )]),
+    )]);
+    let reported = |generation| {
+        siblings::Ready::from([(
+            ((VOLUME.into(), "v2".into()), VOLUME.into()),
+            vec![(0, 0, generation)],
+        )])
+    };
+    let plan = |ready| {
+        place(
+            VOLUME,
+            &actual,
+            &directories,
+            &generations,
+            9,
+            &ready,
+            &[],
+            1,
+        )
+    };
+    // A copy made for an earlier assignment of the range does not count.
+    assert!(plan(reported(4)).is_empty());
+    let Some(Change::Range {
+        owners,
+        generations,
+        ..
+    }) = plan(reported(5)).into_iter().next()
+    else {
+        panic!("v2 becomes ready");
+    };
+    assert_eq!(
+        owners,
+        [Owner {
+            node: "v2".into(),
+            state: State::Ready
+        }]
+    );
+    assert_eq!(generations, BTreeMap::from([("v2".to_owned(), 5)]), "kept");
+    // An owner new to a range gets a generation above the revision the plan read.
+    let first = place(
+        VOLUME,
+        &actual,
+        &Directories::new(),
+        &Generations::new(),
+        9,
+        &siblings::Ready::new(),
+        &[],
+        1,
+    );
+    let Some(Change::Range {
+        generations,
+        owners,
+        ..
+    }) = first.into_iter().next()
+    else {
+        panic!("the first owners are placed");
+    };
+    let expected: BTreeMap<String, u64> = owners.iter().map(|o| (o.node.clone(), 10)).collect();
+    assert_eq!(generations, expected);
+}
+
+#[test]
+fn volume_ranges_merge_only_when_their_owners_generations_agree() {
+    let node = |id: &str| pb::Member {
+        service: VOLUME.into(),
+        roles: vec!["l2".into()],
+        failure_domain: id.into(),
+        datasets: vec![VOLUME.into()],
+        ..ready(id)
+    };
+    let actual = members(&[node("v1")]);
+    let owners = vec![Owner {
+        node: "v1".into(),
+        state: State::Ready,
+    }];
+    let directories = Directories::from([(
+        VOLUME.to_owned(),
+        Directory::from([(0, owners.clone()), (1 << 63, owners)]),
+    )]);
+    let merges = |later: u64| {
+        let generations = Generations::from([(
+            VOLUME.to_owned(),
+            BTreeMap::from([
+                (0, BTreeMap::from([("v1".to_owned(), 3)])),
+                (1 << 63, BTreeMap::from([("v1".to_owned(), later)])),
+            ]),
+        )]);
+        place(
+            VOLUME,
+            &actual,
+            &directories,
+            &generations,
+            9,
+            &siblings::Ready::new(),
+            &[],
+            1,
+        )
+        .into_iter()
+        .filter(|c| matches!(c, Change::Merge { .. }))
+        .count()
+    };
+    assert_eq!(merges(3), 1);
+    assert_eq!(merges(5), 0, "v1 would forget its copy of the later range");
 }

@@ -163,6 +163,7 @@ async fn the_log_is_read_only_by_the_promised_holder_and_repair_only_by_a_volume
             end: 0,
             after: Vec::new(),
             limit: 10,
+            seal: false,
         })
     };
     let denied = owner.repair(from(caller("compute", "h"), repair())).await;

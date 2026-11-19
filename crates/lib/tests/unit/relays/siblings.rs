@@ -57,6 +57,7 @@ fn subscribe(
             member: None,
             pushed: BTreeMap::new(),
             ranges_acked: BTreeMap::new(),
+            reported: BTreeMap::new(),
             moved: None,
         },
     );

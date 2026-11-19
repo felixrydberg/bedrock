@@ -55,6 +55,30 @@ struct Pushed {
     retired: BTreeSet<(String, Range)>,
     /// Per dataset, held ranges the latest applied set merged, joined once their consumers agree (#66 / B-61).
     merges: BTreeMap<String, Vec<ranges::Merge>>,
+    /// What the member holds of each dataset no relay streams (#114 / S-06).
+    holdings: BTreeMap<String, Arc<dyn Holdings>>,
+    /// The last set of each such dataset applied on this connection, acknowledged again with each new report.
+    applied: BTreeMap<String, pb::Ranges>,
+    /// Bumped by [`Session::report`].
+    reports: Arc<Watched<u64>>,
+}
+
+/// A member's own record of which ranges of a dataset no relay streams (`volume`) it holds a complete copy of (#114 /
+/// S-06, `docs/spec/handoff.tla` with `Reported`). The relay counts the member ready for a range only from its report.
+pub trait Holdings: Send + Sync {
+    /// Called once the member's own view has reached the pushed set `spans`, with the member's generation of each, before
+    /// the set is acknowledged. Forgets, durably, any held range outside `spans` or held for another generation, so a
+    /// range revoked and assigned again is copied again. Returns the held ranges with their generations, which the
+    /// acknowledgement reports.
+    fn settle(
+        &self,
+        dataset: &str,
+        spans: &[pb::Span],
+        generations: &[u64],
+    ) -> Result<Vec<(pb::Span, u64)>, Status>;
+    /// The held ranges inside the set already settled, for a report after a copy. Forgets nothing: the member's view
+    /// may already be ahead of that set, and a copy it made for the newer assignment must stay held.
+    fn held(&self, dataset: &str, spans: &[pb::Span], generations: &[u64]) -> Vec<(pb::Span, u64)>;
 }
 
 fn span(range: Option<(u64, u64)>) -> Option<pb::Span> {
@@ -194,6 +218,7 @@ pub struct Session {
     rebuilds: Rebuilds,
     task: tokio::task::JoinHandle<()>,
     member: Option<Membership>,
+    reports: Arc<Watched<u64>>,
 }
 
 impl Session {
@@ -205,7 +230,14 @@ impl Session {
         upstreams: Vec<String>,
         targets: Vec<Target>,
     ) -> Result<Self, Status> {
-        Self::open(peers, upstreams, targets, None, BTreeMap::new())
+        Self::open(
+            peers,
+            upstreams,
+            targets,
+            None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
     }
 
     /// Like [`Session::start`], announcing `member` to the relays, which makes this process a cell member (B-12).
@@ -230,7 +262,48 @@ impl Session {
         if member.status != pb::member::Status::Ready as i32 {
             return Err(Status::invalid_argument("a joining member must be ready"));
         }
-        Self::open(peers, upstreams, targets, Some(member), ranged)
+        Self::open(
+            peers,
+            upstreams,
+            targets,
+            Some(member),
+            ranged,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Like [`Session::join`] for a member of datasets no relay streams (`volume`): it copies their ranges itself, and
+    /// every acknowledgement of a pushed set reports what `holdings` says it holds (#114 / S-06). Call
+    /// [`Session::report`] when that changes.
+    pub fn join_reporting(
+        peers: Arc<Peers>,
+        upstreams: Vec<String>,
+        targets: Vec<Target>,
+        member: pb::Member,
+        holdings: BTreeMap<String, Arc<dyn Holdings>>,
+    ) -> Result<Self, Status> {
+        if holdings.keys().any(|d| super::pushed(d)) {
+            return Err(Status::invalid_argument(
+                "only datasets no relay streams report their holdings",
+            ));
+        }
+        crate::membership::validate(&member)?;
+        if member.status != pb::member::Status::Ready as i32 {
+            return Err(Status::invalid_argument("a joining member must be ready"));
+        }
+        Self::open(
+            peers,
+            upstreams,
+            targets,
+            Some(member),
+            BTreeMap::new(),
+            holdings,
+        )
+    }
+
+    /// Acknowledges the latest applied sets again with fresh reports, after a copy finished.
+    pub fn report(&self) {
+        self.reports.update(|v| *v = v.wrapping_add(1));
     }
 
     fn open(
@@ -239,6 +312,7 @@ impl Session {
         mut targets: Vec<Target>,
         member: Option<pb::Member>,
         ranged: BTreeMap<String, Arc<dyn StorageEngine>>,
+        holdings: BTreeMap<String, Arc<dyn Holdings>>,
     ) -> Result<Self, Status> {
         if upstreams.is_empty() {
             return Err(Status::invalid_argument("upstreams are required"));
@@ -337,9 +411,13 @@ impl Session {
             pending: BTreeMap::new(),
             retired: BTreeSet::new(),
             merges: BTreeMap::new(),
+            holdings,
+            applied: BTreeMap::new(),
+            reports: Arc::new(Watched::new(0)),
         };
+        let reports = pushed.reports.clone();
         // Without its own view a member could never confirm a revoke or acknowledge a pushed set.
-        if !pushed.ranged.is_empty()
+        if !(pushed.ranged.is_empty() && pushed.holdings.is_empty())
             && !pushed
                 .me
                 .as_ref()
@@ -369,6 +447,7 @@ impl Session {
             rebuilds,
             task,
             member,
+            reports,
         })
     }
 
@@ -1191,6 +1270,7 @@ async fn run(
             pushed.pending.clear();
             pushed.retired.clear();
             pushed.merges.clear();
+            pushed.applied.clear();
             let error = connection(
                 &peers,
                 upstream,
@@ -1331,6 +1411,8 @@ async fn connected(
     });
     let mut tick = tokio::time::interval(Duration::from_secs(10));
     let mut intake = Intake::default();
+    let reports = pushed.reports.clone();
+    let mut reported = reports.get();
     loop {
         // Keep this read's deadline when sending progress; outbound activity cannot prove the source is alive.
         let frame = {
@@ -1368,6 +1450,15 @@ async fn connected(
                                 state.scopes.get_mut(scope).unwrap().2 = false;
                             });
                             send(&requests, consumer.request()).await?;
+                        }
+                    },
+                    seen = reports.wait_until(|v| *v != reported) => {
+                        reported = seen;
+                        for frame in pushed.applied.values() {
+                            let ack = holdings(pushed, frame, false);
+                            send(&requests, pb::RelayRequest {
+                                kind: Some(pb::relay_request::Kind::Ranges(ack)),
+                            }).await?;
                         }
                     },
                     frame = &mut reading => break Some(frame?),
@@ -1571,6 +1662,7 @@ async fn settle(
                         revision: frame.revision,
                         refused: vec![pb::Span { start: 0, end: 0 }],
                         reason: error.to_string(),
+                        ..Default::default()
                     };
                     send(
                         requests,
@@ -1666,11 +1758,16 @@ async fn settle(
                 .await?;
             }
         }
+        let report = holdings(pushed, &frame, true);
+        if pushed.holdings.contains_key(&dataset) {
+            pushed.applied.insert(dataset.clone(), frame.clone());
+        }
         let ack = pb::RangesAck {
             dataset,
             revision: frame.revision,
             refused,
             reason: reasons.join("; "),
+            ..report
         };
         send(
             requests,
@@ -1681,6 +1778,34 @@ async fn settle(
         .await?;
     }
     Ok(())
+}
+
+/// The report on what the member holds of `frame`'s dataset, as the `ready` and `generations` of an acknowledgement:
+/// nothing for a dataset relays stream, or when its record cannot be written. `settle` for a newly applied set; a later
+/// report only reads.
+fn holdings(pushed: &Pushed, frame: &pb::Ranges, settle: bool) -> pb::RangesAck {
+    let Some(holdings) = pushed.holdings.get(&frame.dataset) else {
+        return pb::RangesAck::default();
+    };
+    let held = if settle {
+        // Reporting none keeps every range of the set unready. A later report reads the marks, inside this set and for its
+        // generations only, so a span this failed to forget is still not reported.
+        holdings
+            .settle(&frame.dataset, &frame.spans, &frame.generations)
+            .unwrap_or_else(|error| {
+                tracing::warn!(dataset = %frame.dataset, %error, "held ranges unknown; reporting none");
+                Vec::new()
+            })
+    } else {
+        holdings.held(&frame.dataset, &frame.spans, &frame.generations)
+    };
+    pb::RangesAck {
+        dataset: frame.dataset.clone(),
+        revision: frame.revision,
+        generations: held.iter().map(|(_, g)| *g).collect(),
+        ready: held.into_iter().map(|(s, _)| s).collect(),
+        ..Default::default()
+    }
 }
 
 /// Joins the consumers of each pending merge whose parts agree: every namespace of the dataset has a validated consumer
