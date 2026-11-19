@@ -233,3 +233,51 @@ async fn a_fresh_store_given_a_range_again_repairs_its_old_copy() {
     let (records, _) = target.records(0, 0, &[], store::MAX_LIMIT).unwrap();
     assert!(records.is_empty(), "the stale copy is gone");
 }
+
+#[tokio::test]
+async fn a_revoked_copy_leaves_the_store_unfresh_and_a_later_ready_range_repairs() {
+    // A fresh store's handoff copy is revoked partway: part of the leaving owner's actor is left behind, unheld.
+    let (target, held) = copied(true).await;
+    assert!(!held);
+    assert_eq!(target.fresh(), Some(false));
+    let ready = Directory::from([(
+        0,
+        vec![Owner {
+            node: "d".into(),
+            state: State::Ready,
+        }],
+    )]);
+    let generations = BTreeMap::from([(0, BTreeMap::from([("d".to_owned(), 2)]))]);
+    let held = Repair::new(target.clone(), Arc::new(Nobody), "d", "cell-c")
+        .tick(&ready, &generations)
+        .await
+        .unwrap();
+    assert!(held);
+    assert!(
+        target.repaired().overlaps(0, 0),
+        "the range is repaired, not trusted"
+    );
+    let (records, _) = target.records(0, 0, &[], store::MAX_LIMIT).unwrap();
+    assert!(records.is_empty(), "the partial copy is gone");
+}
+
+#[tokio::test]
+async fn a_cell_s_first_owner_holds_its_range_without_a_repair() {
+    let target = Arc::new(Store::new(Arc::new(MemoryEngine::new("volume"))));
+    decide(&target, &Directory::new(), "d").unwrap();
+    let ready = Directory::from([(
+        0,
+        vec![Owner {
+            node: "d".into(),
+            state: State::Ready,
+        }],
+    )]);
+    let generations = BTreeMap::from([(0, BTreeMap::from([("d".to_owned(), 1)]))]);
+    let held = Repair::new(target.clone(), Arc::new(Nobody), "d", "cell-c")
+        .tick(&ready, &generations)
+        .await
+        .unwrap();
+    assert!(held);
+    assert_eq!(target.fresh(), Some(true));
+    assert!(!target.repaired().overlaps(0, 0));
+}

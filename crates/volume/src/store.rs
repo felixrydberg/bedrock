@@ -532,8 +532,8 @@ impl Store {
 
     /// Ends the copy of `[start, end)` that [`Store::start_copy`] began, and holds it for `generation` if it `copied` and
     /// no held span or copy was forgotten since `start_copy` returned `forgotten`: the copy may then be stale. Both happen
-    /// under the marks lock, so a [`Store::keep`] either sees the copy being made or the span held. Returns whether it
-    /// holds.
+    /// under the marks lock, so a [`Store::keep`] either sees the copy being made or the span held. A copy it does not
+    /// hold may have left part of a stale copy behind, so the store is no longer fresh. Returns whether it holds.
     pub fn finish_copy(
         &self,
         start: u64,
@@ -548,6 +548,8 @@ impl Store {
             if copied && m.forgotten == forgotten {
                 m.held.add_generation(start, end, generation);
                 held = true;
+            } else {
+                m.fresh = false;
             }
         })?;
         Ok(held)
@@ -618,8 +620,14 @@ impl Store {
     }
 
     /// Drops every record and mark of `[start, end)`, in one batch: a range this node no longer owns, or one it is about
-    /// to copy again.
+    /// to copy again. It holds every stripe lock meanwhile, so no write admitted before it lands after the delete.
     pub fn clear(&self, start: u64, end: u64) -> Result<(), Error> {
+        // ponytail: blocks every actor's writes for one clear; lock only the span's stripes if clears get frequent.
+        let _stripes: Vec<_> = self
+            .locks
+            .iter()
+            .map(|l| l.lock().unwrap_or_else(PoisonError::into_inner))
+            .collect();
         let mut batch = WriteBatch::default();
         batch.delete_range(span(start, end));
         let (freed, _) = self.tally(start, end)?;

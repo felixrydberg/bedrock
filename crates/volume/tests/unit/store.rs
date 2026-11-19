@@ -1006,3 +1006,25 @@ fn a_sealed_slot_does_not_skip_to_s3() {
         Err(Error::Sealed)
     ));
 }
+
+#[test]
+fn a_clear_waits_for_writes_already_admitted() {
+    let store = store();
+    let actor = actor();
+    let admitted = store.lock(&actor);
+    let (done, cleared) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            store.clear(0, 0).unwrap();
+            done.send(()).unwrap();
+        });
+        assert!(
+            cleared
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "the clear waits while a write holds its stripe"
+        );
+        drop(admitted);
+        cleared.recv().unwrap();
+    });
+}
