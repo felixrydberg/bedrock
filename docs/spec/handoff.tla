@@ -61,8 +61,7 @@ Init == /\ pub = [n \in Nodes |-> "absent"] /\ conn = [n \in Nodes |-> FALSE] /\
 Connect(n) == /\ ~conn[n] /\ conn' = [conn EXCEPT ![n] = TRUE]
               /\ UNCHANGED <<pub, quorum, starts, own, gen, rev, nvars, cuts, flips>>
 \* The node keeps its data on disk. Its unprocessed frames are lost, and its next relay
-\* pushes everything again. Its report ends with the session (keeping it is safe too: the next
-\* relay's push is acknowledged with a fresh report before the node can count as ready).
+\* pushes everything again. Its report ends with the session, as a relay keeps it per session.
 Disconnect(n) == /\ conn[n] /\ conn' = [conn EXCEPT ![n] = FALSE]
                  /\ chan' = [chan EXCEPT ![n] = [h \in Points |-> <<>>]]
                  /\ told' = [told EXCEPT ![n] = [h \in Points |-> "unknown"]]

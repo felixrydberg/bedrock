@@ -1023,9 +1023,10 @@ fn a_clear_waits_for_writes_already_admitted() {
     let store = store();
     // A write holds the last stripe; the clear takes the stripes in order, so it is waiting once it holds the first.
     let last = store.locks.len() - 1;
-    let admitted = store.locks[last].lock().unwrap();
     let (done, cleared) = std::sync::mpsc::channel();
     std::thread::scope(|s| {
+        // Taken inside the scope, so a failed assertion releases it before the clear's thread is joined.
+        let admitted = store.locks[last].lock().unwrap();
         s.spawn(|| {
             store.clear(0, 0).unwrap();
             done.send(()).unwrap();

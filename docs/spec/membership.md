@@ -162,8 +162,8 @@ two disconnects passed 4.7 GB in 2 h 40 min without finishing.
 | `early-report` | `ReadyCopied` | The node reports a range it is still copying |
 | `no-gen` | `ReadyCopied` | Reports and pushes ignore the generation, so a node removed and given the range again in revisions its relay skipped is ready with its old copy |
 
-Keeping the report across a disconnect is safe: the next relay pushes the set again, and its acknowledgement replaces
-the report before the member can count as ready.
+A relay keeps the report per session, and a new session starts with none (`Disconnect` clears `rep`). A member is
+therefore ready only on an acknowledgement of its current session, sent after the relay pushed it the set again.
 
 TLC 1.8.0, 2026-11-17, `handoff-volume.cfg` (`Points = {0}`, `MaxRev = 4`, `MaxCuts = 1`): 61,589,313 generated and
 5,588,055 distinct states, depth 37, no violation (10 min 12 s, 2 workers). `early-report` and `no-gen` each break

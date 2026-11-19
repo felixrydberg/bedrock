@@ -83,6 +83,13 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
             "bedrock-volume takes ranges as role l2 and hosts no relay-fed datasets".into(),
         ));
     }
+    // A store's start is decided from a majority of these relays ([`newest_directory`]): fewer than a cell's three
+    // would let one relay that lost its state decide it.
+    if config.relays.len() < 3 {
+        return Err(ConfigError(
+            "bedrock-volume needs at least its cell's three relays".into(),
+        ));
+    }
     let node = &config.node;
     tracing::info!(node_id = %node.node_id, "starting bedrock-volume");
     let admin = node::start_admin(node).await?;

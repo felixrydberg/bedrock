@@ -357,10 +357,19 @@ impl crate::repair::Peers for Cells {
                 .repair(request)
                 .await
         };
-        Ok(self
+        let reply = self
             .peers
             .call(&member.address, Class::Control, TIMEOUT, call)
-            .await?
-            .into_inner())
+            .await;
+        // The source no longer serves the span as this view says: the next fetch must be newer.
+        if let Err(status) = &reply
+            && status.code() == tonic::Code::FailedPrecondition
+        {
+            self.stale
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(source.cell.clone(), table.revision);
+        }
+        Ok(reply?.into_inner())
     }
 }
