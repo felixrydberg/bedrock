@@ -406,6 +406,45 @@ fn reads_refuse_a_slot_behind_min_seq_and_a_flushed_miss_is_cold() {
 }
 
 #[test]
+fn a_slot_behind_s3_skips_to_it_and_keeps_its_vote() {
+    let store = store();
+    let a = host("a");
+    claimed(&store, &a, 1);
+    append(&store, &a, 1, 0, vec![entry(1, 1, &[("k", Some("1"))])], 0);
+    // The holder recovered from a slot that flushed through 5, so it cannot resend 2..=5.
+    let gap = append(&store, &a, 1, 1, vec![entry(6, 1, &[])], 6);
+    assert_eq!(refused(&gap), Refusal::LogGap);
+    // Not to a point a newer holder wrote: this slot's holder may not have it.
+    assert!(store.skip(&actor(), &a, 1, 5, 2, None).unwrap().is_none());
+    // Not for another holder, or for an epoch the slot no longer promises.
+    assert!(
+        store
+            .skip(&actor(), &host("b"), 1, 5, 1, None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.skip(&actor(), &a, 2, 5, 1, None).unwrap().is_none());
+    let skipped = store
+        .skip(&actor(), &a, 1, 5, 1, Some(42))
+        .unwrap()
+        .unwrap();
+    let after = slot(&skipped.answer);
+    assert!(after.voting);
+    assert_eq!((after.flushed, after.committed), (5, 5));
+    assert_eq!(after.end.unwrap().seq, 5);
+    assert!(skipped.overlay < 0, "the overlay record of entry 1 is gone");
+    // `k` is read from S3 now.
+    let (_, _, cold) = store.read(&actor(), &[b"k".to_vec()], 0).unwrap();
+    assert_eq!(cold, vec![0]);
+    assert_eq!(
+        refused(&append(&store, &a, 1, 1, vec![entry(6, 1, &[])], 6)),
+        Refusal::None
+    );
+    // A log that already reaches S3's point stays.
+    assert!(store.skip(&actor(), &a, 1, 5, 1, None).unwrap().is_none());
+}
+
+#[test]
 fn scans_list_live_keys_in_order() {
     let store = store();
     let a = host("a");
@@ -763,4 +802,300 @@ fn an_owed_truncation_only_rises() {
     let restarted = Store::new(engine);
     restarted.recover().unwrap();
     assert_eq!(restarted.owed()[0].1, 10);
+}
+
+fn records(store: &Store) -> Vec<pb::Record> {
+    store.records(0, 0, &[], MAX_LIMIT).unwrap().0
+}
+
+#[test]
+fn a_sealed_range_refuses_reservations_claims_and_appends() {
+    let store = store();
+    let actor = actor();
+    let a = host("a");
+    claimed(&store, &a, 1);
+    store.seal(0, 0).unwrap();
+    assert!(matches!(store.reserve(&actor, 2, 0), Err(Error::Sealed)));
+    assert!(matches!(
+        store.claim(&actor, &a, 2, 0, |_| false),
+        Err(Error::Sealed)
+    ));
+    let request = pb::AppendRequest {
+        holder: Some(a.clone()),
+        epoch: 1,
+        entries: vec![entry(1, 1, &[])],
+        ..Default::default()
+    };
+    assert!(matches!(store.append(&actor, &request), Err(Error::Sealed)));
+    // The seal is durable.
+    let reopened = Store::new(store.engine.clone());
+    reopened.recover().unwrap();
+    assert!(matches!(reopened.reserve(&actor, 2, 0), Err(Error::Sealed)));
+}
+
+#[test]
+fn an_actor_with_no_record_in_a_repaired_range_starts_repaired() {
+    let store = store();
+    let actor = actor();
+    assert!(slot(&store.reserve(&actor, 1, 0).unwrap()).voting);
+    store.mark_repaired(0, 0).unwrap();
+    assert_eq!(
+        refused(&store.reserve(&actor, 2, 0).unwrap()),
+        Refusal::None,
+        "a record written before the mark keeps its own state"
+    );
+    let other = Actor::new(&pb::Actor {
+        namespace: "ns".into(),
+        id: id('d'),
+        kind: 0,
+    })
+    .unwrap();
+    assert_eq!(
+        refused(&store.reserve(&other, 1, 0).unwrap()),
+        Refusal::NotVoting
+    );
+}
+
+#[test]
+fn a_repair_keeps_the_more_advanced_log_and_the_higher_promise_and_reservation() {
+    let a = host("a");
+    // One peer has the log; the other only a higher reservation.
+    let logged = store();
+    logged.reserve(&actor(), 1, 0).unwrap();
+    claimed(&logged, &a, 1);
+    append(
+        &logged,
+        &a,
+        1,
+        0,
+        vec![entry(1, 1, &[("k", Some("v"))]), entry(2, 1, &[])],
+        0,
+    );
+    let reserved = store();
+    reserved.reserve(&actor(), 3, 0).unwrap();
+    // A peer that is itself repaired is no voting copy, however far its log goes.
+    let repaired = store();
+    claimed(&repaired, &a, 5);
+    append(&repaired, &a, 5, 0, vec![entry(1, 5, &[])], 0);
+    repaired.mark_repaired(0, 0).unwrap();
+    let marked = pb::ClaimRecord {
+        repaired: true,
+        ..repaired.load(&actor()).unwrap()
+    };
+    repaired
+        .engine
+        .put(&claim_key(&actor()), &marked.encode_to_vec())
+        .unwrap();
+
+    let target = store();
+    for source in [&reserved, &logged, &repaired] {
+        target.install(&records(source), true).unwrap();
+    }
+    let claim = target.load(&actor()).unwrap();
+    assert_eq!((claim.epoch, claim.holder.as_ref()), (1, Some(&a)));
+    assert_eq!(claim.reserved, 3);
+    assert!(claim.repaired);
+    assert_eq!(end(&claim), pb::LogEnd { seq: 2, epoch: 1 });
+    assert_eq!(read(&target, "k"), Some(b"v".to_vec()));
+    // A range handoff copies a slot as it is.
+    let handed = store();
+    handed.install(&records(&reserved), false).unwrap();
+    assert!(!handed.load(&actor()).unwrap().repaired);
+}
+
+#[test]
+fn a_pushed_set_without_a_held_range_forgets_it_and_clearing_drops_its_records() {
+    let store = store();
+    let a = host("a");
+    claimed(&store, &a, 1);
+    store.initialize(true).unwrap();
+    store.hold(0, 0, 0).unwrap();
+    let held = store.keep(&[(0, 1 << 63, 0)]).unwrap();
+    assert_eq!(held.list(), [(0, 1 << 63)]);
+    assert_eq!(store.fresh(), Some(false));
+    assert_eq!(store.forgotten(), 1);
+    assert_eq!(
+        store.keep(&[(0, 0, 0)]).unwrap(),
+        held,
+        "nothing new is held"
+    );
+    // A pushed set that gives the range anew, at another generation, forgets the copy.
+    assert_eq!(store.keep(&[(0, 0, 7)]).unwrap(), Spans::default());
+    store.hold(0, 0, 7).unwrap();
+    store.seal(0, 0).unwrap();
+    store.clear(0, 0).unwrap();
+    assert!(records(&store).is_empty());
+    assert_eq!(store.held(), Spans::default());
+    assert_eq!(store.sealed(), Spans::default());
+}
+
+#[test]
+fn spans_coalesce_and_cut() {
+    let mut spans = Spans::default();
+    spans.add(10, 20);
+    spans.add(20, 30);
+    spans.add(40, 0);
+    assert_eq!(spans.list(), [(10, 30), (40, 0)]);
+    assert!(spans.covers(12, 30) && !spans.covers(12, 31) && spans.covers(50, 0));
+    assert!(spans.contains(u64::MAX) && !spans.contains(35));
+    spans.remove(15, 45);
+    assert_eq!(spans.list(), [(10, 15), (45, 0)]);
+    assert!(spans.overlaps(0, 11) && !spans.overlaps(15, 45));
+    assert_eq!(spans.within(12, 50).list(), [(12, 15), (45, 50)]);
+}
+
+#[test]
+fn copied_log_bytes_count_once_and_a_copy_cut_short_clears_to_zero() {
+    let a = host("a");
+    let source = store();
+    claimed(&source, &a, 1);
+    append(
+        &source,
+        &a,
+        1,
+        0,
+        vec![entry(1, 1, &[("k", Some("v"))]), entry(2, 1, &[])],
+        0,
+    );
+    let logged = source.unflushed();
+    assert!(logged > 0);
+    let target = store();
+    target.install(&records(&source), true).unwrap();
+    assert_eq!(target.unflushed(), logged, "counted when installed");
+    target.install(&records(&source), true).unwrap();
+    assert_eq!(
+        target.unflushed(),
+        logged,
+        "a log no more advanced is not taken"
+    );
+    target.adopt(0, 0).unwrap();
+    assert_eq!(target.unflushed(), logged, "adopting counts nothing again");
+    let cut = store();
+    cut.install(&records(&source), true).unwrap();
+    cut.clear(0, 0).unwrap();
+    assert_eq!(
+        cut.unflushed(),
+        0,
+        "a copy cut short and cleared leaves nothing counted"
+    );
+}
+
+#[test]
+fn a_copy_finished_after_a_set_forgot_it_is_not_held_and_reports_forget_nothing() {
+    let store = store();
+    store.initialize(true).unwrap();
+    let forgotten = store.start_copy(0, 0, 3);
+    store.keep(&[(0, 0, 4)]).unwrap();
+    assert!(!store.finish_copy(0, 0, 3, forgotten, true).unwrap());
+    assert!(store.held().list().is_empty());
+    // A copy that failed is no longer being made, so a set without it forgets nothing.
+    let forgotten = store.start_copy(0, 0, 4);
+    assert!(!store.finish_copy(0, 0, 4, forgotten, false).unwrap());
+    let before = store.forgotten();
+    store.keep(&[]).unwrap();
+    assert_eq!(store.forgotten(), before);
+    let forgotten = store.start_copy(0, 0, 4);
+    assert!(store.finish_copy(0, 0, 4, forgotten, true).unwrap());
+    assert_eq!(store.holding(&[(0, 0, 4)]).list(), [(0, 0)]);
+    assert!(store.holding(&[(0, 0, 5)]).list().is_empty());
+    assert_eq!(
+        store.held().list(),
+        [(0, 0)],
+        "reading a report forgets nothing"
+    );
+}
+
+#[test]
+fn a_sealed_slot_does_not_skip_to_s3() {
+    let store = store();
+    claimed(&store, &host("a"), 1);
+    store.seal(0, 0).unwrap();
+    // A second seal of the same span still waits for writes in flight, and the seal refuses the skip.
+    store.seal(0, 0).unwrap();
+    assert!(matches!(
+        store.skip(&actor(), &host("a"), 1, 5, 1, None),
+        Err(Error::Sealed)
+    ));
+}
+
+#[test]
+fn a_clear_waits_for_writes_already_admitted() {
+    let store = store();
+    // A write holds the last stripe; the clear takes the stripes in order, so it is waiting once it holds the first.
+    let last = store.locks.len() - 1;
+    let (done, cleared) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        // Taken inside the scope, so a failed assertion releases it before the clear's thread is joined.
+        let admitted = store.locks[last].lock().unwrap();
+        s.spawn(|| {
+            store.clear(0, 0).unwrap();
+            done.send(()).unwrap();
+        });
+        let mut tries = 0;
+        while store.locks[0].try_lock().is_ok() {
+            tries += 1;
+            assert!(tries < 100_000_000, "the clear never started");
+            std::thread::yield_now();
+        }
+        assert!(
+            cleared.try_recv().is_err(),
+            "the clear waits while a write holds its stripe"
+        );
+        drop(admitted);
+        cleared
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the clear finishes once the write does");
+    });
+}
+
+#[test]
+fn a_range_mark_with_an_empty_span_is_corruption() {
+    let engine = Arc::new(MemoryEngine::new("volume"));
+    let bad = [5u64.to_be_bytes(), 3u64.to_be_bytes(), 0u64.to_be_bytes()].concat();
+    engine.put(HELD, &bad).unwrap();
+    assert!(matches!(
+        Store::new(engine).recover(),
+        Err(Error::Storage(StorageError::Corruption(_)))
+    ));
+}
+
+#[test]
+fn copies_of_the_same_log_keep_the_further_commit_point_in_either_order() {
+    let a = host("a");
+    let log = vec![entry(1, 1, &[("k", Some("v"))]), entry(2, 1, &[])];
+    let at = |commit| {
+        let store = store();
+        claimed(&store, &a, 1);
+        append(&store, &a, 1, 0, log.clone(), commit);
+        store
+    };
+    let (behind, ahead) = (at(0), at(2));
+    for order in [[&behind, &ahead], [&ahead, &behind]] {
+        let target = store();
+        for source in order {
+            target.install(&records(source), true).unwrap();
+        }
+        assert_eq!(target.load(&actor()).unwrap().committed, 2);
+        target.adopt(0, 0).unwrap();
+        assert_eq!(
+            target.dirty(0, 0).len(),
+            1,
+            "the committed entries wait for a flush"
+        );
+    }
+    // A longer log is taken whole, with its own commit point.
+    let longer = store();
+    claimed(&longer, &a, 1);
+    append(
+        &longer,
+        &a,
+        1,
+        0,
+        [log.clone(), vec![entry(3, 1, &[])]].concat(),
+        1,
+    );
+    let target = store();
+    target.install(&records(&ahead), true).unwrap();
+    target.install(&records(&longer), true).unwrap();
+    assert_eq!(target.load(&actor()).unwrap().committed, 1);
 }

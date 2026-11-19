@@ -21,8 +21,9 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(1);
 
 pub type Members = BTreeMap<MemberKey, pb::Member>;
-/// Leaf member and dataset → the ranges its holding relay reports it ready for (#22 / B-21).
-pub type Ready = BTreeMap<(MemberKey, String), Vec<(u64, u64)>>;
+/// Leaf member and dataset → the ranges its holding relay reports it ready for (#22 / B-21): start, end, and for a dataset
+/// no relay streams the generation the member's copy is for (#114 / S-06), else 0.
+pub type Ready = BTreeMap<(MemberKey, String), Vec<(u64, u64, u64)>>;
 
 /// The follows a relay's own subscribers need from upstream, by selector (#41 / B-12b).
 pub type Interests = BTreeMap<StreamKey, pb::Follow>;
@@ -318,15 +319,19 @@ fn validate_control(hub: &Hub, peer: Option<&pb::ControlAck>) -> Result<(), Stat
     }
 }
 
-fn wire(((service, node_id), dataset): &(MemberKey, String), spans: &[(u64, u64)]) -> pb::Ready {
+fn wire(
+    ((service, node_id), dataset): &(MemberKey, String),
+    spans: &[(u64, u64, u64)],
+) -> pb::Ready {
     pb::Ready {
         service: service.clone(),
         node_id: node_id.clone(),
         dataset: dataset.clone(),
         spans: spans
             .iter()
-            .map(|&(start, end)| pb::Span { start, end })
+            .map(|&(start, end, _)| pb::Span { start, end })
             .collect(),
+        generations: spans.iter().map(|&(_, _, generation)| generation).collect(),
     }
 }
 
@@ -484,8 +489,18 @@ impl Siblings {
                 }
                 for entry in update.ready {
                     let at = ((entry.service, entry.node_id), entry.dataset);
-                    let spans: Vec<(u64, u64)> =
-                        entry.spans.iter().map(|s| (s.start, s.end)).collect();
+                    let spans: Vec<(u64, u64, u64)> = entry
+                        .spans
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| {
+                            (
+                                s.start,
+                                s.end,
+                                entry.generations.get(i).copied().unwrap_or(0),
+                            )
+                        })
+                        .collect();
                     if spans.is_empty() {
                         ready.remove(&at);
                     } else {

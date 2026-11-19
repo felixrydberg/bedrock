@@ -154,6 +154,7 @@ fn directory_entries_sit_beside_members_in_one_namespace() {
     // An owner state this build does not know is corruption, not an empty range.
     let unknown = pb::Range {
         owners: vec![pb::range::Owner {
+            generation: 0,
             node_id: "cdn-1".into(),
             state: 7,
         }],

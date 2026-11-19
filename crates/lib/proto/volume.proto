@@ -22,7 +22,7 @@ service Volume {
   rpc Log(LogRequest) returns (LogReply);
   // From the maintainer once S3 holds everything through `through` (S-05).
   rpc Truncate(TruncateRequest) returns (Answer);
-  // Another slot copies one hash range's records (S-06).
+  // A new range owner, or a slot repairing after losing its data, copies one hash range's records (S-06).
   rpc Repair(RepairRequest) returns (RepairReply);
 }
 
@@ -123,10 +123,15 @@ message LogReply { Answer answer = 1; repeated Entry entries = 2; bool more = 3;
 
 message TruncateRequest { Actor actor = 1; uint64 through = 2; }
 
-// Records whose hash lies in `[start, end)`, `end` 0 meaning 2⁶⁴, after the raw key `after`.
-message RepairRequest { uint64 start = 1; uint64 end = 2; bytes after = 3; uint32 limit = 4; }
+// Records whose hash lies in `[start, end)`, `end` 0 meaning 2⁶⁴, after the raw key `after`. With `seal` (a range
+// handoff) the answering node must be the range's `leaving` owner, and it first seals the span: from then on it refuses
+// reservations, claims and appends there, so the copy holds every promise it gave.
+message RepairRequest { uint64 start = 1; uint64 end = 2; bytes after = 3; uint32 limit = 4; bool seal = 5; }
 message Record { bytes key = 1; bytes value = 2; }
-message RepairReply { repeated Record records = 1; bool more = 2; }
+// `repaired`: the parts of the span where an actor the node has no record of starts repaired (S-06).
+message RepairReply { repeated Record records = 1; bool more = 2; repeated HashSpan repaired = 3; }
+// `[start, end)` of the hash space, `end` 0 meaning 2⁶⁴.
+message HashSpan { uint64 start = 1; uint64 end = 2; }
 
 // Stored records (`crates/volume/src/store.rs`).
 message ClaimRecord {

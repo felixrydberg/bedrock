@@ -149,6 +149,7 @@ fn table(revision: u64, ranges: &[(u64, &[(&str, &str)])]) -> pb::RoutesReply {
             owners: owners
                 .iter()
                 .map(|(node, _)| pb::range::Owner {
+                    generation: 0,
                     node_id: node.to_string(),
                     state: pb::range::owner::State::Ready as i32,
                 })

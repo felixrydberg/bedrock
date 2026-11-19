@@ -96,14 +96,20 @@ constant, `"none"` in its config. Every other value is a bug that must break the
 it, checked with that invariant alone so no other one fires first. `scripts/tlc.sh bugs` runs only the bugs, in
 about 2 minutes, and `scripts/tlc.sh relays` runs one model. It needs Java 11 or later and the
 [TLA+ tools jar](https://github.com/tlaplus/tlaplus/releases), checked in at `scripts/tla2tools.jar`.
-Every invariant and property has a bug except `TypeOK`, which only catches mistakes in a model.
+TLC uses 2 workers and a 4 GB heap unless `TLC_WORKERS` and `TLC_HEAP` (for example `10g`) say otherwise, and writes
+each run's output to `target/tlc/{run}.log` while it runs. Every invariant and property has a bug except `TypeOK`, which only catches mistakes in a model.
 
 On 2026-11-09, the new `cell` integration model passed 1,975,881 generated states / 247,328 distinct states and its four
 negative controls. It abstracts Raft consensus and checks Bedrock's persistence, publication and conditional-apply boundary;
 this result does not establish the full hardening gate.
 
-A model with several configs names each `model-variant.cfg`. `volume` has four: `volume-base`, `volume-handoff` and
-`volume-topology` pass, and `volume-wipe` fails `NoLostAck` on an open design finding ([volume.md](volume.md)).
+A model with several configs names each `model-variant.cfg`. `volume` has five, which all passed on 2026-11-18:
+`volume-base`, `volume-handoff`, `volume-wipe`, `volume-topology`, and `volume-truncate`, which also checks `Skip`
+([volume.md](volume.md)).
+`handoff` has three more configs for readiness of `volume` ranges, which the node reports and its relay checks (#114 /
+S-06, [membership.md](membership.md#node-reported-readiness-volume-114--s-06)): `handoff-volume`, `handoff-volume-split`
+with two points, which has not finished and is left out of the default run, and `handoff-volume-faulty` with partitions
+and faulty revokes.
 
 On 2026-11-09, `service_isolation` passed 2,640,649 generated states / 182,408 distinct states; its six deliberate
 fault checks also detected their intended violations. The model checks independent enabling, not eventual progress.

@@ -1036,6 +1036,26 @@ impl Cold {
         }
         result
     }
+
+    /// The actor's [`Meta`] from a range database that holds it at `at_least` or later: where a slot left behind skips
+    /// to (S-06).
+    pub async fn meta(&self, cell: &str, actor: &pb::Actor, at_least: u64) -> Result<Meta, Status> {
+        let parsed = Actor::new(actor).map_err(status)?;
+        let (first, name, db) = self.holding(cell, actor, &parsed, at_least).await?;
+        let read = async {
+            let bytes = db
+                .get(&meta_key(parsed.name()))
+                .await
+                .map_err(storage)?
+                .ok_or_else(|| Status::unavailable("the range database does not hold the actor"))?;
+            Meta::decode(&bytes).ok_or_else(|| Status::data_loss("an actor meta does not decode"))
+        };
+        let result = read.await;
+        if result.is_err() {
+            self.forget(&first, &name, &db);
+        }
+        result
+    }
 }
 
 /// The key [`Store::owed`] orders an actor by, as its range database keys it.

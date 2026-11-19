@@ -13,12 +13,13 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bedrock_lib::datasets::capabilities::{VOLUME, ranged_datasets};
+use bedrock_lib::datasets::capabilities::{VOLUME, pushed, ranged_datasets};
 use bedrock_lib::membership::{
-    DATASET, Directories, Published, Publisher, RANGE, SERVICES, encode, key, namespace,
+    DATASET, Directories, Generations, Published, Publisher, RANGE, SERVICES, encode_generations,
+    key, namespace,
 };
 use bedrock_lib::node::MembershipSettings;
-use bedrock_lib::placement::{Directory, Owner};
+use bedrock_lib::placement::{Directory, Owner, State};
 use bedrock_lib::reconciliation::drain::{self, Drain};
 use bedrock_lib::relays::client::Session;
 use bedrock_lib::relays::siblings::{self, Members, Siblings};
@@ -52,6 +53,8 @@ pub enum Change {
         dataset: String,
         start: u64,
         owners: Vec<Owner>,
+        /// Owner → the generation of its assignment, for a dataset no relay streams (#114 / S-06).
+        generations: BTreeMap<String, u64>,
     },
     /// Deletes the range entry at `start`, joining its range to the one before (#66 / B-61, [`placement::merges`]).
     Merge {
@@ -218,10 +221,16 @@ pub fn majority(seen: &Observed) -> bool {
 /// One service's directory writes from the published `actual` members, per dataset it places, over the members
 /// carrying that dataset: complete the handoffs `ready` reports, otherwise assign (`docs/spec/membership.tla` and
 /// `handoff.tla`, `Write`).
+/// For a dataset no relay streams (`volume`, #114 / S-06), each owner's assignment has a generation: an owner keeps
+/// the one it has, and one new to a range gets `revision + 1`, above the revision this plan read and below any later
+/// plan's. A populating owner counts as ready only for its current generation.
+#[allow(clippy::too_many_arguments)]
 pub fn place(
     service: &str,
     actual: &Members,
     directories: &Directories,
+    generations: &Generations,
+    revision: u64,
     ready: &siblings::Ready,
     drains: &[Drain],
     replicas: usize,
@@ -235,11 +244,22 @@ pub fn place(
             .collect();
         let empty = Directory::new();
         let directory = directories.get(dataset).unwrap_or(&empty);
+        let owned = generations.get(dataset);
+        let generation = |start: u64, node: &str| {
+            owned
+                .and_then(|g| g.get(&start))
+                .and_then(|g| g.get(node))
+                .copied()
+                .unwrap_or(0)
+        };
         let ready: BTreeSet<(String, u64)> = ready
             .iter()
             .filter(|(((s, _), d), _)| s == service && d == dataset)
             .flat_map(|(((_, node), _), spans)| {
-                spans.iter().map(|(start, _)| (node.clone(), *start))
+                spans
+                    .iter()
+                    .filter(|(start, _, copied)| *copied == generation(*start, node))
+                    .map(|(start, _, _)| (node.clone(), *start))
             })
             .collect();
         // Storage trouble in a dataset takes no new ranges of it (B-14). Such members keep what they hold for B-22 to
@@ -260,17 +280,55 @@ pub fn place(
             let drained = drain::apply(&members, drains, dataset);
             let moving = drain::moving(drains, MAX_MOVING);
             entries = placement::assign(directory, &drained, &unhealthy, replicas, moving);
+            // A cell's first owners of a dataset no relay streams (`volume`) have nothing anywhere to copy, so they start
+            // `ready` (#114 / S-06). Every later owner copies and reports.
+            if directory.is_empty() && !pushed(dataset) {
+                for owner in entries.values_mut().flatten() {
+                    owner.state = State::Ready;
+                }
+            }
         }
-        // Merges wait for a pass with nothing else to write, so they never share a plan with a split.
+        // Merges wait for a pass with nothing else to write, so they never share a plan with a split. The merged range
+        // keeps the earlier entry's generations, so only ranges whose owners have the same generation in both merge:
+        // otherwise an owner would forget its copy of the later part and copy it again.
         let merges = if entries.is_empty() {
             placement::merges(directory)
+                .into_iter()
+                .filter(|start| {
+                    let before = bedrock_lib::placement::start_of(directory, start - 1);
+                    directory[start]
+                        .iter()
+                        .all(|o| generation(before, &o.node) == generation(*start, &o.node))
+                })
+                .collect()
         } else {
             Vec::new()
+        };
+        let assigned = |start: u64, owners: &[Owner]| -> BTreeMap<String, u64> {
+            if pushed(dataset) {
+                return BTreeMap::new();
+            }
+            let before = bedrock_lib::placement::owners(directory, start);
+            let cover = bedrock_lib::placement::start_of(directory, start);
+            owners
+                .iter()
+                .map(|o| {
+                    let kept = before.iter().any(|b| b.node == o.node);
+                    let g = if kept {
+                        generation(cover, &o.node)
+                    } else {
+                        revision + 1
+                    };
+                    (o.node.clone(), g)
+                })
+                .filter(|(_, g)| *g != 0)
+                .collect()
         };
         changes.extend(entries.into_iter().map(|(start, owners)| Change::Range {
             service: service.into(),
             dataset: dataset.into(),
             start,
+            generations: assigned(start, &owners),
             owners,
         }));
         changes.extend(merges.into_iter().map(|start| Change::Merge {
@@ -295,10 +353,11 @@ fn owned(directory: &Directory, node: &str) -> Vec<pb::Span> {
     spans
 }
 
-/// A placement view and the exact membership revision captured with it.
+/// A placement view, its assignment generations and the exact membership revision captured with them.
 struct DirectoryAt {
     revision: u64,
     directories: Directories,
+    generations: Generations,
 }
 
 impl DirectoryAt {
@@ -308,10 +367,26 @@ impl DirectoryAt {
             .get(dataset)
             .map(|directory| owned(directory, node))
             .unwrap_or_default();
+        let generations = if pushed(dataset) {
+            Vec::new()
+        } else {
+            let owned = self.generations.get(dataset);
+            spans
+                .iter()
+                .map(|s| {
+                    owned
+                        .and_then(|g| g.get(&s.start))
+                        .and_then(|g| g.get(node))
+                        .copied()
+                        .unwrap_or(0)
+                })
+                .collect()
+        };
         pb::Ranges {
             dataset: dataset.into(),
             revision: self.revision,
             spans,
+            generations,
         }
     }
 }
@@ -416,7 +491,7 @@ impl Cell {
                     .drain_hooks
                     .get(*service)
                     .map_or(&[][..], Vec::as_slice);
-                let (members, directory, records, revision) = match view
+                let (members, directory, records, revision, generations) = match view
                     .validated(service, &self.cell, hooks)
                 {
                     Ok(read) => read,
@@ -445,6 +520,7 @@ impl Cell {
                     DirectoryAt {
                         revision,
                         directories: directory,
+                        generations,
                     },
                 ));
             }
@@ -483,6 +559,8 @@ impl Cell {
                         service,
                         &actual,
                         &snapshot.directories,
+                        &snapshot.generations,
+                        snapshot.revision,
                         &ready,
                         drains,
                         if *service == VOLUME {
@@ -572,9 +650,10 @@ impl Cell {
                 dataset,
                 start,
                 owners,
+                generations,
             } => (
                 (service.clone(), format!("{RANGE}{dataset}/{start:016x}")),
-                Some(encode(owners)),
+                Some(encode_generations(owners, generations)),
             ),
             Change::Merge {
                 service,

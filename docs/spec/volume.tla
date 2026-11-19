@@ -11,7 +11,7 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \*   "topology" : the slot set {a, b, c} becomes {a, b, d} through a joint version;
 \*   "truncate" : no change of votes; every slot tracks its commit point, refuses appends under
 \*                backpressure while still learning the commit point, and truncates what S3 holds
-\*                (S-05, #113).
+\*                (S-05, #113); a slot behind S3 skips to it (S-06, #114).
 \* Messages are abstract. A grant the holder has received stays counted after the slot that sent
 \* it changes; a fenced holder's appends still arrive. A commit is acknowledged in the step whose
 \* fsync completes its quorum.
@@ -200,6 +200,25 @@ Wipe == /\ Change = "wipe" /\ st["c"] = "vote" /\ copied["c"] = {}
         /\ log' = [log EXCEPT !["c"] = <<>>] /\ reserved' = [reserved EXCEPT !["c"] = 0]
         /\ fl' = [fl EXCEPT !["c"] = 0] /\ cp' = [cp EXCEPT !["c"] = 0]
         /\ UNCHANGED <<sv, copied, holders, acked, s3, maint, tv, jointDone>>
+\* A slot whose log ends below what S3 holds (S-06, #114): a holder that recovered from a slot that
+\* truncated cannot resend what S3 has, and that slot keeps its vote, so it takes S3's state as its
+\* log through the flush and its commit point. S3 holds only committed entries, so whatever the slot
+\* had there is either the same or could never commit. The slot skips on an append from its promised
+\* holder, which appends only once it has recovered, and only to an S3 point no newer than that
+\* promise: the holder's recovered log then holds it, so its appends continue S3's state. A late
+\* append of a holder fenced after it wrote at its epoch also counts; one fenced before it recovered
+\* never appends in the code. A holder a newer one fenced may lack the S3 point (bug "skip-any").
+\* Bug "skip-keep" keeps the slot's own prefix and only appends S3's tail.
+Skip(n) == /\ Change = "truncate" /\ Takes(n) /\ Len(log[n]) < Len(s3)
+           /\ \E h \in Hosts : /\ promise[n] = Ballot(h)
+                              /\ \/ phase[h] \in {"recover", "claimed", "open", "released"}
+                                 \/ phase[h] = "fenced" /\ \E i \in DOMAIN hlog[h] : hlog[h][i] = Ballot(h)
+           /\ LastE(s3) <= promise[n].e \/ Bug = "skip-any"
+           /\ log' = [log EXCEPT ![n] = IF Bug = "skip-keep" THEN @ \o SubSeq(s3, Len(@) + 1, Len(s3))
+                                         ELSE s3]
+           /\ fl' = [fl EXCEPT ![n] = Len(s3)]
+           /\ cp' = [cp EXCEPT ![n] = IF Len(s3) > @ THEN Len(s3) ELSE @]
+           /\ UNCHANGED <<promise, st, sv, copied, reserved, holders, acked, s3, maint, tv, jointDone>>
 \* A populating node copies the claim and log of one source: the sealed leaving owner, or a
 \* voting peer. It keeps the higher promise and reservation, and the more advanced log.
 Copy(n, m) == /\ st[n] = "pop" /\ m \in Sources \ copied[n]
@@ -230,7 +249,7 @@ End == /\ tv = 2 /\ jointDone /\ tv' = 3
 Next == \/ \E h \in Hosts : \/ Start(h) \/ Reserved(h)
                             \/ Recover(h) \/ Write(h) \/ Release(h) \/ Fence(h)
         \/ \E n \in Nodes, h \in Hosts : Reserve(n, h) \/ Grant(n, h) \/ Replicate(n, h) \/ Learn(n, h)
-        \/ \E n \in Nodes : Truncate(n)
+        \/ \E n \in Nodes : Truncate(n) \/ Skip(n)
         \/ \E n \in Maintainers : OpenMaint(n) \/ Flush(n)
         \/ \E n \in Nodes : Ready(n) \/ \E m \in Nodes : Copy(n, m)
         \/ StartHandoff \/ Seal \/ Wipe \/ Begin \/ End

@@ -92,6 +92,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             member: None,
             pushed: BTreeMap::new(),
             ranges_acked: BTreeMap::new(),
+            reported: BTreeMap::new(),
             moved: None,
         },
     );
@@ -915,15 +916,18 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
     );
     hub.observe_head(&site.0, 5);
     let ranges = |dataset: &str, revision| pb::Ranges {
+        generations: Vec::new(),
         dataset: dataset.into(),
         revision,
         spans: vec![pb::Span { start: 0, end: 0 }],
     };
     let ack = |dataset: &str, revision| pb::RangesAck {
+        generations: Vec::new(),
         dataset: dataset.into(),
         revision,
         refused: Vec::new(),
         reason: String::new(),
+        ready: Vec::new(),
     };
     hub.push_ranges(&me, ranges("quicksilver", 7));
     hub.push_ranges(&me, ranges("quicksilver", 8));
@@ -976,7 +980,10 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
     // The target is the head when the stream first could be ready; later writes do not move it.
     hub.observe_head(&site.0, 9);
     set(&|i| i.acked = 5);
-    let expected = siblings::Ready::from([((me.clone(), "quicksilver".to_string()), vec![whole])]);
+    let expected = siblings::Ready::from([(
+        (me.clone(), "quicksilver".to_string()),
+        vec![(whole.0, whole.1, 0)],
+    )]);
     assert_eq!(hub.ready(), expected);
     set(&|i| i.confirming = true);
     assert!(
@@ -1006,7 +1013,7 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
     assert_eq!(hub.ready(), expected, "`workers` is not followed yet");
     follow("workers");
     let mut both = expected.clone();
-    both.insert((me, "cdn".to_string()), vec![whole]);
+    both.insert((me, "cdn".to_string()), vec![(whole.0, whole.1, 0)]);
     assert_eq!(hub.ready(), both);
 }
 
@@ -1099,6 +1106,7 @@ async fn a_refused_push_is_pushed_again_on_the_next_pass() {
         .member = Some(member("q1", pb::member::Status::Ready));
     let me = ("kv".to_string(), "q1".to_string());
     let ranges = |revision| pb::Ranges {
+        generations: Vec::new(),
         dataset: "quicksilver".into(),
         revision,
         spans: vec![pb::Span {
@@ -1107,6 +1115,7 @@ async fn a_refused_push_is_pushed_again_on_the_next_pass() {
         }],
     };
     let refused = |revision| pb::RangesAck {
+        generations: Vec::new(),
         dataset: "quicksilver".into(),
         revision,
         refused: vec![pb::Span {
@@ -1114,6 +1123,7 @@ async fn a_refused_push_is_pushed_again_on_the_next_pass() {
             end: 0,
         }],
         reason: "still an owner".into(),
+        ready: Vec::new(),
     };
     let mut next = async || match tokio_stream::StreamExt::next(&mut frames)
         .await
@@ -1253,4 +1263,61 @@ async fn routes_return_a_services_published_namespace_to_callers_in_the_cell() {
     );
     let kv = hub.routes(ask("volume", Some(caller("kv", "other", "kv-9"))));
     assert_eq!(kv.await.unwrap_err().code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn a_volume_member_is_ready_for_a_range_only_from_its_report_with_the_latest_set() {
+    let hub = hub();
+    let (_frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    hub.0
+        .subscribers
+        .lock()
+        .unwrap()
+        .get_mut(&1)
+        .unwrap()
+        .member = Some(member("v1", pb::member::Status::Ready));
+    let me = ("kv".to_string(), "v1".to_string());
+    let half = pb::Span {
+        start: 0,
+        end: 1 << 63,
+    };
+    let whole = pb::Span { start: 0, end: 0 };
+    let set = |revision, generation| pb::Ranges {
+        dataset: "volume".into(),
+        revision,
+        spans: vec![half],
+        generations: vec![generation],
+    };
+    let ack = |revision, ready: Vec<(pb::Span, u64)>| pb::RangesAck {
+        dataset: "volume".into(),
+        revision,
+        generations: ready.iter().map(|(_, g)| *g).collect(),
+        ready: ready.into_iter().map(|(s, _)| s).collect(),
+        ..Default::default()
+    };
+    hub.push_ranges(&me, set(4, 3));
+    hub.ranges_acked(1, ack(4, Vec::new()));
+    assert!(hub.ready().is_empty(), "acknowledged, but still copying");
+    hub.ranges_acked(1, ack(4, vec![(whole, 2)]));
+    assert!(hub.ready().is_empty(), "a copy for another assignment");
+    // The report after the copy: a held span that covers the range, for its generation, counts.
+    hub.ranges_acked(1, ack(4, vec![(whole, 3)]));
+    let expected =
+        siblings::Ready::from([((me.clone(), "volume".to_string()), vec![(0, 1 << 63, 3)])]);
+    assert_eq!(hub.ready(), expected);
+    // A set that gives the range anew is pushed although its spans are unchanged, and needs a new report.
+    hub.push_ranges(&me, set(6, 5));
+    assert!(hub.ready().is_empty(), "the report predates the set");
+    hub.ranges_acked(1, ack(6, vec![(half, 5)]));
+    let renewed =
+        siblings::Ready::from([((me.clone(), "volume".to_string()), vec![(0, 1 << 63, 5)])]);
+    assert_eq!(hub.ready(), renewed);
+    // A stale acknowledgement arriving late changes nothing.
+    hub.ranges_acked(1, ack(4, vec![(whole, 3)]));
+    assert_eq!(hub.ready(), renewed);
+    hub.ranges_acked(1, ack(6, Vec::new()));
+    assert!(
+        hub.ready().is_empty(),
+        "a range forgotten since is not ready"
+    );
 }
