@@ -415,8 +415,19 @@ fn a_slot_behind_s3_skips_to_it_and_keeps_its_vote() {
     let gap = append(&store, &a, 1, 1, vec![entry(6, 1, &[])], 6);
     assert_eq!(refused(&gap), Refusal::LogGap);
     // Not to a point a newer holder wrote: this slot's holder may not have it.
-    assert!(store.skip(&actor(), 5, 2, None).unwrap().is_none());
-    let skipped = store.skip(&actor(), 5, 1, Some(42)).unwrap().unwrap();
+    assert!(store.skip(&actor(), &a, 1, 5, 2, None).unwrap().is_none());
+    // Not for another holder, or for an epoch the slot no longer promises.
+    assert!(
+        store
+            .skip(&actor(), &host("b"), 1, 5, 1, None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.skip(&actor(), &a, 2, 5, 1, None).unwrap().is_none());
+    let skipped = store
+        .skip(&actor(), &a, 1, 5, 1, Some(42))
+        .unwrap()
+        .unwrap();
     let after = slot(&skipped.answer);
     assert!(after.voting);
     assert_eq!((after.flushed, after.committed), (5, 5));
@@ -430,7 +441,7 @@ fn a_slot_behind_s3_skips_to_it_and_keeps_its_vote() {
         Refusal::None
     );
     // A log that already reaches S3's point stays.
-    assert!(store.skip(&actor(), 5, 1, None).unwrap().is_none());
+    assert!(store.skip(&actor(), &a, 1, 5, 1, None).unwrap().is_none());
 }
 
 #[test]
@@ -1002,7 +1013,7 @@ fn a_sealed_slot_does_not_skip_to_s3() {
     // A second seal of the same span still waits for writes in flight, and the seal refuses the skip.
     store.seal(0, 0).unwrap();
     assert!(matches!(
-        store.skip(&actor(), 5, 1, None),
+        store.skip(&actor(), &host("a"), 1, 5, 1, None),
         Err(Error::Sealed)
     ));
 }
@@ -1010,21 +1021,80 @@ fn a_sealed_slot_does_not_skip_to_s3() {
 #[test]
 fn a_clear_waits_for_writes_already_admitted() {
     let store = store();
-    let actor = actor();
-    let admitted = store.lock(&actor);
+    // A write holds the last stripe; the clear takes the stripes in order, so it is waiting once it holds the first.
+    let last = store.locks.len() - 1;
+    let admitted = store.locks[last].lock().unwrap();
     let (done, cleared) = std::sync::mpsc::channel();
     std::thread::scope(|s| {
         s.spawn(|| {
             store.clear(0, 0).unwrap();
             done.send(()).unwrap();
         });
+        let mut tries = 0;
+        while store.locks[0].try_lock().is_ok() {
+            tries += 1;
+            assert!(tries < 100_000_000, "the clear never started");
+            std::thread::yield_now();
+        }
         assert!(
-            cleared
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
+            cleared.try_recv().is_err(),
             "the clear waits while a write holds its stripe"
         );
         drop(admitted);
-        cleared.recv().unwrap();
+        cleared
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the clear finishes once the write does");
     });
+}
+
+#[test]
+fn a_range_mark_with_an_empty_span_is_corruption() {
+    let engine = Arc::new(MemoryEngine::new("volume"));
+    let bad = [5u64.to_be_bytes(), 3u64.to_be_bytes(), 0u64.to_be_bytes()].concat();
+    engine.put(HELD, &bad).unwrap();
+    assert!(matches!(
+        Store::new(engine).recover(),
+        Err(Error::Storage(StorageError::Corruption(_)))
+    ));
+}
+
+#[test]
+fn copies_of_the_same_log_keep_the_further_commit_point_in_either_order() {
+    let a = host("a");
+    let log = vec![entry(1, 1, &[("k", Some("v"))]), entry(2, 1, &[])];
+    let at = |commit| {
+        let store = store();
+        claimed(&store, &a, 1);
+        append(&store, &a, 1, 0, log.clone(), commit);
+        store
+    };
+    let (behind, ahead) = (at(0), at(2));
+    for order in [[&behind, &ahead], [&ahead, &behind]] {
+        let target = store();
+        for source in order {
+            target.install(&records(source), true).unwrap();
+        }
+        assert_eq!(target.load(&actor()).unwrap().committed, 2);
+        target.adopt(0, 0).unwrap();
+        assert_eq!(
+            target.dirty(0, 0).len(),
+            1,
+            "the committed entries wait for a flush"
+        );
+    }
+    // A longer log is taken whole, with its own commit point.
+    let longer = store();
+    claimed(&longer, &a, 1);
+    append(
+        &longer,
+        &a,
+        1,
+        0,
+        [log.clone(), vec![entry(3, 1, &[])]].concat(),
+        1,
+    );
+    let target = store();
+    target.install(&records(&ahead), true).unwrap();
+    target.install(&records(&longer), true).unwrap();
+    assert_eq!(target.load(&actor()).unwrap().committed, 1);
 }

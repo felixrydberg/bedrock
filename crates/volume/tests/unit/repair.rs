@@ -281,3 +281,39 @@ async fn a_cell_s_first_owner_holds_its_range_without_a_repair() {
     assert_eq!(target.fresh(), Some(true));
     assert!(!target.repaired().overlaps(0, 0));
 }
+
+#[tokio::test]
+async fn records_of_a_range_left_without_a_mark_are_cleared_once_another_owner_is_ready() {
+    // A pushed set forgot the hold before the revoke was seen: the records stay, with no held or sealed mark.
+    let target = source();
+    decide(&target, &Directory::new(), "d").unwrap();
+    let elsewhere = Directory::from([(
+        0,
+        vec![Owner {
+            node: "e".into(),
+            state: State::Ready,
+        }],
+    )]);
+    Repair::new(target.clone(), Arc::new(Nobody), "d", "cell-c")
+        .tick(&elsewhere, &BTreeMap::new())
+        .await
+        .unwrap();
+    let (records, _) = target.records(0, 0, &[], store::MAX_LIMIT).unwrap();
+    assert!(records.is_empty());
+}
+
+#[test]
+fn a_log_record_whose_key_names_another_entry_is_corruption() {
+    let (mut records, _) = source().records(0, 0, &[], store::MAX_LIMIT).unwrap();
+    let last = records
+        .iter_mut()
+        .rfind(|r| r.key.ends_with(&3u64.to_be_bytes()))
+        .unwrap();
+    let mut entry = pb::Entry::decode(last.value.as_slice()).unwrap();
+    entry.seq = 4;
+    last.value = entry.encode_to_vec();
+    assert_eq!(
+        consistent(&records).unwrap_err().code(),
+        tonic::Code::DataLoss
+    );
+}

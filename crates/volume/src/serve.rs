@@ -346,7 +346,8 @@ impl pb::volume_server::Volume for Service {
             .map_or(0, |s| s.end.unwrap_or_default().seq);
         let behind = outcome.answer.refused == pb::Refusal::LogGap as i32 && end < prev;
         if let (true, Some(cold)) = (behind, &self.cold) {
-            let Some(pb_actor) = request.actor.as_ref() else {
+            let (Some(pb_actor), Some(holder)) = (request.actor.as_ref(), request.holder.clone())
+            else {
                 return Ok(Response::new(outcome.answer));
             };
             match cold.meta(&self.cell, pb_actor, end + 1).await {
@@ -354,10 +355,12 @@ impl pb::volume_server::Volume for Service {
                     let actor = self.actor(Some(pb_actor))?;
                     let kind = actor.kind();
                     let store = self.store.clone();
-                    let skipped =
-                        blocking(move || store.skip(&actor, meta.seq, meta.epoch, meta.alarm))
-                            .await?
-                            .map_err(status)?;
+                    let epoch = request.epoch;
+                    let skipped = blocking(move || {
+                        store.skip(&actor, &holder, epoch, meta.seq, meta.epoch, meta.alarm)
+                    })
+                    .await?
+                    .map_err(status)?;
                     if let Some(skipped) = skipped {
                         self.record(kind, &skipped);
                         return Ok(Response::new(self.append_once(&request).await?.answer));

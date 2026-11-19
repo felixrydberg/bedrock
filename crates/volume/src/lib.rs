@@ -195,7 +195,11 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
                         *assignments.write().unwrap_or_else(PoisonError::into_inner)=
                             session.ready().then_some(current);
                     }
-                    Err(error)=>tracing::warn!(%error,"volume directory unreadable"),
+                    // Repair waits for the next good read; serving keeps the last directory.
+                    Err(error)=>{
+                        *assignments.write().unwrap_or_else(PoisonError::into_inner)=None;
+                        tracing::warn!(%error,"volume directory unreadable");
+                    }
                 }
             },
             _=measure.tick()=>{

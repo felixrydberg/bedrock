@@ -290,7 +290,10 @@ impl crate::repair::Peers for Cells {
                     clip(start, end, from, placement::end_of(&directory, from));
                 let found: Vec<_> = owners
                     .iter()
-                    .filter(|o| o.state != State::Populating && o.node != self.node)
+                    // Node names are unique within a cell only: a sibling cell's owner may share this node's.
+                    .filter(|o| {
+                        o.state != State::Populating && !(o.node == self.node && *cell == self.cell)
+                    })
                     .map(|o| Source {
                         cell: cell.clone(),
                         node: o.node.clone(),

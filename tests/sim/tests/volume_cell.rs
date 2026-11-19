@@ -553,8 +553,7 @@ async fn scenario(follow: bool) -> Vec<String> {
     holding.await.unwrap();
     let acked = holder.acked.lock().unwrap().clone();
     trace.push(format!(
-        "acked {} reopened {}",
-        acked.len(),
+        "acked {acked:?} reopened {}",
         holder.reopened.load(Ordering::SeqCst)
     ));
 

@@ -302,6 +302,15 @@ impl Spans {
         let mut spans = Spans::default();
         for triple in triples {
             let word = |i: usize| u64::from_be_bytes(triple[i * 8..i * 8 + 8].try_into().unwrap());
+            if word(1) != 0 && word(1) <= word(0) {
+                return Err(Error::Storage(StorageError::Corruption(ErrorContext {
+                    engine: "volume",
+                    instance: "volume".into(),
+                    file: None,
+                    partition: None,
+                    detail: "a range mark holds an empty span".into(),
+                })));
+            }
             spans.add_generation(word(0), word(1), word(2));
         }
         Ok(spans)
@@ -786,7 +795,12 @@ impl Store {
             }
             copied.clone()
         } else {
-            here.clone().unwrap()
+            let mut kept = here.clone().unwrap();
+            // Logs that end at the same entry are the same log (Raft's log matching), so the further commit point holds.
+            if last(&copied) == last(&kept) {
+                kept.committed = kept.committed.max(copied.committed);
+            }
+            kept
         };
         if let Some(here) = &here {
             let promise = if copied.epoch > here.epoch {
@@ -1398,9 +1412,12 @@ impl Store {
     /// Only to an S3 point no newer than the slot's promise: the promised holder's log then holds it, so its appends
     /// continue S3's state, while a holder a newer one fenced may lack it. The answer is `None` when the log already
     /// reaches `seq` or `epoch` is above the promise.
+    #[allow(clippy::too_many_arguments)]
     pub fn skip(
         &self,
         actor: &Actor,
+        holder: &pb::Holder,
+        promise: u64,
         seq: u64,
         epoch: u64,
         alarm: Option<u64>,
@@ -1409,7 +1426,10 @@ impl Store {
         self.check_sealed(actor)?;
         let old = self.load(actor)?;
         let old_end = end(&old);
-        if old_end.seq >= seq || epoch > old.epoch {
+        // Only for the holder whose append found the gap, while the slot still promises it: another claim may have come
+        // in since.
+        let promised = old.holder.as_ref() == Some(holder) && old.epoch == promise;
+        if !promised || old_end.seq >= seq || epoch > old.epoch {
             return Ok(None);
         }
         let log = self.entries(actor, old.flushed + 1, old_end.seq)?;

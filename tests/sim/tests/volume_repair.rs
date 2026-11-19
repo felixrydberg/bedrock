@@ -454,7 +454,22 @@ async fn populating(cluster: Cluster) -> u64 {
     assert_eq!(committed.len(), 1, "h1 committed its no-op");
     h2.reserve(A).await;
     cluster.set(C, &[(C, State::Leaving), (D, State::Populating)]);
-    let reserved = counts(&h2.reserve(D).await);
+    // d answers, and refuses: a refusal for want of an answer would prove nothing.
+    let request = pb::ReserveRequest {
+        actor: Some(actor()),
+        epoch: h2.epoch,
+        version: 0,
+    };
+    let answer = timeout(CALL, client(D).await.unwrap().reserve(request))
+        .await
+        .unwrap();
+    let reserved = match answer {
+        Ok(answer) => counts(&Some(answer.into_inner())),
+        Err(status) => {
+            assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+            false
+        }
+    };
     assert!(!reserved, "a populating owner takes no reservation");
     if reserved {
         h2.claim(A).await;
@@ -613,8 +628,11 @@ async fn wipe_then_handoff(cluster: Cluster) -> u64 {
     let mut repairing = None;
     // Which node holds c's slot.
     let mut third = C;
+    // How many commits were acknowledged before the wipe and before the handoff.
+    let (mut before_wipe, mut before_handoff) = (0, 0);
     for n in 0..16u32 {
         if n == wipe_at {
+            before_wipe = committed.len();
             cluster.wipe(C).await;
             let c = cluster.repair(C, None);
             let directory = cluster.view(C);
@@ -623,6 +641,7 @@ async fn wipe_then_handoff(cluster: Cluster) -> u64 {
             }));
         }
         if n == handoff_at {
+            before_handoff = committed.len();
             let repaired = repairing.take().unwrap().await.unwrap().unwrap();
             assert!(repaired, "c holds its range again");
             cluster.set(C, &[(C, State::Leaving), (D, State::Populating)]);
@@ -652,6 +671,11 @@ async fn wipe_then_handoff(cluster: Cluster) -> u64 {
     if let Some(repairing) = repairing {
         let _ = repairing.await;
     }
+    assert!(
+        0 < before_wipe && before_wipe < before_handoff && before_handoff < committed.len(),
+        "commits were acknowledged before the wipe, between it and the handoff, and after: {before_wipe} {before_handoff} {}",
+        committed.len()
+    );
     // h1 stops; h2 waits out its lease, reserves above it and recovers.
     sleep(LEASE + Duration::from_secs(1)).await;
     let mut h2 = Holder::new("h2", 2);

@@ -118,13 +118,22 @@ impl Repair {
         let mine = owners.iter().find(|o| o.node == self.node).map(|o| o.state);
         match mine {
             None => {
-                let marked = held.overlaps(start, end) || self.store.sealed().overlaps(start, end);
-                if marked && owners.iter().any(|o| o.state == State::Ready) {
-                    let store = self.store.clone();
-                    blocking(move || store.clear(start, end))
-                        .await?
-                        .map_err(status)?;
+                if !owners.iter().any(|o| o.state == State::Ready) {
+                    return Ok(false);
                 }
+                // Records left without a mark (a pushed set forgot the hold first, or a copy was cut short) go too.
+                // ponytail: one seek per unowned range per pass; keep a cleanup mark if cells grow many ranges.
+                let store = self.store.clone();
+                let marked = held.overlaps(start, end) || store.sealed().overlaps(start, end);
+                blocking(move || {
+                    let leftover = !store.records(start, end, &[], 1)?.0.is_empty();
+                    if marked || leftover {
+                        store.clear(start, end)?;
+                    }
+                    Ok::<_, store::Error>(())
+                })
+                .await?
+                .map_err(status)?;
                 return Ok(false);
             }
             // A copy made for another assignment of the range is stale: others may have written since.
@@ -356,11 +365,17 @@ fn consistent(records: &[pb::Record]) -> Result<bool, Status> {
         let name = &record.key[at..];
         if let Some(seq) = name.strip_prefix(b"log/") {
             let entry = pb::Entry::decode(record.value.as_slice()).map_err(corrupt)?;
+            let seq = <[u8; 8]>::try_from(seq).ok().map(u64::from_be_bytes);
+            if seq != Some(entry.seq) {
+                return Err(Status::data_loss(
+                    "a copied log record's key does not name its entry",
+                ));
+            }
             if entry.epoch < epoch {
                 return Ok(false);
             }
             epoch = entry.epoch;
-            seqs.push(u64::from_be_bytes(seq.try_into().unwrap_or_default()));
+            seqs.push(entry.seq);
         } else if name.starts_with(b"data/") {
             let overlay = pb::OverlayRecord::decode(record.value.as_slice()).map_err(corrupt)?;
             if overlay.seq > end {
