@@ -7,7 +7,13 @@
 //!
 //! - **Older copies.** Range databases keep an actor's copy after it moves until S-05b deletes it: a first-slot move
 //!   inside the DC leaves an older copy in another of its cells, so only the highest sequence counts, and an actor that
-//!   moved to another DC earlier is skipped, since its `dc_of` is no longer the lost DC.
+//!   moved to another DC before this DC change is skipped, since the lost DC is neither its `dc_of` nor its
+//!   `dc_before`.
+//! - **Unfinished moves.** While a DC change runs, an actor leaving the lost DC (`dc_before`) is recorded too: its
+//!   handover may not have imported its new slots. Its meta's `moved` is the first `MOVE` when S3 holds it, which is the
+//!   point the handover imports at, so importing there finishes the move; without it the actor is imported at its
+//!   flushed point like any other. A move that did finish imported that same point already, and repeating it changes
+//!   nothing.
 //! - **Nothing is copied here.** Once an actor's new slots start at its recorded sequence, its maintainer copies its keys
 //!   from the lost cell's database on its next flush (the first-slot move in [`super::Cold`]), and cold reads find it
 //!   there until then. Each actor loses what its slots had committed beyond the recorded sequence: its unflushed tail.
@@ -25,8 +31,8 @@ use super::{Meta, meta_key, undecodable};
 /// Actors recorded per commit, so a large DC's record is many small commits; a rerun writes the same keys again.
 const RECORD_BATCH: usize = 10_000;
 
-/// Restores lost DC `dc` of `topology` (the region's record, which still lists it) as restore `id`, and returns how
-/// many actors it recorded.
+/// Restores lost DC `dc` of `topology` (the region's record, which still lists it, or lists it as a previous DC while a
+/// DC change retires it) as restore `id`, and returns how many actors it recorded.
 pub async fn restore(
     databases: &dyn Databases,
     topology: &Topology,
@@ -68,7 +74,8 @@ pub async fn restore(
         let parsed = ActorId::parse(&regions, &actor.id)
             .map_err(|e| corrupt(format!("actor {}: {e}", actor.id)))?;
         let home = actors::dc_of(&parsed, topology).map_err(|e| corrupt(e.to_string()))?;
-        if home.name != dc {
+        let before = actors::dc_before(&parsed, topology).map_err(|e| corrupt(e.to_string()))?;
+        if home.name != dc && before.is_none_or(|b| b.name != dc) {
             continue;
         }
         batch.push((meta_key(&lowest), Some(meta.encode())));
@@ -119,9 +126,10 @@ pub async fn restored(
     listed.map(|()| page)
 }
 
-/// The lost DC's cells, sorted.
+/// The lost DC's cells, sorted: from the current DCs, or the previous ones when a DC change is retiring it.
 fn cells(topology: &Topology, dc: &str) -> StorageResult<Vec<String>> {
-    let found = topology.dcs.iter().find(|d| d.name == dc).ok_or_else(|| {
+    let mut dcs = topology.dcs.iter().chain(&topology.previous_dcs);
+    let found = dcs.find(|d| d.name == dc).ok_or_else(|| {
         StorageError::Unsupported(context(format!(
             "the topology of {} lists no DC {dc}",
             topology.region

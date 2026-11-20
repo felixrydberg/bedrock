@@ -213,6 +213,19 @@ fn meta_round_trips_and_rejects_other_lengths() {
             seq: 7,
             epoch: 2,
             alarm: Some(99),
+            moved: None,
+        },
+        Meta {
+            seq: 7,
+            epoch: 2,
+            alarm: None,
+            moved: Some((5, 2)),
+        },
+        Meta {
+            seq: 7,
+            epoch: 2,
+            alarm: Some(99),
+            moved: Some((5, 2)),
         },
     ] {
         assert_eq!(Meta::decode(&meta.encode()), Some(meta));
@@ -306,6 +319,40 @@ async fn a_restore_records_each_homed_actor_once_at_its_newest_copy() {
             .await
             .is_err()
     );
+
+    // While a DC change moves the other actors out of dc-1, their handovers may not have finished: dc-1's restore
+    // records them too, at their flushed meta, with the first MOVE S3 holds.
+    let leaving = (0..5).find(|i| !homed(*i)).unwrap();
+    let mut moving = entry(2, &[]);
+    moving.kind = pb::entry::Kind::Move as i32;
+    append(&one.store, leaving, 1, vec![moving], 2).unwrap();
+    one.cold.tick(&one.directory).await;
+    let changing = Topology {
+        previous_dcs: vec![topology.dcs[0].clone()],
+        ..topology.clone()
+    };
+    // Each actor's ID, recorded sequence and first MOVE.
+    type Recorded = (String, u64, Option<(u64, u64)>);
+    let mut want: Vec<Recorded> = (0..5)
+        .map(|i| {
+            let seq = if i == 0 || i == leaving { 2 } else { 1 };
+            (actor(i).id, seq, (i == leaving).then_some((2, 1)))
+        })
+        .collect();
+    want.sort_by_key(|(id, _, _)| ActorId::hash_of(id).unwrap());
+    assert_eq!(
+        restore::restore(&bucket, &changing, "dc-1", "r3")
+            .await
+            .unwrap(),
+        5
+    );
+    let got: Vec<Recorded> = restore::restored(&bucket, &changing, "dc-1", "r3", None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(a, m)| (a.id, m.seq, m.moved))
+        .collect();
+    assert_eq!(got, want);
 }
 
 /// One flush writes every changed actor of a range in one batch, so S3 writes per interval do not grow with actors.
@@ -911,6 +958,7 @@ async fn adopt_skips_a_cell_it_cannot_read_and_fails_only_when_no_cell_qualified
         seq: 1,
         epoch: 1,
         alarm: None,
+        moved: None,
     };
     let changes = vec![
         (meta_key(parsed.name()), Some(meta.encode())),
@@ -962,6 +1010,7 @@ async fn a_moved_actor_read_skips_a_cell_it_cannot_read() {
         seq: 1,
         epoch: 1,
         alarm: None,
+        moved: None,
     };
     let writer = bucket.open(&name).await.unwrap();
     writer
@@ -1425,7 +1474,9 @@ mod slate {
     }
 
     /// The acceptance check: S3 requests per flush do not grow with the actors in a range. One flush is one L0 file
-    /// and one manifest update; measuring sizes reads the manifest the writer holds.
+    /// and one manifest update; measuring sizes reads the manifest the writer holds. SlateDB's background tasks (the
+    /// manifest poll, compactor and garbage collector) may land inside one flush on a slow machine, so the quietest of
+    /// a few steady flushes is measured.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn s3_requests_per_flush_do_not_grow_with_actors() {
         let mut writes = Vec::new();
@@ -1433,7 +1484,14 @@ mod slate {
             let store = Arc::new(Counting::default());
             let n = slate_node(&store, "n1");
             round(&n, &store, actors, 0).await;
-            let steady = round(&n, &store, actors, 1).await;
+            let mut quietest: Option<[u64; 5]> = None;
+            for seq in 1..=3 {
+                let flush = round(&n, &store, actors, seq).await;
+                if quietest.is_none_or(|q| flush.iter().sum::<u64>() < q.iter().sum::<u64>()) {
+                    quietest = Some(flush);
+                }
+            }
+            let steady = quietest.expect("three flushes");
             assert_eq!(steady[3], 0, "no copies");
             writes.push(steady[0]);
             assert!(
@@ -1441,7 +1499,7 @@ mod slate {
                 "{actors} actors made {steady:?}"
             );
             for i in 0..actors {
-                assert_eq!(flushed(&n.store, i), 2);
+                assert_eq!(flushed(&n.store, i), 4);
             }
             let before = store.requests();
             assert!(n.cold.size(0, 0) > 0);

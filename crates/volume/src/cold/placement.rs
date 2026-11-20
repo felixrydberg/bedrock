@@ -68,7 +68,8 @@ impl Cells {
         }
     }
 
-    /// The region's topology, read again when the cached one is older than [`TOPOLOGY_TTL`] or below `version`.
+    /// The region's topology, read again when the cached one is older than [`TOPOLOGY_TTL`] or below `version`. A read
+    /// still below `version` is a retryable failure: the record's storage revision says nothing of its version.
     async fn topology(&self, region: &str, version: u64) -> Result<Arc<Topology>, Status> {
         let now = bedrock_lib::monotonic_now();
         if let Some((topology, read)) = self
@@ -96,6 +97,12 @@ impl Cells {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(region.to_owned(), (topology.clone(), now));
+        if topology.version < version {
+            return Err(Status::unavailable(format!(
+                "topology of {region} is at version {}, below {version}",
+                topology.version
+            )));
+        }
         Ok(topology)
     }
 

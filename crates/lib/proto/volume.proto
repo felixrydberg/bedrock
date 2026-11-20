@@ -116,6 +116,8 @@ message Slot {
   LogEnd moved = 11;
   // The alarm as of `flushed`, which a DC change imports with the `MOVE` (S-17).
   optional uint64 flushed_alarm_ms = 12;
+  // Where the slot was imported into the actor's new DC, if it was (S-17).
+  Import imported = 13;
 }
 
 message Answer { Refusal refused = 1; Slot slot = 2; }
@@ -137,6 +139,8 @@ message LogReply { Answer answer = 1; repeated Entry entries = 2; bool more = 3;
 message TruncateRequest { Actor actor = 1; uint64 through = 2; }
 // The actor's state starts at `seq`, whose entry has `epoch`, with `alarm_ms` as of there (S-17).
 message ImportRequest { Actor actor = 1; uint64 epoch = 2; uint64 seq = 3; optional uint64 alarm_ms = 4; uint64 version = 5; }
+// An import's point, kept apart from the slot's live state so a repeated import is recognised after claims moved on.
+message Import { uint64 epoch = 1; uint64 seq = 2; optional uint64 alarm_ms = 3; }
 
 // Records whose hash lies in `[start, end)`, `end` 0 meaning 2⁶⁴, after the raw key `after`. With `seal` (a range
 // handoff) the answering node must be the range's `leaving` owner, and it first seals the span: from then on it refuses
@@ -167,7 +171,7 @@ message ClaimRecord {
   int32 kind = 13;
   // The first `MOVE`, once truncated here (S-17).
   LogEnd moved = 14;
-  // The slot was imported into the actor's new DC (S-17).
-  bool imported = 15;
+  // Where the slot was imported into the actor's new DC (S-17).
+  Import imported = 15;
 }
 message OverlayRecord { uint64 seq = 1; optional bytes value = 2; }

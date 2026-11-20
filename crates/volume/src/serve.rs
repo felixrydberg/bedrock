@@ -388,7 +388,15 @@ impl pb::volume_server::Volume for Service {
                     let store = self.store.clone();
                     let epoch = request.epoch;
                     let skipped = blocking(move || {
-                        store.skip(&actor, &holder, epoch, meta.seq, meta.epoch, meta.alarm)
+                        store.skip(
+                            &actor,
+                            &holder,
+                            epoch,
+                            meta.seq,
+                            meta.epoch,
+                            meta.alarm,
+                            meta.moved(),
+                        )
                     })
                     .await?
                     .map_err(status)?;

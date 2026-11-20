@@ -327,6 +327,35 @@ async fn scenario() -> (u64, bool) {
         committed > seq + 1,
         "the new DC continues after the MOVE and its no-op"
     );
+    // Moving back to the old DC is refused before any MOVE commits, and the new DC still serves.
+    let back = compute(5)
+        .spawn(async move {
+            client::handover(
+                host("back", "new-1"),
+                &actor(),
+                slots(true),
+                &slots(false),
+                0,
+            )
+            .await
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(&back, Err(Error::Rpc(s)) if s.code() == tonic::Code::FailedPrecondition),
+        "a return to the old DC: {back:?}"
+    );
+    let after = compute(6)
+        .spawn(async move {
+            let writer = open(&host("new-again", "new-1"), true).await;
+            writer.commit(change(1001), None, 1001).await.unwrap()
+        })
+        .await
+        .unwrap();
+    assert!(
+        after > committed,
+        "the new DC still serves after the refusal"
+    );
     fingerprint.mix((
         "handover",
         crash,

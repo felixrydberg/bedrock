@@ -407,6 +407,8 @@ pub struct Pending {
     pub through: u64,
     pub epoch: u64,
     pub alarm: Option<u64>,
+    /// The log's first `MOVE`, when it is at or before `through` (S-17).
+    pub moved: Option<pb::LogEnd>,
     /// The last write of each key in `(flushed, through]`, in key order; `None` deletes it.
     pub changes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
@@ -440,6 +442,7 @@ fn answer(refused: Refusal, claim: &pb::ClaimRecord, voting: bool) -> pb::Answer
             flushed_epoch: claim.flushed_epoch,
             moved: claim.moved,
             flushed_alarm_ms: claim.flushed_alarm_ms,
+            imported: claim.imported,
         }),
     }
 }
@@ -938,6 +941,14 @@ impl Store {
             through: claim.committed,
             epoch: self.epoch_at(actor, &claim, claim.committed)?,
             alarm,
+            moved: claim.moved.or_else(|| {
+                log.iter()
+                    .find(|e| e.kind == EntryKind::Move as i32)
+                    .map(|e| pb::LogEnd {
+                        seq: e.seq,
+                        epoch: e.epoch,
+                    })
+            }),
             changes: changes.into_iter().collect(),
         }))
     }
@@ -1070,8 +1081,8 @@ impl Store {
 
     /// Starts the actor on this slot of its new DC at `seq`, whose entry has `epoch`, with `alarm_ms` as of there: the
     /// flushed `MOVE` of a DC change or a restore's point (S-17, `Import` in `volume_dc.tla`). The slot holds no log; S3
-    /// holds everything through `seq`. Repeating the same import is a no-op; a slot holding anything else of the actor
-    /// refuses with `STALE_EPOCH`. Synced before the answer.
+    /// holds everything through `seq`. Repeating the same import, alarm included, is a no-op, also after claims moved the
+    /// slot on; a slot holding anything else of the actor refuses with `STALE_EPOCH`. Synced before the answer.
     pub fn import(
         &self,
         actor: &Actor,
@@ -1084,8 +1095,12 @@ impl Store {
         self.check_sealed(actor)?;
         let old = self.load(actor)?;
         let voting = !old.repaired;
-        let end = pb::LogEnd { seq, epoch };
-        if old.imported && old.epoch == epoch && old.flushed == seq && old.end == Some(end) {
+        let point = pb::Import {
+            epoch,
+            seq,
+            alarm_ms,
+        };
+        if old.imported == Some(point) {
             return Ok(answer(Refusal::None, &old, voting));
         }
         // A slot in a repaired span starts repaired; the import keeps that, and the slot votes once a claim commits.
@@ -1102,13 +1117,13 @@ impl Store {
             released: true,
             version,
             committed: seq,
-            end: Some(end),
+            end: Some(pb::LogEnd { seq, epoch }),
             flushed: seq,
             flushed_epoch: epoch,
             alarm_ms,
             flushed_alarm_ms: alarm_ms,
             kind: actor.kind,
-            imported: true,
+            imported: Some(point),
             ..old.clone()
         };
         let mut batch = WriteBatch::default();
@@ -1120,7 +1135,10 @@ impl Store {
     /// The `NOT_IMPORTED` refusal while this slot has not been imported: for an actor moving into this DC (S-17).
     pub fn unimported(&self, actor: &Actor) -> Result<Option<pb::Answer>, Error> {
         let old = self.load(actor)?;
-        Ok((!old.imported).then(|| answer(Refusal::NotImported, &old, !old.repaired)))
+        Ok(old
+            .imported
+            .is_none()
+            .then(|| answer(Refusal::NotImported, &old, !old.repaired)))
     }
 
     /// Promises `epoch` to `holder`: only above the slot's promise, at its topology version or newer, and while no other
@@ -1477,7 +1495,8 @@ impl Store {
     /// vote. S3 holds only committed entries, so what the slot had up to there is either the same or could never commit.
     /// Only to an S3 point no newer than the slot's promise: the promised holder's log then holds it, so its appends
     /// continue S3's state, while a holder a newer one fenced may lack it. The answer is `None` when the log already
-    /// reaches `seq` or `epoch` is above the promise.
+    /// reaches `seq` or `epoch` is above the promise. `moved` is the first `MOVE` S3 holds (S-17), which the slot keeps
+    /// as its own, so a later `MOVE` never takes its place.
     #[allow(clippy::too_many_arguments)]
     pub fn skip(
         &self,
@@ -1487,6 +1506,7 @@ impl Store {
         seq: u64,
         epoch: u64,
         alarm: Option<u64>,
+        moved: Option<pb::LogEnd>,
     ) -> Result<Option<Outcome>, Error> {
         let _lock = self.lock(actor);
         self.check_sealed(actor)?;
@@ -1525,6 +1545,7 @@ impl Store {
             flushed_epoch: epoch,
             alarm_ms: alarm,
             flushed_alarm_ms: alarm,
+            moved: old.moved.or(moved),
             ..old.clone()
         };
         Self::save(&mut batch, actor, &old, &new);

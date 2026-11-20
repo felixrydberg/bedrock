@@ -20,7 +20,7 @@ use bedrock_lib::storage::sim::Fingerprint;
 use bedrock_lib::volume::{self as pb, Refusal};
 use bedrock_volume::cold::db::{Databases, Memory, database};
 use bedrock_volume::cold::readers::Readers;
-use bedrock_volume::cold::{self, Cold, Placement, restore};
+use bedrock_volume::cold::{self, Cold, Meta, Placement, restore};
 use bedrock_volume::store::{Actor, Store};
 use madsim::rand::{Rng, thread_rng};
 use madsim::runtime::Runtime;
@@ -104,7 +104,8 @@ impl Holder {
     /// Sends the slot its missing entries; whether it holds the whole log now.
     fn send(&mut self, store: &Store, i: usize) -> bool {
         loop {
-            let from = self.next[i].max(1);
+            // A slot holding the whole log is sent its last entry again, which it acknowledges.
+            let from = self.next[i].min(self.log.len() as u64).max(1);
             let request = pb::AppendRequest {
                 holder: Some(pb::Holder {
                     cell: "cell-1".into(),
@@ -150,17 +151,25 @@ fn state(log: &[pb::Entry], seq: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {
     keys
 }
 
-/// The data keys the lost cell's database serving `actor` holds for it.
-async fn stored(bucket: &Memory, actor: &pb::Actor) -> BTreeMap<Vec<u8>, Vec<u8>> {
+/// The data keys and the meta the lost cell's database serving `actor` holds for it.
+async fn stored(bucket: &Memory, actor: &pb::Actor) -> (BTreeMap<Vec<u8>, Vec<u8>>, Option<Meta>) {
     let parsed = Actor::new(actor).unwrap();
     let (catalog, _) = bucket.catalog("cell-1").await.unwrap();
-    let (_, (_, db)) = catalog.spans.range(..=parsed.hash()).next_back().unwrap();
+    let Some((_, (_, db))) = catalog.spans.range(..=parsed.hash()).next_back() else {
+        return (BTreeMap::new(), None);
+    };
+    let contents = bucket.contents(&database("cell-1", db));
     let prefix = cold::data_key(parsed.name(), b"");
-    bucket
-        .contents(&database("cell-1", db))
+    let meta_key = cold::meta_key(parsed.name());
+    let meta = contents
+        .iter()
+        .find(|(k, _)| k.as_slice() == meta_key.as_slice())
+        .map(|(_, v)| Meta::decode(v).unwrap());
+    let keys = contents
         .into_iter()
         .filter_map(|(k, v)| Some((k.strip_prefix(prefix.as_slice())?.to_vec(), v)))
-        .collect()
+        .collect();
+    (keys, meta)
 }
 
 /// The trace, and how many entries the restore lost across actors.
@@ -274,27 +283,30 @@ async fn scenario() -> (u64, u64) {
         .await
         .unwrap();
     assert_eq!(count, recorded.len() as u64, "the record reads back");
-    let recorded: BTreeMap<String, u64> = recorded
-        .into_iter()
-        .map(|(a, meta)| (a.id, meta.seq))
-        .collect();
+    let recorded: BTreeMap<String, Meta> = recorded.into_iter().map(|(a, m)| (a.id, m)).collect();
+    // The oracle: exactly the actors S3 holds a meta for, each recorded with that meta.
+    let mut durable = BTreeMap::new();
+    for holder in &holders {
+        if let (_, Some(meta)) = stored(&bucket, &holder.actor).await {
+            durable.insert(holder.actor.id.clone(), meta);
+        }
+    }
+    assert_eq!(recorded, durable, "the restore records exactly S3's actors");
     let mut lost = 0;
     for (holder, truncated) in holders.iter().zip(truncated) {
-        let seq = recorded.get(&holder.actor.id).copied().unwrap_or(0);
+        let seq = durable.get(&holder.actor.id).map_or(0, |m| m.seq);
         assert!(
             seq >= truncated,
             "{}: restored at {seq}, but its slots had truncated through {truncated}",
             holder.actor.id
         );
         assert!(seq <= holder.commit, "only committed entries reach S3");
-        if seq > 0 {
-            assert_eq!(
-                stored(&bucket, &holder.actor).await,
-                state(&holder.log, seq),
-                "{} restores its state at {seq}",
-                holder.actor.id
-            );
-        }
+        assert_eq!(
+            stored(&bucket, &holder.actor).await.0,
+            state(&holder.log, seq),
+            "{} restores its state at {seq}",
+            holder.actor.id
+        );
         lost += holder.commit - seq;
         fingerprint.mix(("restored", seq, holder.commit));
     }

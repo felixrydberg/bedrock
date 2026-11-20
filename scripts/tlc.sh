@@ -133,7 +133,7 @@ pass() {
 
 bug() {
     local model="$1" value="$2" invariant="$3" kind config out
-    kind="$(grep -E "^(INVARIANTS|PROPERTIES) .*\b$invariant\b" "$model.cfg" | cut -d' ' -f1)"
+    kind="$(grep -E "^(INVARIANTS|PROPERTIES) .*\b$invariant\b" "$model.cfg" | cut -d' ' -f1 || true)"
     # A reachability check is not among the model's invariants: it is an invariant TLC must find violated.
     kind="${kind:-INVARIANTS}"
     config="$work/$model-$value-$invariant.cfg"

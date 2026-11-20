@@ -584,7 +584,6 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
         let from = request.entries[0].seq;
         let last = request.entries.last().expect("an append carries entries");
         let (through, release) = (last.seq, last.kind == Kind::Release as i32);
-        let commit = request.commit;
         let answer = call(
             &shared.joined.host.peers,
             &shared.joined.slots[i],
@@ -623,7 +622,8 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
         let mut state = shared.lock();
         match refused(&answer) {
             Some(Refusal::None) => {
-                state.ack(i, through, slot.voting, commit);
+                // The commit point the slot learned, which is below the one sent while it lacks entries up to it.
+                state.ack(i, through, slot.voting, slot.committed);
                 shared.changed.notify_waiters();
             }
             Some(Refusal::LogGap) => {
@@ -761,19 +761,22 @@ impl Writer {
             });
             let answers = gather(reserves, |a| quorum(a) >= 2).await;
             let mut seen = epoch;
+            let mut unimported = false;
             for (_, answer) in &answers {
                 if let Ok(answer) = answer {
                     if refused(answer) == Some(Refusal::StaleVersion) {
                         return Err(Error::StaleVersion);
                     }
-                    if refused(answer) == Some(Refusal::NotImported) {
-                        return Err(not_imported());
-                    }
+                    unimported |= refused(answer) == Some(Refusal::NotImported);
                     let slot = slot_of(answer);
                     seen = seen.max(slot.reserved).max(slot.epoch);
                 }
             }
             if quorum(&answers) < 2 {
+                // An import needs only two slots, so the third may refuse while the other two grant.
+                if unimported {
+                    return Err(not_imported());
+                }
                 epoch = seen + 1;
                 sleep(RETRY).await;
                 continue;
@@ -1082,14 +1085,7 @@ impl Writer {
                     }
                     refusal => last = format!("slot {i} refused: {refusal:?}"),
                 },
-                Err(status)
-                    if matches!(
-                        status.code(),
-                        Code::Unavailable | Code::DeadlineExceeded | Code::FailedPrecondition
-                    ) =>
-                {
-                    last = format!("slot {i}: {status}");
-                }
+                Err(status) if transient(&status) => last = format!("slot {i}: {status}"),
                 Err(status) => return Err(Error::Rpc(status)),
             }
         }
@@ -1122,7 +1118,8 @@ fn not_imported() -> Error {
 }
 
 /// Where the actor's first `MOVE` is, and the alarm as of the flushed point, from the first slot that truncated it: S3
-/// then holds it, since a slot truncates only after the flush is durable. `None` while no answering slot has.
+/// then holds it, since a slot truncates only after the flush is durable. `None` while no answering slot has; a slot's
+/// explicit failure, when no slot answered with the `MOVE`, is returned rather than taken for an unflushed one.
 pub async fn moved(
     host: &Host,
     actor: &pb::Actor,
@@ -1137,11 +1134,28 @@ pub async fn moved(
         async move { call(&peers, &slot, |mut c| async move { c.read(request).await }).await }
     });
     let answers = gather(reads, |_| false).await;
-    Ok(answers
-        .into_iter()
-        .filter_map(|(_, reply)| reply.ok()?.answer)
-        .map(|answer| slot_of(&answer))
-        .find_map(|slot| Some((slot.moved?, slot.flushed_alarm_ms))))
+    let mut failed = None;
+    for (_, reply) in answers {
+        match reply {
+            Ok(reply) => {
+                let slot = reply.answer.as_ref().map(slot_of).unwrap_or_default();
+                if let Some(moved) = slot.moved {
+                    return Ok(Some((moved, slot.flushed_alarm_ms)));
+                }
+            }
+            Err(status) if !transient(&status) => failed = Some(status),
+            Err(_) => {}
+        }
+    }
+    failed.map_or(Ok(None), |status| Err(Error::Rpc(status)))
+}
+
+/// A failure a retry may get past: the slot did not answer, or is not ready.
+fn transient(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::DeadlineExceeded | Code::FailedPrecondition
+    )
 }
 
 /// Imports `actor` into the `slots` of its new DC at `seq`, whose entry has `epoch`, with `alarm_ms` (S-17, `Import` in
@@ -1188,7 +1202,8 @@ pub const HANDOVER_FLUSH: Duration = Duration::from_secs(60);
 /// old DC, waits until S3 holds it, then imports the new DC's slots at the log's first `MOVE`, which an earlier
 /// handover may have committed. Every import starts at that one point, so the new slots agree. From the first `MOVE`
 /// on, the old DC never serves the actor; the new DC serves it once imported. Safe to repeat after any failure;
-/// returns the imported point as (epoch, sequence).
+/// returns the imported point as (epoch, sequence). A new DC whose slots held the actor before is refused before any
+/// `MOVE` commits (see [`importable`]).
 pub async fn handover(
     host: Arc<Host>,
     actor: &pb::Actor,
@@ -1196,6 +1211,13 @@ pub async fn handover(
     new: &[Slot; SLOTS],
     version: u64,
 ) -> Result<(u64, u64), Error> {
+    let earlier = moved(&host, actor, &old).await?;
+    let point = earlier.map(|(first, alarm_ms)| pb::Import {
+        epoch: first.epoch,
+        seq: first.seq,
+        alarm_ms,
+    });
+    importable(&host, actor, new, point).await?;
     Writer::move_out(host.clone(), actor.clone(), old.clone(), version).await?;
     let deadline = bedrock_lib::monotonic_now() + HANDOVER_FLUSH;
     let (first, alarm_ms) = loop {
@@ -1218,6 +1240,55 @@ pub async fn handover(
     )
     .await?;
     Ok((first.epoch, first.seq))
+}
+
+/// Checks, before any `MOVE` commits, that two of the new DC's `slots` can take the import at `point` (the first `MOVE`
+/// of an earlier attempt, `None` for a first one): each is blank or already imported there. A slot that held the actor
+/// before, as when it returns to a DC it left, refuses any other import, so the handover stops here, with the actor still
+/// served by its old DC, instead of leaving it fenced there and unimportable here.
+async fn importable(
+    host: &Host,
+    actor: &pb::Actor,
+    slots: &[Slot; SLOTS],
+    point: Option<pb::Import>,
+) -> Result<(), Error> {
+    let reads = slots.iter().map(|slot| {
+        let (peers, slot) = (host.peers.clone(), slot.clone());
+        let request = pb::ReadRequest {
+            actor: Some(actor.clone()),
+            ..Default::default()
+        };
+        async move { call(&peers, &slot, |mut c| async move { c.read(request).await }).await }
+    });
+    let (mut fit, mut held) = (0, 0);
+    for (_, reply) in gather(reads, |_| false).await {
+        let Some(answer) = reply.ok().and_then(|r| r.answer) else {
+            continue;
+        };
+        let slot = slot_of(&answer);
+        let blank = slot.imported.is_none()
+            && slot.epoch == 0
+            && slot.reserved == 0
+            && slot.end.is_none()
+            && slot.moved.is_none();
+        if blank || (slot.imported.is_some() && slot.imported == point) {
+            fit += 1;
+        } else if slot.imported.is_none() || point.is_some() {
+            held += 1;
+        }
+        // Imported while no old slot that answered names the first `MOVE`: unknown until one does.
+    }
+    if fit >= 2 {
+        Ok(())
+    } else if fit + (SLOTS - fit - held) >= 2 {
+        Err(Error::Unavailable(
+            "too few slots of the new DC answered".into(),
+        ))
+    } else {
+        Err(Error::Rpc(Status::failed_precondition(
+            "the new DC's slots held the actor before; a return to a DC it left is not supported",
+        )))
+    }
 }
 
 /// Reads the most advanced log, which ends at `end`, from `slot` and appends the claim's entry of `kind` (the no-op, or
@@ -1257,6 +1328,10 @@ async fn recover(
         }
         if from == 0 {
             let slot = reply.answer.as_ref().map(slot_of).unwrap_or_default();
+            // The slot may have truncated a `MOVE` since it answered the claim; only the mover recovers past it.
+            if kind != Kind::Move && slot.moved.is_some() {
+                return Err(Error::Moved);
+            }
             flushed = pb::LogEnd {
                 seq: slot.flushed,
                 epoch: slot.flushed_epoch,

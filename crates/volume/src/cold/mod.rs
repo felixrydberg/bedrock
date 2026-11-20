@@ -76,35 +76,49 @@ const COPY_ATTEMPTS: usize = 3;
 /// How many actors' flushed points one writer keeps in memory before starting its cache over, about a million.
 const KNOWN: usize = 1 << 20;
 
-/// What a range database holds for an actor besides its keys: the sequence they are at, its epoch, and the alarm.
+/// What a range database holds for an actor besides its keys: the sequence they are at, its epoch, the alarm, and the
+/// log's first `MOVE` as (sequence, epoch) once it is flushed (S-17), which a slot skipping to S3 keeps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Meta {
     pub seq: u64,
     pub epoch: u64,
     pub alarm: Option<u64>,
+    pub moved: Option<(u64, u64)>,
 }
 
 impl Meta {
+    /// Two words, then the alarm and the `MOVE`'s two words when present: 16, 24, 32 or 40 bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = [self.seq.to_be_bytes(), self.epoch.to_be_bytes()].concat();
         if let Some(alarm) = self.alarm {
             bytes.extend_from_slice(&alarm.to_be_bytes());
+        }
+        if let Some((seq, epoch)) = self.moved {
+            bytes.extend_from_slice(&[seq.to_be_bytes(), epoch.to_be_bytes()].concat());
         }
         bytes
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let word = |at: usize| Some(u64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
-        let alarm = match bytes.len() {
-            16 => None,
-            24 => Some(word(16)?),
+        let (alarm, moved) = match bytes.len() {
+            16 => (None, None),
+            24 => (Some(word(16)?), None),
+            32 => (None, Some((word(16)?, word(24)?))),
+            40 => (Some(word(16)?), Some((word(24)?, word(32)?))),
             _ => return None,
         };
         Some(Meta {
             seq: word(0)?,
             epoch: word(8)?,
             alarm,
+            moved,
         })
+    }
+
+    /// The first `MOVE`, as a log position.
+    pub fn moved(&self) -> Option<pb::LogEnd> {
+        self.moved.map(|(seq, epoch)| pb::LogEnd { seq, epoch })
     }
 }
 
@@ -1145,6 +1159,7 @@ fn meta(pending: &Pending) -> Meta {
         seq: pending.through,
         epoch: pending.epoch,
         alarm: pending.alarm,
+        moved: pending.moved.map(|m| (m.seq, m.epoch)),
     }
 }
 
