@@ -106,6 +106,7 @@ async fn subscribe(
             tier: 0,
             member: None,
             moved: false,
+            ..Default::default()
         })),
     })
     .await

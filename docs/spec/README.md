@@ -1,6 +1,6 @@
 # Storage recovery model (#11 / B-11)
 
-Relay protocol and recovery: [#14 / B-17 and #16 / B-18](relays.md).
+Relay protocol and recovery: [#14 / B-17 and #16 / B-18](relays.md). The cells below a relay, for upper-tier Gateways: [#89 / B-57](relays.md#cells-below-a-relay-89--b-57), `cells.tla`.
 Cell membership from relay streams, the L2 placement directory and range handoff: [#15 / B-12, #19 / B-16 and #22 / B-21](membership.md).
 The cell's relays now own this control authority through embedded Raft; `cell.tla` models its durable commit/apply boundary.
 `service_isolation.tla` checks that an unreadable service freezes independently, including recovery clocks and conditional writes.

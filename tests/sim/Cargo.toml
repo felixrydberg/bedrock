@@ -14,6 +14,7 @@ tonic.workspace = true
 
 [target.'cfg(madsim)'.dev-dependencies]
 bedrock-cdn = { path = "../../crates/cdn" }
+bedrock-gateway = { path = "../../crates/gateway" }
 bedrock-kv = { path = "../../crates/kv" }
 bedrock-quicksilver = { path = "../../crates/quicksilver" }
 bedrock-relay = { path = "../../crates/relay" }

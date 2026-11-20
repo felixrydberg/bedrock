@@ -238,6 +238,30 @@ The member still stages its selected snapshot in memory before atomic installati
 diagnostic full-view and startup history APIs also retain their existing materialization.
 This is bounded source export, not an end-to-end constant-memory bootstrap.
 
+## Cells below a relay (#89 / B-57)
+
+Upper-tier Gateways learn the cells below them from the relay tree, decided 2026-11-19 (option B of the issue's open
+question). A relay's `Hello` to its upstream carries its advertised `address` and, at the cell tier, its `cell`. With
+TLS the upstream checks the address against the certificate's hosts and the cell against its cell, and rejects the
+session otherwise. A certificate names no DC, so a DC relay is listed by address only. `Relay.Cells` returns the
+relay's live child relay sessions: a DC relay lists its cell relays, a region relay its DC relays. Relays and Gateways
+may call it. A child appears when its session opens and is gone when it closes. Leaves are never listed.
+
+A DC Gateway asks every DC relay it is configured with and unions the answers, since each cell relay is connected to
+only one of them. A region Gateway asks its region relays, then each DC relay they list. It then fetches the cell's
+`gateway.{cell}` table with `Relay.Routes` at that cell's relays (Gateways of any cell may fetch `gateway` routes, and
+nothing else of a foreign cell), and forwards to a member of the target cell. A cell Gateway serves forwarded reads only
+for its own cell. A stale or wrong listing therefore only costs availability. The shared client finds the target DC's
+and region's Gateways in operator-written Quicksilver records (`gateways/{region}/{dc}`, `gateways/{region}`), not
+through relays.
+
+`cells.tla` checks this with one parent tier, two addresses and two cells; an address may be reprovisioned for another
+cell after its session ends. `ListedLive`: the parent lists exactly its live child sessions, each under its
+certificate's cell (bugs `unchecked`, which accepts any announced cell, and `sticky`, which keeps a closed session).
+`ServedInTarget`: every forwarded request was served in the cell it targeted, however stale the Gateway's listing (bug
+`unscoped`, a cell Gateway that serves any cell). `Relay.Cells` reads sessions only and, like `Tick`, never advances
+applied state, so `relays.tla` is unchanged.
+
 ## Introspection and metrics (#17 / B-18b)
 
 `bedrock-relay` serves read-only JSON on its admin listener at `/introspect/{view}`. Every list view is

@@ -225,6 +225,7 @@ async fn hello(
         tier,
         member: None,
         moved,
+        ..Default::default()
     })))
     .await
     .unwrap();
@@ -341,6 +342,7 @@ async fn invalid_tier_and_customer_kv_subscriptions_are_rejected() {
             tier,
             member: None,
             moved: false,
+            ..Default::default()
         })))
         .await
         .unwrap();
