@@ -93,9 +93,13 @@ impl Foyer {
         self.cache.close().await.map_err(|e| failed(None, e))
     }
 
-    /// Drops the artifact's record. The entry stays listed until its file is gone, so a failed removal is retried.
-    fn forget(&self, hash: &Hash) -> StorageResult<()> {
+    /// Drops the artifact's record, and its entry if `remove`; otherwise only while Foyer still lacks it, since `put`
+    /// publishes under the same lock. The entry stays listed until its file is gone, so a failed removal is retried.
+    fn forget(&self, hash: &Hash, remove: bool) -> StorageResult<()> {
         let mut inventory = self.inventory.lock().unwrap();
+        if !remove && self.cache.contains(&hash.0[..]) {
+            return Ok(());
+        }
         if inventory.contains_key(hash) {
             match fs::remove_file(self.dir.join(hash.to_string())) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -105,6 +109,9 @@ impl Foyer {
                     inventory.remove(hash);
                 }
             }
+        }
+        if remove {
+            self.cache.remove(&hash.0[..]);
         }
         Ok(())
     }
@@ -118,7 +125,7 @@ impl Foyer {
             if self.cache.contains(&hash.0[..]) {
                 held.insert(hash, size);
             } else {
-                self.forget(&hash)?;
+                self.forget(&hash, false)?;
             }
         }
         Ok(held)
@@ -130,11 +137,13 @@ impl CacheStorage for Foyer {
     async fn put(&self, hash: &Hash, body: Body) -> StorageResult<()> {
         let bytes = collect(body).await?;
         let size = bytes.len() as u64;
+        // ponytail: one lock serializes puts and record cleanup; per-hash locks if put throughput matters.
+        let mut inventory = self.inventory.lock().unwrap();
         self.cache.insert(hash.0.to_vec(), bytes);
         // ponytail: not fsynced; a crash loses only the listing, and Foyer may lose the bytes anyway.
         fs::write(self.dir.join(hash.to_string()), size.to_string())
             .map_err(|e| failed(Some(hash), e))?;
-        self.inventory.lock().unwrap().insert(*hash, size);
+        inventory.insert(*hash, size);
         Ok(())
     }
 
@@ -142,7 +151,7 @@ impl CacheStorage for Foyer {
         match self.cache.get(&hash.0[..]).await {
             Ok(Some(entry)) => Ok(Some(body(entry.value().clone()))),
             Ok(None) => {
-                self.forget(hash)?;
+                self.forget(hash, false)?;
                 Ok(None)
             }
             Err(e) => Err(failed(Some(hash), e)),
@@ -154,9 +163,7 @@ impl CacheStorage for Foyer {
     }
 
     async fn delete(&self, hash: &Hash) -> StorageResult<()> {
-        self.forget(hash)?;
-        self.cache.remove(&hash.0[..]);
-        Ok(())
+        self.forget(hash, true)
     }
 
     fn inventory(&self) -> StorageResult<Vec<(Hash, u64)>> {

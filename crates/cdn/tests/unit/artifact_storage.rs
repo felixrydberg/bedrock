@@ -318,11 +318,7 @@ async fn inventory_file_errors_are_not_swallowed() {
     assert_eq!(cache.inventory().unwrap(), vec![(hash, 1)]);
     cache.close().await.unwrap();
     drop(cache);
-    // A well-formed record the process may not read.
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::remove_dir(&record).unwrap();
-    std::fs::write(&record, "1").unwrap();
-    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Reading the directory fails even for root, unlike a mode-000 file.
     assert!(matches!(
         Foyer::open(dir.path(), 4, 16).await,
         Err(StorageError::IoError(_))
