@@ -438,6 +438,8 @@ fn answer(refused: Refusal, claim: &pb::ClaimRecord, voting: bool) -> pb::Answer
             flushed: claim.flushed,
             released: claim.released,
             flushed_epoch: claim.flushed_epoch,
+            moved: claim.moved,
+            flushed_alarm_ms: claim.flushed_alarm_ms,
         }),
     }
 }
@@ -1066,6 +1068,61 @@ impl Store {
         Ok(answer(refused, &new, voting))
     }
 
+    /// Starts the actor on this slot of its new DC at `seq`, whose entry has `epoch`, with `alarm_ms` as of there: the
+    /// flushed `MOVE` of a DC change or a restore's point (S-17, `Import` in `volume_dc.tla`). The slot holds no log; S3
+    /// holds everything through `seq`. Repeating the same import is a no-op; a slot holding anything else of the actor
+    /// refuses with `STALE_EPOCH`. Synced before the answer.
+    pub fn import(
+        &self,
+        actor: &Actor,
+        epoch: u64,
+        seq: u64,
+        alarm_ms: Option<u64>,
+        version: u64,
+    ) -> Result<pb::Answer, Error> {
+        let _lock = self.lock(actor);
+        self.check_sealed(actor)?;
+        let old = self.load(actor)?;
+        let voting = !old.repaired;
+        let end = pb::LogEnd { seq, epoch };
+        if old.imported && old.epoch == epoch && old.flushed == seq && old.end == Some(end) {
+            return Ok(answer(Refusal::None, &old, voting));
+        }
+        // A slot in a repaired span starts repaired; the import keeps that, and the slot votes once a claim commits.
+        let blank = pb::ClaimRecord {
+            repaired: false,
+            ..old.clone()
+        };
+        if blank != pb::ClaimRecord::default() {
+            return Ok(answer(Refusal::StaleEpoch, &old, voting));
+        }
+        let new = pb::ClaimRecord {
+            epoch,
+            reserved: epoch,
+            released: true,
+            version,
+            committed: seq,
+            end: Some(end),
+            flushed: seq,
+            flushed_epoch: epoch,
+            alarm_ms,
+            flushed_alarm_ms: alarm_ms,
+            kind: actor.kind,
+            imported: true,
+            ..old.clone()
+        };
+        let mut batch = WriteBatch::default();
+        Self::save(&mut batch, actor, &old, &new);
+        self.commit(batch)?;
+        Ok(answer(Refusal::None, &new, voting))
+    }
+
+    /// The `NOT_IMPORTED` refusal while this slot has not been imported: for an actor moving into this DC (S-17).
+    pub fn unimported(&self, actor: &Actor) -> Result<Option<pb::Answer>, Error> {
+        let old = self.load(actor)?;
+        Ok((!old.imported).then(|| answer(Refusal::NotImported, &old, !old.repaired)))
+    }
+
     /// Promises `epoch` to `holder`: only above the slot's promise, at its topology version or newer, and while no other
     /// holder's lease is `live`. Returns whether this took over from a holder whose lease expired.
     pub fn claim(
@@ -1229,7 +1286,9 @@ impl Store {
             if let Some(alarm) = &entry.alarm {
                 new.alarm_ms = alarm.at_ms;
             }
-            if entry.kind == EntryKind::Release as i32 && entry.epoch == request.epoch {
+            // A `MOVE` ends the holder's claim like a release (S-17).
+            let ends = [EntryKind::Release as i32, EntryKind::Move as i32].contains(&entry.kind);
+            if ends && entry.epoch == request.epoch {
                 new.released = true;
             }
             new.end = Some(pb::LogEnd {
@@ -1386,6 +1445,13 @@ impl Store {
             }
             if let Some(alarm) = &entry.alarm {
                 new.flushed_alarm_ms = alarm.at_ms;
+            }
+            // Only committed entries are truncated, in order, so the first `MOVE` truncated is the log's first (S-17).
+            if entry.kind == EntryKind::Move as i32 && new.moved.is_none() {
+                new.moved = Some(pb::LogEnd {
+                    seq: entry.seq,
+                    epoch: entry.epoch,
+                });
             }
         }
         new.flushed = through;

@@ -6,8 +6,9 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 \*   1. A holder in the old DC (the mover) commits a MOVE entry. A later claimant there that
 \*      recovers a MOVE never serves; it may only commit MOVE again, at its own epoch.
 \*   2. The maintainer flushes the old DC's log to S3 through the MOVE entry.
-\*   3. A new-DC slot is imported from S3 once S3 holds a MOVE: it takes S3's log and the MOVE's
-\*      epoch as its promise. Only imported slots take claims and appends in the new DC.
+\*   3. A new-DC slot is imported from S3 once S3 holds a MOVE: it takes S3's log through the first
+\*      MOVE and that MOVE's epoch as its promise, the same point for every slot. Only imported
+\*      slots take claims and appends in the new DC.
 \* Any host may claim in its DC at any time: routing and topology are only hints. Reservations,
 \* repair, handoff and truncation are volume.tla's; here a claim promises directly, which is the
 \* same protocol without lost disks.
@@ -72,10 +73,10 @@ Grant(n, h) == /\ n \in SlotsOf(h) /\ Takes(n)
 Recover(h) == /\ phase[h] = "claiming" /\ Quorum(h, granted[h])
               /\ phase' = [phase EXCEPT ![h] = "recover"]
               /\ UNCHANGED <<slots, epoch, granted, hlog, ackd, acked, s3>>
-\* The no-op after recovery, then data. A claimant that recovered a MOVE never serves (bug
-\* "serve-moved" lets it).
+\* The no-op after recovery, then data. An old-DC claimant that recovered a MOVE never serves (bug
+\* "serve-moved" lets it); a new-DC claimant's imported log always ends in one.
 Write(h) == /\ phase[h] \in {"recover", "open"} /\ Len(hlog[h]) < MaxLen
-            /\ phase[h] = "open" \/ ~HasMove(hlog[h]) \/ Bug = "serve-moved"
+            /\ phase[h] = "open" \/ h \in NewHosts \/ ~HasMove(hlog[h]) \/ Bug = "serve-moved"
             /\ hlog' = [hlog EXCEPT ![h] = Append(@, Entry(h, "data"))]
             /\ phase' = [phase EXCEPT ![h] = IF @ = "recover" THEN "claimed" ELSE @]
             /\ UNCHANGED <<slots, epoch, granted, ackd, acked, s3>>
@@ -115,13 +116,18 @@ Replicate(n, h) ==
 Flush == /\ \E k \in Len(s3) + 1..(IF Bug = "flush" THEN Len(log[Maint]) ELSE Min(cp, Len(log[Maint]))) :
               s3' = s3 \o SubSeq(log[Maint], Len(s3) + 1, k)
          /\ UNCHANGED <<slots, holders, acked>>
-\* A new-DC slot imports S3's log once it holds a MOVE, promising the MOVE's epoch (bug
-\* "early-import": whatever S3 holds).
-Import(n) == /\ n \in New /\ ~imported[n]
+\* Where the first MOVE of S3 is; S3 holds only committed entries, so every import finds the same
+\* one, however far S3 has grown since.
+FirstMove == CHOOSE i \in DOMAIN s3 : s3[i].k = "move" /\ \A j \in 1..i - 1 : s3[j].k # "move"
+\* A new-DC slot imports S3's log through its first MOVE, promising that MOVE's epoch. Bug
+\* "early-import" imports whatever S3 holds before any MOVE; bug "any-move" imports all of S3 once it
+\* holds a MOVE, so slots imported at different times start at different points.
+Import(n) == LET upto == IF HasMove(s3) /\ Bug # "any-move" THEN SubSeq(s3, 1, FirstMove) ELSE s3 IN
+             /\ n \in New /\ ~imported[n]
              /\ HasMove(s3) \/ Bug = "early-import"
              /\ imported' = [imported EXCEPT ![n] = TRUE]
-             /\ log' = [log EXCEPT ![n] = s3]
-             /\ promise' = [promise EXCEPT ![n] = [e |-> LastE(s3), h |-> NoHost]]
+             /\ log' = [log EXCEPT ![n] = upto]
+             /\ promise' = [promise EXCEPT ![n] = [e |-> LastE(upto), h |-> NoHost]]
              /\ UNCHANGED <<cp, holders, acked, s3>>
 
 Next == \/ \E h \in Hosts : Start(h) \/ Recover(h) \/ Write(h) \/ Move(h) \/ Fence(h)
@@ -149,6 +155,9 @@ NoLostAck == /\ \A x, y \in acked : x[1] = y[1] /\ SameDC(x[3].h, y[3].h) => x[2
                      => Len(hlog[h]) >= x[1] /\ hlog[h][x[1]] = x[2]
 \* At most one holder serves the actor, across both DCs.
 OneWriter == Cardinality({h \in Hosts : phase[h] = "open"}) <= 1
+\* Not a property of the protocol: TLC must find it violated, so a new-DC holder can serve and the
+\* other invariants are not vacuous (scripts/tlc.sh checks it as bug "reach").
+NewNeverServes == \A h \in NewHosts : phase[h] # "open"
 \* S3 holds only committed entries, in order.
 S3Committed == \A i \in 1..Len(s3) : \E x \in acked : x[1] = i /\ x[2] = s3[i]
 =============================================================================

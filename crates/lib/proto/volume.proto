@@ -24,6 +24,9 @@ service Volume {
   rpc Truncate(TruncateRequest) returns (Answer);
   // A new range owner, or a slot repairing after losing its data, copies one hash range's records (S-06).
   rpc Repair(RepairRequest) returns (RepairReply);
+  // A DC change or restore (S-17, `docs/spec/volume_dc.tla`): starts the actor on this slot of its new DC at the
+  // flushed `MOVE` entry, or the restored point. Accepted only on a slot holding nothing of the actor, or the same import.
+  rpc Import(ImportRequest) returns (Answer);
 }
 
 // `kind` is a `bedrock_lib::actors::Kind`, used only as a metrics label.
@@ -41,6 +44,9 @@ message Entry {
     // A claim's first entry at its epoch (Raft's Figure 8 rule).
     NOOP = 1;
     RELEASE = 2;
+    // The actor moved to another DC (S-17). Like `RELEASE`, a new claim needs no lease wait after it; a claimant that
+    // recovers it never serves, and may only commit `MOVE` again.
+    MOVE = 3;
   }
   uint64 seq = 1;
   uint64 epoch = 2;
@@ -84,6 +90,8 @@ enum Refusal {
   NOT_VOTING = 6;
   // The slot has not caught up with `min_seq`, or `through` is past its commit point.
   BEHIND = 7;
+  // The actor is moving into this slot's DC and the slot has not been imported yet (S-17).
+  NOT_IMPORTED = 8;
 }
 
 // The slot's state after the request.
@@ -103,6 +111,11 @@ message Slot {
   // The epoch of entry `flushed`, so a claimant that recovers from this slot can send a lagging slot the entry after it
   // (#112 / S-04).
   uint64 flushed_epoch = 10;
+  // The first `MOVE` of the actor's log, once the slot truncated it: the actor moved to another DC there (S-17).
+  // Every import starts at this point, which is the same on every slot.
+  LogEnd moved = 11;
+  // The alarm as of `flushed`, which a DC change imports with the `MOVE` (S-17).
+  optional uint64 flushed_alarm_ms = 12;
 }
 
 message Answer { Refusal refused = 1; Slot slot = 2; }
@@ -122,6 +135,8 @@ message LogRequest { Actor actor = 1; Holder holder = 2; uint64 epoch = 3; uint6
 message LogReply { Answer answer = 1; repeated Entry entries = 2; bool more = 3; }
 
 message TruncateRequest { Actor actor = 1; uint64 through = 2; }
+// The actor's state starts at `seq`, whose entry has `epoch`, with `alarm_ms` as of there (S-17).
+message ImportRequest { Actor actor = 1; uint64 epoch = 2; uint64 seq = 3; optional uint64 alarm_ms = 4; uint64 version = 5; }
 
 // Records whose hash lies in `[start, end)`, `end` 0 meaning 2⁶⁴, after the raw key `after`. With `seal` (a range
 // handoff) the answering node must be the range's `leaving` owner, and it first seals the span: from then on it refuses
@@ -150,5 +165,9 @@ message ClaimRecord {
   // The alarm as of `flushed`, which a log truncation falls back to.
   optional uint64 flushed_alarm_ms = 12;
   int32 kind = 13;
+  // The first `MOVE`, once truncated here (S-17).
+  LogEnd moved = 14;
+  // The slot was imported into the actor's new DC (S-17).
+  bool imported = 15;
 }
 message OverlayRecord { uint64 seq = 1; optional bytes value = 2; }

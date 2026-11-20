@@ -96,8 +96,16 @@ volume_cold-split no-cas NoLostFlush
 volume_cold-move no-adopt Consistent
 volume_dc no-import NoLostAck
 volume_dc early-import NoLostAck
+volume_dc any-move NoLostAck
 volume_dc serve-moved OneWriter
 volume_dc flush S3Committed
+volume_dc reach NewNeverServes
+volume_dc-small no-import NoLostAck
+volume_dc-small early-import NoLostAck
+volume_dc-small any-move NoLostAck
+volume_dc-small serve-moved OneWriter
+volume_dc-small flush S3Committed
+volume_dc-small reach NewNeverServes
 '
 
 tlc() {
@@ -126,6 +134,8 @@ pass() {
 bug() {
     local model="$1" value="$2" invariant="$3" kind config out
     kind="$(grep -E "^(INVARIANTS|PROPERTIES) .*\b$invariant\b" "$model.cfg" | cut -d' ' -f1)"
+    # A reachability check is not among the model's invariants: it is an invariant TLC must find violated.
+    kind="${kind:-INVARIANTS}"
     config="$work/$model-$value-$invariant.cfg"
     sed -e "s/Bug = \"none\"/Bug = \"$value\"/" -e '/^INVARIANTS /d' -e '/^PROPERTIES /d' "$model.cfg" > "$config"
     echo "$kind $invariant" >> "$config"
@@ -139,7 +149,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move volume_dc"
+models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

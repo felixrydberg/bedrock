@@ -224,6 +224,11 @@ pub trait Placement: Send + Sync {
     async fn truncate_others(&self, actor: &pb::Actor, through: u64) -> Result<bool, Status>;
     /// The cell of the actor's first slot, whose range databases hold it.
     async fn first_cell(&self, actor: &pb::Actor) -> Result<String, Status>;
+    /// Whether a DC change in progress moves the actor into this node's DC, by a topology at `version` or newer (S-17):
+    /// its slots here then take claims only once imported. Stubs for tests that move nothing keep the default.
+    async fn moving_in(&self, _actor: &pb::Actor, _version: u64) -> Result<bool, Status> {
+        Ok(false)
+    }
 }
 
 /// An open writer and the flushed point of every actor it has flushed or read. `known` is locked for a whole flush,
@@ -284,6 +289,11 @@ impl Cold {
             settle_cursor: Mutex::default(),
             mark: Mutex::new(0),
         }
+    }
+
+    /// Whether a DC change moves `actor` into this DC (S-17); see [`Placement::moving_in`].
+    pub async fn moving_in(&self, actor: &pb::Actor, version: u64) -> Result<bool, Status> {
+        self.placement.moving_in(actor, version).await
     }
 
     /// Whether enough was appended since the last flush to flush before the interval ends.

@@ -197,6 +197,25 @@ impl Service {
         self
     }
 
+    /// The `NOT_IMPORTED` refusal for an actor that a DC change moves into this DC, by a topology at `version` or newer,
+    /// while this slot has not been imported (S-17). `None` lets the request through.
+    async fn unimported(
+        &self,
+        actor: Option<&pb::Actor>,
+        version: u64,
+    ) -> Result<Option<pb::Answer>, Status> {
+        let (Some(cold), Some(wire)) = (&self.cold, actor) else {
+            return Ok(None);
+        };
+        if !cold.moving_in(wire, version).await? {
+            return Ok(None);
+        }
+        let (store, actor) = (self.store.clone(), self.actor(Some(wire))?);
+        blocking(move || store.unimported(&actor))
+            .await?
+            .map_err(status)
+    }
+
     fn cold(&self) -> Result<&Cold, Status> {
         self.cold
             .as_deref()
@@ -291,6 +310,12 @@ impl pb::volume_server::Volume for Service {
         check(&request, COMPUTE, None)?;
         let request = request.into_inner();
         let actor = self.actor(request.actor.as_ref())?;
+        if let Some(refused) = self
+            .unimported(request.actor.as_ref(), request.version)
+            .await?
+        {
+            return Ok(Response::new(refused));
+        }
         let store = self.store.clone();
         let answer = blocking(move || store.reserve(&actor, request.epoch, request.version))
             .await?
@@ -306,6 +331,12 @@ impl pb::volume_server::Volume for Service {
         check(&request, COMPUTE, Some(&claimant))?;
         let request = request.into_inner();
         let actor = self.actor(request.actor.as_ref())?;
+        if let Some(refused) = self
+            .unimported(request.actor.as_ref(), request.version)
+            .await?
+        {
+            return Ok(Response::new(refused));
+        }
         let kind = actor.kind();
         let (store, leases, started) = (self.store.clone(), self.leases.clone(), self.started);
         let (answer, expired) = blocking(move || {
@@ -519,6 +550,28 @@ impl pb::volume_server::Volume for Service {
             .map_err(status)?;
         self.record(kind, &outcome);
         Ok(Response::new(outcome.answer))
+    }
+
+    async fn import(
+        &self,
+        request: Request<pb::ImportRequest>,
+    ) -> Result<Response<pb::Answer>, Status> {
+        check(&request, COMPUTE, None)?;
+        let request = request.into_inner();
+        let actor = self.actor(request.actor.as_ref())?;
+        let store = self.store.clone();
+        let answer = blocking(move || {
+            store.import(
+                &actor,
+                request.epoch,
+                request.seq,
+                request.alarm_ms,
+                request.version,
+            )
+        })
+        .await?
+        .map_err(status)?;
+        Ok(Response::new(answer))
     }
 
     async fn repair(
