@@ -295,8 +295,15 @@ dependencies = [
 name = "bedrock-cdn"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bedrock-lib",
+ "bytes",
+ "foyer",
  "madsim-tokio",
+ "object_store",
+ "sha2",
+ "tempfile",
+ "tokio-stream",
  "tracing",
 ]
 

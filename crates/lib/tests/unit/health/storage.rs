@@ -231,3 +231,29 @@ fn a_failure_reading_the_quarantine_record_is_reported() {
     let _engine = health.wrap("a", ENGINE, raw);
     assert_eq!(health.unhealthy(), BTreeSet::from(["a".to_string()]));
 }
+
+/// One corrupt item is evicted and refetched by its caller (B-30): only repeated failures with no verified read between
+/// them quarantine the source.
+#[test]
+fn contained_corruption_quarantines_only_when_repeated() {
+    const LAYER: &str = "artifacts";
+    let health = StorageHealth::new(&Admin::new());
+    let corrupt = StorageError::Corruption(io().context().clone());
+    for _ in 0..CONSECUTIVE_FAILURES * 2 {
+        health.report_contained("a", LAYER, &corrupt);
+        health.verified("a", LAYER);
+    }
+    let report = health.get("a", LAYER).unwrap();
+    assert_eq!(
+        (report.state, report.errors),
+        (State::Healthy, u64::from(CONSECUTIVE_FAILURES) * 2)
+    );
+    assert_eq!(report.last, Some(corrupt.clone()));
+
+    for _ in 1..CONSECUTIVE_FAILURES {
+        health.report_contained("a", LAYER, &corrupt);
+    }
+    assert!(health.unhealthy().is_empty());
+    health.report_contained("a", LAYER, &corrupt);
+    assert_eq!(health.get("a", LAYER).unwrap().state, State::Unhealthy);
+}

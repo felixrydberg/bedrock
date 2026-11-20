@@ -5,9 +5,22 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 bedrock-lib.workspace = true
+bytes = "1"
+sha2.workspace = true
 tokio.workspace = true
+tokio-stream = "0.1"
 tracing.workspace = true
+
+# Foyer runs real threads and files, and native S3 I/O stays outside simulation (B-23a), as in `bedrock-volume`.
+[target.'cfg(not(madsim))'.dependencies]
+# The version `bedrock-volume` already builds.
+foyer = "0.22.6"
+object_store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
