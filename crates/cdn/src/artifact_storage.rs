@@ -159,11 +159,9 @@ mod store {
 
         /// The verified artifact, or `Ok(None)` when S3 has no artifact by that hash.
         pub async fn fetch(&self, hash: &Hash) -> StorageResult<Option<Body>> {
-            let cached = self
-                .health
-                .get(DATASET, LAYER)
-                .is_none_or(|report| report.state == State::Healthy);
-            if cached && let Some(bytes) = self.cached(hash).await {
+            if self.healthy()
+                && let Some(bytes) = self.cached(hash).await
+            {
                 return Ok(Some(body(bytes)));
             }
             let Some(bytes) = get_checked(&*self.s3, &path(hash)).await? else {
@@ -178,10 +176,20 @@ mod store {
                     "SHA-256 differs from the artifact's name",
                 )));
             }
-            if cached && let Err(error) = self.cache.put(hash, body(bytes.clone())).await {
+            // Rechecked: other fetches may have quarantined the cache meanwhile.
+            if self.healthy()
+                && let Err(error) = self.cache.put(hash, body(bytes.clone())).await
+            {
                 self.health.report_contained(DATASET, LAYER, &error);
             }
             Ok(Some(body(bytes)))
+        }
+
+        /// Whether the cache is in service; a quarantined one is bypassed.
+        fn healthy(&self) -> bool {
+            self.health
+                .get(DATASET, LAYER)
+                .is_none_or(|report| report.state == State::Healthy)
         }
 
         /// The cached artifact if it verifies. Otherwise it is evicted and reported, and the caller refetches it.

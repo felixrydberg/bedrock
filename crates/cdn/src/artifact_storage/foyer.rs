@@ -2,8 +2,8 @@
 //! `inventory/` lists them, since Foyer cannot list its keys. Foyer recovers its disk tier on open and the inventory is
 //! reread, so both survive a restart.
 //!
-//! Foyer may drop an entry at any time (eviction, a full flush queue, a crash before its write); a miss then drops the
-//! artifact from the inventory too. An entry Foyer kept whose inventory file was lost is still served, just not listed.
+//! Foyer may drop an entry at any time (eviction, a full flush queue, a crash before its write) and reports no disk
+//! evictions; a miss, or listing the inventory, then drops the artifact's record too. An entry Foyer kept whose inventory file was lost is still served, just not listed.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -68,7 +68,9 @@ impl Foyer {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .and_then(Hash::parse);
-            let size = fs::read_to_string(&path)
+            // A failed read is an I/O error; only contents that do not decode mark a torn record.
+            let contents = fs::read(&path).map_err(|e| failed(None, e))?;
+            let size = std::str::from_utf8(&contents)
                 .ok()
                 .and_then(|size| size.parse().ok());
             match record.zip(size) {
@@ -91,16 +93,35 @@ impl Foyer {
         self.cache.close().await.map_err(|e| failed(None, e))
     }
 
+    /// Drops the artifact's record. The entry stays listed until its file is gone, so a failed removal is retried.
     fn forget(&self, hash: &Hash) -> StorageResult<()> {
-        if self.inventory.lock().unwrap().remove(hash).is_some() {
+        let mut inventory = self.inventory.lock().unwrap();
+        if inventory.contains_key(hash) {
             match fs::remove_file(self.dir.join(hash.to_string())) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                     return Err(failed(Some(hash), e));
                 }
-                _ => {}
+                _ => {
+                    inventory.remove(hash);
+                }
             }
         }
         Ok(())
+    }
+
+    /// The listed artifacts Foyer still holds. Foyer reports no disk evictions, so records of artifacts it dropped
+    /// are forgotten here.
+    fn held(&self) -> StorageResult<BTreeMap<Hash, u64>> {
+        let listed = self.inventory.lock().unwrap().clone();
+        let mut held = BTreeMap::new();
+        for (hash, size) in listed {
+            if self.cache.contains(&hash.0[..]) {
+                held.insert(hash, size);
+            } else {
+                self.forget(&hash)?;
+            }
+        }
+        Ok(held)
     }
 }
 
@@ -139,16 +160,11 @@ impl CacheStorage for Foyer {
     }
 
     fn inventory(&self) -> StorageResult<Vec<(Hash, u64)>> {
-        Ok(self
-            .inventory
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(h, s)| (*h, *s))
-            .collect())
+        Ok(self.held()?.into_iter().collect())
     }
 
+    // ponytail: both scan the inventory against Foyer's index on each call; keep a running total if callers poll often.
     fn usage(&self) -> StorageResult<u64> {
-        Ok(self.inventory.lock().unwrap().values().sum())
+        Ok(self.held()?.values().sum())
     }
 }

@@ -284,9 +284,47 @@ async fn an_artifact_larger_than_a_foyer_block_does_not_survive_a_restart() {
         cache.close().await.unwrap();
     }
     let cache = Foyer::open(dir.path(), 64, 128).await.unwrap();
+    // Listing alone drops what Foyer no longer holds, record file included.
+    assert_eq!(cache.usage().unwrap(), 0);
+    assert!(cache.inventory().unwrap().is_empty());
     assert!(cache.get(&hash).await.unwrap().is_none());
-    assert!(
-        cache.inventory().unwrap().is_empty(),
-        "the miss drops it from the inventory"
-    );
+    #[allow(clippy::disallowed_methods)] // the test inspects the adapter's files
+    let records = std::fs::read_dir(dir.path().join("inventory"))
+        .unwrap()
+        .count();
+    assert_eq!(records, 0);
+}
+
+/// A record that cannot be removed stays listed so a later cleanup retries; one that cannot be read fails the open
+/// rather than being taken for a torn record.
+#[tokio::test]
+#[allow(clippy::disallowed_methods)] // the test replaces a record file with a directory
+async fn inventory_file_errors_are_not_swallowed() {
+    let dir = tempfile::tempdir().unwrap();
+    let hash = Hash::of(b"a");
+    let record = dir.path().join("inventory").join(hash.to_string());
+    let cache = Foyer::open(dir.path(), 4, 16).await.unwrap();
+    cache
+        .put(&hash, body(Bytes::from_static(b"a")))
+        .await
+        .unwrap();
+    std::fs::remove_file(&record).unwrap();
+    std::fs::create_dir(&record).unwrap();
+
+    assert!(matches!(
+        cache.delete(&hash).await,
+        Err(StorageError::IoError(_))
+    ));
+    assert_eq!(cache.inventory().unwrap(), vec![(hash, 1)]);
+    cache.close().await.unwrap();
+    drop(cache);
+    // A well-formed record the process may not read.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::remove_dir(&record).unwrap();
+    std::fs::write(&record, "1").unwrap();
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(matches!(
+        Foyer::open(dir.path(), 4, 16).await,
+        Err(StorageError::IoError(_))
+    ));
 }
