@@ -126,18 +126,23 @@ pub async fn restored(
     listed.map(|()| page)
 }
 
-/// The lost DC's cells, sorted: from the current DCs, or the previous ones when a DC change is retiring it.
+/// The lost DC's cells, sorted: from its entries among the current DCs and the previous ones, which differ while a
+/// change of its cells runs.
 fn cells(topology: &Topology, dc: &str) -> StorageResult<Vec<String>> {
-    let mut dcs = topology.dcs.iter().chain(&topology.previous_dcs);
-    let found = dcs.find(|d| d.name == dc).ok_or_else(|| {
-        StorageError::Unsupported(context(format!(
+    let cells: std::collections::BTreeSet<String> = topology
+        .dcs
+        .iter()
+        .chain(&topology.previous_dcs)
+        .filter(|d| d.name == dc)
+        .flat_map(|d| d.cells.iter().cloned())
+        .collect();
+    if cells.is_empty() {
+        return Err(StorageError::Unsupported(context(format!(
             "the topology of {} lists no DC {dc}",
             topology.region
-        )))
-    })?;
-    let mut cells = found.cells.clone();
-    cells.sort();
-    Ok(cells)
+        ))));
+    }
+    Ok(cells.into_iter().collect())
 }
 
 /// The record of restore `id` of the DC with these (sorted) cells: under its first cell, whose name no other cell or

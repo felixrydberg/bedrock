@@ -742,6 +742,9 @@ impl Writer {
         let peers = host.peers.clone();
         let holder = host.holder.clone();
         let mut epoch = 1;
+        // A slot not imported yet refused the last attempt: once a retry above every epoch named still finds one and
+        // no quorum, the actor is not imported here.
+        let mut unimported_before = false;
         for _ in 0..ATTEMPTS {
             let reserves = slots.iter().map(|slot| {
                 let (peers, slot) = (peers.clone(), slot.clone());
@@ -774,9 +777,10 @@ impl Writer {
             }
             if quorum(&answers) < 2 {
                 // An import needs only two slots, so the third may refuse while the other two grant.
-                if unimported {
+                if unimported && unimported_before {
                     return Err(not_imported());
                 }
+                unimported_before = unimported;
                 epoch = seen + 1;
                 sleep(RETRY).await;
                 continue;
@@ -832,6 +836,7 @@ impl Writer {
                 }))
                 .await;
             }
+            let mut unimported = false;
             for (_, answer) in answers
                 .iter()
                 .filter_map(|(i, a)| Some((i, a.as_ref().ok()?)))
@@ -842,10 +847,14 @@ impl Writer {
                         return Err(Error::Held(slot.holder.unwrap_or_default()));
                     }
                     Some(Refusal::StaleVersion) => return Err(Error::StaleVersion),
-                    Some(Refusal::NotImported) => return Err(not_imported()),
+                    Some(Refusal::NotImported) => unimported = true,
                     _ => seen = seen.max(slot.reserved).max(slot.epoch),
                 }
             }
+            if unimported && unimported_before {
+                return Err(not_imported());
+            }
+            unimported_before = unimported;
             epoch = seen + 1;
             sleep(RETRY).await;
         }
@@ -1243,7 +1252,8 @@ pub async fn handover(
 }
 
 /// Checks, before any `MOVE` commits, that two of the new DC's `slots` can take the import at `point` (the first `MOVE`
-/// of an earlier attempt, `None` for a first one): each is blank or already imported there. A slot that held the actor
+/// of an earlier attempt, `None` for a first one): each votes and is blank or already imported there; a repaired slot
+/// is imported as a follower but counts towards no quorum, so it is left out here too. A slot that held the actor
 /// before, as when it returns to a DC it left, refuses any other import, so the handover stops here, with the actor still
 /// served by its old DC, instead of leaving it fenced there and unimportable here.
 async fn importable(
@@ -1272,11 +1282,11 @@ async fn importable(
             && slot.end.is_none()
             && slot.moved.is_none();
         if blank || (slot.imported.is_some() && slot.imported == point) {
-            fit += 1;
+            fit += usize::from(slot.voting);
         } else if slot.imported.is_none() || point.is_some() {
             held += 1;
         }
-        // Imported while no old slot that answered names the first `MOVE`: unknown until one does.
+        // Not voting, or imported while no old slot that answered names the first `MOVE`: unknown until later.
     }
     if fit >= 2 {
         Ok(())
