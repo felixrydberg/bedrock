@@ -7,6 +7,14 @@ The cell's relays now own this control authority through embedded Raft; `cell.tl
 Actor storage on `bedrock-volume` (claims, quorum appends, lease, release, slot repair, range handoff and topology
 changes): [S-02 / #110](volume.md).
 Its cold tier (range databases split and merged by clone, first-slot moves): [S-05 / #113](volume.md#cold-tier-range-databases-s-05-113), `volume_cold.tla`.
+Moving an actor to another DC (a committed MOVE entry fences the old DC, every new-DC slot is imported from S3 at the
+log's first MOVE, and only imported slots take claims): S-17 / #125, `volume_dc.tla`. `volume_dc.cfg` (two old-DC
+hosts) is the full config for larger machines and nightly runs; `volume_dc-small.cfg` (one old-DC host that moves,
+restarts and claims again) finishes locally in about 45 minutes with 2 workers. Both carry the same bugs, including `any-move`: importing all of
+S3 once it holds a MOVE lets slots imported at different times start at different points, which loses an acknowledged
+write (found by TLC on 2026-11-19). The model's new-DC slots start blank and read the first MOVE from S3; the code
+matches by refusing a handover into a DC whose slots held the actor before, and by carrying the first MOVE in each
+actor's S3 meta, so a slot that skips to S3 keeps it.
 
 The standalone writer persists directly to SlateDB in S3. See
 [the atomic namespace protocol model](materialized.md) for its bounded checks and
