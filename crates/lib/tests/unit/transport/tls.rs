@@ -409,6 +409,7 @@ async fn a_leaf_may_announce_only_itself() {
                     ..Default::default()
                 }),
                 moved: false,
+                ..Default::default()
             })),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -469,4 +470,91 @@ async fn the_write_listener_accepts_callers_without_a_certificate() {
     let (dialed, served) = tokio::join!(connect, accepted());
     dialed.unwrap();
     served.unwrap();
+}
+
+/// #89 / B-57 with real certificates: an upper-tier Gateway's certificate names its DC. It is a leaf of a DC relay
+/// (whose Welcome gives its role), lists the cells there, may ask a foreign cell's relay for routes, and is reached
+/// only as the identity its Quicksilver record names.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upper_tier_gateway_reaches_relays_and_is_reached_as_its_record_names() {
+    let ca = Ca::new();
+    let relay = tls(&ca, "relay", "c1", "r1").await;
+    let dc = Hub::relay(
+        "r1".into(),
+        2,
+        Arc::new(peers(Some(relay.clone()))),
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .with_cell("c1".into());
+    let dc_addr = serve(relay.clone(), dc).await;
+    let gateway_tls = tls(&ca, "gateway", "arn1", "gw1").await;
+    let gateway = peers(Some(gateway_tls.clone()));
+    let relay_client = |addr: &str| {
+        pb::relay_client::RelayClient::new(gateway.channel(addr, Class::Control).unwrap())
+    };
+
+    let hello = pb::RelayRequest {
+        kind: Some(pb::relay_request::Kind::Hello(pb::Hello {
+            version: 1,
+            ..Default::default()
+        })),
+    };
+    let mut frames = relay_client(&dc_addr)
+        .session(tokio_stream::iter([hello]))
+        .await
+        .unwrap()
+        .into_inner();
+    match frames.message().await.unwrap() {
+        Some(pb::RelayFrame {
+            kind: Some(pb::relay_frame::Kind::Welcome(welcome)),
+        }) => assert_eq!(welcome.tier, 2),
+        other => panic!("expected a welcome, got {other:?}"),
+    }
+    relay_client(&dc_addr)
+        .cells(pb::CellsRequest {})
+        .await
+        .unwrap();
+    let kv = peers(Some(tls(&ca, "kv", "c1", "n7").await));
+    let denied = pb::relay_client::RelayClient::new(kv.channel(&dc_addr, Class::Control).unwrap())
+        .cells(pb::CellsRequest {})
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code(), Code::PermissionDenied, "{denied}");
+
+    // A foreign cell relay authorizes the Gateway's route fetch; this one has no control group to answer it.
+    let cell_relay = tls(&ca, "relay", "c9", "r9").await;
+    let cell_addr = serve(
+        cell_relay.clone(),
+        hub("c9", Arc::new(peers(Some(cell_relay)))),
+    )
+    .await;
+    let routes = |service: &str| {
+        let mut client = relay_client(&cell_addr);
+        let request = pb::RoutesRequest {
+            service: service.into(),
+        };
+        async move { client.routes(request).await }
+    };
+    assert_eq!(
+        routes("gateway").await.unwrap_err().code(),
+        Code::Unavailable
+    );
+    assert_eq!(
+        routes("quicksilver").await.unwrap_err().code(),
+        Code::PermissionDenied
+    );
+
+    let served = serve(gateway_tls, hub("c1", Arc::new(gateway))).await;
+    let client = peers(Some(tls(&ca, "relay", "c1", "r2").await));
+    for (cell, accepted) in [("arn1", true), ("eu", false)] {
+        let channel = client
+            .pinned(&served, Class::Control, identity("gateway", cell, "gw1"))
+            .unwrap();
+        let reached = pb::relay_client::RelayClient::new(channel)
+            .cells(pb::CellsRequest {})
+            .await;
+        assert_eq!(reached.is_ok(), accepted, "{cell}");
+    }
 }

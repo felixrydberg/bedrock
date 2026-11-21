@@ -109,6 +109,12 @@ impl pb::relay_server::Relay for Relay {
         self.fetches.fetch_add(1, Ordering::Relaxed);
         Ok(Response::new(self.table.lock().unwrap().clone()))
     }
+    async fn cells(
+        &self,
+        _: Request<pb::CellsRequest>,
+    ) -> Result<Response<pb::CellsReply>, Status> {
+        Err(Status::unimplemented("routes only"))
+    }
 }
 
 async fn serve(router: tonic::transport::server::Router) -> String {
@@ -414,4 +420,98 @@ async fn sibling_routes_come_from_that_cells_relays() {
         panic!("a cell without relays has no routes");
     };
     assert_eq!(unknown.code(), tonic::Code::FailedPrecondition);
+}
+
+/// A Gateway that answers every read itself, recording the service and cell each one was for.
+#[derive(Clone, Default)]
+struct Gateway {
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+#[tonic::async_trait]
+impl pb::reads_server::Reads for Gateway {
+    async fn get(
+        &self,
+        request: Request<pb::GetRequest>,
+    ) -> Result<Response<pb::GetReply>, Status> {
+        self.seen.lock().unwrap().push(target_of(&request)?);
+        Ok(Response::new(pb::GetReply {
+            revision: 9,
+            value: Some(b"remote".to_vec()),
+        }))
+    }
+    async fn list(&self, _: Request<pb::ListRequest>) -> Result<Response<pb::ListReply>, Status> {
+        Err(Status::unimplemented("get only"))
+    }
+}
+
+fn gateways(addresses: &[&str]) -> Vec<u8> {
+    pb::Gateways {
+        members: addresses
+            .iter()
+            .enumerate()
+            .map(|(i, address)| pb::Member {
+                node_id: format!("gw{i}"),
+                service: "gateway".into(),
+                address: address.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+    }
+    .encode_to_vec()
+}
+
+/// #89 / B-57: a read of another cell holds no table of it; it goes to the target DC's Gateways, then the region's,
+/// with the target in its metadata. A read in the caller's own cell goes to the holder directly.
+#[tokio::test]
+async fn a_read_of_another_cell_falls_back_through_the_tiers_gateways() {
+    let gateway = Gateway::default();
+    let region = serve(
+        tonic::transport::Server::builder()
+            .add_service(pb::reads_server::ReadsServer::new(gateway.clone())),
+    )
+    .await;
+    let dead = holder(Mode::NotOwner, 0, &[]).await;
+    let entries = BTreeMap::from([
+        (b"k".to_vec(), b"local".to_vec()),
+        (gateways_key("eu", "arn2"), gateways(&[&dead])),
+        (gateways_key("eu", ""), gateways(&[&region])),
+    ]);
+    let owner = serve(tonic::transport::Server::builder().add_service(
+        pb::reads_server::ReadsServer::new(Holder {
+            mode: Mode::Serve,
+            revision: 3,
+            entries,
+        }),
+    ))
+    .await;
+    let relay = Relay::default();
+    *relay.table.lock().unwrap() = table(1, &[(0, &[("qs", &owner)])]);
+    let location = |dc: &str, cell: &str| Location {
+        region: "eu".into(),
+        dc: dc.into(),
+        cell: cell.into(),
+    };
+    let client = client(&relay).await.with_home(location("arn1", "c1"));
+    let remote = client
+        .get_in(&location("arn2", "c9"), "quicksilver", DATASET, NS, b"k", 0)
+        .await
+        .unwrap();
+    assert_eq!(remote.value.as_deref(), Some(&b"remote"[..]));
+    assert_eq!(
+        *gateway.seen.lock().unwrap(),
+        [("quicksilver".to_owned(), "c9".to_owned())]
+    );
+    let tables: Vec<String> = client.tables.lock().unwrap().keys().cloned().collect();
+    assert_eq!(tables, ["quicksilver"], "no table of the target cell");
+    let local = client
+        .get_in(&location("arn1", "c1"), "quicksilver", DATASET, NS, b"k", 0)
+        .await
+        .unwrap();
+    assert_eq!(local.value.as_deref(), Some(&b"local"[..]));
+    assert_eq!(
+        gateway.seen.lock().unwrap().len(),
+        1,
+        "no Gateway in the cell"
+    );
 }
