@@ -4,6 +4,8 @@
 //! - **Quarantine.** `Corruption` marks the engine instance `Unhealthy` at once, as do [`CONSECUTIVE_FAILURES`] I/O or
 //!   unavailability errors in a row. The error's partition (hash range or key) is recorded, but the whole instance is
 //!   quarantined: no adapter can yet prove damage is limited to it. `Fenced` and `Unsupported` are not storage failures.
+//!   The exception is damage confined to one content-addressed item, which [`StorageHealth::report_contained`] counts
+//!   like an I/O error (the CDN artifact cache, B-30).
 //! - **Isolation.** A quarantined instance answers every call with `Unavailable`, never a miss, so callers fall back to
 //!   other sources. Other datasets keep running, and readiness ignores quarantined ones. The process announces
 //!   [`StorageHealth::unhealthy`] datasets in its member updates, so relays assign it no new ranges and peers skip it as a
@@ -156,9 +158,22 @@ impl StorageHealth {
         Arc::new(monitored)
     }
 
-    /// Reports a failure of storage that is not a wrapped engine, such as the CDN's `CacheStorage` (B-30).
+    /// Reports a failure of storage that is not a wrapped engine; for one item the caller evicts and refetches, see
+    /// [`StorageHealth::report_contained`].
     pub fn report(&self, dataset: &str, layer: &'static str, error: &StorageError) {
-        self.failed(&self.source(dataset, layer), error);
+        self.failed(&self.source(dataset, layer), error, false);
+    }
+
+    /// Reports a failure confined to one item that the caller evicts and refetches, such as one CDN artifact whose hash
+    /// mismatched (B-30). Corruption then counts toward [`CONSECUTIVE_FAILURES`] like I/O errors, instead of
+    /// quarantining the whole source at once; [`StorageHealth::verified`] resets the count.
+    pub fn report_contained(&self, dataset: &str, layer: &'static str, error: &StorageError) {
+        self.failed(&self.source(dataset, layer), error, true);
+    }
+
+    /// A non-engine source served a verified read, so its earlier failures are no longer consecutive.
+    pub fn verified(&self, dataset: &str, layer: &'static str) {
+        self.succeeded(&self.source(dataset, layer));
     }
 
     /// Datasets with a source that is not healthy, for the member update.
@@ -247,9 +262,9 @@ impl StorageHealth {
     }
 
     /// Returns whether this failure quarantined the source.
-    fn failed(&self, source: &Source, error: &StorageError) -> bool {
+    fn failed(&self, source: &Source, error: &StorageError, contained: bool) -> bool {
         let (kind, quarantine) = match error {
-            StorageError::Corruption(_) => ("corruption", true),
+            StorageError::Corruption(_) => ("corruption", !contained),
             StorageError::IoError(_) => ("io", false),
             StorageError::Unavailable(_) => ("unavailable", false),
             StorageError::Fenced(_)
@@ -348,7 +363,7 @@ impl Monitored {
     }
 
     fn failed(&self, error: &StorageError) {
-        if self.health.failed(&self.source, error)
+        if self.health.failed(&self.source, error, false)
             && let Err(error) = quarantine(self.inner.as_ref())
         {
             tracing::warn!(%error, "could not record the quarantine; a restart will forget it");

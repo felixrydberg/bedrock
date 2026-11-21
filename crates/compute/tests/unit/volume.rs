@@ -28,6 +28,7 @@ fn topology(cells: &[&str]) -> (Regions, Topology) {
             name: "dc1".into(),
             cells: cells.iter().map(|c| (*c).into()).collect(),
         }],
+        ..Default::default()
     };
     (BTreeMap::from([("eu".into(), topology.clone())]), topology)
 }

@@ -177,6 +177,7 @@ fn topology() -> Topology {
             name: DC.into(),
             cells: vec![CELL.into()],
         }],
+        previous_dcs: Vec::new(),
     }
 }
 

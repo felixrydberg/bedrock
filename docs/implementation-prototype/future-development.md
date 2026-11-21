@@ -120,3 +120,15 @@ not the need to recover and catch up after failover.
   Define the placement policy only if the measured gains justify its operational and routing complexity.
 
 **Depends on:** #57 / B-39 (readers), B-28 (residency policy), and the existing writer-fencing and handoff guarantees.
+
+## Cloudflare Pages compatibility API
+
+Decision 17 makes a deployment one kind: a Worker with static assets. A Pages-compatible API can sit on top as a
+translation layer at publish time, added once Workers with assets work end to end:
+
+- `_redirects` and `_headers` parse into the deployment's routing config.
+- A `functions/` directory compiles into a Worker bundle, as wrangler does; `_routes.json` becomes the run-the-Worker-first
+  rules.
+- Pages-only features (preview deployments per git branch, project aliases) map onto deployment records and host names.
+
+Nothing Pages-specific exists in the backend after publish.

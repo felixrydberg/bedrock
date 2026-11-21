@@ -68,7 +68,9 @@ impl Cells {
         }
     }
 
-    async fn topology(&self, region: &str) -> Result<Arc<Topology>, Status> {
+    /// The region's topology, read again when the cached one is older than [`TOPOLOGY_TTL`] or below `version`. A read
+    /// still below `version` is a retryable failure: the record's storage revision says nothing of its version.
+    async fn topology(&self, region: &str, version: u64) -> Result<Arc<Topology>, Status> {
         let now = bedrock_lib::monotonic_now();
         if let Some((topology, read)) = self
             .topology
@@ -76,6 +78,7 @@ impl Cells {
             .unwrap_or_else(PoisonError::into_inner)
             .get(region)
             && now.duration_since(*read) < TOPOLOGY_TTL
+            && topology.version >= version
         {
             return Ok(topology.clone());
         }
@@ -94,20 +97,36 @@ impl Cells {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(region.to_owned(), (topology.clone(), now));
+        if topology.version < version {
+            return Err(Status::unavailable(format!(
+                "topology of {region} is at version {}, below {version}",
+                topology.version
+            )));
+        }
         Ok(topology)
     }
 
-    /// The actor's three slot cells.
-    async fn slots(&self, actor: &pb::Actor) -> Result<[String; actors::SLOTS], Status> {
+    /// The actor's ID and its region's topology, at `version` or newer.
+    async fn placed(
+        &self,
+        actor: &pb::Actor,
+        version: u64,
+    ) -> Result<(ActorId, Arc<Topology>), Status> {
         let region = actor
             .id
             .rsplit_once('_')
             .map(|(region, _)| region)
             .ok_or_else(|| Status::invalid_argument("an actor ID names its region"))?;
-        let topology = self.topology(region).await?;
+        let topology = self.topology(region, version).await?;
         let regions = BTreeMap::from([(region.to_owned(), (*topology).clone())]);
         let id = ActorId::parse(&regions, &actor.id)
             .map_err(|e| Status::invalid_argument(format!("{e:?}")))?;
+        Ok((id, topology))
+    }
+
+    /// The actor's three slot cells.
+    async fn slots(&self, actor: &pb::Actor) -> Result<[String; actors::SLOTS], Status> {
+        let (id, topology) = self.placed(actor, 0).await?;
         let slots = actors::slots(&id, &topology)
             .map_err(|e| Status::invalid_argument(format!("{e:?}")))?;
         Ok(slots.map(str::to_owned))
@@ -256,6 +275,16 @@ impl Placement for Cells {
     async fn first_cell(&self, actor: &pb::Actor) -> Result<String, Status> {
         Ok(self.slots(actor).await?[0].clone())
     }
+
+    async fn moving_in(&self, actor: &pb::Actor, version: u64) -> Result<bool, Status> {
+        let (id, topology) = self.placed(actor, version).await?;
+        let placed = |e: actors::Error| Status::invalid_argument(format!("{e:?}"));
+        let Some(before) = actors::dc_before(&id, &topology).map_err(placed)? else {
+            return Ok(false);
+        };
+        let now = actors::dc_of(&id, &topology).map_err(placed)?;
+        Ok(before.name != now.name && now.name == self.dc)
+    }
 }
 
 /// `[start, end)` cut to `[from, to)`, `end` and `to` 0 meaning 2⁶⁴.
@@ -268,7 +297,7 @@ fn clip(start: u64, end: u64, from: u64, to: u64) -> (u64, u64) {
 #[async_trait]
 impl crate::repair::Peers for Cells {
     async fn sources(&self, start: u64, end: u64) -> Result<Vec<Source>, Status> {
-        let topology = self.topology(&self.region).await?;
+        let topology = self.topology(&self.region, 0).await?;
         let dc = topology
             .dcs
             .iter()

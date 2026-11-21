@@ -415,17 +415,27 @@ fn a_slot_behind_s3_skips_to_it_and_keeps_its_vote() {
     let gap = append(&store, &a, 1, 1, vec![entry(6, 1, &[])], 6);
     assert_eq!(refused(&gap), Refusal::LogGap);
     // Not to a point a newer holder wrote: this slot's holder may not have it.
-    assert!(store.skip(&actor(), &a, 1, 5, 2, None).unwrap().is_none());
-    // Not for another holder, or for an epoch the slot no longer promises.
     assert!(
         store
-            .skip(&actor(), &host("b"), 1, 5, 1, None)
+            .skip(&actor(), &a, 1, 5, 2, None, None)
             .unwrap()
             .is_none()
     );
-    assert!(store.skip(&actor(), &a, 2, 5, 1, None).unwrap().is_none());
+    // Not for another holder, or for an epoch the slot no longer promises.
+    assert!(
+        store
+            .skip(&actor(), &host("b"), 1, 5, 1, None, None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .skip(&actor(), &a, 2, 5, 1, None, None)
+            .unwrap()
+            .is_none()
+    );
     let skipped = store
-        .skip(&actor(), &a, 1, 5, 1, Some(42))
+        .skip(&actor(), &a, 1, 5, 1, Some(42), None)
         .unwrap()
         .unwrap();
     let after = slot(&skipped.answer);
@@ -441,7 +451,12 @@ fn a_slot_behind_s3_skips_to_it_and_keeps_its_vote() {
         Refusal::None
     );
     // A log that already reaches S3's point stays.
-    assert!(store.skip(&actor(), &a, 1, 5, 1, None).unwrap().is_none());
+    assert!(
+        store
+            .skip(&actor(), &a, 1, 5, 1, None, None)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1013,7 +1028,7 @@ fn a_sealed_slot_does_not_skip_to_s3() {
     // A second seal of the same span still waits for writes in flight, and the seal refuses the skip.
     store.seal(0, 0).unwrap();
     assert!(matches!(
-        store.skip(&actor(), &host("a"), 1, 5, 1, None),
+        store.skip(&actor(), &host("a"), 1, 5, 1, None, None),
         Err(Error::Sealed)
     ));
 }
@@ -1098,4 +1113,132 @@ fn copies_of_the_same_log_keep_the_further_commit_point_in_either_order() {
     target.install(&records(&ahead), true).unwrap();
     target.install(&records(&longer), true).unwrap();
     assert_eq!(target.load(&actor()).unwrap().committed, 1);
+}
+
+/// S-17: a committed `MOVE` ends the claim like a release, and truncating it leaves `moved` set, so a claimant still
+/// learns of it once the entry is gone from the log.
+#[test]
+fn a_truncated_move_stays_known_and_ends_the_claim() {
+    let store = store();
+    let (a, b) = (host("a"), host("b"));
+    claimed(&store, &a, 1);
+    let mut moving = entry(2, 1, &[]);
+    moving.kind = EntryKind::Move as i32;
+    let answer = append(
+        &store,
+        &a,
+        1,
+        0,
+        vec![entry(1, 1, &[("k", Some("v"))]), moving],
+        2,
+    );
+    assert_eq!(refused(&answer), Refusal::None);
+    assert!(slot(&answer).released, "MOVE ends the claim like a release");
+    assert_eq!(slot(&answer).moved, None, "not truncated yet");
+    let first = Some(pb::LogEnd { seq: 2, epoch: 1 });
+    assert_eq!(
+        store.pending(&actor()).unwrap().unwrap().moved,
+        first,
+        "a flush carries the MOVE to S3"
+    );
+    let answer = store.truncate(&actor(), 2).unwrap().answer;
+    assert_eq!(slot(&answer).moved, first);
+    // A new claimant needs no lease wait and sees where the actor moved; its own MOVE keeps the first one.
+    let (answer, _) = store.claim(&actor(), &b, 2, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None);
+    assert_eq!(slot(&answer).moved, first);
+    let mut again = entry(3, 2, &[]);
+    again.kind = EntryKind::Move as i32;
+    assert_eq!(
+        refused(&append(&store, &b, 2, 1, vec![again], 3)),
+        Refusal::None
+    );
+    let answer = store.truncate(&actor(), 3).unwrap().answer;
+    assert_eq!(
+        slot(&answer).moved,
+        first,
+        "the first MOVE stays the import point"
+    );
+}
+
+/// S-17: an import starts the actor at the given point on a slot that holds nothing of it, is idempotent, and is
+/// refused on a slot holding other state; a claim then goes above its epoch.
+#[test]
+fn an_import_starts_an_empty_slot_at_the_moved_point() {
+    let store = store();
+    assert_eq!(
+        refused(&store.unimported(&actor()).unwrap().unwrap()),
+        Refusal::NotImported
+    );
+    let answer = store.import(&actor(), 3, 7, Some(99), 1).unwrap();
+    assert_eq!(refused(&answer), Refusal::None);
+    let s = slot(&answer);
+    assert_eq!(
+        (s.epoch, s.flushed, s.committed, s.flushed_epoch),
+        (3, 7, 7, 3)
+    );
+    assert_eq!(s.end, Some(pb::LogEnd { seq: 7, epoch: 3 }));
+    assert_eq!(s.flushed_alarm_ms, Some(99));
+    assert!(store.unimported(&actor()).unwrap().is_none());
+    // The same import again is a no-op; another one is refused.
+    assert_eq!(
+        refused(&store.import(&actor(), 3, 7, Some(99), 1).unwrap()),
+        Refusal::None
+    );
+    assert_eq!(
+        refused(&store.import(&actor(), 3, 8, None, 1).unwrap()),
+        Refusal::StaleEpoch
+    );
+    let (answer, _) = store.claim(&actor(), &host("a"), 3, 1, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::StaleEpoch,
+        "a claim goes above the MOVE's epoch"
+    );
+    let (answer, _) = store.claim(&actor(), &host("a"), 4, 1, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None);
+    // After the claim moved the slot on, the same import is still acknowledged and changes nothing; the same point with
+    // another alarm is refused.
+    let answer = store.import(&actor(), 3, 7, Some(99), 1).unwrap();
+    assert_eq!(refused(&answer), Refusal::None);
+    assert_eq!(
+        slot(&answer).epoch,
+        4,
+        "a repeated import leaves the live state"
+    );
+    assert_eq!(
+        refused(&store.import(&actor(), 3, 7, None, 1).unwrap()),
+        Refusal::StaleEpoch
+    );
+
+    let other = Store::new(Arc::new(MemoryEngine::new("volume")));
+    claimed(&other, &host("a"), 1);
+    assert_eq!(
+        refused(&other.import(&actor(), 3, 7, None, 1).unwrap()),
+        Refusal::StaleEpoch,
+        "a slot holding a claim is never imported"
+    );
+}
+
+/// S-17: a slot that skips to S3 past the first `MOVE` keeps it from S3's meta, so a later `MOVE` truncated there never
+/// becomes its import point.
+#[test]
+fn a_skip_past_the_first_move_keeps_it() {
+    let store = store();
+    let a = host("a");
+    claimed(&store, &a, 2);
+    let first = Some(pb::LogEnd { seq: 4, epoch: 1 });
+    let skipped = store
+        .skip(&actor(), &a, 2, 5, 2, None, first)
+        .unwrap()
+        .unwrap();
+    assert_eq!(slot(&skipped.answer).moved, first);
+    let mut again = entry(6, 2, &[]);
+    again.kind = EntryKind::Move as i32;
+    assert_eq!(
+        refused(&append(&store, &a, 2, 2, vec![again], 6)),
+        Refusal::None
+    );
+    let answer = store.truncate(&actor(), 6).unwrap().answer;
+    assert_eq!(slot(&answer).moved, first);
 }

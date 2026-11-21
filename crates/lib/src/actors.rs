@@ -6,7 +6,7 @@
 //! - [`ActorId`] is `{region}_{base32(128 bits)}`. A region the topology does not list is rejected.
 //! - [`Topology`] (`topology/region/{code}`) and [`ActorNamespace`] (`actor_ns/{id}`) are records in Quicksilver's
 //!   `infrastructure` namespace.
-//! - [`dc_of`], [`cells_of`], [`slots`] and [`wake_host`] place an actor by rendezvous hashing with the stable hash of
+//! - [`dc_of`], [`dc_before`], [`cells_of`], [`slots`] and [`wake_host`] place an actor by rendezvous hashing with the stable hash of
 //!   [`crate::placement`].
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -246,6 +246,10 @@ pub struct Topology {
     pub version: u64,
     #[prost(message, repeated, tag = "4")]
     pub dcs: Vec<Dc>,
+    /// While a DC joins or leaves the region (S-17), the DCs before the change; empty otherwise. An actor whose
+    /// [`dc_before`] differs from its [`dc_of`] is moving.
+    #[prost(message, repeated, tag = "5")]
+    pub previous_dcs: Vec<Dc>,
 }
 
 /// The key of region `code`'s topology record.
@@ -264,18 +268,21 @@ impl Topology {
         if record.region != code || !valid_region(code) {
             return malformed("record region does not match its key");
         }
-        let mut dcs = BTreeSet::new();
-        let mut cells = BTreeSet::new();
-        for dc in &record.dcs {
-            if dc.name.is_empty() || !dcs.insert(&dc.name) || dc.cells.is_empty() {
-                return malformed("a DC needs a unique name and at least one cell");
-            }
-            if dc.cells.iter().any(|c| c.is_empty() || !cells.insert(c)) {
-                return malformed("a cell needs a unique non-empty name");
-            }
-        }
-        if dcs.is_empty() {
+        if record.dcs.is_empty() {
             return malformed("a region needs at least one DC");
+        }
+        // The previous list is checked like the current one; a cell may be in both.
+        for list in [&record.dcs, &record.previous_dcs] {
+            let mut dcs = BTreeSet::new();
+            let mut cells = BTreeSet::new();
+            for dc in list {
+                if dc.name.is_empty() || !dcs.insert(&dc.name) || dc.cells.is_empty() {
+                    return malformed("a DC needs a unique name and at least one cell");
+                }
+                if dc.cells.iter().any(|c| c.is_empty() || !cells.insert(c)) {
+                    return malformed("a cell needs a unique non-empty name");
+                }
+            }
         }
         Ok(record)
     }
@@ -360,7 +367,11 @@ fn check<'a>(id: &ActorId, topology: &'a Topology) -> Result<&'a Topology, Error
     if topology.region != id.region {
         return Err(Error::UnknownRegion(id.region.clone()));
     }
-    if topology.dcs.is_empty() || topology.dcs.iter().any(|dc| dc.cells.is_empty()) {
+    if topology.dcs.is_empty()
+        || (topology.dcs.iter())
+            .chain(&topology.previous_dcs)
+            .any(|dc| dc.cells.is_empty())
+    {
         return malformed("a region needs at least one DC, and every DC at least one cell");
     }
     Ok(topology)
@@ -382,6 +393,15 @@ fn rank<'a, T>(id: &ActorId, items: &'a [T], name: impl Fn(&T) -> &str) -> Vec<&
 pub fn dc_of<'a>(id: &ActorId, topology: &'a Topology) -> Result<&'a Dc, Error> {
     let topology = check(id, topology)?;
     Ok(rank(id, &topology.dcs, |dc| &dc.name)[0])
+}
+
+/// The ID's DC before the DC change in progress (S-17), or `None` when none is. The actor moves when it differs from
+/// [`dc_of`]: the new DC may claim it only after the old one released and flushed it.
+pub fn dc_before<'a>(id: &ActorId, topology: &'a Topology) -> Result<Option<&'a Dc>, Error> {
+    let topology = check(id, topology)?;
+    Ok(rank(id, &topology.previous_dcs, |dc| &dc.name)
+        .first()
+        .copied())
 }
 
 /// The DC's cells, most preferred first.

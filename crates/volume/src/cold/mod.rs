@@ -29,6 +29,7 @@
 pub mod db;
 pub mod placement;
 pub mod readers;
+pub mod restore;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -75,35 +76,49 @@ const COPY_ATTEMPTS: usize = 3;
 /// How many actors' flushed points one writer keeps in memory before starting its cache over, about a million.
 const KNOWN: usize = 1 << 20;
 
-/// What a range database holds for an actor besides its keys: the sequence they are at, its epoch, and the alarm.
+/// What a range database holds for an actor besides its keys: the sequence they are at, its epoch, the alarm, and the
+/// log's first `MOVE` as (sequence, epoch) once it is flushed (S-17), which a slot skipping to S3 keeps.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Meta {
     pub seq: u64,
     pub epoch: u64,
     pub alarm: Option<u64>,
+    pub moved: Option<(u64, u64)>,
 }
 
 impl Meta {
+    /// Two words, then the alarm and the `MOVE`'s two words when present: 16, 24, 32 or 40 bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = [self.seq.to_be_bytes(), self.epoch.to_be_bytes()].concat();
         if let Some(alarm) = self.alarm {
             bytes.extend_from_slice(&alarm.to_be_bytes());
+        }
+        if let Some((seq, epoch)) = self.moved {
+            bytes.extend_from_slice(&[seq.to_be_bytes(), epoch.to_be_bytes()].concat());
         }
         bytes
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let word = |at: usize| Some(u64::from_be_bytes(bytes.get(at..at + 8)?.try_into().ok()?));
-        let alarm = match bytes.len() {
-            16 => None,
-            24 => Some(word(16)?),
+        let (alarm, moved) = match bytes.len() {
+            16 => (None, None),
+            24 => (Some(word(16)?), None),
+            32 => (None, Some((word(16)?, word(24)?))),
+            40 => (Some(word(16)?), Some((word(24)?, word(32)?))),
             _ => return None,
         };
         Some(Meta {
             seq: word(0)?,
             epoch: word(8)?,
             alarm,
+            moved,
         })
+    }
+
+    /// The first `MOVE`, as a log position.
+    pub fn moved(&self) -> Option<pb::LogEnd> {
+        self.moved.map(|(seq, epoch)| pb::LogEnd { seq, epoch })
     }
 }
 
@@ -223,6 +238,11 @@ pub trait Placement: Send + Sync {
     async fn truncate_others(&self, actor: &pb::Actor, through: u64) -> Result<bool, Status>;
     /// The cell of the actor's first slot, whose range databases hold it.
     async fn first_cell(&self, actor: &pb::Actor) -> Result<String, Status>;
+    /// Whether a DC change in progress moves the actor into this node's DC, by a topology at `version` or newer (S-17):
+    /// its slots here then take claims only once imported. Stubs for tests that move nothing keep the default.
+    async fn moving_in(&self, _actor: &pb::Actor, _version: u64) -> Result<bool, Status> {
+        Ok(false)
+    }
 }
 
 /// An open writer and the flushed point of every actor it has flushed or read. `known` is locked for a whole flush,
@@ -283,6 +303,11 @@ impl Cold {
             settle_cursor: Mutex::default(),
             mark: Mutex::new(0),
         }
+    }
+
+    /// Whether a DC change moves `actor` into this DC (S-17); see [`Placement::moving_in`].
+    pub async fn moving_in(&self, actor: &pb::Actor, version: u64) -> Result<bool, Status> {
+        self.placement.moving_in(actor, version).await
     }
 
     /// Whether enough was appended since the last flush to flush before the interval ends.
@@ -1134,6 +1159,7 @@ fn meta(pending: &Pending) -> Meta {
         seq: pending.through,
         epoch: pending.epoch,
         alarm: pending.alarm,
+        moved: pending.moved.map(|m| (m.seq, m.epoch)),
     }
 }
 
