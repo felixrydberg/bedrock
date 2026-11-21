@@ -145,6 +145,11 @@ async fn holder(mode: Mode, revision: u64, entries: &[(&str, &str)]) -> String {
 
 /// A table at `revision` whose ranges (by start) are owned, ready, by the named holders at their addresses.
 fn table(revision: u64, ranges: &[(u64, &[(&str, &str)])]) -> pb::RoutesReply {
+    table_in("c1", revision, ranges)
+}
+
+/// [`table`] with members of `cell`.
+fn table_in(cell: &str, revision: u64, ranges: &[(u64, &[(&str, &str)])]) -> pb::RoutesReply {
     let mut entries = Vec::new();
     let mut members = BTreeMap::new();
     for (start, owners) in ranges {
@@ -170,7 +175,7 @@ fn table(revision: u64, ranges: &[(u64, &[(&str, &str)])]) -> pb::RoutesReply {
         let member = pb::Member {
             node_id: node.clone(),
             service: "quicksilver".into(),
-            cell: "c1".into(),
+            cell: cell.into(),
             address,
             datasets: vec![DATASET.into()],
             ..Default::default()
@@ -372,7 +377,7 @@ async fn sibling_routes_come_from_that_cells_relays() {
     let owner = holder(Mode::Serve, 7, &[]).await;
     let (own, sibling) = (Relay::default(), Relay::default());
     *own.table.lock().unwrap() = table(1, &[(0, &[("a", &owner)])]);
-    *sibling.table.lock().unwrap() = table(9, &[(0, &[("b", &owner)])]);
+    *sibling.table.lock().unwrap() = table_in("cell-2", 9, &[(0, &[("b", &owner)])]);
     let mut addresses = Vec::new();
     for relay in [&own, &sibling] {
         addresses.push(
@@ -390,10 +395,11 @@ async fn sibling_routes_come_from_that_cells_relays() {
         vec![addresses[0].clone()],
         String::new(),
     )
-    .with_siblings(BTreeMap::from([(
-        "cell-2".to_owned(),
-        vec![addresses[1].clone()],
-    )]));
+    .with_siblings(BTreeMap::from([
+        ("cell-2".to_owned(), vec![addresses[1].clone()]),
+        // A relay reprovisioned for c1 that is still listed as cell-4's.
+        ("cell-4".to_owned(), vec![addresses[0].clone()]),
+    ]));
     assert_eq!(client.routes("volume", None).await.unwrap().revision, 1);
     assert_eq!(
         client
@@ -420,6 +426,15 @@ async fn sibling_routes_come_from_that_cells_relays() {
         panic!("a cell without relays has no routes");
     };
     assert_eq!(unknown.code(), tonic::Code::FailedPrecondition);
+    // Another cell's table is refused and never cached.
+    let before = own.fetches.load(Ordering::Relaxed);
+    for _ in 0..2 {
+        let Err(foreign) = client.routes_in("cell-4", "volume", None).await else {
+            panic!("a table of another cell is refused");
+        };
+        assert_eq!(foreign.code(), tonic::Code::FailedPrecondition);
+    }
+    assert_eq!(own.fetches.load(Ordering::Relaxed), before + 2);
 }
 
 /// A Gateway that answers every read itself, recording the service and cell each one was for.

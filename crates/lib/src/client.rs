@@ -168,7 +168,7 @@ impl Client {
     /// `service`'s routing table: the cached one, or a fetched one when none is cached, it went idle, or the caller
     /// saw `stale` fail and needs one newer than that revision.
     pub async fn routes(&self, service: &str, stale: Option<u64>) -> Result<Arc<Table>, Status> {
-        self.routes_from(service.to_owned(), &self.relays, service, stale)
+        self.routes_from(service.to_owned(), &self.relays, service, None, stale)
             .await
     }
 
@@ -194,8 +194,14 @@ impl Client {
         service: &str,
         stale: Option<u64>,
     ) -> Result<Arc<Table>, Status> {
-        self.routes_from(format!("{service}.{cell}"), relays, service, stale)
-            .await
+        self.routes_from(
+            format!("{service}.{cell}"),
+            relays,
+            service,
+            Some(cell),
+            stale,
+        )
+        .await
     }
 
     async fn routes_from(
@@ -203,6 +209,7 @@ impl Client {
         key: String,
         relays: &[String],
         service: &str,
+        cell: Option<&str>,
         stale: Option<u64>,
     ) -> Result<Arc<Table>, Status> {
         let now = crate::monotonic_now();
@@ -225,7 +232,7 @@ impl Client {
                 reason,
             })
             .inc();
-        let fetched = self.fetch(relays, service, stale).await?;
+        let fetched = self.fetch(relays, service, cell, stale).await?;
         let mut tables = self.tables.lock().unwrap();
         let entry = tables.entry(key).or_insert_with(|| (fetched.clone(), now));
         // A lagging relay must not replace a newer table another caller fetched meanwhile.
@@ -237,11 +244,13 @@ impl Client {
     }
 
     /// The first relay table newer than `stale`. Relays apply the cell's view separately, so one may lag another; when
-    /// none is newer, the newest answer.
+    /// none is newer, the newest answer. With `cell`, an answer naming a member of another cell is refused: a relay
+    /// reprovisioned for another cell must not replace this cell's table, whose revisions it does not share.
     async fn fetch(
         &self,
         relays: &[String],
         service: &str,
+        cell: Option<&str>,
         stale: Option<u64>,
     ) -> Result<Arc<Table>, Status> {
         let mut last = Status::unavailable("no cell relays configured");
@@ -261,6 +270,14 @@ impl Client {
                 Ok(reply) => {
                     let (members, directories) =
                         membership::parse(reply.entries.into_iter().map(|e| Ok((e.key, e.value))))?;
+                    if let Some(cell) = cell
+                        && members.values().any(|member| member.cell != cell)
+                    {
+                        last = Status::failed_precondition(format!(
+                            "relay {relay} answered with members of a cell other than {cell}"
+                        ));
+                        continue;
+                    }
                     let table = Arc::new(Table {
                         revision: reply.revision,
                         members,

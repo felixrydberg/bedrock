@@ -31,7 +31,18 @@ pub struct Cells {
     /// This Gateway's own tier's relays.
     relays: Vec<String>,
     tier: u32,
-    known: Mutex<(Arc<Listing>, Option<Instant>)>,
+    known: Mutex<Known>,
+    /// Held for a walk, so concurrent refreshes share one.
+    walking: tokio::sync::Mutex<()>,
+}
+
+/// The last walk's outcome. A failed walk keeps an earlier listing; with none, its error is reused until
+/// [`MIN_REFRESH`] passes.
+#[derive(Default)]
+struct Known {
+    listing: Arc<Listing>,
+    error: Option<Status>,
+    at: Option<Instant>,
 }
 
 impl Cells {
@@ -40,7 +51,8 @@ impl Cells {
             client,
             relays,
             tier,
-            known: Mutex::new((Arc::default(), None)),
+            known: Mutex::default(),
+            walking: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -82,7 +94,13 @@ impl Cells {
         // Live edges strictly increase tier, so a walk from tier t ends within t - 1 levels.
         for _ in 1..self.tier {
             let mut below = BTreeSet::new();
-            for child in self.children(&parents).await? {
+            let children = match self.children(&parents).await {
+                Ok(children) => children,
+                Err(status) if listing.is_empty() => return Err(status),
+                // A deeper level that fails keeps the cells already found.
+                Err(_) => break,
+            };
+            for child in children {
                 if child.tier == 1 {
                     listing.entry(child.cell).or_default().insert(child.address);
                 } else {
@@ -99,19 +117,44 @@ impl Cells {
 
     /// The current listing, walked again when `refresh` asks and the last walk is at least [`MIN_REFRESH`] old.
     pub async fn listing(&self, refresh: bool) -> Result<Arc<Listing>, Status> {
-        let now = bedrock_lib::monotonic_now();
-        {
-            let known = self.known.lock().unwrap();
-            let fresh = known
-                .1
-                .is_some_and(|at| !refresh || now.duration_since(at) < MIN_REFRESH);
-            if fresh {
-                return Ok(known.0.clone());
-            }
+        if let Some(known) = self.known(refresh) {
+            return known;
         }
-        let listing = Arc::new(self.walk().await?);
-        *self.known.lock().unwrap() = (listing.clone(), Some(now));
-        Ok(listing)
+        let _walking = self.walking.lock().await;
+        // A caller that waited reuses the walk it waited for.
+        if let Some(known) = self.known(refresh) {
+            return known;
+        }
+        let now = bedrock_lib::monotonic_now();
+        let walked = self.walk().await;
+        let mut known = self.known.lock().unwrap();
+        let listed = known.at.is_some() && known.error.is_none();
+        known.at = Some(now);
+        match walked {
+            Ok(listing) => {
+                known.listing = Arc::new(listing);
+                known.error = None;
+            }
+            Err(status) if !listed => known.error = Some(status),
+            Err(_) => {}
+        }
+        match &known.error {
+            Some(status) => Err(status.clone()),
+            None => Ok(known.listing.clone()),
+        }
+    }
+
+    /// The last walk's outcome, unless `refresh` asks for a new one and it is at least [`MIN_REFRESH`] old.
+    fn known(&self, refresh: bool) -> Option<Result<Arc<Listing>, Status>> {
+        let known = self.known.lock().unwrap();
+        let at = known.at?;
+        if refresh && bedrock_lib::monotonic_now().duration_since(at) >= MIN_REFRESH {
+            return None;
+        }
+        Some(match &known.error {
+            Some(status) => Err(status.clone()),
+            None => Ok(known.listing.clone()),
+        })
     }
 
     /// Calls one of `cell`'s Gateways. A cell missing from the listing, or whose Gateways all fail, walks again (at most
@@ -138,8 +181,13 @@ impl Cells {
             };
             stale = Some(table.revision);
             last = Status::unavailable(format!("no gateway of cell {cell} answered"));
-            // A relay reprovisioned for another cell answers with that cell's Gateways; they are never tried.
-            for member in table.members.values().filter(|m| m.cell == cell) {
+            // `routes_at` refuses a table naming another cell's members, so these are all `cell`'s Gateways.
+            let addresses: Vec<String> =
+                table.members.values().map(|m| m.address.clone()).collect();
+            for address in self.client.route(&addresses) {
+                let Some(member) = table.members.values().find(|m| m.address == *address) else {
+                    continue;
+                };
                 match self.client.call_member(member, &call).await {
                     Ok(reply) => return Ok(reply),
                     Err(status) => last = status,
