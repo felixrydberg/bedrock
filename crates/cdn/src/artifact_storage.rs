@@ -7,13 +7,16 @@
 //! no verified read between them quarantine the whole cache; reads then bypass it to S3. Nothing rebuilds a quarantined
 //! cache yet, so it stays bypassed until restart.
 //!
-//! Foyer and native S3 I/O are compiled out of simulation builds, like RocksDB; the contract and hash type remain.
+//! Foyer and native S3 I/O ([`S3`]) are compiled out of simulation builds, like RocksDB; simulation supplies its own
+//! [`Origin`] and [`CacheStorage`].
 
 use std::fmt;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use bedrock_lib::storage::StorageResult;
+use bedrock_lib::health::storage::{State, StorageHealth};
+use bedrock_lib::storage::{ErrorContext, StorageError, StorageResult};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio_stream::{Stream, StreamExt};
@@ -92,131 +95,181 @@ pub trait CacheStorage: Send + Sync {
     fn usage(&self) -> StorageResult<u64>;
 }
 
-#[cfg(not(madsim))]
-pub use store::Artifacts;
+/// Where artifacts live for good: S3, or a model of it in simulation. It returns what it holds; [`Artifacts`] checks
+/// that the bytes match their name.
+#[async_trait]
+pub trait Origin: Send + Sync {
+    /// Stores `bytes` under `hash`; storing an artifact that exists succeeds.
+    async fn put(&self, hash: &Hash, bytes: Bytes) -> StorageResult<()>;
+    /// The bytes stored under `hash`, or `Ok(None)`.
+    async fn get(&self, hash: &Hash) -> StorageResult<Option<Bytes>>;
+}
 
 #[cfg(not(madsim))]
-mod store {
+pub use s3::S3;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use memory::Memory;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "../tests/support/memory.rs"]
+mod memory;
+
+#[cfg(not(madsim))]
+mod s3 {
     use std::sync::Arc;
 
-    use bedrock_lib::health::storage::{State, StorageHealth};
+    use async_trait::async_trait;
     use bedrock_lib::s3::{get_checked, put_checked};
-    use bedrock_lib::storage::{ErrorContext, StorageError, StorageResult};
+    use bedrock_lib::storage::{StorageError, StorageResult};
     use bytes::Bytes;
-    use object_store::path::Path;
     use object_store::{ObjectStore, PutMode};
 
-    use super::{Body, CacheStorage, Hash, body, collect};
+    use super::{Hash, Origin, context, path};
 
-    /// The health manager's source for the artifact cache.
-    pub const DATASET: &str = bedrock_lib::datasets::capabilities::CDN;
-    pub const LAYER: &str = "artifacts";
+    /// Artifacts in S3 under `artifacts/{sha256}`.
+    pub struct S3(pub Arc<dyn ObjectStore>);
 
-    /// Artifacts in S3 by SHA-256, read through a local cache.
-    pub struct Artifacts {
-        s3: Arc<dyn ObjectStore>,
-        cache: Arc<dyn CacheStorage>,
-        health: Arc<StorageHealth>,
-    }
-
-    fn path(hash: &Hash) -> Path {
-        Path::from(format!("artifacts/{hash}"))
-    }
-
-    fn context(engine: &'static str, hash: &Hash, detail: &str) -> ErrorContext {
-        ErrorContext {
-            engine,
-            instance: DATASET.into(),
-            file: Some(path(hash).to_string()),
-            partition: None,
-            detail: detail.into(),
-        }
-    }
-
-    impl Artifacts {
-        pub fn new(
-            s3: Arc<dyn ObjectStore>,
-            cache: Arc<dyn CacheStorage>,
-            health: Arc<StorageHealth>,
-        ) -> Self {
-            Artifacts { s3, cache, health }
-        }
-
-        /// Stores `body` in S3 under its SHA-256, which it returns. Uploading an artifact that exists succeeds.
-        pub async fn upload(&self, body: Body) -> StorageResult<Hash> {
-            let body = collect(body).await?;
-            let hash = Hash::of(&body);
-            match put_checked(&*self.s3, &path(&hash), body.into(), PutMode::Create).await {
-                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(hash),
+    #[async_trait]
+    impl Origin for S3 {
+        async fn put(&self, hash: &Hash, bytes: Bytes) -> StorageResult<()> {
+            let path = path(hash).into();
+            match put_checked(&*self.0, &path, bytes.into(), PutMode::Create).await {
+                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
                 // Backend errors can carry configured URLs, so only the classification is kept.
                 Err(_) => Err(StorageError::Unavailable(context(
                     "object_store",
-                    &hash,
+                    hash,
                     "artifact upload failed",
                 ))),
             }
         }
 
-        /// The verified artifact, or `Ok(None)` when S3 has no artifact by that hash.
-        pub async fn fetch(&self, hash: &Hash) -> StorageResult<Option<Body>> {
-            if self.healthy()
-                && let Some(bytes) = self.cached(hash).await
-            {
-                return Ok(Some(body(bytes)));
-            }
-            let Some(bytes) = get_checked(&*self.s3, &path(hash)).await? else {
-                return Ok(None);
-            };
-            // `get_checked` matched the body to its metadata; the name must match too. S3 damage is not local damage.
-            let bytes = Bytes::from(bytes);
-            if Hash::of(&bytes) != *hash {
-                return Err(StorageError::Corruption(context(
-                    "object_store",
-                    hash,
-                    "SHA-256 differs from the artifact's name",
-                )));
-            }
-            // Rechecked: other fetches may have quarantined the cache meanwhile.
-            if self.healthy()
-                && let Err(error) = self.cache.put(hash, body(bytes.clone())).await
-            {
-                self.health.report_contained(DATASET, LAYER, &error);
-            }
-            Ok(Some(body(bytes)))
+        async fn get(&self, hash: &Hash) -> StorageResult<Option<Bytes>> {
+            // `get_checked` matches the body to its metadata.
+            let bytes = get_checked(&*self.0, &path(hash).into()).await?;
+            Ok(bytes.map(Bytes::from))
         }
+    }
+}
 
-        /// Whether the cache is in service; a quarantined one is bypassed.
-        fn healthy(&self) -> bool {
-            self.health
-                .get(DATASET, LAYER)
-                .is_none_or(|report| report.state == State::Healthy)
+/// The health manager's source for the artifact cache.
+pub const DATASET: &str = bedrock_lib::datasets::capabilities::CDN;
+pub const LAYER: &str = "artifacts";
+
+fn path(hash: &Hash) -> String {
+    format!("artifacts/{hash}")
+}
+
+fn context(engine: &'static str, hash: &Hash, detail: &str) -> ErrorContext {
+    ErrorContext {
+        engine,
+        instance: DATASET.into(),
+        file: Some(path(hash)),
+        partition: None,
+        detail: detail.into(),
+    }
+}
+
+/// Artifacts in their [`Origin`] by SHA-256, read through a local cache.
+pub struct Artifacts {
+    origin: Arc<dyn Origin>,
+    cache: Arc<dyn CacheStorage>,
+    health: Arc<StorageHealth>,
+}
+
+impl Artifacts {
+    pub fn new(
+        origin: Arc<dyn Origin>,
+        cache: Arc<dyn CacheStorage>,
+        health: Arc<StorageHealth>,
+    ) -> Self {
+        Artifacts {
+            origin,
+            cache,
+            health,
         }
+    }
 
-        /// The cached artifact if it verifies. Otherwise it is evicted and reported, and the caller refetches it.
-        async fn cached(&self, hash: &Hash) -> Option<Bytes> {
-            let error = match self.cache.get(hash).await {
-                Ok(None) => return None,
-                Ok(Some(body)) => match collect(body).await {
-                    Ok(bytes) if Hash::of(&bytes) == *hash => {
-                        self.health.verified(DATASET, LAYER);
-                        return Some(bytes);
-                    }
-                    Ok(_) => StorageError::Corruption(context(
-                        "cache",
-                        hash,
-                        "cached artifact failed SHA-256 verification",
-                    )),
-                    Err(error) => error,
-                },
-                Err(error) => error,
-            };
-            tracing::warn!(%hash, %error, "evicting a damaged cached artifact");
+    /// Stores `body` in the origin under its SHA-256, which it returns. Uploading an artifact that exists succeeds.
+    pub async fn upload(&self, body: Body) -> StorageResult<Hash> {
+        let body = collect(body).await?;
+        let hash = Hash::of(&body);
+        self.origin.put(&hash, body).await?;
+        Ok(hash)
+    }
+
+    /// The verified artifact, or `Ok(None)` when the origin has no artifact by that hash.
+    pub async fn fetch(&self, hash: &Hash) -> StorageResult<Option<Body>> {
+        if let Some(bytes) = self.cached(hash).await {
+            return Ok(Some(body(bytes)));
+        }
+        Ok(self.fetch_origin(hash).await?.map(body))
+    }
+
+    /// The verified artifact from the origin, which then fills the cache.
+    pub(crate) async fn fetch_origin(&self, hash: &Hash) -> StorageResult<Option<Bytes>> {
+        let Some(bytes) = self.origin.get(hash).await? else {
+            return Ok(None);
+        };
+        // Origin damage is not local damage.
+        if Hash::of(&bytes) != *hash {
+            return Err(StorageError::Corruption(context(
+                "origin",
+                hash,
+                "SHA-256 differs from the artifact's name",
+            )));
+        }
+        self.fill(hash, bytes.clone()).await;
+        Ok(Some(bytes))
+    }
+
+    /// Caches `bytes`, which the caller verified against `hash`. A failure is reported, not returned: the cache may
+    /// drop artifacts anyway.
+    pub(crate) async fn fill(&self, hash: &Hash, bytes: Bytes) {
+        // Rechecked: other fetches may have quarantined the cache meanwhile.
+        if self.healthy()
+            && let Err(error) = self.cache.put(hash, body(bytes)).await
+        {
             self.health.report_contained(DATASET, LAYER, &error);
-            if let Err(error) = self.cache.delete(hash).await {
-                tracing::warn!(%hash, %error, "could not evict a damaged cached artifact");
-            }
-            None
         }
+    }
+
+    /// Whether the cache is in service; a quarantined one is bypassed.
+    fn healthy(&self) -> bool {
+        self.health
+            .get(DATASET, LAYER)
+            .is_none_or(|report| report.state == State::Healthy)
+    }
+
+    /// The cached artifact if the cache is in service and the artifact verifies. Otherwise a damaged one is evicted
+    /// and reported, and the caller refetches it.
+    pub(crate) async fn cached(&self, hash: &Hash) -> Option<Bytes> {
+        if !self.healthy() {
+            return None;
+        }
+        let error = match self.cache.get(hash).await {
+            Ok(None) => return None,
+            Ok(Some(body)) => match collect(body).await {
+                Ok(bytes) if Hash::of(&bytes) == *hash => {
+                    self.health.verified(DATASET, LAYER);
+                    return Some(bytes);
+                }
+                Ok(_) => StorageError::Corruption(context(
+                    "cache",
+                    hash,
+                    "cached artifact failed SHA-256 verification",
+                )),
+                Err(error) => error,
+            },
+            Err(error) => error,
+        };
+        tracing::warn!(%hash, %error, "evicting a damaged cached artifact");
+        self.health.report_contained(DATASET, LAYER, &error);
+        if let Err(error) = self.cache.delete(hash).await {
+            tracing::warn!(%hash, %error, "could not evict a damaged cached artifact");
+        }
+        None
     }
 }
 

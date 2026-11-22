@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+// Artifact transfer between CDN nodes (#79 / B-31, `cdn.md` §3), served on the bulk traffic class. Artifacts are named
+// by their SHA-256, so a fetch is an idempotent read and the receiver verifies what arrives.
+package bedrock.artifact;
+
+service ArtifactTransfer {
+  // The artifact as a stream of chunks; `NOT_FOUND` when neither the node nor S3 has it. The serving node fetches a
+  // missing artifact from S3 itself, never from other peers.
+  rpc Fetch(FetchRequest) returns (stream Chunk);
+}
+
+// `hash` is the artifact's 32-byte SHA-256.
+message FetchRequest { bytes hash = 1; }
+message Chunk { bytes data = 1; }

@@ -300,10 +300,15 @@ dependencies = [
  "bytes",
  "foyer",
  "madsim-tokio",
+ "madsim-tonic",
+ "madsim-tonic-build",
  "object_store",
+ "prost",
+ "protoc-bin-vendored",
  "sha2",
  "tempfile",
  "tokio-stream",
+ "tonic-prost",
  "tracing",
 ]
 
@@ -450,6 +455,7 @@ dependencies = [
  "bedrock-quicksilver",
  "bedrock-relay",
  "bedrock-volume",
+ "bytes",
  "http-body-util",
  "hyper",
  "hyper-util",
