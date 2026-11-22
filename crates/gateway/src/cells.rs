@@ -125,11 +125,11 @@ impl Cells {
         if let Some(known) = self.known(refresh) {
             return known;
         }
-        let now = bedrock_lib::monotonic_now();
         let walked = self.walk().await;
         let mut known = self.known.lock().unwrap();
         let listed = known.at.is_some() && known.error.is_none();
-        known.at = Some(now);
+        // Timed from the walk's end, so a slow failed walk is still reused for a whole `MIN_REFRESH`.
+        known.at = Some(bedrock_lib::monotonic_now());
         match walked {
             Ok(listing) => {
                 known.listing = Arc::new(listing);

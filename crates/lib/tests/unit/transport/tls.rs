@@ -558,3 +558,51 @@ async fn an_upper_tier_gateway_reaches_relays_and_is_reached_as_its_record_names
         assert_eq!(reached.is_ok(), accepted, "{cell}");
     }
 }
+
+/// #89 / B-57: relays with no subscribers still keep their upstream sessions, so a region Gateway can walk down to a
+/// quiet cell.
+#[tokio::test(flavor = "multi_thread")]
+async fn quiet_relays_stay_listed_up_to_the_region() {
+    async fn relay(ca: &Ca, tier: u32, node: &str, upstream: Option<&str>) -> String {
+        let tls = tls(ca, "relay", "c1", node).await;
+        let mut hub = Hub::relay(
+            node.into(),
+            tier,
+            Arc::new(peers(Some(tls.clone()))),
+            upstream.into_iter().map(str::to_owned).collect(),
+            Vec::new(),
+            None,
+        );
+        if tier == 1 {
+            hub = hub.with_cell("c1".into());
+        }
+        let hub = hub.with_address("127.0.0.1:1".into());
+        // Detached: the upstream task lives as long as the test.
+        drop(hub.start());
+        serve(tls, hub).await
+    }
+    let ca = Ca::new();
+    let region = relay(&ca, 3, "g1", None).await;
+    let dc = relay(&ca, 2, "d1", Some(&region)).await;
+    relay(&ca, 1, "r1", Some(&dc)).await;
+    let gateway = peers(Some(tls(&ca, "gateway", "eu", "gw1").await));
+    for (parent, tier) in [(&dc, 1), (&region, 2)] {
+        let mut client =
+            pb::relay_client::RelayClient::new(gateway.channel(parent, Class::Control).unwrap());
+        let mut listed = false;
+        for _ in 0..100 {
+            let children = client
+                .cells(pb::CellsRequest {})
+                .await
+                .unwrap()
+                .into_inner()
+                .children;
+            listed = children.iter().any(|c| c.tier == tier);
+            if listed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(listed, "the quiet tier-{tier} relay was never listed");
+    }
+}

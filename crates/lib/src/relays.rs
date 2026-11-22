@@ -2041,7 +2041,12 @@ impl Hub {
         }
         (namespaces, datasets)
     }
+    /// A relay with upstreams that advertises an address is never idle: its session is how upper Gateways walk down to
+    /// its cells, even quiet ones (#89 / B-57).
     fn idle(&self) -> bool {
+        if !self.0.upstreams.is_empty() && self.0.address.get().is_some() {
+            return false;
+        }
         let (namespaces, datasets) = self.desired();
         namespaces.is_empty() && datasets.is_empty()
     }
