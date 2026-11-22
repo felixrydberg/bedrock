@@ -12,13 +12,10 @@
 //!   no healthy host.
 //! - **Redirects.** The host's `Acquire` serves, wakes, or redirects to the live holder. The entry Gateway follows at most
 //!   [`REDIRECTS`], then answers `UNAVAILABLE` (a retryable 503).
-//! - **At most once per request.** A host that took the event answers with its outcome, failures included, so the
-//!   forwarding hops never retry it. A gRPC error means the request failed on the way; the entry Gateway drops the cached
-//!   place and returns the error rather than send the event again. The caller retries.
-//!
-//! ponytail: a hop that times out while the host is still running the event is retried by the forwarding loops built
-//! for reads (`Cells::forward`, `Client::through_gateways`), so an event slower than the client's 5 s timeout may run
-//! twice; carry a request ID for the host to deduplicate if that matters.
+//! - **At most once per request.** A host that took the event answers with its outcome, failures included. A forwarding
+//!   hop tries another Gateway only after a failure that proves the event was not dispatched ([`Dispatch`]); after any
+//!   other failure, a timeout included, it stops. The entry Gateway then drops the cached place and returns the error
+//!   rather than send the event again. The caller retries.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -100,6 +97,46 @@ impl<K: Ord + Clone, V: Clone> Lru<K, V> {
         if let Some((_, tick)) = self.entries.remove(key) {
             self.order.remove(&tick);
         }
+    }
+}
+
+/// One actor event's sends through a forwarding loop built for reads (`Cells::forward`, `Client::through_gateways`),
+/// which tries the next Gateway after any failure. Once a send fails in a way that may have reached a host (a timeout,
+/// a broken connection), every later send is refused without being made, so the event runs at most once.
+#[derive(Default)]
+pub struct Dispatch {
+    failed: Mutex<Option<Status>>,
+}
+
+impl Dispatch {
+    /// Failures a Gateway answers before it hands the event on: a cell it does not serve or has no healthy host for
+    /// (`FAILED_PRECONDITION`), and its own limit (`RESOURCE_EXHAUSTED`). Host failures travel inside the reply.
+    pub fn undispatched(status: &Status) -> bool {
+        matches!(
+            status.code(),
+            Code::FailedPrecondition | Code::ResourceExhausted
+        )
+    }
+
+    /// Sends with `send` unless an earlier send may have dispatched the event.
+    pub async fn send<T>(
+        &self,
+        send: impl Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        if let Some(status) = self.lock().clone() {
+            return Err(status);
+        }
+        let result = send.await;
+        if let Err(status) = &result
+            && !Self::undispatched(status)
+        {
+            *self.lock() = Some(status.clone());
+        }
+        result
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Status>> {
+        self.failed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -275,14 +312,15 @@ impl Router {
         if target == self.home {
             return self.deliver(request).await;
         }
+        let dispatch = Dispatch::default();
         self.client
             .through_gateways(&target, |channel| {
                 let request = targeted(request.clone(), COMPUTE, &target.cell);
-                async move {
+                dispatch.send(async move {
                     pb::actors_client::ActorsClient::new(channel)
                         .invoke(request?)
                         .await
-                }
+                })
             })
             .await
     }

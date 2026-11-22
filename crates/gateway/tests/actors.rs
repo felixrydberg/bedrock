@@ -85,3 +85,30 @@ async fn the_actors_listener_refuses_requests_it_cannot_route() {
         Code::ResourceExhausted
     );
 }
+
+#[tokio::test]
+async fn an_actor_event_is_not_sent_again_after_a_failure_that_may_have_dispatched_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bedrock_gateway::actors::Dispatch;
+    use tonic::Status;
+
+    let sent = AtomicUsize::new(0);
+    let send = |status: Option<Status>| {
+        let sent = &sent;
+        async move {
+            sent.fetch_add(1, Ordering::SeqCst);
+            status.map_or(Ok(()), Err)
+        }
+    };
+    let dispatch = Dispatch::default();
+    // A Gateway that refused before handing the event on: the next Gateway is tried.
+    let refused = Status::failed_precondition("this Gateway serves another cell");
+    assert!(dispatch.send(send(Some(refused))).await.is_err());
+    // A timeout may have reached a host: later sends are refused without being made.
+    let timeout = Status::deadline_exceeded("timed out");
+    assert!(dispatch.send(send(Some(timeout))).await.is_err());
+    let after = dispatch.send(send(None)).await.unwrap_err();
+    assert_eq!(after.code(), Code::DeadlineExceeded);
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+}

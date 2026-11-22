@@ -270,6 +270,8 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
         use bedrock_lib::volume::actors_client::ActorsClient;
         let router = self.router.as_ref();
         if request.metadata().get(CELL_HEADER).is_some() {
+            let dispatch = actors::Dispatch::default();
+            let dispatch = &dispatch;
             return self
                 .serve(
                     request,
@@ -277,10 +279,14 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
                         if service != COMPUTE {
                             return Err(Status::invalid_argument("actor requests are for compute"));
                         }
-                        let router = router.ok_or_else(|| Status::unimplemented("no actor routing"))?;
+                        let router =
+                            router.ok_or_else(|| Status::unimplemented("no actor routing"))?;
                         router.deliver(r).await
                     },
-                    |channel, request| async move { ActorsClient::new(channel).invoke(request).await },
+                    |channel, request| {
+                        dispatch
+                            .send(async move { ActorsClient::new(channel).invoke(request).await })
+                    },
                 )
                 .await;
         }

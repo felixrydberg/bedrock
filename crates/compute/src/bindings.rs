@@ -6,9 +6,9 @@ use bedrock_lib::datasets::capabilities::GATEWAY;
 use bedrock_lib::volume as pb;
 use tonic::Status;
 
-/// Sends `payload` to `actor` through this cell's Gateway and returns the actor's answer.
-// ponytail: one Gateway per call, in health order; a failed call is the caller's to retry, which then skips a Gateway
-// whose breaker opened. Fail over inside the call if binding retries get noisy.
+/// Sends `payload` to `actor` through this cell's Gateway and returns the actor's answer. A failed call is not sent again:
+/// the event may have run. It fetches a newer Gateway table for the caller's retry, which also skips a Gateway whose
+/// breaker opened.
 pub async fn call(client: &Client, actor: pb::Actor, payload: Vec<u8>) -> Result<Vec<u8>, Status> {
     let mut table = client.routes(GATEWAY, None).await?;
     if table.members.is_empty() {
@@ -37,6 +37,10 @@ pub async fn call(client: &Client, actor: pb::Actor, payload: Vec<u8>) -> Result
                 .invoke(request)
                 .await
         })
-        .await?;
-    Ok(reply.payload)
+        .await;
+    if reply.is_err() {
+        // The table may name Gateways that left; the call's own error is what the caller sees.
+        let _ = client.routes(GATEWAY, Some(table.revision)).await;
+    }
+    Ok(reply?.payload)
 }
