@@ -1354,6 +1354,7 @@ async fn connected(
                 tier: 0,
                 member: sent.clone(),
                 moved: last.as_deref().is_some_and(|last| last != upstream),
+                ..Default::default()
             })),
         },
     )

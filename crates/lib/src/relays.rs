@@ -105,6 +105,8 @@ struct Inner {
     tier: u32,
     /// The relay's cell; with TLS, leaf callers must belong to it (B-55).
     cell: OnceLock<String>,
+    /// The address this relay advertises, announced to its upstream for Relay.Cells (#89 / B-57).
+    address: OnceLock<String>,
     control: OnceLock<Arc<dyn LocalControlSource>>,
     peers: Arc<Peers>,
     upstreams: Vec<String>,
@@ -154,6 +156,8 @@ struct Subscriber {
     ranges: BTreeSet<(String, (u64, u64))>,
     changed: Arc<Watched<u64>>,
     member: Option<pb::Member>,
+    /// A child relay's announced cell and address, listed by Relay.Cells (#89 / B-57).
+    child: Option<pb::Child>,
     /// The range set last pushed to this leaf member per dataset, and the latest one it acknowledged (#22 / B-21).
     pushed: BTreeMap<String, pb::Ranges>,
     ranges_acked: BTreeMap<String, u64>,
@@ -258,6 +262,7 @@ impl Hub {
             id,
             tier,
             cell: OnceLock::new(),
+            address: OnceLock::new(),
             control: OnceLock::new(),
             peers,
             upstreams,
@@ -287,6 +292,10 @@ impl Hub {
     }
     pub fn with_cell(self, cell: String) -> Self {
         let _ = self.0.cell.set(cell);
+        self
+    }
+    pub fn with_address(self, address: String) -> Self {
+        let _ = self.0.address.set(address);
         self
     }
     pub fn with_control(self, control: Arc<dyn LocalControlSource>) -> Self {
@@ -1788,7 +1797,7 @@ impl Hub {
                         version: 1,
                         tier: 0,
                         member: None,
-                        moved: false,
+                        moved: false, ..Default::default()
                     })),
                 })
                 .await
@@ -2032,7 +2041,12 @@ impl Hub {
         }
         (namespaces, datasets)
     }
+    /// A relay with upstreams that advertises an address is never idle: its session is how upper Gateways walk down to
+    /// its cells, even quiet ones (#89 / B-57).
     fn idle(&self) -> bool {
+        if !self.0.upstreams.is_empty() && self.0.address.get().is_some() {
+            return false;
+        }
         let (namespaces, datasets) = self.desired();
         namespaces.is_empty() && datasets.is_empty()
     }
@@ -2066,6 +2080,12 @@ impl Hub {
                 tier: self.0.tier,
                 member: None,
                 moved: last.as_deref().is_some_and(|last| last != peer),
+                cell: if self.0.tier == 1 {
+                    self.cell().into()
+                } else {
+                    String::new()
+                },
+                address: self.0.address.get().cloned().unwrap_or_default(),
             })),
         })
         .await
@@ -2292,6 +2312,36 @@ impl Hub {
     }
 }
 
+/// The child relay a non-leaf `hello` announces, for Relay.Cells (#89 / B-57). With TLS the address must be one of the
+/// certificate's hosts and a cell relay's cell its certificate's cell, so a relay cannot list itself under another
+/// cell (`docs/spec/cells.tla`, `ListedLive`). A leaf, or a relay that announces no address, is no child. Above the cell
+/// tier the certificate names no DC, so a DC relay is listed by address only.
+pub fn child(caller: Option<&Caller>, hello: &pb::Hello) -> Result<Option<pb::Child>, Status> {
+    // A cell relay configured without a cell names no cell to route to.
+    if hello.tier == 0 || hello.address.is_empty() || (hello.tier == 1 && hello.cell.is_empty()) {
+        return Ok(None);
+    }
+    if hello.tier > 1 && !hello.cell.is_empty() {
+        return Err(Status::invalid_argument(
+            "only a cell relay announces a cell",
+        ));
+    }
+    if let Some(caller) = caller
+        && (!caller.has_host(host_of(&hello.address))
+            || (hello.tier == 1 && hello.cell != caller.cell))
+    {
+        return Err(Status::permission_denied(
+            "announced relay does not match the caller's certificate",
+        ));
+    }
+    Ok(Some(pb::Child {
+        tier: hello.tier,
+        cell: hello.cell.clone(),
+        address: hello.address.clone(),
+        node_id: caller.map(|c| c.node_id.clone()).unwrap_or_default(),
+    }))
+}
+
 /// Who may open a session with tier `tier` to a relay of tier `own_tier` (B-55): relays reach the writer and upper
 /// tiers, and any relay as a leaf without a member; Quicksilver, KV and CDN processes are leaves of their own cell's
 /// relays, and a leaf's announced member must be the caller itself.
@@ -2302,6 +2352,15 @@ pub fn authorize(
     tier: u32,
     member: Option<&pb::Member>,
 ) -> Result<(), Status> {
+    // A Gateway learns its tier from an upper-tier relay's Welcome on a leaf session without a member (#89 / B-57); at
+    // a cell relay it is a leaf of its own cell like any service.
+    if caller.service == crate::datasets::capabilities::GATEWAY
+        && member.is_none()
+        && tier == 0
+        && (2..WRITER).contains(&own_tier)
+    {
+        return Ok(());
+    }
     // A relay also reads published views through its upstreams as a leaf without a member (B-12).
     if own_tier == WRITER || tier > 0 || (caller.service == "relay" && member.is_none()) {
         return caller.require(&["relay"], None);
@@ -2339,9 +2398,15 @@ impl pb::relay_server::Relay for Hub {
         if let Some(caller) = Caller::of(&request) {
             // Volume routes also serve sibling cells' volume nodes, which reach an actor's slots directly (§10
             // decision 15). The certificate names no DC; sibling relay addresses are configured per DC.
-            let volume = request.get_ref().service == crate::datasets::capabilities::VOLUME;
-            let cell = (!volume || caller.service != crate::datasets::capabilities::VOLUME)
-                .then(|| self.cell());
+            // Upper-tier Gateways resolve any cell's Gateways the same way (#89 / B-57).
+            let wanted = request.get_ref().service.as_str();
+            let across = [
+                crate::datasets::capabilities::VOLUME,
+                crate::datasets::capabilities::GATEWAY,
+            ]
+            .contains(&wanted)
+                && caller.service == wanted;
+            let cell = (!across).then(|| self.cell());
             caller.require(&crate::membership::SERVICES, cell)?;
         }
         let Some(control) = self.0.control.get() else {
@@ -2355,6 +2420,7 @@ impl pb::relay_server::Relay for Hub {
         control.validate_namespace(self.cell(), &namespace)?;
         let view = control.view(&namespace)?;
         Ok(Response::new(pb::RoutesReply {
+            cell: self.cell().to_owned(),
             revision: view.sequence,
             entries: view
                 .values
@@ -2362,6 +2428,27 @@ impl pb::relay_server::Relay for Hub {
                 .map(|(key, value)| pb::StateEntry { key, value })
                 .collect(),
         }))
+    }
+
+    /// The live child relay sessions, in order (#89 / B-57).
+    async fn cells(
+        &self,
+        request: Request<pb::CellsRequest>,
+    ) -> Result<Response<pb::CellsReply>, Status> {
+        if let Some(caller) = Caller::of(&request) {
+            caller.require(&["relay", crate::datasets::capabilities::GATEWAY], None)?;
+        }
+        let mut children: Vec<pb::Child> = self
+            .0
+            .subscribers
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|s| s.child.clone())
+            .collect();
+        children.sort_by(|a, b| (&a.cell, &a.address).cmp(&(&b.cell, &b.address)));
+        children.dedup();
+        Ok(Response::new(pb::CellsReply { children }))
     }
 
     type SessionStream = Frames;
@@ -2374,7 +2461,7 @@ impl pb::relay_server::Relay for Hub {
         let first = tokio::time::timeout(Duration::from_secs(5), requests.message())
             .await
             .map_err(|_| Status::deadline_exceeded("hello timeout"))??;
-        let (tier, member, moved) = match first.and_then(|r| r.kind) {
+        let (tier, member, moved, child) = match first.and_then(|r| r.kind) {
             Some(pb::relay_request::Kind::Hello(hello))
                 if hello.version == 1
                     && hello.tier < self.0.tier
@@ -2382,7 +2469,10 @@ impl pb::relay_server::Relay for Hub {
                         hello.tier == 0 && crate::membership::validate(member).is_ok()
                     }) =>
             {
-                (hello.tier, hello.member, hello.moved)
+                let child = child(caller.as_ref(), &hello).inspect_err(
+                    |status| tracing::warn!(?caller, %status, "relay session rejected"),
+                )?;
+                (hello.tier, hello.member, hello.moved, child)
             }
             _ => {
                 return Err(Status::failed_precondition(
@@ -2418,6 +2508,7 @@ impl pb::relay_server::Relay for Hub {
                 ranges: BTreeSet::new(),
                 changed: changed.clone(),
                 member,
+                child,
                 pushed: BTreeMap::new(),
                 ranges_acked: BTreeMap::new(),
                 reported: BTreeMap::new(),

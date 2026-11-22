@@ -27,8 +27,10 @@ message Span { uint64 start = 1; uint64 end = 2; }
 // V1 relay session. Tier rank: leaf=0, cell=1, dc=2,
 // region=3, writer=4. Zero on Welcome is invalid.
 // A kv/cdn process's leaf session carries its membership entry (B-12). `moved`: this session replaces one on a
-// different relay, so its catch-up counts as failover (#41 / B-12b).
-message Hello { uint32 version = 1; uint32 tier = 2; Member member = 3; bool moved = 4; }
+// different relay, so its catch-up counts as failover (#41 / B-12b). A relay's Hello to its upstream carries its own
+// `cell` (empty above the cell tier) and advertised `address`, both checked against its certificate, which the upstream
+// lists in Relay.Cells (#89 / B-57, docs/spec/cells.tla).
+message Hello { uint32 version = 1; uint32 tier = 2; Member member = 3; bool moved = 4; string cell = 5; string address = 6; }
 
 // B-12 cell membership entry, published under dataset `membership`, namespace `{service}.{cell}`.
 // Budgets of zero mean unlimited.
@@ -176,10 +178,20 @@ message RelayFrame {
 // A service's published membership namespace in the relay's cell: members and placement directories, as the cell
 // control group stores them (#56 / B-25). Callers fetch it on demand instead of subscribing to every service they call.
 message RoutesRequest { string service = 1; }
-message RoutesReply { uint64 revision = 1; repeated StateEntry entries = 2; }
+// `cell` names the answering relay's cell, so a caller fetching another cell's table can refuse a reply from a relay
+// reprovisioned for another cell (#89 / B-57, `docs/spec/cells.tla` TablesOfTarget).
+message RoutesReply { uint64 revision = 1; repeated StateEntry entries = 2; string cell = 3; }
+// The relay's live child relay sessions (#89 / B-57): what upper-tier Gateways walk to find the cells below them.
+message CellsRequest {}
+message Child { uint32 tier = 1; string cell = 2; string address = 3; string node_id = 4; }
+message CellsReply { repeated Child children = 1; }
+// Upper-tier Gateways of one DC or region, written by operators to `quicksilver/infrastructure` at `gateways/{region}/{dc}`
+// or `gateways/{region}` (#89 / B-57). Only node_id, cell and address are read.
+message Gateways { repeated Member members = 1; }
 service Relay {
   rpc Session(stream RelayRequest) returns (stream RelayFrame);
   rpc Routes(RoutesRequest) returns (RoutesReply);
+  rpc Cells(CellsRequest) returns (CellsReply);
 }
 
 // Sibling relays (`replay_peers`) watch each other: a snapshot completed by `synced`, then changes.

@@ -90,6 +90,7 @@ fn subscriber(hub: &Hub, id: u64, capacity: usize) -> (Frames, Arc<Watched<bool>
             ranges: Default::default(),
             changed: changed.clone(),
             member: None,
+            child: None,
             pushed: BTreeMap::new(),
             ranges_acked: BTreeMap::new(),
             reported: BTreeMap::new(),
@@ -1093,6 +1094,124 @@ fn sessions_are_authorized_by_the_callers_certificate() {
     denied(authorize(&caller("kv", "", "n7"), 1, "", 0, None));
 }
 
+/// #89 / B-57: a Gateway opens a leaf session without a member at any relay but the writer, to learn its tier; a
+/// cell Gateway joins its own cell as a member like any service.
+#[test]
+fn gateways_are_leaves_of_every_relay_tier_but_the_writer() {
+    let denied = |result: Result<(), Status>| {
+        assert_eq!(result.unwrap_err().code(), tonic::Code::PermissionDenied)
+    };
+    let gateway = caller("gateway", "c1", "gw1");
+    authorize(&gateway, 1, "c1", 0, None).unwrap();
+    authorize(&gateway, 2, "", 0, None).unwrap();
+    authorize(&gateway, 3, "", 0, None).unwrap();
+    denied(authorize(&gateway, WRITER, "", 0, None));
+    // At a cell relay it is a leaf of its own cell only.
+    denied(authorize(&gateway, 1, "c2", 0, None));
+    // It is no relay: it may not open a session as a lower tier.
+    denied(authorize(&gateway, 2, "", 1, None));
+    let member = pb::Member {
+        node_id: "gw1".into(),
+        service: "gateway".into(),
+        cell: "c1".into(),
+        address: "10.0.0.7:7000".into(),
+        ..Default::default()
+    };
+    authorize(&gateway, 1, "c1", 0, Some(&member)).unwrap();
+    denied(authorize(&gateway, 2, "", 0, Some(&member)));
+    denied(authorize(&gateway, 1, "c2", 0, Some(&member)));
+}
+
+/// #89 / B-57, `docs/spec/cells.tla` `ListedLive`: a child relay is listed only under the cell and host its
+/// certificate names, and leaves are never listed.
+#[test]
+fn child_relays_are_listed_as_their_certificates_name_them() {
+    let hello = |tier: u32, cell: &str, address: &str| pb::Hello {
+        version: 1,
+        tier,
+        cell: cell.into(),
+        address: address.into(),
+        ..Default::default()
+    };
+    let relay = caller("relay", "c1", "r1");
+    assert_eq!(
+        child(Some(&relay), &hello(1, "c1", "10.0.0.7:7000")).unwrap(),
+        Some(pb::Child {
+            tier: 1,
+            cell: "c1".into(),
+            address: "10.0.0.7:7000".into(),
+            node_id: "r1".into(),
+        })
+    );
+    let code = |hello: pb::Hello| child(Some(&relay), &hello).unwrap_err().code();
+    assert_eq!(
+        code(hello(1, "c2", "10.0.0.7:7000")),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        code(hello(1, "c1", "10.0.0.8:7000")),
+        tonic::Code::PermissionDenied
+    );
+    assert_eq!(
+        code(hello(2, "c1", "10.0.0.7:7000")),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        child(Some(&relay), &hello(2, "", "10.0.0.7:7000"))
+            .unwrap()
+            .map(|c| c.tier),
+        Some(2)
+    );
+    // Leaves, relays announcing no address and cell relays without a cell are no children.
+    assert_eq!(
+        child(Some(&relay), &hello(0, "c1", "10.0.0.7:7000")).unwrap(),
+        None
+    );
+    assert_eq!(child(Some(&relay), &hello(1, "c1", "")).unwrap(), None);
+    assert_eq!(
+        child(Some(&relay), &hello(1, "", "10.0.0.7:7000")).unwrap(),
+        None
+    );
+}
+
+/// `docs/spec/cells.tla` `ListedLive`: Relay.Cells lists the live child sessions, and a closed one is gone.
+#[tokio::test]
+async fn cells_lists_live_child_sessions_to_relays_and_gateways() {
+    use pb::relay_server::Relay as _;
+    let ask = |from: Caller| {
+        let mut request = Request::new(pb::CellsRequest {});
+        request.extensions_mut().insert(from);
+        request
+    };
+    let hub = hub();
+    let (_frames, _) = subscriber(&hub, 1, MAX_EVENTS);
+    let (_leaf, _) = subscriber(&hub, 2, MAX_EVENTS);
+    let listed = pb::Child {
+        tier: 1,
+        cell: "c1".into(),
+        address: "10.0.0.7:7000".into(),
+        node_id: "r1".into(),
+    };
+    hub.0.subscribers.lock().unwrap().get_mut(&1).unwrap().child = Some(listed.clone());
+    let children = |from| async { hub.cells(ask(from)).await.map(|r| r.into_inner().children) };
+    assert_eq!(
+        children(caller("gateway", "", "gw")).await.unwrap(),
+        std::slice::from_ref(&listed)
+    );
+    assert_eq!(children(caller("relay", "", "r9")).await.unwrap(), [listed]);
+    assert_eq!(
+        children(caller("kv", "c1", "n7")).await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
+    hub.remove(1);
+    assert!(
+        children(caller("gateway", "", "gw"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn a_refused_push_is_pushed_again_on_the_next_pass() {
     let hub = hub();
@@ -1263,6 +1382,14 @@ async fn routes_return_a_services_published_namespace_to_callers_in_the_cell() {
     );
     let kv = hub.routes(ask("volume", Some(caller("kv", "other", "kv-9"))));
     assert_eq!(kv.await.unwrap_err().code(), tonic::Code::PermissionDenied);
+    // An upper-tier Gateway resolves any cell's Gateways (#89 / B-57), and nothing else of that cell.
+    let gateways = hub.routes(ask("gateway", Some(caller("gateway", "", "gw-dc"))));
+    assert_eq!(gateways.await.unwrap().into_inner().revision, 3);
+    let reads = hub.routes(ask("quicksilver", Some(caller("gateway", "", "gw-dc"))));
+    assert_eq!(
+        reads.await.unwrap_err().code(),
+        tonic::Code::PermissionDenied
+    );
 }
 
 #[tokio::test]

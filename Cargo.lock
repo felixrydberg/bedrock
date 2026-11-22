@@ -342,6 +342,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bedrock-gateway"
+version = "0.1.0"
+dependencies = [
+ "bedrock-lib",
+ "madsim-tokio",
+ "madsim-tonic",
+ "prometheus-client",
+ "serde",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
 name = "bedrock-kv"
 version = "0.1.0"
 dependencies = [
@@ -436,6 +449,7 @@ dependencies = [
  "bedrock-api",
  "bedrock-cdn",
  "bedrock-compute",
+ "bedrock-gateway",
  "bedrock-kv",
  "bedrock-lib",
  "bedrock-quicksilver",

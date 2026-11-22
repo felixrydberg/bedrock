@@ -512,7 +512,7 @@ async fn watch_membership(chaos: Arc<Chaos>, peers: Arc<Peers>) {
             let attempt = async {
                 let (tx, rx) = tokio::sync::mpsc::channel(32);
                 tx.send(pb::RelayRequest { kind: Some(pb::relay_request::Kind::Hello(pb::Hello {
-                    version: 1, tier: 0, member: None, moved: false,
+                    version: 1, tier: 0, member: None, moved: false, ..Default::default()
                 })) }).await.unwrap();
                 let channel = peers.channel(&address, bedrock_lib::transport::Class::Control)
                     .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
