@@ -103,7 +103,8 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
         replay,
     )
     .with_clock(now)
-    .with_cell(config.node.location.cell.clone());
+    .with_cell(config.node.location.cell.clone())
+    .with_address(config.node.advertised());
     if let Some(control) = &control {
         hub = hub.with_control(control.clone());
     }

@@ -55,6 +55,7 @@ fn subscribe(
                 .collect(),
             changed: Arc::new(Watched::new(0)),
             member: None,
+            child: None,
             pushed: BTreeMap::new(),
             ranges_acked: BTreeMap::new(),
             reported: BTreeMap::new(),
