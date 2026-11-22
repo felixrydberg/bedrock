@@ -102,7 +102,8 @@ impl<K: Ord + Clone, V: Clone> Lru<K, V> {
 
 /// One actor event's sends through a forwarding loop built for reads (`Cells::forward`, `Client::through_gateways`),
 /// which tries the next Gateway after any failure. Once a send fails in a way that may have reached a host (a timeout,
-/// a broken connection), every later send is refused without being made, so the event runs at most once.
+/// a broken connection, or a send cancelled mid-flight), every later send is refused without being made, so the event
+/// runs at most once, and [`Dispatch::finish`] keeps that failure as the result.
 #[derive(Default)]
 pub struct Dispatch {
     failed: Mutex<Option<Status>>,
@@ -123,16 +124,32 @@ impl Dispatch {
         &self,
         send: impl Future<Output = Result<T, Status>>,
     ) -> Result<T, Status> {
-        if let Some(status) = self.lock().clone() {
-            return Err(status);
+        {
+            let mut failed = self.lock();
+            if let Some(status) = failed.clone() {
+                return Err(status);
+            }
+            // Marked before the send, so one cancelled mid-flight (an outer timeout) still counts as dispatched.
+            *failed = Some(Status::unavailable(
+                "an earlier send of this actor event may have reached a host",
+            ));
         }
         let result = send.await;
-        if let Err(status) = &result
-            && !Self::undispatched(status)
-        {
-            *self.lock() = Some(status.clone());
+        let mut failed = self.lock();
+        match &result {
+            Err(status) if !Self::undispatched(status) => *failed = Some(status.clone()),
+            _ => *failed = None,
         }
         result
+    }
+
+    /// The forwarding loop's result, or the failure that may have dispatched the event: a later routing error must not
+    /// replace it, since a refusal would let the caller send the event elsewhere.
+    pub fn finish<T>(&self, result: Result<T, Status>) -> Result<T, Status> {
+        match (result, self.lock().clone()) {
+            (Err(_), Some(status)) => Err(status),
+            (result, _) => result,
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Option<Status>> {
@@ -313,7 +330,8 @@ impl Router {
             return self.deliver(request).await;
         }
         let dispatch = Dispatch::default();
-        self.client
+        let result = self
+            .client
             .through_gateways(&target, |channel| {
                 let request = targeted(request.clone(), COMPUTE, &target.cell);
                 dispatch.send(async move {
@@ -322,7 +340,8 @@ impl Router {
                         .await
                 })
             })
-            .await
+            .await;
+        dispatch.finish(result)
     }
 
     /// Delivers to a Compute host of this cell: the named one while it is a member, otherwise the wake host.

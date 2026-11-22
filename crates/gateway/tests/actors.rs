@@ -111,4 +111,18 @@ async fn an_actor_event_is_not_sent_again_after_a_failure_that_may_have_dispatch
     let after = dispatch.send(send(None)).await.unwrap_err();
     assert_eq!(after.code(), Code::DeadlineExceeded);
     assert_eq!(sent.load(Ordering::SeqCst), 2);
+    // A later routing refusal does not replace it, so the caller cannot send the event to another cell.
+    let finished = dispatch.finish::<()>(Err(Status::failed_precondition("no relays listed")));
+    assert_eq!(finished.unwrap_err().code(), Code::DeadlineExceeded);
+
+    // A send cancelled mid-flight (an outer timeout) counts as dispatched too.
+    let cancelled = Dispatch::default();
+    let pending = cancelled.send(std::future::pending::<Result<(), Status>>());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1), pending)
+            .await
+            .is_err()
+    );
+    assert!(cancelled.send(send(None)).await.is_err());
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
 }

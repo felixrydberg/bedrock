@@ -272,7 +272,7 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
         if request.metadata().get(CELL_HEADER).is_some() {
             let dispatch = actors::Dispatch::default();
             let dispatch = &dispatch;
-            return self
+            let result = self
                 .serve(
                     request,
                     |service, r| async move {
@@ -289,6 +289,7 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
                     },
                 )
                 .await;
+            return dispatch.finish(result);
         }
         let Some(router) = router else {
             return Err(Status::invalid_argument(format!("missing {CELL_HEADER}")));
