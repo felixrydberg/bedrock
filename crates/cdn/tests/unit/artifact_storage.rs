@@ -9,7 +9,6 @@ use bedrock_lib::storage::StorageError;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 
-use super::store::{DATASET, LAYER};
 use super::*;
 
 /// A cache that flips a byte of every artifact it returns while `damaged` is set, and counts reads.
@@ -74,7 +73,7 @@ async fn upload_then_fetch_round_trips_through_foyer() {
     let dir = tempfile::tempdir().unwrap();
     let cache = Arc::new(Foyer::open(dir.path(), 4, 16).await.unwrap());
     let artifacts = Artifacts::new(
-        Arc::new(InMemory::new()),
+        Arc::new(S3(Arc::new(InMemory::new()))),
         cache.clone(),
         StorageHealth::new(&Admin::new()),
     );
@@ -113,7 +112,11 @@ async fn upload_then_fetch_round_trips_through_foyer() {
 async fn a_corrupted_cached_artifact_is_evicted_reported_and_refetched() {
     let cache = Arc::new(Damaged::default());
     let health = StorageHealth::new(&Admin::new());
-    let artifacts = Artifacts::new(Arc::new(InMemory::new()), cache.clone(), health.clone());
+    let artifacts = Artifacts::new(
+        Arc::new(S3(Arc::new(InMemory::new()))),
+        cache.clone(),
+        health.clone(),
+    );
     let hash = artifacts
         .upload(body(Bytes::from_static(b"page")))
         .await
@@ -139,7 +142,11 @@ async fn a_corrupted_cached_artifact_is_evicted_reported_and_refetched() {
 async fn repeated_corruption_quarantines_the_cache_and_reads_bypass_it() {
     let cache = Arc::new(Damaged::default());
     let health = StorageHealth::new(&Admin::new());
-    let artifacts = Artifacts::new(Arc::new(InMemory::new()), cache.clone(), health.clone());
+    let artifacts = Artifacts::new(
+        Arc::new(S3(Arc::new(InMemory::new()))),
+        cache.clone(),
+        health.clone(),
+    );
     let hash = artifacts
         .upload(body(Bytes::from_static(b"page")))
         .await
@@ -165,7 +172,7 @@ async fn an_s3_object_that_does_not_match_its_name_is_corruption() {
     let s3 = Arc::new(InMemory::new());
     let health = StorageHealth::new(&Admin::new());
     let cache = Arc::new(Damaged::default());
-    let artifacts = Artifacts::new(s3.clone(), cache.clone(), health.clone());
+    let artifacts = Artifacts::new(Arc::new(S3(s3.clone())), cache.clone(), health.clone());
     let hash = Hash::of(b"expected");
     let path = Path::from(format!("artifacts/{hash}"));
     bedrock_lib::s3::put_checked(
@@ -236,8 +243,11 @@ async fn damage_on_foyers_disk_is_refetched_from_s3() {
     let artifact: Vec<u8> = (0..64 << 10).map(|i| (i * 7 % 251) as u8).collect();
     let hash = {
         let cache = Arc::new(Foyer::open(dir.path(), 4, 16).await.unwrap());
-        let artifacts =
-            Artifacts::new(s3.clone(), cache.clone(), StorageHealth::new(&Admin::new()));
+        let artifacts = Artifacts::new(
+            Arc::new(S3(s3.clone())),
+            cache.clone(),
+            StorageHealth::new(&Admin::new()),
+        );
         let hash = artifacts
             .upload(body(artifact.clone().into()))
             .await
@@ -260,7 +270,7 @@ async fn damage_on_foyers_disk_is_refetched_from_s3() {
 
     let cache = Arc::new(Foyer::open(dir.path(), 4, 16).await.unwrap());
     let health = StorageHealth::new(&Admin::new());
-    let artifacts = Artifacts::new(s3, cache.clone(), health.clone());
+    let artifacts = Artifacts::new(Arc::new(S3(s3)), cache.clone(), health.clone());
     assert!(cache.get(&hash).await.unwrap().is_none());
     assert_eq!(
         read(&artifacts, &hash).await.as_deref(),

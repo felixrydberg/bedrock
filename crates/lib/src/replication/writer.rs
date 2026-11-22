@@ -230,6 +230,16 @@ impl Writer {
         if self.closed.load(Ordering::SeqCst) {
             return Err(unavailable("writer closed"));
         }
+        // Opening the store again would take it back from the writer that fenced this one.
+        if state.fenced {
+            return Err(StorageError::Fenced(ErrorContext {
+                engine: "writer",
+                instance: format!("{dataset}/{namespace}"),
+                file: None,
+                partition: None,
+                detail: "another writer owns this namespace".into(),
+            }));
+        }
         if let Some(source) = &state.source {
             return Ok(source.clone());
         }
@@ -259,6 +269,28 @@ impl Writer {
                 }));
             }
             let entries = source.events().await?;
+            // Durable events past the log are this writer's unresolved batch, or none. Anything else another writer
+            // committed while this one was away (the stale publisher): it fences itself rather than retry its batch on
+            // top of them. A namespace this writer never held has no log to compare.
+            if head > 0 || state.unresolved.is_some() {
+                let tail: Vec<_> = entries
+                    .iter()
+                    .filter(|entry| entry.event.sequence > head)
+                    .collect();
+                let unresolved = state.unresolved.as_deref().unwrap_or_default();
+                if !tail.is_empty() && !tail.iter().copied().eq(unresolved) {
+                    return Err(StorageError::Fenced(ErrorContext {
+                        engine: "writer",
+                        instance: format!("{dataset}/{namespace}"),
+                        file: None,
+                        partition: None,
+                        detail: format!(
+                            "another writer committed through {} past this writer's {head}",
+                            progress.sequence
+                        ),
+                    }));
+                }
+            }
             if head == 0 {
                 self.log
                     .reset(dataset, namespace, progress.pruned_through)
@@ -282,6 +314,10 @@ impl Writer {
         }
         .await;
         if let Err(error) = restored {
+            if matches!(error, StorageError::Fenced(_)) {
+                state.fenced = true;
+                state.unresolved = None;
+            }
             let _ = source.close().await;
             return Err(error);
         }

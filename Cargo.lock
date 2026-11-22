@@ -300,10 +300,15 @@ dependencies = [
  "bytes",
  "foyer",
  "madsim-tokio",
+ "madsim-tonic",
+ "madsim-tonic-build",
  "object_store",
+ "prost",
+ "protoc-bin-vendored",
  "sha2",
  "tempfile",
  "tokio-stream",
+ "tonic-prost",
  "tracing",
 ]
 
@@ -334,6 +339,19 @@ dependencies = [
  "madsim-tokio",
  "rand 0.8.8",
  "rcgen",
+]
+
+[[package]]
+name = "bedrock-gateway"
+version = "0.1.0"
+dependencies = [
+ "bedrock-lib",
+ "madsim-tokio",
+ "madsim-tonic",
+ "prometheus-client",
+ "serde",
+ "tokio-stream",
+ "tracing",
 ]
 
 [[package]]
@@ -431,11 +449,13 @@ dependencies = [
  "bedrock-api",
  "bedrock-cdn",
  "bedrock-compute",
+ "bedrock-gateway",
  "bedrock-kv",
  "bedrock-lib",
  "bedrock-quicksilver",
  "bedrock-relay",
  "bedrock-volume",
+ "bytes",
  "http-body-util",
  "hyper",
  "hyper-util",

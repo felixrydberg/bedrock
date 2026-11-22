@@ -97,6 +97,10 @@ volume-delete-truncate undelete DeletedNeverServes
 volume_cold-split no-retire NoLostFlush
 volume_cold-split no-cas NoLostFlush
 volume_cold-move no-adopt Consistent
+cells unchecked ListedLive
+cells sticky ListedLive
+cells unscoped ServedInTarget
+cells unattributed TablesOfTarget
 volume_dc no-import NoLostAck
 volume_dc early-import NoLostAck
 volume_dc any-move NoLostAck
@@ -152,7 +156,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
+models="relays cells follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

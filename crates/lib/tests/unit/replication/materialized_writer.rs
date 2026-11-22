@@ -539,6 +539,74 @@ async fn bootstrap_settles_a_failed_flush_without_a_later_commit() {
     assert_eq!(writer.commit(write(Some("v"), Some("r"))).await.unwrap(), 1);
 }
 
+/// Found by the simulation (#89 / B-57, seed 36029): a stale publisher whose flush failed reopened the store after another
+/// writer had committed, and retried its batch on top of their events. It must fence itself instead. Each case: what the
+/// failed flush did, how many writes the other writer commits, and whether the stale one held the namespace before.
+#[tokio::test]
+async fn a_stale_writer_that_finds_another_writers_commits_fences_itself() {
+    for (fault, commits, held) in [
+        // Landed, then passed: the seed.
+        ((StoreAccess::Flush, StoreFault::Ambiguous), 1, true),
+        // Never landed, and as many writes took its place.
+        ((StoreAccess::Write, StoreFault::Unavailable), 1, true),
+        // The stale writer's first write to the namespace.
+        ((StoreAccess::Write, StoreFault::Unavailable), 2, false),
+    ] {
+        let next = Arc::new(std::sync::Mutex::new(None));
+        let store = {
+            let next = next.clone();
+            Arc::new(SimFactory::new(Arc::new(move |access| {
+                let mut next = next.lock().unwrap();
+                match *next {
+                    Some((at, fault)) if at == access => next.take().map(|_| fault),
+                    _ => None,
+                }
+            })))
+        };
+        let open = || {
+            Writer::open(
+                early,
+                config(
+                    store.clone(),
+                    Retention::default(),
+                    PersistenceMetrics::default(),
+                ),
+            )
+        };
+        let stale = open().await.unwrap();
+        if held {
+            assert_eq!(stale.commit(write(Some("first"), None)).await, Ok(1));
+        }
+        *next.lock().unwrap() = Some(fault);
+        assert!(stale.commit(write(Some("stale"), None)).await.is_err());
+        let current = open().await.unwrap();
+        for _ in 0..commits {
+            current.commit(write(Some("current"), None)).await.unwrap();
+        }
+        assert!(
+            matches!(
+                stale.bootstrap("kv", "one").await,
+                Err(StorageError::Fenced(_))
+            ),
+            "{fault:?}"
+        );
+        assert_eq!(
+            stale.commit(write(Some("late"), None)).await,
+            Err(CommitError::Fenced)
+        );
+        // Opening the store to look fenced the current writer too; a restart returns the namespace to service.
+        assert_eq!(
+            current.commit(write(Some("after"), None)).await,
+            Err(CommitError::Fenced)
+        );
+        let restarted = open().await.unwrap();
+        assert_eq!(
+            restarted.commit(write(Some("after"), None)).await,
+            Ok(commits + u64::from(held) + 1 + u64::from(fault.1 == StoreFault::Ambiguous))
+        );
+    }
+}
+
 /// A subscriber must not apply an event that a crash could still erase.
 #[tokio::test]
 async fn recovery_never_serves_past_the_durable_head() {

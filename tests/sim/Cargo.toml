@@ -13,14 +13,14 @@ tokio.workspace = true
 tonic.workspace = true
 
 [target.'cfg(madsim)'.dev-dependencies]
-bedrock-cdn = { path = "../../crates/cdn" }
+bedrock-gateway = { path = "../../crates/gateway" }
 bedrock-kv = { path = "../../crates/kv" }
 bedrock-quicksilver = { path = "../../crates/quicksilver" }
 bedrock-relay = { path = "../../crates/relay" }
 # The VOPR binary's allocator: about a quarter faster than glibc's, and traces do not depend on it (B-61). Simulation only.
 mimalloc = { version = "0.1.52", default-features = false }
 
-# `tests/transport.rs`, `subscriptions.rs` and `writes.rs` run in both builds.
+# `tests/transport.rs`, `artifact_transfer.rs`, `subscriptions.rs` and `writes.rs` run in both builds.
 [build-dependencies]
 protoc-bin-vendored = "3"
 tonic-build = { package = "madsim-tonic-build", version = "0.6" }
@@ -28,6 +28,9 @@ tonic-build = { package = "madsim-tonic-build", version = "0.6" }
 [dev-dependencies]
 async-trait.workspace = true
 bedrock-api = { path = "../../crates/api" }
+# Both builds: `tests/artifact_transfer.rs` needs real HTTP/2 flow control too.
+bedrock-cdn = { path = "../../crates/cdn", features = ["test-support"] }
+bytes = "1"
 # Both builds: `tests/volume_client_limits.rs` needs real tonic's message limits.
 bedrock-compute = { path = "../../crates/compute" }
 bedrock-volume = { path = "../../crates/volume" }

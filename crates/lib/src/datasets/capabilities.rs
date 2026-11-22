@@ -6,9 +6,11 @@ pub const CDN: &str = "cdn";
 pub const KV: &str = "kv";
 pub const MEMBERSHIP: &str = "membership";
 pub const VOLUME: &str = "volume";
+/// `bedrock-gateway`: cell Gateways are members of their cell (#89 / B-57), with no datasets.
+pub const GATEWAY: &str = "gateway";
 
 /// Services with a membership namespace in each cell, including services without ranged datasets.
-pub const SERVICES: [&str; 4] = [QUICKSILVER, KV, CDN, VOLUME];
+pub const SERVICES: [&str; 5] = [QUICKSILVER, KV, CDN, VOLUME, GATEWAY];
 
 struct Capability {
     dataset: &'static str,
