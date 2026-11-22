@@ -440,10 +440,11 @@ impl Client {
         })
     }
 
-    /// Tries the target DC's Gateways, then the target region's (the tier fallback), each listed in Quicksilver.
+    /// Tries the target DC's Gateways, then the target region's (the tier fallback), each listed in Quicksilver. `call`
+    /// sends a request [`targeted`] at `target`'s cell; Gateways route actor requests this way too (#116 / S-08).
     /// ponytail: reads the lists from Quicksilver on every call, one round trip inside the caller's cell; cache them
     /// like routing tables if cross-cell reads get hot.
-    async fn through_gateways<T, F, Fut>(&self, target: &Location, call: F) -> Result<T, Status>
+    pub async fn through_gateways<T, F, Fut>(&self, target: &Location, call: F) -> Result<T, Status>
     where
         F: Fn(Channel) -> Fut,
         Fut: Future<Output = Result<tonic::Response<T>, Status>>,

@@ -9,14 +9,18 @@
 //! Reads inside a cell never pass a Gateway: the shared client reads holders directly, and sends a read of another
 //! cell to the target DC's or region's Gateways ([`bedrock_lib::client::Client::get_in`]). The public listener and API
 //! keys are B-57 part 2.
+//!
+//! Actor requests (`Actors.Invoke`, #116 / S-08) are routed by [`actors::Router`] at the cell Gateway they enter and
+//! forwarded through the upper tiers like reads.
 
+pub mod actors;
 pub mod cells;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use bedrock_lib::client::{Client, target_of, targeted};
-use bedrock_lib::datasets::capabilities::{GATEWAY, SERVICES};
+use bedrock_lib::client::{CELL_HEADER, Client, Location, target_of, targeted};
+use bedrock_lib::datasets::capabilities::{COMPUTE, GATEWAY, SERVICES};
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, ConfigError, NodeConfig};
 use bedrock_lib::replication::pb;
@@ -43,10 +47,17 @@ pub struct GatewayConfig {
     /// public listener (part 2) cannot starve internal reads.
     #[serde(default = "internal_limit")]
     pub internal_limit: usize,
+    /// Actor locations a cell Gateway caches.
+    #[serde(default = "actor_cache")]
+    pub actor_cache: usize,
 }
 
 fn internal_limit() -> usize {
     INTERNAL_LIMIT
+}
+
+fn actor_cache() -> usize {
+    actors::CACHE
 }
 
 impl AsRef<NodeConfig> for GatewayConfig {
@@ -81,12 +92,14 @@ struct Labels {
     outcome: &'static str,
 }
 
-/// The internal listener's `Reads` service.
+/// The internal listener's `Reads` and `Actors` services.
 pub struct Gateway {
     role: Role,
     client: Arc<Client>,
     limit: Semaphore,
     requests: Family<Labels, Counter>,
+    /// A cell Gateway's actor routing.
+    router: Option<actors::Router>,
 }
 
 impl Gateway {
@@ -107,7 +120,14 @@ impl Gateway {
             client,
             limit: Semaphore::new(limit),
             requests,
+            router: None,
         }
+    }
+
+    /// Routes actor requests that enter or reach this cell Gateway.
+    pub fn with_actors(mut self, router: actors::Router) -> Self {
+        self.router = Some(router);
+        self
     }
 
     fn count(&self, service: &str, outcome: &'static str) {
@@ -239,6 +259,51 @@ impl pb::reads_server::Reads for Gateway {
     }
 }
 
+#[tonic::async_trait]
+impl bedrock_lib::volume::actors_server::Actors for Gateway {
+    /// Without a target cell the request enters here and is routed; with one it was forwarded, and is delivered in that
+    /// cell or forwarded further down like a read.
+    async fn invoke(
+        &self,
+        request: Request<bedrock_lib::volume::InvokeRequest>,
+    ) -> Result<Response<bedrock_lib::volume::InvokeReply>, Status> {
+        use bedrock_lib::volume::actors_client::ActorsClient;
+        let router = self.router.as_ref();
+        if request.metadata().get(CELL_HEADER).is_some() {
+            return self
+                .serve(
+                    request,
+                    |service, r| async move {
+                        if service != COMPUTE {
+                            return Err(Status::invalid_argument("actor requests are for compute"));
+                        }
+                        let router = router.ok_or_else(|| Status::unimplemented("no actor routing"))?;
+                        router.deliver(r).await
+                    },
+                    |channel, request| async move { ActorsClient::new(channel).invoke(request).await },
+                )
+                .await;
+        }
+        let Some(router) = router else {
+            return Err(Status::invalid_argument(format!("missing {CELL_HEADER}")));
+        };
+        let Ok(_permit) = self.limit.try_acquire() else {
+            self.count(COMPUTE, "limited");
+            return Err(Status::resource_exhausted("internal listener at its limit"));
+        };
+        let request = request.into_inner();
+        let actor = request
+            .actor
+            .ok_or_else(|| Status::invalid_argument("missing actor"))?;
+        let result = router.route(actor, request.payload).await;
+        self.count(COMPUTE, if result.is_ok() { "served" } else { "failed" });
+        Ok(Response::new(bedrock_lib::volume::InvokeReply {
+            payload: result?,
+            ..Default::default()
+        }))
+    }
+}
+
 /// The tier of the first of `relays` that welcomes a leaf session without a member.
 pub async fn tier_of(client: &Client, relays: &[String]) -> Result<u32, Status> {
     let mut last = Status::unavailable("no relays configured");
@@ -350,9 +415,22 @@ pub async fn run(config: GatewayConfig) -> Result<(), ConfigError> {
         }
     };
     tracing::info!(role = role.label(), "gateway role");
-    let gateway = Gateway::new(&admin, role, client, config.internal_limit);
+    let mut gateway = Gateway::new(&admin, role, client.clone(), config.internal_limit);
+    if let Role::Cell(cell) = &gateway.role {
+        let home = Location {
+            region: config.node.location.region.clone(),
+            dc: config.node.location.dc.clone(),
+            cell: cell.clone(),
+        };
+        let router = actors::Router::new(&admin, client, peers.clone(), home, config.actor_cache);
+        gateway = gateway.with_actors(router);
+    }
+    let gateway = Arc::new(gateway);
     let router = bedrock_lib::transport::server(tls.as_ref())
-        .add_service(pb::reads_server::ReadsServer::new(gateway));
+        .add_service(pb::reads_server::ReadsServer::from_arc(gateway.clone()))
+        .add_service(bedrock_lib::volume::actors_server::ActorsServer::from_arc(
+            gateway,
+        ));
     let mut server = std::pin::pin!(bedrock_lib::transport::serve(
         router,
         config.node.listen,
