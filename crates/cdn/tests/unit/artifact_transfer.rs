@@ -101,6 +101,20 @@ fn artifact(len: usize) -> Bytes {
     (0..len).map(|i| (i * 7 % 251) as u8).collect()
 }
 
+/// The node's transfer service, counting the peer requests that reached it.
+struct Counting(Arc<Transfer>, Arc<AtomicUsize>);
+
+#[tonic::async_trait]
+impl ArtifactTransfer for Counting {
+    type FetchStream = Chunks;
+
+    async fn fetch(&self, request: Request<pb::FetchRequest>) -> Result<Response<Chunks>, Status> {
+        // Counted in the poll that joins the fetch: nothing between here and the coalescer awaits.
+        self.1.fetch_add(1, Ordering::SeqCst);
+        self.0.fetch(request).await
+    }
+}
+
 /// #79 acceptance: 100 concurrent requests for one missing hash, from peers and local prewarming, cause one S3 fetch,
 /// and the peer request that arrives before prewarming starts leads it.
 #[tokio::test(flavor = "multi_thread")]
@@ -109,7 +123,8 @@ async fn concurrent_peer_and_local_requests_share_one_s3_fetch() {
     let hash = Hash::of(&artifact);
     let origin = Gated::new(&[&artifact], false);
     let server = node(origin.clone());
-    let addr = serve(server.transfer.clone()).await;
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let addr = serve(Arc::new(Counting(server.transfer.clone(), arrived.clone()))).await;
 
     let mut requests = tokio::task::JoinSet::new();
     requests.spawn(peer_fetch(addr.clone(), hash));
@@ -121,14 +136,18 @@ async fn concurrent_peer_and_local_requests_share_one_s3_fetch() {
             requests.spawn(peer_fetch(addr.clone(), hash));
         } else {
             let transfer = server.transfer.clone();
+            let arrived = arrived.clone();
             requests.spawn(async move {
+                arrived.fetch_add(1, Ordering::SeqCst);
                 let got = transfer.get("cell-a/warm", &hash, &[]).await;
                 got.unwrap().unwrap()
             });
         }
     }
     // Everyone joins the running fetch before S3 answers; a late joiner would hit the cache and miss the count below.
-    sleep(Duration::from_millis(500)).await;
+    while arrived.load(Ordering::SeqCst) < 100 {
+        sleep(Duration::from_millis(5)).await;
+    }
     origin.open.send_replace(true);
 
     let got = requests.join_all().await;

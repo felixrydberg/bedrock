@@ -37,6 +37,9 @@ pub use pb::artifact_transfer_server::ArtifactTransferServer;
 
 /// Bounds each peer call and each chunk read. A peer's first answer may wait on its own S3 fetch.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds a whole peer transfer, so a peer trickling chunks cannot hold a fetch and everyone waiting on it.
+// ponytail: one bound for every size; scale it with the artifact's size once callers know it (B-32 ref keys).
+pub const DEADLINE: Duration = Duration::from_secs(120);
 /// Well under gRPC's 4 MiB message limit.
 const CHUNK: usize = 256 << 10;
 /// The limiter lane of a peer's request when TLS does not name its cell.
@@ -44,16 +47,16 @@ const PEER_LANE: &str = "peer";
 
 /// A finished fetch: the lane that led it, and its answer.
 type Landed = (String, StorageResult<Option<Bytes>>);
-type Flights = Coalescer<Hash, Landed>;
 
 pub struct Transfer {
     artifacts: Arc<Artifacts>,
     peers: Arc<Peers>,
     /// Fetches asking peers. Peers' requests never join these, so two nodes asking each other never wait on each other.
-    from_peers: Flights,
+    /// Keyed by the sources too: a failure behind one caller's peers says nothing about another's.
+    from_peers: Coalescer<(Hash, Vec<String>), Landed>,
     /// Fetches from the cache, then S3: every peer request, local requests naming no peers, and the last stage of
     /// those that do.
-    from_s3: Flights,
+    from_s3: Coalescer<Hash, Landed>,
     s3: Limiter,
 }
 
@@ -106,7 +109,7 @@ impl Transfer {
             }
             self.fetch_s3(lane, hash).await
         };
-        coalesced(&self.from_peers, lane, hash, fetch).await
+        coalesced(&self.from_peers, (*hash, sources.to_vec()), lane, fetch).await
     }
 
     async fn fetch_s3(&self, lane: &str, hash: &Hash) -> StorageResult<Option<Bytes>> {
@@ -117,7 +120,7 @@ impl Transfer {
             let _permit = self.s3.acquire(lane).await?;
             self.artifacts.fetch_origin(hash).await
         };
-        coalesced(&self.from_s3, lane, hash, fetch).await
+        coalesced(&self.from_s3, *hash, lane, fetch).await
     }
 
     /// The artifact streamed from `peer` and verified, or `None` when the peer could not find it.
@@ -137,15 +140,20 @@ impl Transfer {
             Err(status) => return Err(status),
         };
         // ponytail: whole artifacts are buffered, as in `artifact_storage::collect`.
-        let mut body = BytesMut::new();
-        while let Some(chunk) = self
-            .peers
-            .call(peer, Class::Bulk, TIMEOUT, stream.message())
-            .await?
-        {
-            body.extend_from_slice(&chunk.data);
-        }
-        let body = body.freeze();
+        let read = async {
+            let mut body = BytesMut::new();
+            while let Some(chunk) = self
+                .peers
+                .call(peer, Class::Bulk, TIMEOUT, stream.message())
+                .await?
+            {
+                body.extend_from_slice(&chunk.data);
+            }
+            Ok::<_, Status>(body.freeze())
+        };
+        let body = tokio::time::timeout(DEADLINE, read)
+            .await
+            .map_err(|_| Status::deadline_exceeded(format!("transfer took over {DEADLINE:?}")))??;
         if Hash::of(&body) != *hash {
             return Err(Status::data_loss(format!(
                 "{} bytes received do not match the artifact's SHA-256",
@@ -156,18 +164,18 @@ impl Transfer {
     }
 }
 
-/// Runs `fetch` in `flights`, or joins the one running for `hash`.
-async fn coalesced<F: Future<Output = StorageResult<Option<Bytes>>>>(
-    flights: &Flights,
+/// Runs `fetch` in `flights`, or joins the one running for `key`.
+async fn coalesced<K: Ord + Clone, F: Future<Output = StorageResult<Option<Bytes>>>>(
+    flights: &Coalescer<K, Landed>,
+    key: K,
     lane: &str,
-    hash: &Hash,
     fetch: impl FnOnce() -> F,
 ) -> StorageResult<Option<Bytes>> {
     // Only a leader from `lane` can pass on an overload: it is that lane's queue that is full.
     let accept =
         |(leader, got): &Landed| leader == lane || !matches!(got, Err(StorageError::Overloaded(_)));
     let fetch = || async { (lane.to_owned(), fetch().await) };
-    flights.run(*hash, accept, fetch).await.1
+    flights.run(key, accept, fetch).await.1
 }
 
 type Chunks = Pin<Box<dyn Stream<Item = Result<pb::Chunk, Status>> + Send>>;
