@@ -11,7 +11,7 @@
 
 ## Architecture boundaries
 
-- Put the shared distributed core in `crates/lib`. `quicksilver`, `kv`, `cdn`, `volume`, `compute` (planned, track O), `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
+- Put the shared distributed core in `crates/lib`. `quicksilver`, `kv`, `cdn`, `volume`, `compute` (track O), `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
 - `bedrock-quicksilver` hosts `quicksilver`; `auth` serving awaits the future Gateway binary. `bedrock-kv` hosts customer `kv` only, with no virtual buckets and no dataset subscriptions; `bedrock-cdn` hosts `cdn` retention metadata and artifact bytes. Each subscribes only to its own datasets.
 - `bedrock-volume` stores actor slots (claims, quorum logs, overlays, alarm index) in relay-assigned `volume` hash ranges, which relays place but never stream. Its holders are Compute hosts; it subscribes to no dataset.
 - The write API and relays are generic over datasets. Retention is ordinary SET/DELETE replication interpreted only by CDN apply hooks.

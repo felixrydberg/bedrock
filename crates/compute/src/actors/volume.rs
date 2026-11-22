@@ -21,8 +21,8 @@
 //!   storage call before its commit, and drops an instance whose commit failed (`super::storage`, #115 / S-07), so a
 //!   pending write that is later lost never leaves the host (user decision 2026-11-15).
 //! - **Placement.** [`slot_nodes`] maps an actor to its slots' nodes through each slot cell's `volume` routing table.
-//!   Fetching sibling cells' tables through `Relay.Routes` comes with the `bedrock-compute` binary's relay membership,
-//!   after #114 / S-06 (user decision 2026-11-17).
+//!   The `bedrock-compute` binary passes its own cell's table (#147 / S-20); sibling cells' tables through
+//!   `Relay.Routes` are #148 / S-20b.
 //!
 //! Topology transitions (joint majorities of two slot sets) are not here yet: a writer uses one slot set and carries its
 //! topology version (user decision 2026-11-15).

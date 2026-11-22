@@ -9,7 +9,7 @@ base: f7aa02b4e017 (main; merge-base 011ebd7c with the PR head)
 head: 0fc59a37d0d4
 audited: 2026-11-17
 kind: technical-decision audit — read-only, independent; not a code review, no verdict
-open: 11
+open: 10
 principles: ARCHITECTURAL-PRINCIPLES.md, suggested defaults (unchanged); P-* ids cited below
 not-verified: madsim scenario never run by me (not buildable on this Windows host; CI sets no --cfg madsim), cargo fmt/clippy/test not run locally, no production wiring traced (no binary/relay/Gateway exists), S-05 flush/truncation behaviour for page loss
 
@@ -107,7 +107,8 @@ settled-by: S-10's design sketch showing Instance::invoke carrying a DO WebSocke
 question: is this trait the shape S-10 will keep, and should Storage leave ExecutionSpec before more code depends on it?
 
 F5 — Library-only landing with the issue's binary and AGENTS.md items deferred
-status: open
+status: answered
+answer: 2026-11-22 — #147 / S-20 adds the `bedrock-compute` binary and its `compute` relay membership and updates AGENTS.md; sibling cells' `volume` tables are #148 / S-20b (`crates/compute/src/lib.rs`, `tests/sim/tests/compute_binary.rs`)
 decision: C6
 defensible: deferral is recorded with its reason (files S-06 owns) and its exact item list; the library boundary made the host testable
 contestable: AGENTS.md:14 still reads "compute (planned, track O)" and was not touched, and the only consumer of the new public API is a test (P-DOC-4)

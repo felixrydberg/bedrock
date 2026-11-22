@@ -3,7 +3,7 @@ name = "bedrock-compute"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
-description = "Compute hosts: the actor host, its volume client and SQLite storage, and the one execution seam (#112 / S-04, #115 / S-07)."
+description = "Compute hosts: the `bedrock-compute` binary, the actor host, its volume client and SQLite storage, and the one execution seam (#112 / S-04, #115 / S-07, #147 / S-20)."
 
 [dependencies]
 async-trait.workspace = true
@@ -11,6 +11,7 @@ bedrock-lib.workspace = true
 prometheus-client.workspace = true
 prost.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
 sqlite-plugin.workspace = true
 tokio.workspace = true
 tonic.workspace = true
