@@ -47,6 +47,9 @@ message Entry {
     // The actor moved to another DC (S-17). Like `RELEASE`, a new claim needs no lease wait after it; a claimant that
     // recovers it never serves, and may only commit `MOVE` again.
     MOVE = 3;
+    // Deletes the actor (S-05b, #137). A slot that learns it committed keeps only a tombstone; a claimant that recovers
+    // it never serves, and may only commit `DELETE` again.
+    DELETE = 4;
   }
   uint64 seq = 1;
   uint64 epoch = 2;
@@ -92,6 +95,8 @@ enum Refusal {
   BEHIND = 7;
   // The actor is moving into this slot's DC and the slot has not been imported yet (S-17).
   NOT_IMPORTED = 8;
+  // The actor is deleted: the slot holds its tombstone, and nothing else of it (S-05b).
+  DELETED = 9;
 }
 
 // The slot's state after the request.
@@ -118,6 +123,8 @@ message Slot {
   optional uint64 flushed_alarm_ms = 12;
   // Where the slot was imported into the actor's new DC, if it was (S-17).
   Import imported = 13;
+  // The committed `DELETE`, once the slot holds the actor's tombstone (S-05b).
+  LogEnd deleted = 14;
 }
 
 message Answer { Refusal refused = 1; Slot slot = 2; }
@@ -173,5 +180,11 @@ message ClaimRecord {
   LogEnd moved = 14;
   // Where the slot was imported into the actor's new DC (S-17).
   Import imported = 15;
+  // The log's first `DELETE`, until it commits or is truncated as an old epoch's tail (S-05b).
+  LogEnd deleting = 16;
+  // The tombstone: the committed `DELETE`. The slot then holds no log, overlay or alarm of the actor.
+  LogEnd deleted = 17;
+  // The `DELETE`'s `committed_at`, where the grace period starts.
+  uint64 deleted_at_ms = 18;
 }
 message OverlayRecord { uint64 seq = 1; optional bytes value = 2; }

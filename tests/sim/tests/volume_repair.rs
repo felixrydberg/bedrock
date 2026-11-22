@@ -5,7 +5,8 @@
 //! Four scripted traces are the TLC counterexamples of the deliberate bugs in `docs/spec/volume.tla` (`volume-handoff`:
 //! `populating`, `unsealed`; `volume-wipe`: `early`, `self-epoch`). With the protocol each one loses no acknowledged
 //! commit; with the matching bug it does. A seeded scenario then wipes c and hands its range to d while a holder
-//! commits, checks that no repaired slot counts before the rule allows, and replays its trace.
+//! commits, checks that no repaired slot counts before the rule allows, and replays its trace. A last scenario deletes
+//! the actor amid the wipe and the handoff (#137 / S-05b).
 #![cfg(madsim)]
 
 use std::collections::BTreeMap;
@@ -245,6 +246,25 @@ async fn client(i: usize) -> Option<VolumeClient<tonic::transport::Channel>> {
     .ok()
 }
 
+/// Whether node `i` holds the actor's tombstone: a read refuses it with `Deleted`.
+async fn tombstoned(i: usize) -> bool {
+    let request = pb::ReadRequest {
+        actor: Some(actor()),
+        ..Default::default()
+    };
+    let Some(mut client) = client(i).await else {
+        return false;
+    };
+    let answer = timeout(CALL, client.read(request)).await;
+    answer.is_ok_and(|reply| {
+        reply.is_ok_and(|r| {
+            r.into_inner()
+                .answer
+                .is_some_and(|a| refused(&a) == Refusal::Deleted)
+        })
+    })
+}
+
 fn refused(answer: &pb::Answer) -> Refusal {
     Refusal::try_from(answer.refused).unwrap()
 }
@@ -411,8 +431,17 @@ impl Holder {
 }
 
 /// Runs `scenario` on a fresh simulator; it starts once every node has outlived its startup lease window.
-#[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
 fn run<F: Future<Output = u64> + Send + 'static>(seed: u64, scenario: fn(Cluster) -> F) -> u64 {
+    run_as("BEDROCK_VOLUME_REPAIR_SEED", seed, scenario)
+}
+
+/// [`run`], whose replay line on failure selects the seed with `var`.
+#[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
+fn run_as<F: Future<Output = u64> + Send + 'static>(
+    var: &'static str,
+    seed: u64,
+    scenario: fn(Cluster) -> F,
+) -> u64 {
     std::thread::spawn(move || {
         Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(async move {
             let cluster = Cluster::new();
@@ -433,7 +462,7 @@ fn run<F: Future<Output = u64> + Send + 'static>(seed: u64, scenario: fn(Cluster
     .join()
     .unwrap_or_else(|failure| {
         eprintln!(
-            "Replay: BEDROCK_VOLUME_REPAIR_SEED={seed} RUSTFLAGS=\"--cfg madsim\" cargo test -p bedrock-sim --test volume_repair"
+            "Replay: {var}={seed} RUSTFLAGS=\"--cfg madsim\" cargo test -p bedrock-sim --test volume_repair"
         );
         std::panic::resume_unwind(failure)
     })
@@ -732,6 +761,137 @@ fn a_wiped_slot_repairs_and_hands_off_without_losing_commits_and_seeds_replay() 
     for (seed, trace) in seeds.iter().zip(&traces) {
         assert_eq!(
             run(*seed, wipe_then_handoff),
+            *trace,
+            "seed {seed} did not replay its trace"
+        );
+    }
+    assert!(
+        traces.len() < 2 || traces.windows(2).any(|w| w[0] != w[1]),
+        "seeds should differ"
+    );
+}
+
+/// #137 / S-05b: a holder deletes the actor at a seeded point while it commits, c is wiped and repairs, and c's range
+/// moves to d. The DELETE commits, slots that learn it keep a tombstone, and the repair and the handoff copy it: a later
+/// claimant either finds no quorum or recovers the DELETE, so it never opens the actor.
+async fn delete_amid_wipe_and_handoff(cluster: Cluster) -> u64 {
+    let fingerprint = Fingerprint::new();
+    let mut committed = Vec::new();
+    let mut h1 = Holder::new("h1", 1);
+    for i in [A, B, C] {
+        h1.reserve(i).await;
+        h1.claim(i).await;
+    }
+    assert!(h1.recover().await);
+    let delete_at = thread_rng().gen_range(1..10u32);
+    let wipe_at = thread_rng().gen_range(1..10u32);
+    let handoff_at = wipe_at + thread_rng().gen_range(2..6u32);
+    let mut repairing = None;
+    let mut third = C;
+    let mut buried = 0;
+    // Whether a source of c's repair held the tombstone before it copied.
+    let mut copied_tombstone = false;
+    for n in 0..16u32 {
+        if n == wipe_at {
+            copied_tombstone = tombstoned(A).await || tombstoned(B).await;
+            cluster.wipe(C).await;
+            let c = cluster.repair(C, None);
+            let directory = cluster.view(C);
+            repairing = Some(tokio::spawn(async move {
+                c.tick(&directory, &BTreeMap::new()).await
+            }));
+        }
+        if n == handoff_at {
+            let repaired = repairing.take().unwrap().await.unwrap().unwrap();
+            assert!(repaired, "c holds its range again");
+            assert!(
+                !copied_tombstone || tombstoned(C).await,
+                "c's repair copied a tombstone"
+            );
+            let source_tombstone = tombstoned(A).await || tombstoned(B).await;
+            cluster.set(C, &[(C, State::Leaving), (D, State::Populating)]);
+            let d = cluster.repair(D, None);
+            let directory = cluster.view(D);
+            assert!(d.tick(&directory, &BTreeMap::new()).await.unwrap());
+            cluster.set(D, &[(D, State::Ready)]);
+            assert!(
+                !source_tombstone || tombstoned(D).await,
+                "the handoff copied a tombstone"
+            );
+            third = D;
+        }
+        // Data entries until the DELETE; after it the holder only resends its log, which teaches the commit point.
+        match n.cmp(&delete_at) {
+            std::cmp::Ordering::Less => h1.push(pb::entry::Kind::Data),
+            std::cmp::Ordering::Equal => h1.push(pb::entry::Kind::Delete),
+            std::cmp::Ordering::Greater => {}
+        }
+        let mut order = [A, B, third];
+        let first = thread_rng().gen_range(0..3);
+        order.swap(0, first);
+        for i in order {
+            let answer = h1.append(i, &mut committed).await;
+            if answer
+                .as_ref()
+                .is_some_and(|a| refused(a) == Refusal::Deleted)
+            {
+                buried += 1;
+            }
+            fingerprint.mix((n, i, answer.map(|a| a.refused)));
+        }
+    }
+    if let Some(repairing) = repairing {
+        let _ = repairing.await;
+    }
+    let delete = committed
+        .iter()
+        .find(|e| e.kind == pb::entry::Kind::Delete as i32)
+        .cloned()
+        .expect("the DELETE committed on a and b");
+    assert!(
+        buried > 0,
+        "a slot that learned the DELETE committed keeps a tombstone"
+    );
+    sleep(LEASE + Duration::from_secs(1)).await;
+    let mut h2 = Holder::new("h2", 2);
+    let mut refusals = Vec::new();
+    for i in [A, B, third] {
+        h2.reserve(i).await;
+        let answer = h2.claim(i).await;
+        refusals.push(answer.as_ref().map(|a| a.refused));
+    }
+    let opened = h2.recover().await;
+    assert!(
+        !opened || h2.log.contains(&delete),
+        "a claim after the DELETE committed recovered a log without it: {refusals:?}"
+    );
+    fingerprint.mix((committed.len(), opened, refusals));
+    for node in &cluster.nodes {
+        Handle::current().kill(node.id());
+    }
+    fingerprint.value()
+}
+
+const DELETE_SEED: &str = "BEDROCK_VOLUME_DELETE_SEED";
+
+#[test]
+fn a_deleted_actor_never_opens_again_through_appends_wipe_and_handoff_and_seeds_replay() {
+    // `BEDROCK_VOLUME_DELETE_SEEDS=500` sweeps seeds 1..=500; `BEDROCK_VOLUME_DELETE_SEED=42` runs one.
+    let seeds: Vec<u64> = match std::env::var(DELETE_SEED) {
+        Ok(seed) => vec![seed.parse().unwrap()],
+        Err(_) => {
+            let last =
+                std::env::var("BEDROCK_VOLUME_DELETE_SEEDS").map_or(8, |n| n.parse().unwrap());
+            (1..=last).collect()
+        }
+    };
+    let traces: Vec<u64> = seeds
+        .iter()
+        .map(|seed| run_as(DELETE_SEED, *seed, delete_amid_wipe_and_handoff))
+        .collect();
+    for (seed, trace) in seeds.iter().zip(&traces) {
+        assert_eq!(
+            run_as(DELETE_SEED, *seed, delete_amid_wipe_and_handoff),
             *trace,
             "seed {seed} did not replay its trace"
         );

@@ -235,6 +235,7 @@ fn writer(state: State) -> Writer {
             actor: pb::Actor::default(),
             epoch: 1,
             version: 0,
+            deleting: false,
             state: Mutex::new(state),
             changed: Notify::new(),
         }),
@@ -314,4 +315,20 @@ fn an_unknown_refusal_code_counts_for_no_quorum() {
     let unknown = answer(99);
     assert!(!counts(&unknown));
     assert_eq!(refused(unknown.as_ref().unwrap()), None);
+}
+
+#[test]
+fn one_tombstone_stops_a_claim_but_a_deletion_claims_past_it_until_two() {
+    let answer = |refusal: Refusal| {
+        Ok(pb::Answer {
+            refused: refusal as i32,
+            slot: Some(pb::Slot::default()),
+        })
+    };
+    let one = vec![(0, answer(Refusal::Deleted)), (1, answer(Refusal::None))];
+    assert!(matches!(buried(Kind::Noop, &one), Err(Error::Deleted)));
+    assert!(matches!(buried(Kind::Move, &one), Err(Error::Deleted)));
+    assert!(buried(Kind::Delete, &one).is_ok());
+    let two = vec![(0, answer(Refusal::Deleted)), (2, answer(Refusal::Deleted))];
+    assert!(matches!(buried(Kind::Delete, &two), Err(Error::Deleted)));
 }

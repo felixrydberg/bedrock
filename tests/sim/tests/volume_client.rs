@@ -5,6 +5,7 @@
 //! - A holder cut off from its slots stops serving within 4 s, and no other holder opens before it stops.
 //! - A claim at an epoch not reserved at a quorum never opens: with one slot repaired and one down, no slot is claimed.
 //! - Reads never return state older than the commit point, while the nearest slot falls behind.
+//! - Deleting an actor whose holder crashed mid-commit waits out its lease, and no later claim opens it (#137 / S-05b).
 //! - A seed replays its trace.
 //!
 //! The simulated network has no TLS, so calls carry no `Caller`; `crates/volume/tests/unit/serve.rs` checks callers.
@@ -518,6 +519,77 @@ async fn reads(fingerprint: &Fingerprint, next: &mut usize, nodes: &[NodeHandle]
     Handle::current().kill(node.id());
 }
 
+/// The `committed_at` of every `DELETE` here.
+const DELETED_AT: u64 = 77;
+
+/// Deletes `actor`, retrying while a previous holder's lease is live or a quorum is unreachable.
+async fn delete(host: &Arc<Host>, actor: pb::Actor) {
+    for _ in 0..60 {
+        match Writer::delete(host.clone(), actor.clone(), slots(), 0, DELETED_AT).await {
+            Ok(()) => return,
+            Err(Error::Held(_) | Error::Unavailable(_)) => sleep(Duration::from_millis(500)).await,
+            Err(error) => panic!("delete failed: {error}"),
+        }
+    }
+    panic!("no delete went through within the retries");
+}
+
+/// S-05b: a holder commits until it crashes at a seeded point, possibly mid-commit; another host deletes the actor once
+/// the lease ran out. After that no claim opens it, deleting it again succeeds, and the tombstones carry the `DELETE`'s
+/// `committed_at`, where the grace period starts.
+async fn deleted(fingerprint: &Fingerprint, next: &mut usize, engines: &[Arc<SimEngine>]) {
+    let case = *next;
+    *next += 1;
+    let first = compute(2 * case);
+    first.spawn(async move {
+        let host = host("del-1");
+        let writer = open(&host, actor(case)).await;
+        for n in 1.. {
+            if writer.commit(change("k", n), None, n).await.is_err() {
+                return;
+            }
+        }
+    });
+    sleep(Duration::from_millis(thread_rng().gen_range(500..1500))).await;
+    Handle::current().kill(first.id());
+    let second = compute(2 * case + 1);
+    let opened = second
+        .spawn(async move {
+            let host = host("del-2");
+            delete(&host, actor(case)).await;
+            delete(&host, actor(case)).await;
+            for _ in 0..60 {
+                match Writer::open(host.clone(), actor(case), slots(), 0).await {
+                    Err(Error::Deleted) => return false,
+                    Err(Error::Held(_) | Error::Unavailable(_)) => {
+                        sleep(Duration::from_millis(500)).await
+                    }
+                    Ok(_) => return true,
+                    Err(error) => panic!("open failed: {error}"),
+                }
+            }
+            panic!("no claim was answered within the retries");
+        })
+        .await
+        .unwrap();
+    assert!(!opened, "a claim opened a deleted actor");
+    let tombstones = engines
+        .iter()
+        .map(|engine| {
+            let store = Store::new(engine.clone() as Arc<dyn StorageEngine>);
+            let at = |before| store.expired(0, 0, before).unwrap().len();
+            (at(DELETED_AT), at(DELETED_AT + 1))
+        })
+        .filter(|counts| *counts == (0, 1))
+        .count();
+    assert!(
+        tombstones >= 2,
+        "two slots hold the tombstone from DELETED_AT"
+    );
+    fingerprint.mix(("deleted", opened));
+    Handle::current().kill(second.id());
+}
+
 async fn scenario() -> u64 {
     let fingerprint = Fingerprint::new();
     let engines: Vec<Arc<SimEngine>> = (0..3)
@@ -538,6 +610,7 @@ async fn scenario() -> u64 {
     stale_epoch(&fingerprint, &mut next, &engines, &nodes).await;
     flushed_point(&fingerprint, &mut next, &engines, &nodes).await;
     unreserved(&fingerprint, &mut next, &engines, &nodes).await;
+    deleted(&fingerprint, &mut next, &engines).await;
     for node in &nodes {
         Handle::current().kill(node.id());
     }

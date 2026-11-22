@@ -4,7 +4,8 @@
 //! with `s/` and the actor's big-endian hash, so a hash range is one scan and dropping it one `delete_range`:
 //! `s/{hash}{namespace}\0{id}\0` followed by `claim`, `log/{seq}`, `data/{key}` (the overlay) or `owed` (a flush's
 //! truncation the actor's other slots have not confirmed, kept by its maintainer). Released actors with an
-//! alarm are also indexed by time, `alarm/{when}{hash}{namespace}\0{id}`, removed with the claim's release.
+//! alarm are also indexed by time, `alarm/{when}{hash}{namespace}\0{id}`, removed with the claim's release, and
+//! tombstones of deleted actors (S-05b) by their `DELETE`'s time under `gone/`, removed with the tombstone.
 //!
 //! Each request is one atomic batch: log entries, overlay changes and the claim together. The engine syncs every batch
 //! before it returns, and RocksDB group-commits concurrent batches into one fsync, so an answer always follows its fsync.
@@ -164,6 +165,19 @@ fn owed_key(actor: &Actor) -> Vec<u8> {
 fn alarm_key(actor: &Actor, claim: &pb::ClaimRecord) -> Option<Vec<u8>> {
     let at = claim.alarm_ms.filter(|_| claim.released)?;
     Some([b"alarm/".as_slice(), &at.to_be_bytes(), &actor.prefix[2..]].concat())
+}
+
+/// The tombstone index entry of a deleted actor (S-05b).
+fn gone_key(actor: &Actor, claim: &pb::ClaimRecord) -> Option<Vec<u8>> {
+    claim.deleted?;
+    Some(
+        [
+            b"gone/".as_slice(),
+            &claim.deleted_at_ms.to_be_bytes(),
+            &actor.prefix[2..],
+        ]
+        .concat(),
+    )
 }
 
 /// Every actor key whose hash lies in `[start, end)`, `end` 0 meaning 2⁶⁴.
@@ -443,8 +457,22 @@ fn answer(refused: Refusal, claim: &pb::ClaimRecord, voting: bool) -> pb::Answer
             moved: claim.moved,
             flushed_alarm_ms: claim.flushed_alarm_ms,
             imported: claim.imported,
+            deleted: claim.deleted,
         }),
     }
+}
+
+/// The `DELETED` refusal of a slot holding the actor's tombstone (S-05b).
+fn buried(claim: &pb::ClaimRecord) -> Option<pb::Answer> {
+    claim
+        .deleted
+        .is_some()
+        .then(|| answer(Refusal::Deleted, claim, !claim.repaired))
+}
+
+/// Whether the claim knows its `DELETE` committed and is not a tombstone yet.
+fn deletes(claim: &pb::ClaimRecord) -> bool {
+    claim.deleted.is_none() && claim.deleting.is_some_and(|d| claim.committed >= d.seq)
 }
 
 fn end(claim: &pb::ClaimRecord) -> pb::LogEnd {
@@ -645,14 +673,16 @@ impl Store {
         let mut batch = WriteBatch::default();
         batch.delete_range(span(start, end));
         let (freed, _) = self.tally(start, end)?;
-        // ponytail: scans the whole alarm index; keep alarms per range if clears get frequent.
-        for item in self.engine.scan(&KeyRange::prefix(*b"alarm/"))? {
-            let (key, _) = item?;
-            let hash = key
-                .get(14..22)
-                .map(|h| u64::from_be_bytes(h.try_into().unwrap()));
-            if hash.is_some_and(|h| h >= start && (end == 0 || h < end)) {
-                batch.delete(key);
+        // ponytail: scans the whole alarm and tombstone indexes; keep them per range if clears get frequent.
+        for (index, at) in [(b"alarm/".as_slice(), 14), (b"gone/".as_slice(), 13)] {
+            for item in self.engine.scan(&KeyRange::prefix(index.to_vec()))? {
+                let (key, _) = item?;
+                let hash = key
+                    .get(at..at + 8)
+                    .map(|h| u64::from_be_bytes(h.try_into().unwrap()));
+                if hash.is_some_and(|h| h >= start && (end == 0 || h < end)) {
+                    batch.delete(key);
+                }
             }
         }
         let mut marks = self.marks();
@@ -756,7 +786,8 @@ impl Store {
         }
         let copied =
             pb::ClaimRecord::decode(claim.value.as_slice()).map_err(|e| corrupt("a claim", e))?;
-        if repair && copied.repaired {
+        // A tombstone is a committed fact, so it is copied even from a repaired slot.
+        if repair && copied.repaired && copied.deleted.is_none() {
             return Ok(());
         }
         let parsed = Actor::parse(prefix, copied.kind)
@@ -770,6 +801,13 @@ impl Store {
                 pb::ClaimRecord::decode(bytes.as_slice()).map_err(|e| corrupt("a claim", e))
             })
             .transpose()?;
+        if let Some(tomb) = here
+            .as_ref()
+            .filter(|h| h.deleted.is_some())
+            .or(copied.deleted.is_some().then_some(&copied))
+        {
+            return self.install_tombstone(&actor, here.as_ref(), &copied, tomb.clone(), repair);
+        }
         let last = |c: &pb::ClaimRecord| {
             let end = end(c);
             (end.epoch, end.seq)
@@ -826,6 +864,50 @@ impl Store {
         Self::save(&mut batch, &actor, &old, &new);
         self.commit(batch)?;
         self.unflushed.fetch_add(logged, Ordering::Relaxed);
+        // The copy's commit point can reach the kept log's `DELETE`.
+        if deletes(&new) {
+            self.bury(&actor, &new, new.clone(), &[])?;
+        }
+        Ok(())
+    }
+
+    /// Installs a tombstone (S-05b): the one here, or `tomb` copied from another slot. The actor's other records here
+    /// are dropped, and the higher promise and reservation kept.
+    fn install_tombstone(
+        &self,
+        actor: &Actor,
+        here: Option<&pb::ClaimRecord>,
+        copied: &pb::ClaimRecord,
+        mut tomb: pb::ClaimRecord,
+        repair: bool,
+    ) -> Result<(), Error> {
+        let old = here.cloned().unwrap_or_default();
+        for other in [&old, copied] {
+            if other.epoch > tomb.epoch {
+                tomb.epoch = other.epoch;
+                tomb.holder = other.holder.clone();
+            }
+            tomb.reserved = tomb.reserved.max(other.reserved);
+            tomb.version = tomb.version.max(other.version);
+        }
+        tomb.repaired |= repair;
+        let mut logged = 0;
+        for item in self.engine.scan(&KeyRange::prefix(actor.prefix.clone()))? {
+            let (key, value) = item?;
+            if key[actor.prefix.len()..].starts_with(b"log/") {
+                logged += (key.len() + value.len()) as i64;
+            }
+        }
+        let mut batch = WriteBatch::default();
+        batch.delete_range(KeyRange::prefix(actor.prefix.clone()));
+        Self::save(&mut batch, actor, &old, &tomb);
+        self.commit(batch)?;
+        self.unflushed.fetch_sub(logged, Ordering::Relaxed);
+        self.mark(&actor.prefix, &tomb);
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&actor.prefix);
         Ok(())
     }
 
@@ -1034,9 +1116,14 @@ impl Store {
         Ok(started.elapsed())
     }
 
-    /// Adds the claim, and its alarm index entry if that changed, to `batch`.
+    /// Adds the claim, and its alarm and tombstone index entries if they changed, to `batch`.
     fn save(batch: &mut WriteBatch, actor: &Actor, old: &pb::ClaimRecord, new: &pb::ClaimRecord) {
-        let (was, is) = (alarm_key(actor, old), alarm_key(actor, new));
+        Self::index(batch, alarm_key(actor, old), alarm_key(actor, new));
+        Self::index(batch, gone_key(actor, old), gone_key(actor, new));
+        batch.put(claim_key(actor), new.encode_to_vec());
+    }
+
+    fn index(batch: &mut WriteBatch, was: Option<Vec<u8>>, is: Option<Vec<u8>>) {
         if was != is {
             if let Some(was) = was {
                 batch.delete(was);
@@ -1045,7 +1132,64 @@ impl Store {
                 batch.put(is, Vec::new());
             }
         }
-        batch.put(claim_key(actor), new.encode_to_vec());
+    }
+
+    /// The tombstones of `[start, end)` (`end` 0 meaning 2⁶⁴) whose `DELETE` committed before `before_ms`, oldest
+    /// first, at most [`MAX_LIMIT`]: each actor and its `DELETE` (S-05b).
+    pub fn expired(
+        &self,
+        start: u64,
+        end: u64,
+        before_ms: u64,
+    ) -> Result<Vec<(pb::Actor, pb::LogEnd)>, Error> {
+        let range = KeyRange::new(
+            b"gone/".to_vec(),
+            [b"gone/".as_slice(), &before_ms.to_be_bytes()].concat(),
+        );
+        let mut expired = Vec::new();
+        // ponytail: one index for every range; key it by hash first if many tombstones wait at once.
+        for item in self.engine.scan(&range)? {
+            let (key, _) = item?;
+            let prefix = [b"s/".as_slice(), &key[13..]].concat();
+            let Some(hash) = prefix.get(2..10) else {
+                continue;
+            };
+            let hash = u64::from_be_bytes(hash.try_into().unwrap());
+            if hash < start || (end != 0 && hash >= end) {
+                continue;
+            }
+            let Some(parsed) = Actor::parse(&prefix, 0) else {
+                continue;
+            };
+            let claim = self.load(&Actor::new(&parsed)?)?;
+            if let Some(deleted) = claim.deleted {
+                expired.push((
+                    pb::Actor {
+                        kind: claim.kind,
+                        ..parsed
+                    },
+                    deleted,
+                ));
+                if expired.len() == MAX_LIMIT as usize {
+                    break;
+                }
+            }
+        }
+        Ok(expired)
+    }
+
+    /// Drops the tombstone index entry of `deleted` (S-05b): its range database no longer holds the actor, or this node
+    /// never purges it (its first slot is in another cell). The tombstone itself stays, so the actor's ID is never
+    /// claimed again.
+    pub fn unindex(&self, actor: &Actor, deleted: pb::LogEnd) -> Result<(), Error> {
+        let _lock = self.lock(actor);
+        let old = self.load(actor)?;
+        if old.deleted == Some(deleted) {
+            let mut batch = WriteBatch::default();
+            Self::index(&mut batch, gone_key(actor, &old), None);
+            self.commit(batch)?;
+        }
+        Ok(())
     }
 
     /// Reserves `epoch` for a claim: only above the slot's highest reservation, and never on a repaired slot (#131 /
@@ -1054,6 +1198,9 @@ impl Store {
         let _lock = self.lock(actor);
         self.check_sealed(actor)?;
         let old = self.load(actor)?;
+        if let Some(refused) = buried(&old) {
+            return Ok(refused);
+        }
         let voting = !old.repaired;
         let refused = if !voting {
             Refusal::NotVoting
@@ -1094,6 +1241,9 @@ impl Store {
         let _lock = self.lock(actor);
         self.check_sealed(actor)?;
         let old = self.load(actor)?;
+        if let Some(refused) = buried(&old) {
+            return Ok(refused);
+        }
         let voting = !old.repaired;
         let point = pb::Import {
             epoch,
@@ -1154,6 +1304,9 @@ impl Store {
         let _lock = self.lock(actor);
         self.check_sealed(actor)?;
         let old = self.load(actor)?;
+        if let Some(refused) = buried(&old) {
+            return Ok((refused, false));
+        }
         let voting = !old.repaired;
         let other = old
             .holder
@@ -1210,6 +1363,9 @@ impl Store {
         let _lock = self.lock(actor);
         self.check_sealed(actor)?;
         let old = self.load(actor)?;
+        if let Some(refused) = buried(&old) {
+            return Ok(Outcome::new(refused));
+        }
         let voting = !old.repaired;
         if old.epoch != request.epoch || old.holder.as_ref() != Some(holder) {
             return Ok(Outcome::new(answer(Refusal::NotPromised, &old, voting)));
@@ -1270,6 +1426,9 @@ impl Store {
                     committed: commit,
                     ..old.clone()
                 };
+                if deletes(&new) {
+                    return self.bury(actor, &old, new, &[]);
+                }
                 let mut batch = WriteBatch::default();
                 Self::save(&mut batch, actor, &old, &new);
                 self.commit(batch)?;
@@ -1304,10 +1463,18 @@ impl Store {
             if let Some(alarm) = &entry.alarm {
                 new.alarm_ms = alarm.at_ms;
             }
-            // A `MOVE` ends the holder's claim like a release (S-17).
-            let ends = [EntryKind::Release as i32, EntryKind::Move as i32].contains(&entry.kind);
+            // A `MOVE` (S-17) or `DELETE` (S-05b) ends the holder's claim like a release.
+            let ends = [EntryKind::Release, EntryKind::Move, EntryKind::Delete]
+                .map(|k| k as i32)
+                .contains(&entry.kind);
             if ends && entry.epoch == request.epoch {
                 new.released = true;
+            }
+            if entry.kind == EntryKind::Delete as i32 && new.deleting.is_none() {
+                new.deleting = Some(pb::LogEnd {
+                    seq: entry.seq,
+                    epoch: entry.epoch,
+                });
             }
             new.end = Some(pb::LogEnd {
                 seq: entry.seq,
@@ -1326,6 +1493,9 @@ impl Store {
             if epoch_of(commit)? == request.epoch {
                 new.repaired = false;
             }
+        }
+        if deletes(&new) {
+            return self.bury(actor, &old, new, &fresh);
         }
         let mut delta = 0;
         for (key, record) in overlay {
@@ -1379,6 +1549,9 @@ impl Store {
                 });
             overlay.insert(data_key(actor, &change.key), restored);
         }
+        if claim.deleting.is_some_and(|d| d.seq >= from) {
+            claim.deleting = None;
+        }
         if dropped.iter().any(|e| e.alarm.is_some()) {
             claim.alarm_ms = kept
                 .iter()
@@ -1397,6 +1570,63 @@ impl Store {
             },
         });
         Ok(dropped.iter().map(|e| log_bytes(actor, e)).sum())
+    }
+
+    /// Writes `new`, whose `DELETE` committed, as the actor's tombstone (S-05b, `Replicate` in `volume.tla`): one batch
+    /// drops its log, overlay, alarm and owed truncation, and keeps only the claim, which then refuses reservations,
+    /// claims, appends and reads with `DELETED`. `fresh` holds entries of the request not written yet; the `DELETE` is
+    /// there or in the log. Answers `DELETED`.
+    fn bury(
+        &self,
+        actor: &Actor,
+        old: &pb::ClaimRecord,
+        new: pb::ClaimRecord,
+        fresh: &[&pb::Entry],
+    ) -> Result<Outcome, Error> {
+        let delete = new.deleting.expect("a claim that deletes has its DELETE");
+        let at = match fresh.iter().find(|e| e.seq == delete.seq) {
+            Some(entry) => entry.committed_at,
+            None => self.entry(actor, delete.seq)?.committed_at,
+        };
+        let (mut logged, mut overlay) = (0, 0);
+        for item in self.engine.scan(&KeyRange::prefix(actor.prefix.clone()))? {
+            let (key, value) = item?;
+            let name = &key[actor.prefix.len()..];
+            let size = (key.len() + value.len()) as i64;
+            if name.starts_with(b"log/") {
+                logged += size;
+            } else if name.starts_with(b"data/") {
+                overlay += size;
+            }
+        }
+        let end = end(&new);
+        let tomb = pb::ClaimRecord {
+            released: true,
+            committed: end.seq,
+            flushed: end.seq,
+            flushed_epoch: end.epoch,
+            alarm_ms: None,
+            flushed_alarm_ms: None,
+            deleting: None,
+            deleted: Some(delete),
+            deleted_at_ms: at,
+            ..new
+        };
+        let mut batch = WriteBatch::default();
+        batch.delete_range(KeyRange::prefix(actor.prefix.clone()));
+        Self::save(&mut batch, actor, old, &tomb);
+        let fsync = self.commit(batch)?;
+        self.unflushed.fetch_sub(logged, Ordering::Relaxed);
+        self.mark(&actor.prefix, &tomb);
+        self.owed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&actor.prefix);
+        Ok(Outcome {
+            answer: answer(Refusal::Deleted, &tomb, !tomb.repaired),
+            overlay: -overlay,
+            fsync: Some(fsync),
+        })
     }
 
     /// Drops the log and overlay through `through`, which S3 now holds (S-05's maintainer calls this). Only committed
@@ -1515,7 +1745,7 @@ impl Store {
         // Only for the holder whose append found the gap, while the slot still promises it: another claim may have come
         // in since.
         let promised = old.holder.as_ref() == Some(holder) && old.epoch == promise;
-        if !promised || old_end.seq >= seq || epoch > old.epoch {
+        if !promised || old_end.seq >= seq || epoch > old.epoch || old.deleted.is_some() {
             return Ok(None);
         }
         let log = self.entries(actor, old.flushed + 1, old_end.seq)?;
@@ -1546,6 +1776,9 @@ impl Store {
             alarm_ms: alarm,
             flushed_alarm_ms: alarm,
             moved: old.moved.or(moved),
+            // The dropped log ends below S3, which holds only committed entries and never a `DELETE`: a slot that knows
+            // its `DELETE` committed is a tombstone, so it never flushes one.
+            deleting: None,
             ..old.clone()
         };
         Self::save(&mut batch, actor, &old, &new);
@@ -1577,6 +1810,9 @@ impl Store {
     ) -> Result<(pb::Answer, Vec<pb::Value>, Vec<usize>), Error> {
         let _lock = self.lock(actor);
         let claim = self.load(actor)?;
+        if let Some(refused) = buried(&claim) {
+            return Ok((refused, Vec::new(), Vec::new()));
+        }
         let voting = !claim.repaired;
         if !Self::caught_up(&claim, min_seq) {
             return Ok((
@@ -1616,6 +1852,9 @@ impl Store {
     ) -> Result<(pb::Answer, Vec<pb::Value>, bool), Error> {
         let _lock = self.lock(actor);
         let claim = self.load(actor)?;
+        if let Some(refused) = buried(&claim) {
+            return Ok((refused, Vec::new(), false));
+        }
         let voting = !claim.repaired;
         if !Self::caught_up(&claim, min_seq) {
             return Ok((answer(Refusal::Behind, &claim, voting), Vec::new(), false));
@@ -1658,6 +1897,9 @@ impl Store {
     ) -> Result<(pb::Answer, Vec<pb::Entry>, bool), Error> {
         let _lock = self.lock(actor);
         let claim = self.load(actor)?;
+        if let Some(refused) = buried(&claim) {
+            return Ok((refused, Vec::new(), false));
+        }
         let voting = !claim.repaired;
         if claim.epoch != epoch || claim.holder.as_ref() != Some(holder) {
             return Ok((

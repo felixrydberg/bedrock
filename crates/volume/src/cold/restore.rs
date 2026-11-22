@@ -5,8 +5,9 @@
 //! `{first cell}/restored/{id}`: a database of meta keys, which [`restored`] reads back a page at a time. Memory stays a
 //! few keys per cell whatever the number of actors.
 //!
-//! - **Older copies.** Range databases keep an actor's copy after it moves until S-05b deletes it: a first-slot move
-//!   inside the DC leaves an older copy in another of its cells, so only the highest sequence counts, and an actor that
+//! - **Older copies.** Range databases keep an actor's copy after it moves (S-05b purges a deleted actor only from its
+//!   current first-slot database): a first-slot move inside the DC leaves an older copy in another of its cells, so only
+//!   the highest sequence counts, and an actor that
 //!   moved to another DC before this DC change is skipped, since the lost DC is neither its `dc_of` nor its
 //!   `dc_before`.
 //! - **Unfinished moves.** While a DC change runs, an actor leaving the lost DC (`dc_before`) is recorded too: its

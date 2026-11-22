@@ -43,6 +43,15 @@ after a disk wipe. S-03 (#111), S-04 (#112) and S-06 (#114) implement it.
   - `topology`: version 1 is `{a, b, c}`, version 2 needs majorities of both `{a, b, c}` and `{a, b, d}`, version 3 is
     `{a, b, d}`. Claims and appends carry the version the holder read, and a slot refuses an older one.
 
+- **Deletion** (S-05b, #137; `Deletes = TRUE` only in the `volume-delete-*` configs, so the others keep their state
+  spaces). Each entry says whether it is a `DELETE`. `Write(h, TRUE)` appends one, as a claim's first entry or from an
+  open holder; the holder never opens, or stops serving, after it. A slot that learns the `DELETE` committed (in
+  `Replicate`, or `Learn` under `truncate`) keeps only a tombstone (`gone`): it drops its log and refuses
+  reservations, claims and appends. A claimant whose recovered log holds a `DELETE` may only write `DELETE` again.
+  `Copy` copies the tombstone (repair and handoff); `Wipe` loses it, and the repair copies it back from a peer. The
+  grace period and the purge of the actor's keys from its range database after it are not modeled: tombstones stay,
+  so no claim reads S3 again. Dropping tombstones so that an ID can be reused is not part of the protocol yet.
+
 Messages are abstract. A grant the holder has received stays counted after the slot that sent it is wiped or hands
 off, and a fenced holder's appends still arrive.
 
@@ -52,6 +61,7 @@ off, and a fenced holder's appends still arrive.
 | --- | --- |
 | `NoLostAck` | No two entries commit at one sequence. Every acknowledged entry is in the recovered log of every holder that won a later claim, and of any other holder that won the same epoch. |
 | `OneWriter` | At most one holder serves the actor (is open). |
+| `DeletedNeverServes` | Once a `DELETE` has committed, no holder serves the actor (S-05b). |
 | `NoStaleAppend` | Once a newer holder serves, an older epoch commits nothing that holder lacks. A late fsync may still complete the quorum of an entry the newer holder recovered. |
 | `S3Committed` | Every entry in S3 is committed, at its sequence. |
 | `TruncatedInS3` | What a slot truncated is what S3 holds at those sequences, so reads of it from S3 are the slot's log. |
@@ -73,6 +83,7 @@ Each deliberate bug in `scripts/tlc.sh` breaks the invariant named beside it:
 | `volume-truncate` | `truncate` | `TruncatedInS3` | A slot truncates through what S3 holds, past the commit point it knows |
 | `volume-truncate` | `skip-keep` | `TruncatedInS3` | A slot behind S3 keeps its own prefix and only appends S3's tail |
 | `volume-truncate` | `skip-any` | `TruncatedInS3` | A slot skips to an S3 point newer than its promise, so its fenced holder's appends land on it |
+| `volume-delete-wipe`, `volume-delete-handoff`, `volume-delete-truncate` | `undelete` | `DeletedNeverServes` | A tombstoned slot grants claims as a blank slot |
 
 ## Bounds
 
@@ -85,6 +96,9 @@ The third epoch multiplies the state space, so each config gets the bounds its c
 | `volume-wipe` | wipe | 2 | 2 | Two competing claims around the wipe |
 | `volume-topology` | topology | 2 | 1 | One claim per version is enough for the joint-majority checks |
 | `volume-truncate` | truncate | 2 | 2 | Two entries let a slot match the holder's log in part and truncate in part |
+| `volume-delete-wipe` | wipe | 2 | 2 | A `DELETE` around a wipe and the repair that copies its tombstone |
+| `volume-delete-handoff` | handoff | 2 | 2 | A `DELETE` around a range handoff |
+| `volume-delete-truncate` | truncate | 2 | 2 | A `DELETE` learned through a refused append, with truncation and skips |
 
 Two hosts, symmetric. `MaxEpoch 3` with `MaxLen 2` grew past 38 million distinct states for `handoff` without
 finishing.
