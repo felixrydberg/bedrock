@@ -246,6 +246,25 @@ async fn client(i: usize) -> Option<VolumeClient<tonic::transport::Channel>> {
     .ok()
 }
 
+/// Whether node `i` holds the actor's tombstone: a read refuses it with `Deleted`.
+async fn tombstoned(i: usize) -> bool {
+    let request = pb::ReadRequest {
+        actor: Some(actor()),
+        ..Default::default()
+    };
+    let Some(mut client) = client(i).await else {
+        return false;
+    };
+    let answer = timeout(CALL, client.read(request)).await;
+    answer.is_ok_and(|reply| {
+        reply.is_ok_and(|r| {
+            r.into_inner()
+                .answer
+                .is_some_and(|a| refused(&a) == Refusal::Deleted)
+        })
+    })
+}
+
 fn refused(answer: &pb::Answer) -> Refusal {
     Refusal::try_from(answer.refused).unwrap()
 }
@@ -412,8 +431,17 @@ impl Holder {
 }
 
 /// Runs `scenario` on a fresh simulator; it starts once every node has outlived its startup lease window.
-#[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
 fn run<F: Future<Output = u64> + Send + 'static>(seed: u64, scenario: fn(Cluster) -> F) -> u64 {
+    run_as("BEDROCK_VOLUME_REPAIR_SEED", seed, scenario)
+}
+
+/// [`run`], whose replay line on failure selects the seed with `var`.
+#[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
+fn run_as<F: Future<Output = u64> + Send + 'static>(
+    var: &'static str,
+    seed: u64,
+    scenario: fn(Cluster) -> F,
+) -> u64 {
     std::thread::spawn(move || {
         Runtime::with_seed_and_config(seed, madsim::Config::default()).block_on(async move {
             let cluster = Cluster::new();
@@ -434,7 +462,7 @@ fn run<F: Future<Output = u64> + Send + 'static>(seed: u64, scenario: fn(Cluster
     .join()
     .unwrap_or_else(|failure| {
         eprintln!(
-            "Replay: BEDROCK_VOLUME_REPAIR_SEED={seed} RUSTFLAGS=\"--cfg madsim\" cargo test -p bedrock-sim --test volume_repair"
+            "Replay: {var}={seed} RUSTFLAGS=\"--cfg madsim\" cargo test -p bedrock-sim --test volume_repair"
         );
         std::panic::resume_unwind(failure)
     })
@@ -761,8 +789,11 @@ async fn delete_amid_wipe_and_handoff(cluster: Cluster) -> u64 {
     let mut repairing = None;
     let mut third = C;
     let mut buried = 0;
+    // Whether a source of c's repair held the tombstone before it copied.
+    let mut copied_tombstone = false;
     for n in 0..16u32 {
         if n == wipe_at {
+            copied_tombstone = tombstoned(A).await || tombstoned(B).await;
             cluster.wipe(C).await;
             let c = cluster.repair(C, None);
             let directory = cluster.view(C);
@@ -773,11 +804,20 @@ async fn delete_amid_wipe_and_handoff(cluster: Cluster) -> u64 {
         if n == handoff_at {
             let repaired = repairing.take().unwrap().await.unwrap().unwrap();
             assert!(repaired, "c holds its range again");
+            assert!(
+                !copied_tombstone || tombstoned(C).await,
+                "c's repair copied a tombstone"
+            );
+            let source_tombstone = tombstoned(A).await || tombstoned(B).await;
             cluster.set(C, &[(C, State::Leaving), (D, State::Populating)]);
             let d = cluster.repair(D, None);
             let directory = cluster.view(D);
             assert!(d.tick(&directory, &BTreeMap::new()).await.unwrap());
             cluster.set(D, &[(D, State::Ready)]);
+            assert!(
+                !source_tombstone || tombstoned(D).await,
+                "the handoff copied a tombstone"
+            );
             third = D;
         }
         // Data entries until the DELETE; after it the holder only resends its log, which teaches the commit point.
@@ -832,10 +872,12 @@ async fn delete_amid_wipe_and_handoff(cluster: Cluster) -> u64 {
     fingerprint.value()
 }
 
+const DELETE_SEED: &str = "BEDROCK_VOLUME_DELETE_SEED";
+
 #[test]
 fn a_deleted_actor_never_opens_again_through_appends_wipe_and_handoff_and_seeds_replay() {
     // `BEDROCK_VOLUME_DELETE_SEEDS=500` sweeps seeds 1..=500; `BEDROCK_VOLUME_DELETE_SEED=42` runs one.
-    let seeds: Vec<u64> = match std::env::var("BEDROCK_VOLUME_DELETE_SEED") {
+    let seeds: Vec<u64> = match std::env::var(DELETE_SEED) {
         Ok(seed) => vec![seed.parse().unwrap()],
         Err(_) => {
             let last =
@@ -845,11 +887,11 @@ fn a_deleted_actor_never_opens_again_through_appends_wipe_and_handoff_and_seeds_
     };
     let traces: Vec<u64> = seeds
         .iter()
-        .map(|seed| run(*seed, delete_amid_wipe_and_handoff))
+        .map(|seed| run_as(DELETE_SEED, *seed, delete_amid_wipe_and_handoff))
         .collect();
     for (seed, trace) in seeds.iter().zip(&traces) {
         assert_eq!(
-            run(*seed, delete_amid_wipe_and_handoff),
+            run_as(DELETE_SEED, *seed, delete_amid_wipe_and_handoff),
             *trace,
             "seed {seed} did not replay its trace"
         );

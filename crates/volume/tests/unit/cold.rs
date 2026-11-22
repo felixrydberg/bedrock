@@ -1799,6 +1799,44 @@ async fn a_deleted_actor_is_purged_in_the_normal_flush_batch() {
     assert_eq!(bucket.commits(), 2, "a purged actor costs nothing more");
 }
 
+/// A deleted actor with more keys than [`PURGE_PAGE`] is purged one page per flush batch, and leaves the expiry index
+/// only with the batch that empties its prefix.
+#[tokio::test]
+async fn a_large_deleted_actor_is_purged_one_page_per_batch() {
+    let bucket = Memory::default();
+    let Node {
+        store,
+        cold,
+        directory,
+        ..
+    } = node(&bucket, "n1", u64::MAX);
+    let cold = cold.with_grace(Duration::ZERO);
+    claim(&store, 0);
+    let keys: Vec<String> = (0..PURGE_PAGE).map(|i| format!("k{i:05}")).collect();
+    let changes: Vec<(&str, Option<&str>)> = keys.iter().map(|k| (k.as_str(), Some("v"))).collect();
+    append(&store, 0, 0, vec![entry(1, &changes)], 1).unwrap();
+    cold.tick(&directory).await;
+    assert_eq!(bucket.commits(), 1);
+    let delete = pb::Entry {
+        kind: pb::entry::Kind::Delete as i32,
+        ..entry(2, &[])
+    };
+    append(&store, 0, 1, vec![delete.clone()], 1).unwrap();
+    append(&store, 0, 1, vec![delete], 2).unwrap();
+
+    // The PURGE_PAGE data keys and the meta: a full page, then the meta alone.
+    cold.tick(&directory).await;
+    assert_eq!(bucket.commits(), 3, "one batch per page");
+    let gone = Actor::new(&actor(0)).unwrap();
+    assert!(
+        !bucket
+            .contents(&first_db())
+            .keys()
+            .any(|k| k.starts_with(gone.name()))
+    );
+    assert!(store.expired(0, 0, u64::MAX).unwrap().is_empty());
+}
+
 /// A tombstone younger than the grace period keeps the actor's keys in the range database.
 #[tokio::test]
 async fn a_deleted_actor_keeps_its_keys_during_the_grace_period() {

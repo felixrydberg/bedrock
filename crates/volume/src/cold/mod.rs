@@ -75,6 +75,8 @@ pub const SETTLE_WAIT: Duration =
 /// How long a deleted actor's tombstone and range-database keys stay after its `DELETE` committed (S-05b).
 // ponytail: a placeholder until the user decides the grace period (#137's open question).
 pub const DELETE_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Keys of a deleted actor one flush batch deletes at most; the rest wait for the next batch.
+pub const PURGE_PAGE: usize = 1000;
 /// How often one open tries again after a concurrent catalog change.
 const OPEN_ATTEMPTS: usize = 3;
 /// How often a first-slot move rereads a source whose actor changed during the copy.
@@ -675,12 +677,23 @@ impl Cold {
                     .map_err(status)?;
                 continue;
             }
-            // ponytail: one batch holds all of a large actor's deletes; page them if one exceeds FLUSH_BYTES by much.
-            let keys = all(maintained.db.as_ref(), parsed.name())
+            // One page per batch: what this batch deletes is gone from the next scan, so a later batch takes the next
+            // page. Only the batch that empties the prefix unindexes the tombstone.
+            let end = KeyRange::prefix(parsed.name().to_vec())
+                .end
+                .expect("an actor prefix ends in NUL, so it has an end");
+            let keys = maintained
+                .db
+                .scan(parsed.name(), &end, PURGE_PAGE)
                 .await
                 .map_err(|e| self.failed(span, e))?;
             bytes += keys.iter().map(|(k, _)| k.len() as u64).sum::<u64>();
+            let full = keys.len() == PURGE_PAGE;
             batch.extend(keys.into_iter().map(|(key, _)| (key, None)));
+            if full {
+                more = true;
+                break;
+            }
             purged.push((parsed, deleted));
         }
         for actor in self.store.dirty(start, end) {

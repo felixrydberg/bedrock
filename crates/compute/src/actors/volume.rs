@@ -514,6 +514,8 @@ struct Shared {
     actor: pb::Actor,
     epoch: u64,
     version: u64,
+    /// The claim's entry is `DELETE`: a slot's tombstone answers it rather than stopping it.
+    deleting: bool,
     state: Mutex<State>,
     /// Woken on every change to `state`. Not a `watch`: it picks its waiter shard with tokio's thread RNG, which the
     /// simulation seed does not decide; `Notify` wakes in order.
@@ -629,9 +631,13 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
                 state.ack(i, through, slot.voting, slot.committed);
                 shared.changed.notify_waiters();
             }
-            // The slot holds the actor's tombstone: it knows a `DELETE` committed, and takes nothing more.
+            // The slot holds the actor's tombstone: it knows a `DELETE` committed, and takes nothing more. Any other
+            // writer stops serving.
             Some(Refusal::Deleted) => {
                 state.told[i] = u64::MAX;
+                if !shared.deleting {
+                    return shared.fence(&mut state);
+                }
                 shared.changed.notify_waiters();
                 return;
             }
@@ -732,8 +738,9 @@ impl Writer {
 
     /// Deletes `actor` (S-05b, `Write(h, TRUE)` in `volume.tla`): claims it on `slots` like [`Writer::open`], but its
     /// claim entry is `DELETE`, and returns once the `DELETE` committed and two slots learned it, so they hold its
-    /// tombstone. From then on no claim serves the actor. Deleting a deleted actor succeeds; a live holder elsewhere is
-    /// [`Error::Held`], and deletion goes through it. `committed_at` is the `DELETE`'s: the grace period before the
+    /// tombstone. From then on no claim serves the actor. A retry claims past one tombstone on the other two slots and
+    /// commits `DELETE` again; it succeeds at once when two slots hold one. A live holder elsewhere is [`Error::Held`],
+    /// and deletion goes through it. `committed_at` is the `DELETE`'s: the grace period before the
     /// actor's keys leave its range database runs from it.
     pub async fn delete(
         host: Arc<Host>,
@@ -762,8 +769,9 @@ impl Writer {
 
     /// Claims and recovers `actor`, then opens once the claim's entry of `kind` (the no-op, `MOVE` or `DELETE`) commits.
     /// A serving claim refuses an actor that moved: one whose slots truncated a committed `MOVE` or whose recovered log
-    /// holds one. Any claim refuses a deleted actor ([`Error::Deleted`]): a slot holds its tombstone, or the recovered
-    /// log holds a `DELETE`, which only a deleting claim commits again.
+    /// holds one. Any other claim refuses a deleted actor ([`Error::Deleted`]): a slot holds its tombstone, or the
+    /// recovered log holds a `DELETE`. A deleting claim counts a tombstone as no grant, and stops with
+    /// [`Error::Deleted`] once two slots hold one.
     async fn open_as(
         host: Arc<Host>,
         actor: pb::Actor,
@@ -804,15 +812,13 @@ impl Writer {
                 }
             });
             let answers = gather(reserves, |a| quorum(a) >= 2).await;
+            buried(kind, &answers)?;
             let mut seen = epoch;
             let mut unimported = false;
             for (_, answer) in &answers {
                 if let Ok(answer) = answer {
                     if refused(answer) == Some(Refusal::StaleVersion) {
                         return Err(Error::StaleVersion);
-                    }
-                    if refused(answer) == Some(Refusal::Deleted) {
-                        return Err(Error::Deleted);
                     }
                     unimported |= refused(answer) == Some(Refusal::NotImported);
                     let slot = slot_of(answer);
@@ -843,6 +849,7 @@ impl Writer {
                     }
                 });
             let answers = gather(claims, |a| quorum(a) >= 2).await;
+            buried(kind, &answers)?;
             if quorum(&answers) >= 2 {
                 let granted = answers.iter().filter(|(_, a)| counts(a)).map(|(i, a)| {
                     (
@@ -893,6 +900,7 @@ impl Writer {
                     actor,
                     epoch,
                     version,
+                    deleting: kind == Kind::Delete,
                     state: Mutex::new(state),
                     changed: Notify::new(),
                 }))
@@ -909,7 +917,7 @@ impl Writer {
                         return Err(Error::Held(slot.holder.unwrap_or_default()));
                     }
                     Some(Refusal::StaleVersion) => return Err(Error::StaleVersion),
-                    Some(Refusal::Deleted) => return Err(Error::Deleted),
+                    Some(Refusal::Deleted) => {}
                     Some(Refusal::NotImported) => unimported = true,
                     _ => seen = seen.max(slot.reserved).max(slot.epoch),
                 }
@@ -1155,6 +1163,10 @@ impl Writer {
                     Some((Some(Refusal::None), epoch)) => {
                         last = format!("slot {i} is promised to epoch {epoch}");
                     }
+                    Some((Some(Refusal::Deleted), _)) => {
+                        shared.fence(&mut shared.lock());
+                        return Err(Error::Deleted);
+                    }
                     refusal => last = format!("slot {i} refused: {refusal:?}"),
                 },
                 Err(status) if transient(&status) => last = format!("slot {i}: {status}"),
@@ -1183,6 +1195,23 @@ impl State {
             fenced: false,
         }
     }
+}
+
+/// [`Error::Deleted`] for a claim the slots' tombstones refuse: any for a claim that does not delete, two for one that
+/// does.
+fn buried(kind: Kind, answers: &[(usize, Result<pb::Answer, Status>)]) -> Result<(), Error> {
+    let tombstones = answers
+        .iter()
+        .filter(|(_, a)| {
+            a.as_ref()
+                .is_ok_and(|a| refused(a) == Some(Refusal::Deleted))
+        })
+        .count();
+    let enough = if kind == Kind::Delete { 2 } else { 1 };
+    if tombstones >= enough {
+        return Err(Error::Deleted);
+    }
+    Ok(())
 }
 
 fn not_imported() -> Error {
@@ -1398,7 +1427,13 @@ async fn recover(
         .map_err(|s| Error::Unavailable(format!("reading the log: {s}")))?;
         match reply.answer.as_ref().and_then(refused) {
             Some(Refusal::None) => {}
-            Some(Refusal::Deleted) => return Err(Error::Deleted),
+            Some(Refusal::Deleted) if kind != Kind::Delete => return Err(Error::Deleted),
+            // One tombstone: a retry of the deletion claims the other two slots.
+            Some(Refusal::Deleted) => {
+                return Err(Error::Unavailable(
+                    "the recovery slot buried the actor during the claim".into(),
+                ));
+            }
             _ => {
                 return Err(Error::Unavailable(
                     "the recovery slot took a newer claim".into(),
