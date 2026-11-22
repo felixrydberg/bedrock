@@ -1242,3 +1242,183 @@ fn a_skip_past_the_first_move_keeps_it() {
     let answer = store.truncate(&actor(), 6).unwrap().answer;
     assert_eq!(slot(&answer).moved, first);
 }
+
+fn delete(seq: u64, epoch: u64) -> pb::Entry {
+    pb::Entry {
+        kind: EntryKind::Delete as i32,
+        ..entry(seq, epoch, &[])
+    }
+}
+
+/// Every refusal a tombstone gives: reservations, claims, appends, reads, scans and the recovery log.
+fn assert_buried(store: &Store, holder: &pb::Holder) {
+    let actor = actor();
+    assert_eq!(
+        refused(&store.reserve(&actor, 9, 0).unwrap()),
+        Refusal::Deleted
+    );
+    let (answer, _) = store.claim(&actor, holder, 9, 0, |_| false).unwrap();
+    assert_eq!(refused(&answer), Refusal::Deleted);
+    assert_eq!(
+        refused(&append(store, holder, 1, 0, vec![entry(1, 1, &[])], 0)),
+        Refusal::Deleted
+    );
+    let (answer, values, _) = store.read(&actor, &[b"k".to_vec()], 0).unwrap();
+    assert_eq!((refused(&answer), values.len()), (Refusal::Deleted, 0));
+    assert_eq!(
+        refused(&store.scan(&actor, b"", 10, 0).unwrap().0),
+        Refusal::Deleted
+    );
+    assert_eq!(
+        refused(&store.log(&actor, holder, 1, 0, 10).unwrap().0),
+        Refusal::Deleted
+    );
+    assert_eq!(
+        refused(&store.import(&actor, 1, 1, None, 0).unwrap()),
+        Refusal::Deleted
+    );
+}
+
+/// S-05b: a slot that learns its DELETE committed keeps only the claim as a tombstone, in one batch: no log, overlay,
+/// alarm or flush state is left, and every later request is refused.
+#[test]
+fn a_committed_delete_leaves_only_a_tombstone_that_refuses_everything() {
+    let store = store();
+    let a = host("a");
+    claimed(&store, &a, 1);
+    let mut first = entry(1, 1, &[("k", Some("v"))]);
+    first.alarm = Some(pb::Alarm { at_ms: Some(5000) });
+    let answer = append(&store, &a, 1, 0, vec![first, delete(2, 1)], 1);
+    assert_eq!(refused(&answer), Refusal::None);
+    assert!(
+        slot(&answer).released,
+        "DELETE ends the claim like a release"
+    );
+    assert_eq!(slot(&answer).deleted, None, "not known committed yet");
+    assert_eq!(read(&store, "k"), Some(b"v".to_vec()));
+    assert!(
+        store
+            .engine
+            .scan(&KeyRange::prefix(*b"alarm/"))
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    assert!(store.unflushed() > 0);
+
+    // The commit point reaches the DELETE with the next append.
+    let answer = append(&store, &a, 1, 1, vec![delete(2, 1)], 2);
+    assert_eq!(refused(&answer), Refusal::Deleted);
+    assert_eq!(slot(&answer).deleted, Some(pb::LogEnd { seq: 2, epoch: 1 }));
+    let claim = store.load(&actor()).unwrap();
+    assert_eq!(
+        claim.deleted_at_ms, 1002,
+        "the grace period starts at the DELETE's committed_at"
+    );
+    assert_eq!((claim.alarm_ms, claim.deleting), (None, None));
+    let kept: Vec<_> = records(&store).into_iter().map(|r| r.key).collect();
+    assert_eq!(kept, vec![claim_key(&actor())], "only the tombstone stays");
+    assert!(
+        store
+            .engine
+            .scan(&KeyRange::prefix(*b"alarm/"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert_eq!(store.unflushed(), 0);
+    assert!(store.dirty(0, 0).is_empty());
+    assert_eq!(store.pending(&actor()).unwrap(), None);
+    assert_buried(&store, &a);
+    // A restart finds no flush work in a tombstone.
+    let engine = store.engine.clone();
+    let restarted = Store::new(engine);
+    restarted.recover().unwrap();
+    assert!(restarted.dirty(0, 0).is_empty());
+    assert_buried(&restarted, &host("b"));
+}
+
+/// A DELETE that never committed is an old epoch's tail like any other: a newer claim truncates it.
+#[test]
+fn an_uncommitted_delete_is_truncated_with_an_old_tail() {
+    let store = store();
+    let (a, b) = (host("a"), host("b"));
+    claimed(&store, &a, 1);
+    append(
+        &store,
+        &a,
+        1,
+        0,
+        vec![entry(1, 1, &[("k", Some("v"))]), delete(2, 1)],
+        1,
+    );
+    claimed(&store, &b, 2);
+    let answer = append(&store, &b, 2, 1, vec![entry(2, 2, &[])], 2);
+    assert_eq!(refused(&answer), Refusal::None);
+    let claim = store.load(&actor()).unwrap();
+    assert_eq!((claim.deleting, claim.deleted), (None, None));
+    assert_eq!(read(&store, "k"), Some(b"v".to_vec()));
+}
+
+/// S-05b with S-06: a repair or a handoff copies a tombstone over any log, even from a repaired slot, keeping the higher
+/// promise; and a copy whose commit point reaches the kept log's DELETE buries it.
+#[test]
+fn a_repair_copies_a_tombstone_and_a_copied_commit_point_can_bury() {
+    let a = host("a");
+    let buried = store();
+    claimed(&buried, &a, 1);
+    append(&buried, &a, 1, 0, vec![delete(1, 1)], 0);
+    append(&buried, &a, 1, 0, vec![delete(1, 1)], 1);
+    buried.mark_repaired(0, 0).unwrap();
+    let marked = pb::ClaimRecord {
+        repaired: true,
+        ..buried.load(&actor()).unwrap()
+    };
+    buried
+        .engine
+        .put(&claim_key(&actor()), &marked.encode_to_vec())
+        .unwrap();
+
+    for repair in [true, false] {
+        // A slot with a longer log and a higher promise of its own.
+        let target = store();
+        claimed(&target, &a, 3);
+        append(
+            &target,
+            &a,
+            3,
+            0,
+            vec![entry(1, 3, &[("k", Some("v"))]), entry(2, 3, &[])],
+            2,
+        );
+        target.install(&records(&buried), repair).unwrap();
+        let claim = target.load(&actor()).unwrap();
+        assert_eq!(claim.deleted, Some(pb::LogEnd { seq: 1, epoch: 1 }));
+        assert_eq!(claim.epoch, 3, "the higher promise stays");
+        assert_eq!(records(&target).len(), 1);
+        assert_eq!(target.unflushed(), 0);
+        assert_buried(&target, &a);
+    }
+
+    // The same log on both slots: the copy knows the DELETE committed, the slot here does not.
+    let knows = store();
+    claimed(&knows, &a, 1);
+    append(&knows, &a, 1, 0, vec![entry(1, 1, &[]), delete(2, 1)], 1);
+    let target = store();
+    claimed(&target, &a, 1);
+    append(&target, &a, 1, 0, vec![entry(1, 1, &[]), delete(2, 1)], 1);
+    let committed = pb::ClaimRecord {
+        committed: 2,
+        ..knows.load(&actor()).unwrap()
+    };
+    knows
+        .engine
+        .put(&claim_key(&actor()), &committed.encode_to_vec())
+        .unwrap();
+    target.install(&records(&knows), true).unwrap();
+    assert_eq!(
+        target.load(&actor()).unwrap().deleted,
+        Some(pb::LogEnd { seq: 2, epoch: 1 })
+    );
+    assert_buried(&target, &a);
+}

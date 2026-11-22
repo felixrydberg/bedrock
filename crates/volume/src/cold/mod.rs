@@ -25,6 +25,9 @@
 //!   (the same values), or, past them, only what is newer; a slot truncating twice is a no-op.
 //! - **Commit point.** Only what a slot knows is committed is flushed, which is at most what the holder announced.
 //! - **Backpressure.** While a range cannot flush, its slots' logs grow until the store refuses appends.
+//! - **Deletion** (S-05b). Once a deleted actor's tombstone is older than [`DELETE_GRACE`], its maintainer scans the
+//!   actor's keys and deletes them in the range's flush batch. Tombstones stay on every slot, so the actor's ID is never
+//!   claimed again; when an ID may be reused is not decided yet.
 
 pub mod db;
 pub mod placement;
@@ -69,6 +72,9 @@ const _: () = assert!(SETTLE_CONCURRENCY == 4, "the settlement join is four-wide
 /// wait for the next tick.
 pub const SETTLE_WAIT: Duration =
     Duration::from_secs(placement::TIMEOUT.as_secs() * bedrock_lib::actors::SLOTS as u64);
+/// How long a deleted actor's tombstone and range-database keys stay after its `DELETE` committed (S-05b).
+// ponytail: a placeholder until the user decides the grace period (#137's open question).
+pub const DELETE_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// How often one open tries again after a concurrent catalog change.
 const OPEN_ATTEMPTS: usize = 3;
 /// How often a first-slot move rereads a source whose actor changed during the copy.
@@ -271,6 +277,17 @@ pub struct Cold {
     settle_cursor: Mutex<Option<Vec<u8>>>,
     /// Unflushed bytes at the last flush, for the early trigger.
     mark: Mutex<i64>,
+    /// [`DELETE_GRACE`], shorter in tests.
+    grace: Duration,
+}
+
+/// Wall time, which the grace period of a deletion is measured in: the `DELETE`'s `committed_at` is the writer's wall
+/// clock, and a tombstone outlives restarts. madsim simulates it.
+#[allow(clippy::disallowed_methods)]
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn status(error: Error) -> Status {
@@ -302,7 +319,14 @@ impl Cold {
             catalogs: Mutex::default(),
             settle_cursor: Mutex::default(),
             mark: Mutex::new(0),
+            grace: DELETE_GRACE,
         }
+    }
+
+    /// Purges deleted actors after `grace` instead of [`DELETE_GRACE`].
+    pub fn with_grace(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
     }
 
     /// Whether a DC change moves `actor` into this DC (S-17); see [`Placement::moving_in`].
@@ -629,6 +653,36 @@ impl Cold {
         let mut written = Vec::new();
         let mut truncate = Vec::new();
         let mut more = false;
+        // Deleted actors whose grace period ended (S-05b): point deletes of their keys join this batch, so deletion
+        // adds no commit of its own. Once they are durable the tombstone leaves the expiry index; it stays itself.
+        let before = wall_ms().saturating_sub(self.grace.as_millis() as u64);
+        let store = self.store.clone();
+        let expired = crate::serve::blocking(move || store.expired(start, end, before))
+            .await?
+            .map_err(status)?;
+        let mut purged = Vec::new();
+        for (actor, deleted) in expired {
+            if bytes >= FLUSH_BYTES {
+                more = true;
+                break;
+            }
+            let parsed = Actor::new(&actor).map_err(status)?;
+            if !self.placement.first_here(&actor).await? {
+                // Its first slot's cell purges it; this node never will.
+                let store = self.store.clone();
+                crate::serve::blocking(move || store.unindex(&parsed, deleted))
+                    .await?
+                    .map_err(status)?;
+                continue;
+            }
+            // ponytail: one batch holds all of a large actor's deletes; page them if one exceeds FLUSH_BYTES by much.
+            let keys = all(maintained.db.as_ref(), parsed.name())
+                .await
+                .map_err(|e| self.failed(span, e))?;
+            bytes += keys.iter().map(|(k, _)| k.len() as u64).sum::<u64>();
+            batch.extend(keys.into_iter().map(|(key, _)| (key, None)));
+            purged.push((parsed, deleted));
+        }
         for actor in self.store.dirty(start, end) {
             if bytes >= FLUSH_BYTES {
                 more = true;
@@ -703,9 +757,19 @@ impl Cold {
             truncate.sort_by(|a, b| a.0.id.cmp(&b.0.id).then(b.1.cmp(&a.1)));
             truncate.dedup_by(|a, b| a.0 == b.0);
         }
+        for (parsed, _) in &purged {
+            known_points.remove(parsed.name());
+        }
         drop(known_points);
         for (actor, through) in truncate {
             self.truncate(actor, through).await?;
+        }
+        // The deletes are durable (or there were none): the tombstone leaves the expiry index.
+        for (parsed, deleted) in purged {
+            let store = self.store.clone();
+            crate::serve::blocking(move || store.unindex(&parsed, deleted))
+                .await?
+                .map_err(status)?;
         }
         Ok(more)
     }

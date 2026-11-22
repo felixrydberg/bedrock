@@ -1737,3 +1737,94 @@ fn a_merge_stopped_by_its_limit_resumes_after_the_last_key_it_consumed() {
     // `b` was consumed (a delete); `c` was not returned, so the next page starts right after `b`.
     assert_eq!(next, b"b\0");
 }
+
+/// S-05b: once a deleted actor's grace period ends, its maintainer deletes every key of it from the range database in
+/// the range's one flush batch, with the other actors' changes. The tombstone stays and leaves the expiry index, so later
+/// ticks neither claim nor rescan the actor.
+#[tokio::test]
+async fn a_deleted_actor_is_purged_in_the_normal_flush_batch() {
+    let bucket = Memory::default();
+    let Node {
+        store,
+        cold,
+        directory,
+        ..
+    } = node(&bucket, "n1", u64::MAX);
+    let cold = cold.with_grace(Duration::ZERO);
+    for i in 0..2 {
+        claim(&store, i);
+        append(
+            &store,
+            i,
+            0,
+            vec![entry(1, &[("k", Some("v")), ("j", Some("w"))])],
+            1,
+        )
+        .unwrap();
+    }
+    cold.tick(&directory).await;
+    assert_eq!(bucket.commits(), 1);
+    let gone = Actor::new(&actor(0)).unwrap();
+    let delete = pb::Entry {
+        kind: pb::entry::Kind::Delete as i32,
+        ..entry(2, &[])
+    };
+    append(&store, 0, 1, vec![delete.clone()], 1).unwrap();
+    let answer = append(&store, 0, 1, vec![delete], 2).unwrap();
+    assert_eq!(answer.refused, Refusal::Deleted as i32);
+    // The grace period runs from the DELETE's committed_at (0 here).
+    assert!(store.expired(0, 0, 0).unwrap().is_empty());
+    assert_eq!(store.expired(0, 0, 1).unwrap().len(), 1);
+    append(&store, 1, 1, vec![entry(2, &[("k", Some("x"))])], 2).unwrap();
+
+    cold.tick(&directory).await;
+    assert_eq!(
+        bucket.commits(),
+        2,
+        "one batch for the deletes and the other actor's changes"
+    );
+    let contents = bucket.contents(&first_db());
+    assert!(
+        !contents.keys().any(|k| k.starts_with(gone.name())),
+        "no key of the deleted actor remains"
+    );
+    assert_eq!(stored(&bucket, 1, "k"), Some(b"x".to_vec()));
+    assert_eq!(stored(&bucket, 1, "j"), Some(b"w".to_vec()));
+    assert!(store.expired(0, 0, u64::MAX).unwrap().is_empty());
+    assert_eq!(
+        store.reserve(&gone, 5, 0).unwrap().refused,
+        Refusal::Deleted as i32
+    );
+    cold.tick(&directory).await;
+    assert_eq!(bucket.commits(), 2, "a purged actor costs nothing more");
+}
+
+/// A tombstone younger than the grace period keeps the actor's keys in the range database.
+#[tokio::test]
+async fn a_deleted_actor_keeps_its_keys_during_the_grace_period() {
+    let bucket = Memory::default();
+    let n = node(&bucket, "n1", u64::MAX);
+    claim(&n.store, 0);
+    append(&n.store, 0, 0, vec![entry(1, &[("k", Some("v"))])], 1).unwrap();
+    n.cold.tick(&n.directory).await;
+    #[allow(clippy::disallowed_methods)]
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let delete = pb::Entry {
+        kind: pb::entry::Kind::Delete as i32,
+        committed_at: now,
+        ..entry(2, &[])
+    };
+    append(&n.store, 0, 1, vec![delete.clone()], 1).unwrap();
+    append(&n.store, 0, 1, vec![delete], 2).unwrap();
+    n.cold.tick(&n.directory).await;
+    assert_eq!(bucket.commits(), 1);
+    assert_eq!(stored(&bucket, 0, "k"), Some(b"v".to_vec()));
+    assert_eq!(
+        n.store.expired(0, 0, u64::MAX).unwrap().len(),
+        1,
+        "still waiting"
+    );
+}

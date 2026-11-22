@@ -91,6 +91,9 @@ volume-truncate learn S3Committed
 volume-truncate truncate TruncatedInS3
 volume-truncate skip-keep TruncatedInS3
 volume-truncate skip-any TruncatedInS3
+volume-delete-wipe undelete DeletedNeverServes
+volume-delete-handoff undelete DeletedNeverServes
+volume-delete-truncate undelete DeletedNeverServes
 volume_cold-split no-retire NoLostFlush
 volume_cold-split no-cas NoLostFlush
 volume_cold-move no-adopt Consistent
@@ -149,7 +152,7 @@ bug() {
     fi
 }
 
-models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
+models="relays follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;
