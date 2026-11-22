@@ -244,8 +244,9 @@ impl Client {
     }
 
     /// The first relay table newer than `stale`. Relays apply the cell's view separately, so one may lag another; when
-    /// none is newer, the newest answer. With `cell`, an answer naming a member of another cell is refused: a relay
-    /// reprovisioned for another cell must not replace this cell's table, whose revisions it does not share.
+    /// none is newer, the newest answer. With `cell`, an answer from a relay of another cell is refused: a relay
+    /// reprovisioned for another cell must not replace this cell's table, whose revisions it does not share
+    /// (`docs/spec/cells.tla` TablesOfTarget).
     async fn fetch(
         &self,
         relays: &[String],
@@ -267,17 +268,16 @@ impl Client {
                 })
                 .await;
             match reply {
+                Ok(reply) if cell.is_some_and(|cell| reply.cell != cell) => {
+                    last = Status::failed_precondition(format!(
+                        "relay {relay} answered for cell {:?}, not {}",
+                        reply.cell,
+                        cell.unwrap_or_default()
+                    ));
+                }
                 Ok(reply) => {
                     let (members, directories) =
                         membership::parse(reply.entries.into_iter().map(|e| Ok((e.key, e.value))))?;
-                    if let Some(cell) = cell
-                        && members.values().any(|member| member.cell != cell)
-                    {
-                        last = Status::failed_precondition(format!(
-                            "relay {relay} answered with members of a cell other than {cell}"
-                        ));
-                        continue;
-                    }
                     let table = Arc::new(Table {
                         revision: reply.revision,
                         members,

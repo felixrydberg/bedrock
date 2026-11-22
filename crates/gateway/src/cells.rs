@@ -144,11 +144,13 @@ impl Cells {
         }
     }
 
-    /// The last walk's outcome, unless `refresh` asks for a new one and it is at least [`MIN_REFRESH`] old.
+    /// The last walk's outcome, unless it is at least [`MIN_REFRESH`] old and `refresh` asks for a new one or it
+    /// failed.
     fn known(&self, refresh: bool) -> Option<Result<Arc<Listing>, Status>> {
         let known = self.known.lock().unwrap();
         let at = known.at?;
-        if refresh && bedrock_lib::monotonic_now().duration_since(at) >= MIN_REFRESH {
+        let expired = bedrock_lib::monotonic_now().duration_since(at) >= MIN_REFRESH;
+        if expired && (refresh || known.error.is_some()) {
             return None;
         }
         Some(match &known.error {

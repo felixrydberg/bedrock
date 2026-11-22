@@ -185,7 +185,11 @@ fn table_in(cell: &str, revision: u64, ranges: &[(u64, &[(&str, &str)])]) -> pb:
             value: member.encode_to_vec(),
         });
     }
-    pb::RoutesReply { revision, entries }
+    pb::RoutesReply {
+        revision,
+        entries,
+        cell: cell.into(),
+    }
 }
 
 async fn client(relay: &Relay) -> Client {
@@ -375,11 +379,11 @@ async fn a_list_page_ends_where_a_range_stopped_early() {
 #[tokio::test]
 async fn sibling_routes_come_from_that_cells_relays() {
     let owner = holder(Mode::Serve, 7, &[]).await;
-    let (own, sibling) = (Relay::default(), Relay::default());
+    let (own, sibling, unnamed) = (Relay::default(), Relay::default(), Relay::default());
     *own.table.lock().unwrap() = table(1, &[(0, &[("a", &owner)])]);
     *sibling.table.lock().unwrap() = table_in("cell-2", 9, &[(0, &[("b", &owner)])]);
     let mut addresses = Vec::new();
-    for relay in [&own, &sibling] {
+    for relay in [&own, &sibling, &unnamed] {
         addresses.push(
             serve(
                 tonic::transport::Server::builder()
@@ -399,6 +403,8 @@ async fn sibling_routes_come_from_that_cells_relays() {
         ("cell-2".to_owned(), vec![addresses[1].clone()]),
         // A relay reprovisioned for c1 that is still listed as cell-4's.
         ("cell-4".to_owned(), vec![addresses[0].clone()]),
+        // A relay whose empty reply names no cell.
+        ("cell-5".to_owned(), vec![addresses[2].clone()]),
     ]));
     assert_eq!(client.routes("volume", None).await.unwrap().revision, 1);
     assert_eq!(
@@ -426,15 +432,16 @@ async fn sibling_routes_come_from_that_cells_relays() {
         panic!("a cell without relays has no routes");
     };
     assert_eq!(unknown.code(), tonic::Code::FailedPrecondition);
-    // Another cell's table is refused and never cached.
+    // Another cell's table, or an empty one naming no cell, is refused and never cached.
     let before = own.fetches.load(Ordering::Relaxed);
-    for _ in 0..2 {
-        let Err(foreign) = client.routes_in("cell-4", "volume", None).await else {
-            panic!("a table of another cell is refused");
+    for cell in ["cell-4", "cell-4", "cell-5", "cell-5"] {
+        let Err(foreign) = client.routes_in(cell, "volume", None).await else {
+            panic!("a table not attributed to {cell} is refused");
         };
         assert_eq!(foreign.code(), tonic::Code::FailedPrecondition);
     }
     assert_eq!(own.fetches.load(Ordering::Relaxed), before + 2);
+    assert_eq!(unnamed.fetches.load(Ordering::Relaxed), 2);
 }
 
 /// A Gateway that answers every read itself, recording the service and cell each one was for.

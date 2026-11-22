@@ -85,7 +85,8 @@ async fn concurrent_refreshes_share_one_walk_and_a_failure_is_reused_until_min_r
     assert!(cells.listing(true).await.is_err());
     assert_eq!(relay.calls.load(Ordering::Relaxed), 1, "failure reused");
     tokio::time::sleep(MIN_REFRESH).await;
-    assert!(cells.listing(true).await.is_err());
+    // Even a read that asks for no refresh retries a failed walk once the interval passed.
+    assert!(cells.listing(false).await.is_err());
     assert_eq!(relay.calls.load(Ordering::Relaxed), 2, "walked again");
 }
 

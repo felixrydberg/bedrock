@@ -178,7 +178,9 @@ message RelayFrame {
 // A service's published membership namespace in the relay's cell: members and placement directories, as the cell
 // control group stores them (#56 / B-25). Callers fetch it on demand instead of subscribing to every service they call.
 message RoutesRequest { string service = 1; }
-message RoutesReply { uint64 revision = 1; repeated StateEntry entries = 2; }
+// `cell` names the answering relay's cell, so a caller fetching another cell's table can refuse a reply from a relay
+// reprovisioned for another cell (#89 / B-57, `docs/spec/cells.tla` TablesOfTarget).
+message RoutesReply { uint64 revision = 1; repeated StateEntry entries = 2; string cell = 3; }
 // The relay's live child relay sessions (#89 / B-57): what upper-tier Gateways walk to find the cells below them.
 message CellsRequest {}
 message Child { uint32 tier = 1; string cell = 2; string address = 3; string node_id = 4; }

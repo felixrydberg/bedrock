@@ -97,6 +97,7 @@ volume_cold-move no-adopt Consistent
 cells unchecked ListedLive
 cells sticky ListedLive
 cells unscoped ServedInTarget
+cells unattributed TablesOfTarget
 volume_dc no-import NoLostAck
 volume_dc early-import NoLostAck
 volume_dc any-move NoLostAck

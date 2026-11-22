@@ -259,7 +259,9 @@ through relays.
 cell after its session ends. `ListedLive`: the parent lists exactly its live child sessions, each under its
 certificate's cell (bugs `unchecked`, which accepts any announced cell, and `sticky`, which keeps a closed session).
 `ServedInTarget`: every forwarded request was served in the cell it targeted, however stale the Gateway's listing (bug
-`unscoped`, a cell Gateway that serves any cell). `Relay.Cells` reads sessions only and, like `Tick`, never advances
+`unscoped`, a cell Gateway that serves any cell). `TablesOfTarget`: a cell's cached gateway table is that cell's own:
+`RoutesReply` names the answering relay's cell and the Gateway refuses a reply naming another, empty or not (bug
+`unattributed`, which keeps any reply). `Relay.Cells` reads sessions only and, like `Tick`, never advances
 applied state, so `relays.tla` is unchanged.
 
 ## Introspection and metrics (#17 / B-18b)

@@ -2415,6 +2415,7 @@ impl pb::relay_server::Relay for Hub {
         control.validate_namespace(self.cell(), &namespace)?;
         let view = control.view(&namespace)?;
         Ok(Response::new(pb::RoutesReply {
+            cell: self.cell().to_owned(),
             revision: view.sequence,
             entries: view
                 .values
