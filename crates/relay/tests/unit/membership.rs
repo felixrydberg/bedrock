@@ -896,3 +896,72 @@ fn volume_ranges_merge_only_when_their_owners_generations_agree() {
     assert_eq!(merges(3), 1);
     assert_eq!(merges(5), 0, "v1 would forget its copy of the later range");
 }
+
+#[test]
+fn completeness_counts_only_connected_healthy_holders_up_to_the_cells_size() {
+    use bedrock_lib::placement::coverage::SPACE;
+    let member = |id: &str| pb::Member {
+        service: "quicksilver".into(),
+        datasets: vec!["quicksilver".into()],
+        ..ready(id)
+    };
+    let mut sick = member("sick");
+    sick.unhealthy = vec!["quicksilver".into()];
+    let gone = pb::Member {
+        status: pb::member::Status::Left as i32,
+        ..member("gone")
+    };
+    let elsewhere = pb::Member {
+        cell: "eu-1b".into(),
+        ..member("elsewhere")
+    };
+    let local = members(&[member("q1"), sick.clone(), gone.clone(), elsewhere]);
+    // `b` is synced and lists q4; `c` is unreachable, so q5 behind it counts as gone.
+    let remote = BTreeMap::from([
+        ("b".to_owned(), Some(members(&[member("q4")]))),
+        ("c".to_owned(), None),
+    ]);
+    let relays = relays();
+    let seen = Observed {
+        me: "a",
+        relays: &relays,
+        cell: "eu-1a",
+        local: &local,
+        remote: &remote,
+    };
+    let owner = |node: &str, state| Owner {
+        node: node.into(),
+        state,
+    };
+    const HALF: u64 = 1 << 63;
+    let directory = Directory::from([
+        (
+            0,
+            vec![
+                owner("q1", State::Ready),
+                owner("sick", State::Ready),
+                owner("q4", State::Leaving),
+            ],
+        ),
+        (
+            HALF,
+            vec![
+                owner("gone", State::Ready),
+                owner("q5", State::Ready),
+                owner("q1", State::Populating),
+            ],
+        ),
+    ]);
+    let all = members(&[member("q1"), sick, gone, member("q4"), member("q5")]);
+    let coverage = completeness(&seen, &all, "quicksilver", "quicksilver", &directory);
+    assert_eq!((coverage.complete, coverage.redundant), (SPACE / 2, 0));
+
+    // A cell with two members places two owners per range, and two holders are redundant.
+    let small = members(&[member("q1"), member("q4")]);
+    let two = Directory::from([(
+        0,
+        vec![owner("q1", State::Ready), owner("q4", State::Ready)],
+    )]);
+    let coverage = completeness(&seen, &small, "quicksilver", "quicksilver", &two);
+    assert!(!coverage.degraded() && coverage.complete == SPACE);
+}

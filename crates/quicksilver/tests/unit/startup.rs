@@ -11,6 +11,8 @@ fn opens_only_the_quicksilver_dataset() {
     assert_eq!(r.iter().count(), 1);
     let qs = &r.get("quicksilver").unwrap().dataset.defaults;
     assert_eq!(qs.replication, ReplicationPolicy::FullReplica);
+    // Relays report its completeness from the shared capability, which must agree.
+    assert!(datasets::capabilities::full_replica("quicksilver"));
     assert!(!qs.cache.l2_eviction);
     for other in ["auth", "kv", "cdn"] {
         assert!(Registry::open(DATASETS, &[other.into()], |_| unreachable!()).is_err());

@@ -54,16 +54,19 @@ pub struct PolicyOverrides {
 
 /// Effective policy: dataset defaults, then namespace overrides, then the node's resource budget, which caps the
 /// dataset budget.
+/// `full_replica` forbids L2 eviction whatever the overrides say (#87 / B-40).
 pub fn resolve(defaults: &Policy, overrides: &PolicyOverrides, node: &Budget) -> Policy {
     let o = overrides;
     let d = &defaults.cache;
+    let replication = o.replication.unwrap_or(defaults.replication);
     Policy {
-        replication: o.replication.unwrap_or(defaults.replication),
+        replication,
         cache: CachePolicy {
             l1_recent_window_seconds: o
                 .l1_recent_window_seconds
                 .unwrap_or(d.l1_recent_window_seconds),
-            l2_eviction: o.l2_eviction.unwrap_or(d.l2_eviction),
+            l2_eviction: replication != ReplicationPolicy::FullReplica
+                && o.l2_eviction.unwrap_or(d.l2_eviction),
             pinned_prefixes: o
                 .pinned_prefixes
                 .clone()

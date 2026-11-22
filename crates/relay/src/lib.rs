@@ -120,6 +120,7 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
     tasks.push(watching);
     if let Some(settings) = &config.membership {
         let (publishing, published) = membership::Cell::start(
+            &admin,
             hub.clone(),
             peers,
             siblings,
