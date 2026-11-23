@@ -187,6 +187,92 @@ fn a_release_lets_the_next_claim_skip_the_lease_wait() {
 }
 
 #[test]
+fn due_alarms_include_held_claim_hints_without_changing_the_release_index() {
+    let store = store();
+    let holder = host("a");
+    claimed(&store, &holder, 1);
+    let mut event = entry(1, 1, &[]);
+    event.alarm = Some(pb::Alarm { at_ms: Some(42) });
+    append(&store, &holder, 1, 0, vec![event], 1);
+    assert!(store.due_alarms(41).unwrap().is_empty());
+    let due = store.due_alarms(42).unwrap();
+    assert_eq!(due.len(), 1);
+    assert!(!due[0].released);
+    assert_eq!(due[0].holder.as_ref(), Some(&holder));
+    assert_eq!(due[0].at_ms, 42);
+    assert_eq!(
+        store
+            .engine
+            .scan(&KeyRange::prefix(*b"alarm/"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let mut release = entry(2, 1, &[]);
+    release.kind = EntryKind::Release as i32;
+    append(&store, &holder, 1, 1, vec![release], 2);
+    let due = store.due_alarms(42).unwrap();
+    assert_eq!(due.len(), 1);
+    assert!(due[0].released);
+    assert!(store.alarms.lock().unwrap().is_empty());
+    // Reading candidates never acknowledges or removes an alarm.
+    assert_eq!(store.due_alarms(42).unwrap().len(), 1);
+}
+
+#[test]
+fn due_alarm_scan_reports_corrupt_keys() {
+    let store = store();
+    let mut batch = WriteBatch::default();
+    batch.put(b"alarm/bad".to_vec(), Vec::new());
+    store.commit(batch).unwrap();
+    assert!(matches!(
+        store.due_alarms(u64::MAX),
+        Err(Error::Storage(StorageError::Corruption(_)))
+    ));
+}
+
+#[test]
+fn held_alarm_hints_recover_after_reopen_and_prune_after_clear_delete_and_range_removal() {
+    let original = store();
+    let holder = host("a");
+    claimed(&original, &holder, 1);
+    let mut event = entry(1, 1, &[]);
+    event.alarm = Some(pb::Alarm { at_ms: Some(42) });
+    append(&original, &holder, 1, 0, vec![event], 1);
+    let repaired = store();
+    repaired.install(&records(&original), true).unwrap();
+    assert_eq!(repaired.due_alarms(42).unwrap().len(), 1);
+    let reopened = Store::new(original.engine.clone());
+    reopened.recover().unwrap();
+    assert_eq!(reopened.due_alarms(42).unwrap().len(), 1);
+    let mut clear = entry(2, 1, &[]);
+    clear.alarm = Some(pb::Alarm { at_ms: None });
+    append(&reopened, &holder, 1, 1, vec![clear], 2);
+    assert!(reopened.due_alarms(42).unwrap().is_empty());
+    assert!(reopened.alarms.lock().unwrap().is_empty());
+
+    let mut again = entry(3, 1, &[]);
+    again.alarm = Some(pb::Alarm { at_ms: Some(42) });
+    append(&reopened, &holder, 1, 1, vec![again], 3);
+    assert_eq!(reopened.due_alarms(42).unwrap().len(), 1);
+    let mut delete = entry(4, 1, &[]);
+    delete.kind = EntryKind::Delete as i32;
+    append(&reopened, &holder, 1, 1, vec![delete], 4);
+    assert!(reopened.due_alarms(42).unwrap().is_empty());
+    assert!(reopened.alarms.lock().unwrap().is_empty());
+
+    // A removed range can later be copied again; a stale hint must not hide its new alarm.
+    reopened.clear(0, 0).unwrap();
+    assert!(reopened.due_alarms(42).unwrap().is_empty());
+    reopened.import(&actor(), 2, 1, Some(42), 0).unwrap();
+    assert_eq!(reopened.due_alarms(42).unwrap().len(), 1);
+    reopened.claim(&actor(), &holder, 3, 0, |_| false).unwrap();
+    reopened.clear(0, 0).unwrap();
+    assert!(reopened.due_alarms(42).unwrap().is_empty());
+    assert!(reopened.alarms.lock().unwrap().is_empty());
+}
+
+#[test]
 fn appends_are_written_only_at_the_promise() {
     let store = store();
     let (a, b) = (host("a"), host("b"));

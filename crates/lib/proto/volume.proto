@@ -198,7 +198,11 @@ service Actors {
 }
 
 // `host`: the Compute node a cell Gateway should deliver to, when the sender knows the holder; empty picks the wake host.
-message InvokeRequest { Actor actor = 1; bytes payload = 2; string host = 3; }
+message InvokeRequest {
+  Actor actor = 1; bytes payload = 2; string host = 3;
+  // An alarm Wake, distinct from an opaque request. Compute validates it under the input gate.
+  optional uint64 alarm_ms = 4;
+}
 // `holder` served the event, or with `redirect` holds the actor live elsewhere and `payload` is empty. A nonzero `code`
 // (a gRPC code, with `message`) is the host's failure: the event ran or may have, so it is an answer, never re-sent. Only
 // failures before a host took the event are gRPC errors, which Gateways may retry elsewhere.

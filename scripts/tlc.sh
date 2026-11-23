@@ -21,6 +21,10 @@ rm -rf "$work" && mkdir -p "$work"
 # catches mistakes in the model itself. handoff's single point cannot split a range, so membership checks
 # DirectoryCoverage.
 BUGS='
+alarms consume CommitOnly
+alarms stale CurrentAlarmOnly
+alarms early-fallback LateFallbackOnly
+alarms released-only CrashRecoverable
 cell buffered DurableCommit
 cell uncommitted CommittedApply
 cell cas OrderedCAS
@@ -156,7 +160,7 @@ bug() {
     fi
 }
 
-models="relays cells follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
+models="alarms relays cells follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

@@ -53,7 +53,10 @@ impl pb::actors_server::Actors for Actors {
             .actor
             .ok_or_else(|| Status::invalid_argument("missing actor"))?;
         let reply = match self.host.acquire(&actor).await {
-            Ok(awake) => match awake.invoke(request.payload).await {
+            Ok(awake) => match match request.alarm_ms {
+                Some(at_ms) => awake.alarm(at_ms).await.map(|()| Vec::new()),
+                None => awake.invoke(request.payload).await,
+            } {
                 Ok(payload) => pb::InvokeReply {
                     holder: Some(self.holder.clone()),
                     payload,

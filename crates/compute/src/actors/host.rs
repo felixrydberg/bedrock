@@ -59,6 +59,7 @@ type Latency = Family<KindLabel, Histogram, fn() -> Histogram>;
 struct Metrics {
     claim: Latency,
     wake: Latency,
+    lateness: Latency,
     expiries: Family<KindLabel, Counter>,
 }
 
@@ -68,6 +69,7 @@ impl Metrics {
         let metrics = Metrics {
             claim: Family::new_with_constructor(latency),
             wake: Family::new_with_constructor(latency),
+            lateness: Family::new_with_constructor(latency),
             expiries: Family::default(),
         };
         admin.register_labelled(
@@ -82,6 +84,11 @@ impl Metrics {
                     "compute_actor_wake_seconds",
                     "Time from a wake's start until its instance runs",
                     metrics.wake.clone(),
+                );
+                registry.register(
+                    "compute_actor_alarm_lateness_seconds",
+                    "Time from the scheduled alarm until its handler starts, including wake time",
+                    metrics.lateness.clone(),
                 );
                 registry.register(
                     "compute_actor_lease_expiries",
@@ -137,7 +144,7 @@ impl ActorHost {
         let key = (actor.namespace.clone(), actor.id.clone());
         let cell = self.0.lock().entry(key.clone()).or_default().clone();
         let result = {
-            let mut awake = cell.lock().await;
+            let mut awake = cell.clone().lock_owned().await;
             match awake.as_ref() {
                 Some(running) if running.serving() => {
                     // Under the wake lock, so the watcher sees it before it can sleep the actor.
@@ -145,15 +152,31 @@ impl ActorHost {
                     Ok(running.clone())
                 }
                 _ => {
-                    if let Some(stopped) = awake.take() {
-                        self.0.expired(&stopped).await;
-                    }
-                    let woken = self.0.wake(actor).await;
-                    if let Ok(woken) = &woken {
-                        *awake = Some(woken.clone());
-                        tokio::spawn(watch(Arc::downgrade(&self.0), key.clone(), woken.clone()));
-                    }
-                    woken
+                    let (host, actor, key, cell) =
+                        (self.clone(), actor.clone(), key.clone(), cell.clone());
+                    // A cancelled Gateway Wake must not leave a live held claim without an instance/timer.
+                    tokio::spawn(async move {
+                        if let Some(stopped) = awake.take() {
+                            host.0.expired(&stopped).await;
+                        }
+                        let woken = host.0.wake(&actor).await;
+                        if let Ok(woken) = &woken {
+                            *awake = Some(woken.clone());
+                            let cleanup = woken.storage().expect("a newly woken actor has storage");
+                            tokio::spawn(watch(
+                                Arc::downgrade(&host.0),
+                                key.clone(),
+                                woken.clone(),
+                                cleanup,
+                            ));
+                        }
+                        drop(awake);
+                        drop(cell);
+                        host.0.forget(&key);
+                        woken
+                    })
+                    .await
+                    .map_err(|error| Error::Handler(format!("actor wake failed: {error}")))?
                 }
             }
         };
@@ -220,6 +243,7 @@ impl Inner {
             .observe(started.elapsed().as_secs_f64());
         Ok(Arc::new(Awake {
             kind: actor.kind,
+            lateness: self.metrics.lateness.get_or_create(&kind).clone(),
             storage: Mutex::new(Some(storage)),
             instance: tokio::sync::Mutex::new(Some(instance)),
             last: Mutex::new(bedrock_lib::monotonic_now()),
@@ -246,34 +270,43 @@ async fn release(storage: Storage) {
 }
 
 /// Sleeps `awake` once idle, and drops it once its holder stops serving.
-async fn watch(host: Weak<Inner>, key: Key, awake: Arc<Awake>) {
+async fn watch(host: Weak<Inner>, key: Key, awake: Arc<Awake>, storage: Storage) {
+    // Keep cleanup ownership even if a cancelled or panicked event removes Awake's storage.
+    let timer = AlarmTimer(tokio::spawn(alarms(host.clone(), awake.clone())));
     loop {
         sleep(HEARTBEAT).await;
-        let Some(host) = host.upgrade() else { return };
+        let Some(host) = host.upgrade() else {
+            cleanup(&awake, storage, timer).await;
+            return;
+        };
         let serving = awake.serving();
         if serving && !awake.idle() {
             continue;
         }
-        let Some(cell) = host.lock().get(&key).cloned() else {
+        let cell = { host.lock().get(&key).cloned() };
+        let Some(cell) = cell else {
+            cleanup(&awake, storage, timer).await;
             return;
         };
         {
             let mut current = cell.lock().await;
             if !current.as_ref().is_some_and(|a| Arc::ptr_eq(a, &awake)) {
+                drop(current);
+                cleanup(&awake, storage, timer).await;
                 return;
             }
             if !awake.serving() {
+                timer.0.abort();
                 *current = None;
                 host.expired(&awake).await;
             } else if awake.idle() {
                 *current = None;
                 // Under the wake lock, so a new wake waits for the release and then needs no lease wait.
-                if let Some(storage) = awake.stop().await {
-                    release(storage).await;
-                }
+                drop(awake.stop().await);
             } else {
                 continue;
             }
+            cleanup(&awake, storage, timer).await;
         }
         drop(cell);
         host.forget(&key);
@@ -281,9 +314,55 @@ async fn watch(host: Weak<Inner>, key: Key, awake: Arc<Awake>) {
     }
 }
 
+struct AlarmTimer(tokio::task::JoinHandle<()>);
+
+impl Drop for AlarmTimer {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn cleanup(awake: &Awake, storage: Storage, timer: AlarmTimer) {
+    drop(timer);
+    drop(awake.stop().await);
+    // A healthy writer releases even after a local handler failed. A fenced writer refuses.
+    release(storage).await;
+}
+
+/// A per-instance timer; the lifecycle watcher survives a handler panic and releases its pending alarm.
+async fn alarms(host: Weak<Inner>, awake: Arc<Awake>) {
+    const POLL: Duration = Duration::from_millis(100);
+    let mut previous = None;
+    let mut backoff = POLL;
+    let mut retry = bedrock_lib::monotonic_now();
+    loop {
+        sleep(POLL).await;
+        if host.upgrade().is_none() || !awake.serving() {
+            return;
+        }
+        let at = awake.storage().and_then(|storage| storage.alarm_ms());
+        if at != previous {
+            previous = at;
+            backoff = POLL;
+            retry = bedrock_lib::monotonic_now();
+        }
+        let Some(at) = at else { continue };
+        if at > super::storage::now_ms() || bedrock_lib::monotonic_now() < retry {
+            continue;
+        }
+        if let Err(error) = awake.alarm(at).await {
+            tracing::debug!(%error, "actor alarm attempt failed");
+        }
+        // Even an Ok handler that forgot its clear must not hot-loop.
+        retry = bedrock_lib::monotonic_now() + backoff;
+        backoff = (backoff * 2).min(Duration::from_secs(5));
+    }
+}
+
 /// An awake actor on this host.
 pub struct Awake {
     kind: i32,
+    lateness: Histogram,
     /// `None` once stopped.
     storage: Mutex<Option<Storage>>,
     /// The input gate: one event at a time. `None` once stopped.
@@ -293,6 +372,12 @@ pub struct Awake {
 }
 
 impl Awake {
+    fn storage(&self) -> Option<Storage> {
+        self.storage
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
     /// Whether this holder may still answer: not stopped, and its writer still serving.
     pub fn serving(&self) -> bool {
         self.storage
@@ -320,6 +405,15 @@ impl Awake {
     /// is cancelled, or whose handler panics, may leave the instance's memory ahead of or behind its commits, so the
     /// actor stops and the next `Acquire` wakes it again from its slots.
     pub async fn invoke(&self, request: Vec<u8>) -> Result<Vec<u8>, Error> {
+        self.event(Event::Request(request)).await
+    }
+
+    /// A Wake hint: stale, duplicate and future alarms do nothing. Validation shares the request input gate.
+    pub async fn alarm(&self, at_ms: u64) -> Result<(), Error> {
+        self.event(Event::Alarm(at_ms)).await.map(|_| ())
+    }
+
+    async fn event(&self, event: Event) -> Result<Vec<u8>, Error> {
         self.busy.fetch_add(1, Ordering::Relaxed);
         let mut busy = Busy {
             awake: self,
@@ -330,8 +424,25 @@ impl Awake {
             let result = match instance.as_mut() {
                 Some(instance) if self.serving() => {
                     // Only once the event runs: a caller cancelled while queued at the gate leaves the actor alone.
-                    busy.armed = true;
-                    instance.invoke(request).await
+                    match event {
+                        Event::Alarm(at)
+                            if at > super::storage::now_ms()
+                                || self.storage().and_then(|s| s.alarm_ms()) != Some(at) =>
+                        {
+                            Ok(Vec::new())
+                        }
+                        Event::Alarm(at) => {
+                            busy.armed = true;
+                            self.lateness.observe(
+                                super::storage::now_ms().saturating_sub(at) as f64 / 1000.0,
+                            );
+                            instance.alarm(at).await.map(|()| Vec::new())
+                        }
+                        Event::Request(request) => {
+                            busy.armed = true;
+                            instance.invoke(request).await
+                        }
+                    }
                 }
                 _ => Err(Error::Volume(volume::Error::Fenced)),
             };
@@ -357,6 +468,11 @@ impl Awake {
             .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
+}
+
+enum Event {
+    Request(Vec<u8>),
+    Alarm(u64),
 }
 
 /// One event: on every exit it leaves the busy count and marks the actor used. An event dropped while armed (started

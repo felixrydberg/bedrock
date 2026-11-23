@@ -4,7 +4,7 @@
 //! with `s/` and the actor's big-endian hash, so a hash range is one scan and dropping it one `delete_range`:
 //! `s/{hash}{namespace}\0{id}\0` followed by `claim`, `log/{seq}`, `data/{key}` (the overlay) or `owed` (a flush's
 //! truncation the actor's other slots have not confirmed, kept by its maintainer). Released actors with an
-//! alarm are also indexed by time, `alarm/{when}{hash}{namespace}\0{id}`, removed with the claim's release, and
+//! alarm are also indexed by time, `alarm/{when}{hash}{namespace}\0{id}`, removed when claimed again, and
 //! tombstones of deleted actors (S-05b) by their `DELETE`'s time under `gone/`, removed with the tombstone.
 //!
 //! Each request is one atomic batch: log entries, overlay changes and the claim together. The engine syncs every batch
@@ -19,7 +19,7 @@
 //! `m/repaired` (spans where an actor with no claim record here starts `repaired`, with floor 0) and `m/fresh` (the
 //! store started empty while this node owned no range, so a range it is first given `ready` has nothing to copy).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -27,7 +27,7 @@ use std::time::Duration;
 use bedrock_lib::actors::ActorId;
 use bedrock_lib::replication::pb::{RangeSize, Span};
 use bedrock_lib::storage::{
-    ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, WriteBatch,
+    ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, WriteBatch, WriteOp,
 };
 use bedrock_lib::volume as pb;
 use pb::Refusal;
@@ -91,6 +91,15 @@ pub struct Actor {
     hash: u64,
     prefix: Vec<u8>,
     kind: i32,
+}
+
+/// A due alarm hint. The receiving holder validates it against its recovered, committed alarm before invoking.
+#[derive(Clone, Debug)]
+pub struct AlarmCandidate {
+    pub actor: pb::Actor,
+    pub at_ms: u64,
+    pub released: bool,
+    pub holder: Option<pb::Holder>,
 }
 
 impl Actor {
@@ -404,6 +413,9 @@ pub struct Store {
     locks: Vec<Mutex<()>>,
     /// Actors with committed entries not yet flushed, by slot-store prefix: the maintainer's flush candidates.
     dirty: Mutex<BTreeMap<Vec<u8>, pb::Actor>>,
+    /// Volatile hints for held-alarm scans. Rebuilt at startup; updated only after a claim write succeeds. Stale
+    /// prefixes are harmless and pruned while holding the actor stripe, which serializes repair and range deletion.
+    alarms: Mutex<BTreeSet<Vec<u8>>>,
     /// Log bytes beyond the flushed points, for backpressure.
     unflushed: AtomicI64,
     max_unflushed: u64,
@@ -489,6 +501,7 @@ impl Store {
             engine,
             locks: (0..STRIPES).map(|_| Mutex::new(())).collect(),
             dirty: Mutex::default(),
+            alarms: Mutex::default(),
             unflushed: AtomicI64::new(0),
             max_unflushed: MAX_UNFLUSHED_BYTES,
             owed: Mutex::default(),
@@ -1054,6 +1067,96 @@ impl Store {
         }
     }
 
+    /// Released alarms use the durable time index. Held alarms are also scanned so a crashed holder's alarm can be
+    /// delivered after its host lease expires; the caller checks that lease. These are hints, including an uncommitted
+    /// tail, and never consume an alarm. Compute validates against recovered committed state under its input gate.
+    pub fn due_alarms(&self, now_ms: u64) -> Result<Vec<AlarmCandidate>, Error> {
+        let bad_key = || {
+            Error::Storage(StorageError::Corruption(ErrorContext {
+                engine: "volume",
+                instance: "volume".into(),
+                file: None,
+                partition: None,
+                detail: "an alarm candidate has an invalid actor key".into(),
+            }))
+        };
+        let parse = |prefix: &[u8], kind| -> Result<pb::Actor, Error> {
+            let wire = Actor::parse(prefix, kind).ok_or_else(bad_key)?;
+            let actor = Actor::new(&wire).map_err(|_| bad_key())?;
+            if actor.prefix != prefix {
+                return Err(bad_key());
+            }
+            Ok(wire)
+        };
+        let mut due = Vec::new();
+        for item in self.engine.scan(&KeyRange::prefix(*b"alarm/"))? {
+            let (key, _) = item?;
+            let at = key
+                .get(6..14)
+                .and_then(|v| <[u8; 8]>::try_from(v).ok())
+                .ok_or_else(bad_key)?;
+            let at_ms = u64::from_be_bytes(at);
+            if at_ms > now_ms {
+                break;
+            }
+            let prefix = [b"s/".as_slice(), &key[14..]].concat();
+            let wire = parse(&prefix, 0)?;
+            let claim = self.load(&Actor::new(&wire)?)?;
+            if claim.released
+                && claim.alarm_ms == Some(at_ms)
+                && claim.deleted.is_none()
+                && claim.deleting.is_none()
+                && claim.moved.is_none()
+            {
+                due.push(AlarmCandidate {
+                    actor: pb::Actor {
+                        kind: claim.kind,
+                        ..wire
+                    },
+                    at_ms,
+                    released: true,
+                    holder: claim.holder,
+                });
+            }
+        }
+        // Never hold the hint lock while waiting for a stripe: every writer takes them in the other order.
+        let prefixes: Vec<_> = self
+            .alarms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        for prefix in prefixes {
+            let wire = parse(&prefix, 0)?;
+            let actor = Actor::new(&wire)?;
+            let _stripe = self.lock(&actor);
+            let claim = self.load(&actor)?;
+            if claim.alarm_ms.is_none() || claim.released {
+                self.alarms
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&prefix);
+                continue;
+            }
+            if claim.deleted.is_some() || claim.deleting.is_some() || claim.moved.is_some() {
+                continue;
+            }
+            if let Some(at_ms) = claim.alarm_ms.filter(|at| *at <= now_ms) {
+                due.push(AlarmCandidate {
+                    actor: pb::Actor {
+                        kind: claim.kind,
+                        ..wire
+                    },
+                    at_ms,
+                    released: false,
+                    holder: claim.holder,
+                });
+            }
+        }
+        Ok(due)
+    }
+
     fn entry(&self, actor: &Actor, seq: u64) -> Result<pb::Entry, Error> {
         let bytes = self
             .engine
@@ -1111,8 +1214,25 @@ impl Store {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<Duration, Error> {
+        let mut alarms = Vec::new();
+        for op in &batch.ops {
+            if let WriteOp::Put { key, value } = op
+                && let Some(at) = prefix_len(key)
+                && &key[at..] == b"claim"
+            {
+                let claim =
+                    pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?;
+                if claim.alarm_ms.is_some() && !claim.released {
+                    alarms.push(key[..at].to_vec());
+                }
+            }
+        }
         let started = bedrock_lib::monotonic_now();
         self.engine.write(batch)?;
+        self.alarms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(alarms);
         Ok(started.elapsed())
     }
 
@@ -2015,6 +2135,12 @@ impl Store {
                 let claim =
                     pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?;
                 kind = claim.kind;
+                if claim.alarm_ms.is_some() && !claim.released {
+                    self.alarms
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(key[..at].to_vec());
+                }
                 self.mark(&key[..at], &claim);
             } else if name.starts_with(b"data/") {
                 *bytes.entry(kind).or_default() += (key.len() + value.len()) as i64;
