@@ -531,6 +531,9 @@ impl Cell {
             if !session.ready() {
                 // Reconnects may pass unseen while the local view is recovering; restart grace conservatively.
                 absent.clear();
+                for (service, _) in published {
+                    self.unverified(service);
+                }
                 continue;
             }
             // Read each directory, its drains and its cursor from one applied snapshot.
@@ -551,12 +554,14 @@ impl Cell {
                     Ok(read) => read,
                     Err(error) => {
                         tracing::warn!(%error, service, "published service unreadable; not publishing it");
+                        self.unverified(service);
                         continue;
                     }
                 };
                 let applied = session.applied(DATASET, &namespace(service, &self.cell));
                 let empty = members.is_empty() && directory.is_empty() && records.is_empty();
                 let Some(revision) = validated_revision(revision, applied, empty) else {
+                    self.unverified(service);
                     continue;
                 };
                 based.insert((*service).to_owned(), revision);
@@ -707,6 +712,20 @@ impl Cell {
                     completeness(seen, actual, service, dataset, directory),
                 );
             }
+        }
+    }
+
+    /// Reports `service`'s `full_replica` datasets degraded with nothing confirmed held, while this relay cannot read a
+    /// validated view of them: a stale report would claim coverage nobody checked.
+    fn unverified(&self, service: &str) {
+        for dataset in ranged_datasets(service).filter(|d| full_replica(d)) {
+            self.report.set(
+                dataset,
+                coverage::Coverage {
+                    complete: 0,
+                    redundant: 0,
+                },
+            );
         }
     }
 

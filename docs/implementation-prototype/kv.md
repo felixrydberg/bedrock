@@ -785,6 +785,7 @@ Each cell relay reports it per dataset (`full_replica_complete_ratio`, `full_rep
 serve by, is connected to a cell relay, still carries the dataset and its storage for it is healthy, so a lost node is
 degraded at once rather than after the grace period. `populating` owners never count. Redundancy expects as many holders
 as placement can give a range: R, or the number of `ready` `l2` members carrying the dataset when fewer.
+While a relay has no validated view of the directory, it reports the dataset degraded with nothing confirmed held.
 
 ### 15.6 Automatic Cache Rebuilding
 
