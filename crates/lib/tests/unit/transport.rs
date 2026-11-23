@@ -191,7 +191,7 @@ async fn slow_call(
         addr,
         None,
     );
-    let call = tokio::spawn(async move {
+    let mut call = tokio::spawn(async move {
         let endpoint = Endpoint::from_shared(format!("http://{addr}")).unwrap();
         let mut attempts = 0;
         let channel = loop {
@@ -215,6 +215,8 @@ async fn slow_call(
     tokio::select! {
         served = &mut listener => panic!("the listener stopped: {served:?}"),
         entered = handling.recv() => entered.expect("the call reached the handler"),
+        ended = &mut call => panic!("the call ended before reaching the handler: {ended:?}"),
+        () = tokio::time::sleep(Duration::from_secs(10)) => panic!("the call did not reach the handler"),
     }
     (listener, addr, call, finished)
 }
