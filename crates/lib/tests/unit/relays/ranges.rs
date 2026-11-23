@@ -146,22 +146,22 @@ fn a_drop_is_confirmed_only_when_the_view_dropped_the_node_and_another_owner_is_
         (200, vec![owner("c", State::Populating)]),
     ]);
     assert_eq!(
-        confirms(Some(&directory), "b", (100, 200), &BTreeSet::new()),
+        confirms(Some(&directory), "b", (100, 200), &Unhealthy::new()),
         Ok(())
     );
     assert!(
-        confirms(Some(&directory), "b", (50, 150), &BTreeSet::new())
+        confirms(Some(&directory), "b", (50, 150), &Unhealthy::new())
             .unwrap_err()
             .contains("still an owner"),
         "a leaving owner keeps its range"
     );
     assert!(
-        confirms(Some(&directory), "b", (200, 0), &BTreeSet::new())
+        confirms(Some(&directory), "b", (200, 0), &Unhealthy::new())
             .unwrap_err()
             .contains("no ready owner")
     );
-    assert!(confirms(None, "b", (0, 0), &BTreeSet::new()).is_err());
-    assert!(confirms(Some(&Directory::new()), "b", (0, 0), &BTreeSet::new()).is_err());
+    assert!(confirms(None, "b", (0, 0), &Unhealthy::new()).is_err());
+    assert!(confirms(Some(&Directory::new()), "b", (0, 0), &Unhealthy::new()).is_err());
 }
 
 #[test]
@@ -172,11 +172,11 @@ fn a_revoke_checks_every_overlapping_directory_range_but_not_adjacent_ranges() {
         (200, vec![owner("old", State::Leaving)]),
     ]);
     assert_eq!(
-        confirms(Some(&directory), "old", (0, 200), &BTreeSet::new()),
+        confirms(Some(&directory), "old", (0, 200), &Unhealthy::new()),
         Ok(())
     );
     assert!(
-        confirms(Some(&directory), "old", (99, 201), &BTreeSet::new())
+        confirms(Some(&directory), "old", (99, 201), &Unhealthy::new())
             .unwrap_err()
             .contains("still an owner")
     );
@@ -185,15 +185,36 @@ fn a_revoke_checks_every_overlapping_directory_range_but_not_adjacent_ranges() {
 #[test]
 fn an_unhealthy_ready_owner_does_not_confirm_a_revoke() {
     let directory = Directory::from([(0, vec![owner("sick", State::Ready)])]);
-    let unhealthy = BTreeSet::from(["sick".to_string()]);
+    let unhealthy = Unhealthy::from([("sick".to_string(), Vec::new())]);
     assert!(
         confirms(Some(&directory), "b", (0, 0), &unhealthy)
             .unwrap_err()
             .contains("no ready owner")
     );
     assert_eq!(
-        confirms(Some(&directory), "b", (0, 0), &BTreeSet::new()),
+        confirms(Some(&directory), "b", (0, 0), &Unhealthy::new()),
         Ok(())
+    );
+}
+
+/// #103 / B-62: an owner quarantined only in part counts for the rest, but not for a range overlapping its quarantine,
+/// even one the dropped range only reaches into.
+#[test]
+fn a_partly_quarantined_owner_confirms_only_outside_its_quarantine() {
+    let directory = Directory::from([(0, vec![owner("sick", State::Ready)])]);
+    let unhealthy = Unhealthy::from([("sick".to_string(), vec![(100, 200)])]);
+    assert_eq!(
+        confirms(Some(&directory), "b", (200, 300), &unhealthy),
+        Ok(())
+    );
+    assert_eq!(
+        confirms(Some(&directory), "b", (0, 100), &unhealthy),
+        Ok(())
+    );
+    assert!(
+        confirms(Some(&directory), "b", (150, 300), &unhealthy)
+            .unwrap_err()
+            .contains("no ready owner")
     );
 }
 

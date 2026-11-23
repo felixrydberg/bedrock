@@ -106,12 +106,12 @@ fn a_failed_read_of_a_cold_record_quarantines_through_the_handle() {
 
     let ranges = ranges();
     assert!(handle.get(&cold).unwrap().is_some());
-    assert!(verify(handle.as_ref(), &ranges[0]).unwrap() > 0);
+    assert!(verify(handle.as_ref(), Some(&ranges[0])).unwrap() > 0);
     assert_eq!(health.get("a", ENGINE).unwrap().state, State::Healthy);
 
     let range = ranges.iter().find(|range| range.contains(&cold)).unwrap();
     assert!(matches!(
-        verify(handle.as_ref(), range),
+        verify(handle.as_ref(), Some(range)),
         Err(StorageError::Corruption(_))
     ));
     assert_eq!(health.get("a", ENGINE).unwrap().state, State::Unhealthy);
@@ -132,4 +132,23 @@ async fn one_task_walks_the_engines_in_turn() {
     tokio::time::sleep(pass(1)).await;
     assert_eq!(second.walked.lock().unwrap().len() as u64, SLICES + 2);
     walk.abort();
+}
+
+/// Found by the simulation (#103 / B-62, seed 481): a damaged revision that no consumer reads again stayed hidden, and the
+/// node kept the damage after faults stopped. The walk reads every revision too.
+#[test]
+fn the_walk_reads_revisions_so_hidden_damage_there_quarantines() {
+    use crate::storage::sim::SimEngine;
+    let disk = Arc::new(SimEngine::new("a", Arc::new(|_| None), None, false));
+    let mut batch = WriteBatch::default();
+    batch.set_revision("cold", 1);
+    disk.write(batch).unwrap();
+    disk.damage_revision("cold");
+    let health = StorageHealth::new(&Admin::new());
+    let handle = health.wrap("a", ENGINE, disk);
+    assert!(matches!(
+        verify(handle.as_ref(), None),
+        Err(StorageError::Corruption(_))
+    ));
+    assert_eq!(health.get("a", ENGINE).unwrap().state, State::Unhealthy);
 }

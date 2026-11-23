@@ -132,7 +132,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
                 // Quarantined datasets are routed around (B-14); they do not hold back the others.
                 let unhealthy = storage.unhealthy();
                 admin.set_ready(!skipped && datasets.is_healthy(&unhealthy) && session.ready_except(&unhealthy));
-                session.set_unhealthy(&unhealthy);
+                session.set_unhealthy(&unhealthy, &storage.damaged());
                 if let Err(error)=members.refresh(&session,&peers){
                     tracing::warn!(%error,"membership view unreadable");
                 }

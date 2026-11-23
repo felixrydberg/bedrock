@@ -360,9 +360,19 @@ pub fn check_handoff(
     after: &Placement,
     healthy: &BTreeSet<String>,
 ) -> Result<(), Violation> {
+    check_handoff_by(before, after, |owner, _| healthy.contains(owner))
+}
+
+/// [`check_handoff`] where `healthy(owner, range)` says whether the owner's copy of that range is healthy: an owner
+/// quarantined in part is healthy outside its quarantined ranges (#103 / B-62).
+pub fn check_handoff_by(
+    before: &Placement,
+    after: &Placement,
+    healthy: impl Fn(&str, Range) -> bool,
+) -> Result<(), Violation> {
     for (range, owners) in before {
         let ready = |(owner, state): &(String, OwnerState)| {
-            *state == OwnerState::Ready && healthy.contains(owner)
+            *state == OwnerState::Ready && healthy(owner, *range)
         };
         if !owners.iter().any(ready) {
             continue;

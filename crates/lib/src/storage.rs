@@ -374,6 +374,38 @@ pub trait StorageEngine: Send + Sync {
     fn compact(&self, _range: &KeyRange) -> StorageResult<()> {
         Ok(())
     }
+
+    /// Checks the whole instance for damage and returns the first failure found (#103 / B-62). The default reads every
+    /// record and revision; an adapter with its own verifier runs that first, since reads can miss damage.
+    fn verify(&self) -> StorageResult<()> {
+        read_all(self)
+    }
+
+    /// The span of keys to discard so that the storage `failure` hit leaves the instance, or `None` when the adapter
+    /// cannot name one and the whole instance must be rebuilt. Only an adapter that can [`StorageEngine::discard`] names
+    /// one.
+    fn damaged(&self, _failure: &StorageError) -> Option<KeyRange> {
+        None
+    }
+
+    /// Physically removes `range`'s storage, including any damaged file inside it, and its records. Revisions stay.
+    fn discard(&self, _range: &KeyRange) -> StorageResult<()> {
+        Err(StorageError::Unsupported(ErrorContext {
+            engine: "storage",
+            instance: String::new(),
+            file: None,
+            partition: None,
+            detail: "this engine cannot discard part of itself".into(),
+        }))
+    }
+}
+
+/// Reads every record and revision of `engine`, returning the first failure.
+pub fn read_all(engine: &(impl StorageEngine + ?Sized)) -> StorageResult<()> {
+    for entry in engine.scan(&KeyRange::all())? {
+        entry?;
+    }
+    engine.snapshot()?.revisions().map(drop)
 }
 
 #[cfg(test)]

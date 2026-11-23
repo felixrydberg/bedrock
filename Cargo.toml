@@ -27,6 +27,9 @@ slatedb = { version = "=0.17.0", default-features = false, features = ["moka", "
 object_store = { version = "0.14.2", features = ["aws"] }
 # B-05; compiled out under madsim. Building it needs libclang (bindgen).
 rocksdb = { version = "0.25", default-features = false, features = ["lz4", "bindgen-runtime"] }
+# #103 / B-62: `rocksdb` does not expose VerifyChecksum, so the adapter calls it through the bindings `rocksdb` already
+# builds (user decision 2026-11-22). Keep the version and features those of `rocksdb`'s own dependency.
+librocksdb-sys = { version = "=0.19.0", default-features = false, features = ["lz4", "bindgen-runtime"] }
 tempfile = "3"
 # Actor SQLite (#115 / S-07, user decision 2026-11-17): SQLite compiled from source by `bundled`, and a VFS over the
 # volume client through sqlite-plugin, which links against that SQLite. sqlite-plugin's build runs bindgen (libclang).

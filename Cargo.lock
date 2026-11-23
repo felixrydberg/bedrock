@@ -384,6 +384,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "librocksdb-sys",
  "madsim",
  "madsim-tokio",
  "madsim-tonic",

@@ -6,11 +6,17 @@
 //!
 //! Recovery takes the smallest scope the failure allows:
 //! - **Key.** A missing or stale cached key is refetched by the read itself ([`crate::health::fallback`]).
-//! - **Range.** Rebuilding one L2 hash range needs the relay handoff's `populating` → `ready` readiness (#22 / B-21).
-//! - **Instance.** Corruption quarantines a whole engine instance (B-14), so [`Reinitialise`] recreates it empty and, for
-//!   relay-fed datasets, waits until every subscription installed a verified bootstrap again. Bootstraps come from B-11
-//!   materialized state at a checksummed boundary plus the ordered tail, so deletes stay deleted and nothing older
-//!   replaces newer state, including after retained history expired.
+//! - **Range** (#103 / B-62). Corruption quarantines a whole engine instance (B-14), since its extent is unknown. A
+//!   rebuild then verifies the instance ([`StorageEngine::verify`]), has the adapter discard the span each failure names,
+//!   and verifies again until it is clean. When every span lies in L2 hash ranges and they are few, only the ranges
+//!   overlapping them stay quarantined ([`StorageHealth::narrow`]); each re-bootstraps through its own scope and validates.
+//!   The owner stays `ready` in the directory throughout, as a rebuilding owner always has.
+//! - **Instance.** Otherwise [`Reinitialise`] recreates the instance empty and, for relay-fed datasets, waits until every
+//!   subscription installed a verified bootstrap again: when a failure names no file or key, a span is outside the L2
+//!   ranges (a revision, say), the adapter cannot discard it, verification fails, or too much is damaged.
+//!
+//! Bootstraps come from B-11 materialized state at a checksummed boundary plus the ordered tail, so deletes stay deleted
+//! and nothing older replaces newer state, including after retained history expired.
 //! - **Disk.** A failed disk is replaced outside the process; the instance then rebuilds as above.
 
 use std::collections::BTreeMap;
@@ -19,13 +25,19 @@ use std::time::Duration;
 
 use super::{Config, Metrics, Reconcile, Reconciler};
 use crate::admin::Admin;
-use crate::health::storage::{State, StorageHealth};
+use crate::health::storage::{self, State, StorageHealth};
 use crate::relays::client::{Rebuilder, Session};
+use crate::relays::ranges::Range;
 use crate::storage::memory::MemoryEngine;
-use crate::storage::{ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult};
+use crate::storage::{ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, l2_span};
 
 /// How often the coordinator looks for quarantined sources.
 pub const INTERVAL: Duration = Duration::from_secs(1);
+/// The most damaged spans one rebuild discards before rebuilding the whole instance instead.
+// ponytail: fixed limits; weigh a range rebuild's cost against a whole one's if either rebuilds too much.
+const MAX_SPANS: usize = 8;
+/// The largest share of the hash space, in 1/2⁶⁴ units, rebuilt range by range.
+const MAX_WIDTH: u128 = 1 << 63;
 
 /// `(dataset, layer)`, as [`StorageHealth`] keys its sources.
 pub type Source = (String, &'static str);
@@ -33,8 +45,15 @@ pub type Source = (String, &'static str);
 /// Recreates one source through a [`StorageHealth::wrap_replication`] handle.
 #[async_trait::async_trait]
 pub trait Restore: Send + Sync {
-    /// Returns `Ok` only once the restored state passed integrity and freshness validation.
-    async fn restore(&self) -> StorageResult<()>;
+    /// Verifies the whole source and discards the damage it finds. Returns the L2 hash ranges that held it, recorded in
+    /// the source, or `None` when the whole source must be restored.
+    async fn narrow(&self) -> StorageResult<Option<Vec<Range>>> {
+        Ok(None)
+    }
+
+    /// Restores `ranges`, or the whole source when empty. Returns `Ok` only once the restored state passed integrity and
+    /// freshness validation.
+    async fn restore(&self, ranges: &[Range]) -> StorageResult<()>;
 }
 
 pub struct Rebuild {
@@ -97,9 +116,25 @@ impl Reconcile for Rebuild {
         if self.health.get(dataset, layer).map(|r| r.state) != Some(State::Rebuilding) {
             return Err(failed("is not rebuilding"));
         }
+        let restore = &self.sources[source];
+        let rebuild = async {
+            // Ranges a narrowed quarantine recorded before a restart need no new verification.
+            let mut ranges = self
+                .health
+                .get(dataset, layer)
+                .map(|r| r.ranges)
+                .unwrap_or_default();
+            if ranges.is_empty()
+                && let Some(found) = restore.narrow().await?
+                && self.health.narrow(dataset, layer, found.clone())
+            {
+                ranges = found;
+            }
+            restore.restore(&ranges).await
+        };
         let outcome = tokio::select! {
             biased;
-            outcome = self.sources[source].restore() => outcome,
+            outcome = rebuild => outcome,
             // A new failure quarantines the source, which then refuses the installs a resubscribe waits for, so waiting
             // on could only end at the repair timeout. Start again instead.
             () = self.quarantined_again(dataset, layer) => Err(failed("failed again while rebuilding")),
@@ -118,8 +153,8 @@ impl Reconcile for Rebuild {
     }
 }
 
-/// Recreates an engine instance empty, then, for a relay-fed dataset, waits until its subscriptions installed verified
-/// bootstraps again. Finally every record must read back cleanly.
+/// Recreates an engine instance empty, or only some of its L2 ranges, then, for a relay-fed dataset, waits until those
+/// subscriptions installed verified bootstraps again. Finally every restored record must read back cleanly.
 pub struct Reinitialise {
     pub engine: Arc<dyn StorageEngine>,
     pub resubscribe: Option<Rebuilder>,
@@ -127,18 +162,119 @@ pub struct Reinitialise {
 
 #[async_trait::async_trait]
 impl Restore for Reinitialise {
-    async fn restore(&self) -> StorageResult<()> {
-        let empty = MemoryEngine::new("empty");
-        self.engine.restore(&*empty.snapshot()?)?;
+    async fn narrow(&self) -> StorageResult<Option<Vec<Range>>> {
+        let (engine, rebuilder) = (self.engine.clone(), self.resubscribe.clone());
+        let pass = move || {
+            verify(engine.as_ref(), &|ranges: &[Range]| match &rebuilder {
+                Some(rebuilder) => rebuilder.widen(engine.as_ref(), ranges),
+                None => Ok(ranges.to_vec()),
+            })
+        };
+        #[cfg(not(madsim))]
+        {
+            tokio::task::spawn_blocking(pass)
+                .await
+                .expect("verification does not panic")
+        }
+        #[cfg(madsim)]
+        pass()
+    }
+
+    async fn restore(&self, ranges: &[Range]) -> StorageResult<()> {
+        if ranges.is_empty() {
+            let empty = MemoryEngine::new("empty");
+            self.engine.restore(&*empty.snapshot()?)?;
+        } else {
+            // Again, for a quarantine narrowed before a restart: the discard may not have finished.
+            for range in ranges {
+                self.engine.discard(&l2_span(range.0, range.1))?;
+            }
+        }
         if let Some(rebuilder) = &self.resubscribe {
-            rebuilder.rebuild().await;
+            if !ranges.is_empty() {
+                rebuilder.forget(self.engine.as_ref(), ranges)?;
+            }
+            rebuilder.rebuild(ranges).await;
         }
         // ponytail: a full scan; verify only the subscribed prefixes if instances grow too large for it.
-        for entry in self.engine.scan(&KeyRange::all())? {
-            entry?;
+        let restored = match ranges {
+            [] => vec![KeyRange::all()],
+            ranges => ranges.iter().map(|r| l2_span(r.0, r.1)).collect(),
+        };
+        for range in &restored {
+            for entry in self.engine.scan(range)? {
+                entry?;
+            }
         }
-        self.engine.health()
+        self.engine.health()?;
+        if !ranges.is_empty() {
+            storage::release(self.engine.as_ref())?;
+        }
+        Ok(())
     }
+}
+
+/// Verifies `engine` and discards each damaged span it finds, until it is clean. Returns the L2 hash ranges holding them,
+/// `widen`ed to the subscriptions' ranges around them and listed with the quarantine, or `None` to rebuild the whole
+/// instance. Each span is listed before it is discarded, so a restart before the narrowing still rebuilds it; the whole
+/// instance stays quarantined until the last listing.
+fn verify(
+    engine: &dyn StorageEngine,
+    widen: &dyn Fn(&[Range]) -> StorageResult<Vec<Range>>,
+) -> StorageResult<Option<Vec<Range>>> {
+    let Ok(mut ranges) = storage::listed(engine) else {
+        return Ok(None);
+    };
+    let mut discarded = Vec::new();
+    loop {
+        let failure = match engine.verify() {
+            Ok(()) => break,
+            Err(failure @ StorageError::Corruption(_)) => failure,
+            // Verification itself failed, so the extent is unknown.
+            Err(_) => return Ok(None),
+        };
+        let Some(range) = engine.damaged(&failure).as_ref().and_then(hashes) else {
+            return Ok(None);
+        };
+        // The adapter could not make the damage leave, or there is too much of it.
+        if discarded.contains(&range) || discarded.len() == MAX_SPANS {
+            return Ok(None);
+        }
+        storage::list(engine, &[range], false)?;
+        match engine.discard(&l2_span(range.0, range.1)) {
+            Ok(()) => {}
+            Err(StorageError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        discarded.push(range);
+        ranges.push(range);
+    }
+    let Ok(ranges) = widen(&ranges) else {
+        return Ok(None);
+    };
+    let width: u128 = ranges
+        .iter()
+        .map(|&(start, end)| (if end == 0 { 1 << 64 } else { u128::from(end) }) - u128::from(start))
+        .sum();
+    // A failure that named nothing to discard leaves the extent unknown.
+    if ranges.is_empty() || width > MAX_WIDTH {
+        return Ok(None);
+    }
+    storage::list(engine, &ranges, true)?;
+    Ok(Some(ranges))
+}
+
+/// The L2 hash range holding every key of `range`, or `None` if it reaches outside the L2 keys.
+fn hashes(range: &KeyRange) -> Option<Range> {
+    let hash = |key: &[u8]| -> Option<u64> {
+        Some(u64::from_be_bytes(
+            key.strip_prefix(b"l2/")?.get(..8)?.try_into().ok()?,
+        ))
+    };
+    let start = hash(&range.start)?;
+    // The last key lies before the exclusive end, so the end's hash is the last one the range can hold.
+    let last = hash(range.end.as_deref()?)?;
+    (start <= last).then_some((start, last.wrapping_add(1)))
 }
 
 /// Rebuilds a binary's quarantined dataset engines in the background: each of `engines` (its
