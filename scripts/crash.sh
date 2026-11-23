@@ -8,10 +8,11 @@
 # BEDROCK_CRASH_SEED picks the workload and faults; a run is not deterministic, so a failing seed may not repeat.
 # BEDROCK_CRASH_FAULTS=none runs without faults. Each run's configs, data, logs and faults.log stay in
 # BEDROCK_CRASH_DIR, by default /tmp/bedrock-crash-<seed>. Needs Docker for SeaweedFS (container bedrock-crash-s3).
+# Builds go to CARGO_TARGET_DIR, by default ~/bedrock-crash-target-<checkout folder>, never shared between checkouts.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/bedrock-target-crash}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/bedrock-crash-target-$(basename "$PWD")}"
 export BEDROCK_CRASH_BINS="$CARGO_TARGET_DIR/release"
 
 build() {
