@@ -169,7 +169,7 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     let router = bedrock_lib::transport::server(tls.as_ref()).add_service(
         bedrock_lib::volume::volume_server::VolumeServer::new(service),
     );
-    let mut serving = std::pin::pin!(bedrock_lib::transport::serve(router, node.listen, tls));
+    let mut serving = bedrock_lib::transport::serve(router, node.listen, tls);
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut measure = tokio::time::interval(SIZES);
     let mut flushing = std::pin::pin!(flush(cold.clone(), directory.clone()));
@@ -224,6 +224,7 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     }
     admin.set_ready(false);
     session.drain().await;
+    serving.close().await;
     tracing::info!("shutting down");
     Ok(())
 }

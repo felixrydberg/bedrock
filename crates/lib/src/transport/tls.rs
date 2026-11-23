@@ -94,6 +94,7 @@ mod sim {
             &self,
             _: tonic::transport::server::Router,
             _: std::net::SocketAddr,
+            _: impl std::future::Future<Output = ()>,
         ) -> Result<(), String> {
             match self.0 {}
         }
@@ -313,17 +314,23 @@ mod adapter {
             Ok(stream)
         }
 
-        /// Serves gRPC on `addr`; only callers with a valid node certificate get through, as a [`Caller`].
+        /// Serves gRPC on `addr` until `stop`, then closes the port and lets accepted connections finish their RPCs;
+        /// only callers with a valid node certificate get through, as a [`Caller`].
         pub async fn serve(
             self: &Arc<Self>,
             router: tonic::transport::server::Router,
             addr: SocketAddr,
+            stop: impl Future<Output = ()>,
         ) -> Result<(), String> {
             let listener = TcpListener::bind(addr).await.map_err(|e| e.to_string())?;
             let (tx, rx) = mpsc::channel(64);
             let accepting = tokio::spawn(self.clone().accept_loop(listener, tx));
+            let closing = accepting.abort_handle();
             let served = router
-                .serve_with_incoming(ReceiverStream::new(rx))
+                .serve_with_incoming_shutdown(ReceiverStream::new(rx), async move {
+                    stop.await;
+                    closing.abort();
+                })
                 .await
                 .map_err(|e| e.to_string());
             accepting.abort();

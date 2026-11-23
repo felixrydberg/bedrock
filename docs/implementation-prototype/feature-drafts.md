@@ -85,7 +85,7 @@ server runs every service, each service is its own process, and code is shared a
 | `bedrock-kv` | Customer `kv` read side: value caches, the REST API and namespace management; no hash ranges or buckets (§4 decisions 12, 16) | `l1`, `l2` (only logged until B-39) |
 | `bedrock-cdn` | Dataset `cdn` (path rows and ref keys) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
 | `bedrock-gateway` (planned, B-57) | Public entry point, internal routing between cells, API-key checks and the local `auth` copy (§4 decision 15); actor routing (S-08) | — (follows its relay's tier) |
-| `bedrock-compute` (planned, S-07) | One execution layer: sandboxed customer code (Workers, Durable Objects) and built-in `d1`, `kv`, `queue` and `cron` handlers in Rust; actor host; stateless Worker invocation (§4 decision 16) | — |
+| `bedrock-compute` (S-07, binary S-20) | One execution layer: sandboxed customer code (Workers, Durable Objects) and built-in `d1`, `kv`, `queue` and `cron` handlers in Rust; actor host; stateless Worker invocation (§4 decision 16) | — |
 | `bedrock-volume` (S-03; cold tier S-05) | Actor storage: claims, leases, quorum log, overlay, flushes to S3, alarm index; `volume` hash ranges per cell (§4 decision 16) | — |
 
 Rules this implies:
