@@ -107,7 +107,8 @@ fn member(node: &NodeConfig) -> rpb::Member {
 
 /// Runs the host until Ctrl-C or SIGTERM; built-in actor kinds run in `builtin`. `main` and the simulation both start
 /// here.
-// ponytail: awake actors are not released on shutdown; their slots' 5 s lease lets another host claim them.
+// ponytail: awake actors are not released on shutdown; their slots' 5 s lease lets another host claim them. Events
+// accepted before shutdown get [`bedrock_lib::transport::DRAIN`] to finish.
 pub async fn run(config: ComputeConfig, builtin: Arc<dyn Executor>) -> Result<(), ConfigError> {
     if config.relays.is_empty() {
         return Err(ConfigError("relays must not be empty".into()));
@@ -156,7 +157,7 @@ pub async fn run(config: ComputeConfig, builtin: Arc<dyn Executor>) -> Result<()
     let router = bedrock_lib::transport::server(tls.as_ref()).add_service(
         pb::actors_server::ActorsServer::new(actors::serve::Actors::new(host, holder)),
     );
-    let mut server = std::pin::pin!(bedrock_lib::transport::serve(router, node.listen, tls));
+    let mut server = bedrock_lib::transport::serve(router, node.listen, tls);
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     let mut readiness = tokio::time::interval(Duration::from_millis(100));
     let result = loop {
@@ -173,6 +174,7 @@ pub async fn run(config: ComputeConfig, builtin: Arc<dyn Executor>) -> Result<()
     };
     admin.set_ready(false);
     session.drain().await;
+    server.close().await;
     tracing::info!("shutting down");
     result
 }

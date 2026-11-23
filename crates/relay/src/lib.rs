@@ -158,7 +158,7 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
             .max_decoding_message_size(membership::control::MAX_PACKET)
             .max_encoding_message_size(membership::control::MAX_PACKET),
         );
-    let server = bedrock_lib::transport::serve(router, config.node.listen, tls);
+    let mut server = bedrock_lib::transport::serve(router, config.node.listen, tls);
     admin.set_ready(true);
     let result = tokio::select! {biased;
         () = node::shutdown_signal() => Ok(()),
@@ -168,8 +168,9 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
                 None => std::future::pending::<()>().await,
             }
         } => Err(ConfigError("cell control authority stopped; relay must recover before rejoining".into())),
-        result = server => result.map_err(|error| ConfigError(format!("relay listen: {error}"))),
+        result = &mut server => result.map_err(|error| ConfigError(format!("relay listen: {error}"))),
     };
+    server.close().await;
     for task in tasks {
         task.abort();
     }

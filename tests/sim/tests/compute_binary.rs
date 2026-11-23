@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use bedrock_compute::ComputeConfig;
 use bedrock_compute::actors::host::IDLE;
 use bedrock_compute::actors::storage::Storage;
+use bedrock_compute::actors::volume::HEARTBEAT;
 use bedrock_compute::runtime::{Error, Handler, Instance, RustExecutor};
 use bedrock_gateway::GatewayConfig;
 use bedrock_lib::actors::{self, ActorId, Dc, Kind, Regions, Topology, topology_key};
@@ -412,6 +413,8 @@ async fn scenario() -> Vec<String> {
             // The holder dies: once its lease lapses the other host serves the next value.
             Handle::current().kill(hosts[&wake].id());
             let taken = until("the other host takes over", Duration::from_secs(120), call).await;
+            // The surviving host sleeps the actor no earlier than this.
+            let asleep = bedrock_lib::monotonic_now() + IDLE + HEARTBEAT;
             assert_eq!(
                 taken,
                 format!("{other}#1 3"),
@@ -432,7 +435,8 @@ async fn scenario() -> Vec<String> {
             })
             .await;
             trace.push(format!("rejoined {rejoined:?}"));
-            // The actor slept during the membership grace; the Gateway's cached host wakes it again.
+            // Once the actor sleeps, the Gateway's cached host wakes it again.
+            tokio::time::sleep_until(asleep).await;
             let kept = call().await.expect("the holder still serves");
             let instance = format!("{other}#");
             assert!(
