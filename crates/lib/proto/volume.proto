@@ -188,3 +188,18 @@ message ClaimRecord {
   uint64 deleted_at_ms = 18;
 }
 message OverlayRecord { uint64 seq = 1; optional bytes value = 2; }
+
+// An event for an actor (#116 / S-08, `statefull/v2.md` §6). A Compute host's Worker binding sends it to its cell
+// Gateway; the entry Gateway routes it through the target DC's Gateways (the target cell in `bedrock-cell` metadata) to
+// the cell Gateway, which delivers it to a Compute host. The host's `Acquire` serves, claims and wakes, or redirects.
+// Routing is only a hint: the volume's epochs and leases keep one writer (B-66).
+service Actors {
+  rpc Invoke(InvokeRequest) returns (InvokeReply);
+}
+
+// `host`: the Compute node a cell Gateway should deliver to, when the sender knows the holder; empty picks the wake host.
+message InvokeRequest { Actor actor = 1; bytes payload = 2; string host = 3; }
+// `holder` served the event, or with `redirect` holds the actor live elsewhere and `payload` is empty. A nonzero `code`
+// (a gRPC code, with `message`) is the host's failure: the event ran or may have, so it is an answer, never re-sent. Only
+// failures before a host took the event are gRPC errors, which Gateways may retry elsewhere.
+message InvokeReply { Holder holder = 1; bool redirect = 2; bytes payload = 3; int32 code = 4; string message = 5; }

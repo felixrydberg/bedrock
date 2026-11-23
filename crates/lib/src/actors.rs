@@ -424,8 +424,6 @@ pub fn slots<'a>(id: &ActorId, topology: &'a Topology) -> Result<[&'a str; SLOTS
 /// any, weighted by capacity (`cpus`; a member that reports none counts as 1). `members` are the region's membership
 /// and `healthy` says which nodes peers can reach. This only chooses where to wake; it never moves an awake actor, so
 /// it may differ between callers whose membership differs.
-// ponytail: `f64::ln` is libm, not IEEE-exact, so two platforms could differ in the last bit and pick differently when
-// two scores tie to that bit; harmless for a wake choice, use an integer log if it must be bit-exact.
 pub fn wake_host<'a>(
     id: &ActorId,
     topology: &Topology,
@@ -433,33 +431,44 @@ pub fn wake_host<'a>(
     healthy: impl Fn(&str) -> bool,
 ) -> Result<Option<&'a pb::Member>, Error> {
     for cell in cells_of(id, topology)? {
-        let candidates: Vec<&pb::Member> = members
-            .iter()
-            .filter(|m| {
-                m.cell == cell
-                    && m.roles.iter().any(|r| r == "compute")
-                    && m.status == pb::member::Status::Ready as i32
-                    && healthy(&m.node_id)
-            })
-            .collect();
-        // Smallest -ln(u) / weight wins: a member's chance is proportional to its weight.
-        let host = candidates.into_iter().min_by(|a, b| {
-            let key = |m: &pb::Member| {
-                let bits = crate::placement::score(id.hash(), &m.node_id);
-                // 53 bits plus a half step, so u lies strictly inside (0, 1).
-                let u = ((bits >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
-                let weight = if m.cpus > 0.0 { m.cpus } else { 1.0 };
-                -u.ln() / weight
-            };
-            key(a)
-                .total_cmp(&key(b))
-                .then_with(|| a.node_id.cmp(&b.node_id))
-        });
-        if host.is_some() {
-            return Ok(host);
+        if let Some(host) = host_in(id.hash(), cell, members, &healthy) {
+            return Ok(Some(host));
         }
     }
     Ok(None)
+}
+
+/// [`wake_host`] inside one cell, for the ID whose [`ActorId::hash_of`] is `hash`: a cell Gateway picks among its own
+/// cell's `compute` members (#116 / S-08).
+// ponytail: `f64::ln` is libm, not IEEE-exact, so two platforms could differ in the last bit and pick differently when
+// two scores tie to that bit; harmless for a wake choice, use an integer log if it must be bit-exact.
+pub fn host_in<'a>(
+    hash: u64,
+    cell: &str,
+    members: &'a [pb::Member],
+    healthy: impl Fn(&str) -> bool,
+) -> Option<&'a pb::Member> {
+    // Smallest -ln(u) / weight wins: a member's chance is proportional to its weight.
+    let key = |m: &pb::Member| {
+        let bits = crate::placement::score(hash, &m.node_id);
+        // 53 bits plus a half step, so u lies strictly inside (0, 1).
+        let u = ((bits >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+        let weight = if m.cpus > 0.0 { m.cpus } else { 1.0 };
+        -u.ln() / weight
+    };
+    members
+        .iter()
+        .filter(|m| {
+            m.cell == cell
+                && m.roles.iter().any(|r| r == "compute")
+                && m.status == pb::member::Status::Ready as i32
+                && healthy(&m.node_id)
+        })
+        .min_by(|a, b| {
+            key(a)
+                .total_cmp(&key(b))
+                .then_with(|| a.node_id.cmp(&b.node_id))
+        })
 }
 
 #[cfg(test)]

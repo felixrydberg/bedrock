@@ -896,3 +896,99 @@ fn volume_ranges_merge_only_when_their_owners_generations_agree() {
     assert_eq!(merges(3), 1);
     assert_eq!(merges(5), 0, "v1 would forget its copy of the later range");
 }
+
+#[test]
+fn completeness_counts_only_connected_healthy_holders_up_to_the_cells_size() {
+    use bedrock_lib::placement::coverage::SPACE;
+    let member = |id: &str| pb::Member {
+        service: "quicksilver".into(),
+        datasets: vec!["quicksilver".into()],
+        roles: vec!["l2".into()],
+        ..ready(id)
+    };
+    let mut sick = member("sick");
+    sick.unhealthy = vec!["quicksilver".into()];
+    let gone = pb::Member {
+        status: pb::member::Status::Left as i32,
+        ..member("gone")
+    };
+    let elsewhere = pb::Member {
+        cell: "eu-1b".into(),
+        ..member("elsewhere")
+    };
+    let dropped = pb::Member {
+        datasets: Vec::new(),
+        ..member("dropped")
+    };
+    let local = members(&[
+        member("q1"),
+        sick.clone(),
+        gone.clone(),
+        elsewhere,
+        dropped.clone(),
+    ]);
+    // `b` is synced and lists q4, and `sick` as healthy: this relay's own observation wins. `c` is unreachable, so q5
+    // behind it counts as gone.
+    let remote = BTreeMap::from([
+        (
+            "b".to_owned(),
+            Some(members(&[member("q4"), member("sick")])),
+        ),
+        ("c".to_owned(), None),
+    ]);
+    let relays = relays();
+    let seen = Observed {
+        me: "a",
+        relays: &relays,
+        cell: "eu-1a",
+        local: &local,
+        remote: &remote,
+    };
+    let owner = |node: &str, state| Owner {
+        node: node.into(),
+        state,
+    };
+    const QUARTER: u64 = 1 << 62;
+    // Each range's only holder candidates are the ones under test.
+    let directory = Directory::from([
+        (0, vec![owner("q4", State::Leaving)]),
+        (
+            QUARTER,
+            vec![owner("sick", State::Ready), owner("q1", State::Populating)],
+        ),
+        (
+            2 * QUARTER,
+            vec![
+                owner("elsewhere", State::Ready),
+                owner("dropped", State::Ready),
+            ],
+        ),
+        (
+            3 * QUARTER,
+            vec![owner("gone", State::Ready), owner("q5", State::Ready)],
+        ),
+    ]);
+    let all = members(&[
+        member("q1"),
+        sick,
+        gone,
+        member("q4"),
+        member("q5"),
+        dropped,
+    ]);
+    let coverage = completeness(&seen, &all, "quicksilver", "quicksilver", &directory);
+    assert_eq!((coverage.complete, coverage.redundant), (SPACE / 4, 0));
+
+    // Two `l2` members get two owners per range; an `l1`-only member gets none and is not expected to hold.
+    let l1 = pb::Member {
+        roles: vec!["l1".into()],
+        ..member("l1-only")
+    };
+    let small = members(&[member("q1"), member("q4"), l1]);
+    let two = Directory::from([(
+        0,
+        vec![owner("q1", State::Ready), owner("q4", State::Ready)],
+    )]);
+    let coverage = completeness(&seen, &small, "quicksilver", "quicksilver", &two);
+    assert!(!coverage.degraded() && coverage.complete == SPACE);
+}

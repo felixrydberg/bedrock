@@ -52,7 +52,7 @@ B-11 adds an asynchronous, SlateDB-based atomic S3 persistence contract in `lib/
 Track O reuses it for one S3 database per `volume` range, shared by many actors (amended 2026-11-14): the range's
 maintainer flushes to it and other slots read it through B-39's `Reader`.
 Quicksilver, Auth, relay replay and CDN retention continue using the local `StorageEngine` and pushed replication.
-`full_replica` completeness and CDN phase 3/4 items remain later work. Sequence compression is out of scope.
+Cell relays report `full_replica` completeness (B-40); CDN phase 3/4 items remain later work. Sequence compression is out of scope.
 
 ### Code structure followed
 
