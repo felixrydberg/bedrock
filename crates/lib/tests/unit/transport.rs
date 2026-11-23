@@ -132,9 +132,12 @@ async fn a_cancelled_call_gives_back_its_probe() {
     assert_eq!(peers.health().state("a"), crate::health::State::Closed);
 }
 
-/// Answers `Get` after `min_revision` milliseconds.
+/// Answers `Get` after `min_revision` milliseconds; says when a call entered and records when one finished.
 #[cfg(not(madsim))]
-struct Slow;
+struct Slow {
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    finished: Arc<std::sync::atomic::AtomicBool>,
+}
 
 #[cfg(not(madsim))]
 #[tonic::async_trait]
@@ -143,8 +146,11 @@ impl crate::replication::pb::reads_server::Reads for Slow {
         &self,
         request: tonic::Request<crate::replication::pb::GetRequest>,
     ) -> Result<tonic::Response<crate::replication::pb::GetReply>, Status> {
+        let _ = self.entered.send(());
         let millis = request.into_inner().min_revision;
         tokio::time::sleep(Duration::from_millis(millis)).await;
+        self.finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(tonic::Response::new(crate::replication::pb::GetReply {
             revision: millis,
             value: None,
@@ -159,7 +165,8 @@ impl crate::replication::pb::reads_server::Reads for Slow {
     }
 }
 
-/// A listener serving [`Slow`] on a free local port, and a `Get` to it that takes `millis`, started once it listens.
+/// A listener serving [`Slow`] on a free local port, a `Get` to it that takes `millis`, and whether its handler finished.
+/// Returns once the handler has the call.
 #[cfg(not(madsim))]
 async fn slow_call(
     millis: u64,
@@ -167,24 +174,33 @@ async fn slow_call(
     Listener,
     std::net::SocketAddr,
     tokio::task::JoinHandle<Result<u64, Status>>,
+    Arc<std::sync::atomic::AtomicBool>,
 ) {
     let addr = {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         probe.local_addr().unwrap()
     };
+    let (entered, mut handling) = tokio::sync::mpsc::unbounded_channel();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let slow = Slow {
+        entered,
+        finished: finished.clone(),
+    };
     let mut listener = serve(
-        server(None).add_service(crate::replication::pb::reads_server::ReadsServer::new(Slow)),
+        server(None).add_service(crate::replication::pb::reads_server::ReadsServer::new(slow)),
         addr,
         None,
     );
     let call = tokio::spawn(async move {
+        let endpoint = Endpoint::from_shared(format!("http://{addr}")).unwrap();
+        let mut attempts = 0;
         let channel = loop {
-            if let Ok(channel) = Endpoint::from_shared(format!("http://{addr}"))
-                .unwrap()
-                .connect()
-                .await
-            {
-                break channel;
+            match endpoint.connect().await {
+                Ok(channel) => break channel,
+                Err(error) if attempts == 100 => {
+                    return Err(Status::unavailable(error.to_string()));
+                }
+                Err(_) => attempts += 1,
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
@@ -196,21 +212,24 @@ async fn slow_call(
             .await?;
         Ok(reply.into_inner().revision)
     });
-    // Serves until the call is in its handler.
     tokio::select! {
         served = &mut listener => panic!("the listener stopped: {served:?}"),
-        () = tokio::time::sleep(Duration::from_millis(300)) => {}
+        entered = handling.recv() => entered.expect("the call reached the handler"),
     }
-    (listener, addr, call)
+    (listener, addr, call, finished)
 }
 
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn close_lets_accepted_rpcs_finish_and_refuses_new_connections() {
-    let (listener, addr, call) = slow_call(700).await;
+    let (listener, addr, call, finished) = slow_call(700).await;
     let start = crate::monotonic_now();
     listener.close().await;
-    assert!(start.elapsed() < DRAIN, "closed after the RPC finished");
+    assert!(
+        finished.load(std::sync::atomic::Ordering::SeqCst),
+        "close waited for the accepted call's handler"
+    );
+    assert!(start.elapsed() < DRAIN, "closed once the RPC finished");
     assert_eq!(call.await.unwrap().unwrap(), 700);
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
 }
@@ -218,7 +237,7 @@ async fn close_lets_accepted_rpcs_finish_and_refuses_new_connections() {
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn close_cuts_off_rpcs_still_running_after_the_drain() {
-    let (listener, _, call) = slow_call(60_000).await;
+    let (listener, _, call, finished) = slow_call(60_000).await;
     let start = crate::monotonic_now();
     listener.close().await;
     let waited = start.elapsed();
@@ -226,6 +245,7 @@ async fn close_cuts_off_rpcs_still_running_after_the_drain() {
         waited >= DRAIN && waited < DRAIN + Duration::from_secs(2),
         "{waited:?}"
     );
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
     // The handler's task ends with the runtime; the caller's call has not succeeded.
     assert!(!call.is_finished() || call.await.unwrap().is_err());
 }

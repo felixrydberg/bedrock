@@ -170,6 +170,7 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
         } => Err(ConfigError("cell control authority stopped; relay must recover before rejoining".into())),
         result = &mut server => result.map_err(|error| ConfigError(format!("relay listen: {error}"))),
     };
+    admin.set_ready(false);
     server.close().await;
     for task in tasks {
         task.abort();
@@ -177,7 +178,6 @@ pub async fn run(config: RelayConfig) -> Result<(), ConfigError> {
     if let Some(task) = control_task {
         task.abort();
     }
-    admin.set_ready(false);
     tracing::info!("shutting down");
     result
 }
