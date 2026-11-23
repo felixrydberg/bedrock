@@ -13,12 +13,14 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bedrock_lib::datasets::capabilities::{VOLUME, pushed, ranged_datasets};
+use bedrock_lib::admin::Admin;
+use bedrock_lib::datasets::capabilities::{VOLUME, full_replica, pushed, ranged_datasets};
 use bedrock_lib::membership::{
     DATASET, Directories, Generations, Published, Publisher, RANGE, SERVICES, encode_generations,
     key, namespace,
 };
 use bedrock_lib::node::MembershipSettings;
+use bedrock_lib::placement::coverage::{self, Report};
 use bedrock_lib::placement::{Directory, Owner, State};
 use bedrock_lib::reconciliation::drain::{self, Drain};
 use bedrock_lib::relays::client::Session;
@@ -202,6 +204,54 @@ fn retain_readable(
         members.retain(|(service, _), _| readable.contains(service.as_str()));
     }
     absent.retain(|(service, _), _| readable.contains(service.as_str()));
+}
+
+/// The coverage of a `full_replica` dataset's directory (#87 / B-40). An owner holds a range only while it is connected
+/// to a cell relay (this one or a synced sibling), still carries the dataset and its storage for it is healthy, so a
+/// killed node is degraded at once, not after the grace period; members behind an unreachable sibling count as gone
+/// until they reconnect. Each member is judged by one observation, local first as in [`plan`]. Redundancy wants as many
+/// holders as placement can give each range: [`REPLICAS`], or fewer when fewer published members are `ready` `l2`
+/// members carrying the dataset. Unlike placement, an unhealthy member still counts there: it keeps its ranges, so the
+/// cell stays degraded until it recovers.
+pub fn completeness(
+    seen: &Observed,
+    actual: &Members,
+    service: &str,
+    dataset: &str,
+    directory: &Directory,
+) -> coverage::Coverage {
+    let carries = |m: &pb::Member| m.datasets.iter().any(|d| d == dataset);
+    let mut observed: BTreeMap<&str, &pb::Member> = BTreeMap::new();
+    for list in std::iter::once(seen.local).chain(seen.remote.values().flatten()) {
+        for member in list.values() {
+            if member.cell == seen.cell && member.service == service {
+                observed.entry(member.node_id.as_str()).or_insert(member);
+            }
+        }
+    }
+    // ponytail: B-62's per-range `damaged` spans would refine this; a partly quarantined dataset is already `unhealthy`,
+    // so until then such a member counts as holding none of its ranges.
+    let holders: BTreeSet<&str> = observed
+        .into_iter()
+        .filter(|(_, m)| {
+            m.status != pb::member::Status::Left as i32
+                && carries(m)
+                && !m.unhealthy.iter().any(|d| d == dataset)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    let placeable = actual
+        .iter()
+        .filter(|((s, _), m)| {
+            s == service
+                && m.status == pb::member::Status::Ready as i32
+                && m.roles.iter().any(|r| r == "l2")
+                && carries(m)
+        })
+        .count();
+    coverage::coverage(directory, REPLICAS.min(placeable), |node| {
+        holders.contains(node)
+    })
 }
 
 fn validated_revision(snapshot: Option<u64>, applied: Option<u64>, empty: bool) -> Option<u64> {
@@ -404,6 +454,7 @@ pub struct Cell {
     volume_replicas: usize,
     control: Arc<control::Control>,
     drain_hooks: BTreeMap<String, Vec<Arc<dyn drain::Hook>>>,
+    report: Report,
 }
 
 impl Cell {
@@ -411,6 +462,7 @@ impl Cell {
     /// relay's advertised address, as its siblings list it. The [`Publisher`] serves introspection.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
+        admin: &Admin,
         hub: Hub,
         peers: Arc<Peers>,
         siblings: Arc<Siblings>,
@@ -438,7 +490,9 @@ impl Cell {
             .chain(siblings.state().into_keys())
             .collect();
         let publisher = Arc::new(Publisher::new(published.clone()));
+        let report = Report::register(admin, &cell);
         let cell = Self {
+            report,
             publisher: publisher.clone(),
             published,
             hub,
@@ -477,6 +531,9 @@ impl Cell {
             if !session.ready() {
                 // Reconnects may pass unseen while the local view is recovering; restart grace conservatively.
                 absent.clear();
+                for (service, _) in published {
+                    self.unverified(service);
+                }
                 continue;
             }
             // Read each directory, its drains and its cursor from one applied snapshot.
@@ -497,12 +554,14 @@ impl Cell {
                     Ok(read) => read,
                     Err(error) => {
                         tracing::warn!(%error, service, "published service unreadable; not publishing it");
+                        self.unverified(service);
                         continue;
                     }
                 };
                 let applied = session.applied(DATASET, &namespace(service, &self.cell));
                 let empty = members.is_empty() && directory.is_empty() && records.is_empty();
                 let Some(revision) = validated_revision(revision, applied, empty) else {
+                    self.unverified(service);
                     continue;
                 };
                 based.insert((*service).to_owned(), revision);
@@ -535,6 +594,7 @@ impl Cell {
                 local: &local,
                 remote: &remote,
             };
+            self.report(&seen, &actual, &directories);
             self.publisher.set_majority(majority(&seen));
             // Every relay observes membership and pushes its committed view; only Raft's leader writes.
             let term = self.control.term();
@@ -637,6 +697,35 @@ impl Cell {
                 self.hub
                     .push_ranges(&(service.clone(), node.clone()), frame);
             }
+        }
+    }
+
+    /// Reports each `full_replica` dataset's completeness (#87 / B-40, [`completeness`]). Every relay reports from its
+    /// own view; none writes anything.
+    fn report(&self, seen: &Observed, actual: &Members, directories: &[(&str, DirectoryAt)]) {
+        for (service, published) in directories {
+            for dataset in ranged_datasets(service).filter(|d| full_replica(d)) {
+                let empty = Directory::new();
+                let directory = published.directories.get(dataset).unwrap_or(&empty);
+                self.report.set(
+                    dataset,
+                    completeness(seen, actual, service, dataset, directory),
+                );
+            }
+        }
+    }
+
+    /// Reports `service`'s `full_replica` datasets degraded with nothing confirmed held, while this relay cannot read a
+    /// validated view of them: a stale report would claim coverage nobody checked.
+    fn unverified(&self, service: &str) {
+        for dataset in ranged_datasets(service).filter(|d| full_replica(d)) {
+            self.report.set(
+                dataset,
+                coverage::Coverage {
+                    complete: 0,
+                    redundant: 0,
+                },
+            );
         }
     }
 
