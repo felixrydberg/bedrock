@@ -256,6 +256,50 @@ fn a_pending_alarm_change_does_not_suppress_the_committed_alarm() {
 }
 
 #[test]
+fn an_uncommitted_tail_keeps_the_hint_until_its_alarm_commits() {
+    let store = store();
+    let holder = host("a");
+    claimed(&store, &holder, 1);
+    // The alarm and its clear are both above the commit point.
+    let mut set = entry(1, 1, &[]);
+    set.alarm = Some(pb::Alarm { at_ms: Some(42) });
+    append(&store, &holder, 1, 0, vec![set], 0);
+    let mut clear = entry(2, 1, &[]);
+    clear.alarm = Some(pb::Alarm { at_ms: None });
+    append(&store, &holder, 1, 1, vec![clear.clone()], 0);
+
+    // Nothing is committed, so nothing is due, but the hint must stay for the alarm the tail may commit.
+    assert!(store.due_alarms(42).unwrap().is_empty());
+    assert!(!store.alarms.lock().unwrap().is_empty());
+
+    // The commit point reaches the alarm while the clear is still pending: still no alarm, but still wakeable.
+    append(&store, &holder, 1, 1, vec![clear], 1);
+    assert_eq!(
+        store.load(&actor()).unwrap().alarm_ms,
+        None,
+        "the pending clear is still the tail"
+    );
+    let due = store.due_alarms(42).unwrap();
+    assert_eq!((due.len(), due[0].at_ms), (1, 42));
+}
+
+#[test]
+fn an_uncommitted_delete_leaves_the_committed_alarm_wakeable() {
+    let store = store();
+    let holder = host("a");
+    claimed(&store, &holder, 1);
+    let mut event = entry(1, 1, &[]);
+    event.alarm = Some(pb::Alarm { at_ms: Some(42) });
+    append(&store, &holder, 1, 0, vec![event], 1);
+    // A `DELETE` above the commit point ends the claim but has not deleted the actor: its alarm still fires.
+    append(&store, &holder, 1, 1, vec![delete(2, 1)], 1);
+    let claim = store.load(&actor()).unwrap();
+    assert!(claim.deleting.is_some() && claim.deleted.is_none());
+    let due = store.due_alarms(42).unwrap();
+    assert_eq!((due.len(), due[0].at_ms, due[0].released), (1, 42, true));
+}
+
+#[test]
 fn due_alarm_scan_reports_corrupt_keys() {
     let store = store();
     let mut batch = WriteBatch::default();

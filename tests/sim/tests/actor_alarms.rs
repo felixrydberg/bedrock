@@ -104,6 +104,8 @@ impl Executor for Delayed {
 struct Alarm {
     storage: Storage,
     trace: Trace,
+    /// Every alarm time the holder dispatched, so a test can tell which Wake ran it.
+    times: Arc<Mutex<Vec<u64>>>,
     panic: Arc<AtomicBool>,
     omit_clear_once: bool,
     retry_after: Option<tokio::time::Instant>,
@@ -149,7 +151,8 @@ impl Instance for Alarm {
         }
         Ok(Vec::new())
     }
-    async fn alarm(&mut self, _: u64) -> Result<(), Error> {
+    async fn alarm(&mut self, at: u64) -> Result<(), Error> {
+        self.times.lock().unwrap().push(at);
         self.trace.lock().unwrap().push("attempt");
         if self.panic.swap(false, Ordering::SeqCst) {
             // madsim treats task panics as fatal seed failures; actor_routing kills a real Compute node instead.
@@ -256,13 +259,15 @@ async fn scenario() -> Vec<&'static str> {
     let (c, _, _, _) = volume(2).await;
     let admin = Admin::new();
     let trace: Trace = Arc::default();
+    let times: Arc<Mutex<Vec<u64>>> = Arc::default();
     let panic = Arc::new(AtomicBool::new(false));
     let handler: Handler = {
-        let (trace, panic) = (trace.clone(), panic.clone());
+        let (trace, times, panic) = (trace.clone(), times.clone(), panic.clone());
         Arc::new(move |_, storage| {
             Box::new(Alarm {
                 storage,
                 trace: trace.clone(),
+                times: times.clone(),
                 panic: panic.clone(),
                 omit_clear_once: false,
                 retry_after: None,
@@ -438,6 +443,17 @@ async fn scenario() -> Vec<&'static str> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(&trace.lock().unwrap()[8..], ["attempt", "commit"]);
+
+    // A committed alarm that is already due: a Wake naming another due time must not dispatch it. The holder timer may
+    // dispatch the committed alarm meanwhile, so this checks the time that was dispatched, not the trace.
+    let due = now_ms() - 1_000;
+    let stale = host.acquire(&actor('g')).await.unwrap();
+    stale.invoke(due.to_be_bytes().to_vec()).await.unwrap();
+    stale.alarm(due + 1).await.unwrap();
+    assert!(
+        !times.lock().unwrap().contains(&(due + 1)),
+        "a Wake with another due time dispatched the alarm"
+    );
     trace.lock().unwrap().clone()
 }
 

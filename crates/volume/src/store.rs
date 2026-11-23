@@ -1089,6 +1089,10 @@ impl Store {
     /// Released alarms use the durable time index. Held alarms are also scanned so a crashed holder's alarm can be
     /// delivered after its host lease expires; the caller checks that lease. These are hints, and never consume an
     /// alarm. Compute validates against recovered committed state under its input gate.
+    ///
+    /// Only an actor whose `DELETE` committed, or that moved to another DC, is skipped. An uncommitted `DELETE` is an
+    /// old epoch's tail: a wake may make the next claim truncate it, exactly as any other request would, so the actor
+    /// still serves and its committed alarm still fires.
     pub fn due_alarms(&self, now_ms: u64) -> Result<Vec<AlarmCandidate>, Error> {
         let bad_key = || {
             Error::Storage(StorageError::Corruption(ErrorContext {
@@ -1124,7 +1128,6 @@ impl Store {
             if claim.released
                 && claim.alarm_ms == Some(at_ms)
                 && claim.deleted.is_none()
-                && claim.deleting.is_none()
                 && claim.moved.is_none()
             {
                 due.push(AlarmCandidate {
@@ -1153,14 +1156,19 @@ impl Store {
             let claim = self.load(&actor)?;
             // A pending clear or reschedule above the commit point leaves the committed alarm wakeable.
             let alarm = self.committed_alarm(&actor, &claim)?;
-            if claim.released || alarm.is_none() {
+            if claim.released || (alarm.is_none() && end(&claim).seq <= claim.committed) {
                 self.alarms
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&prefix);
                 continue;
             }
-            if claim.deleted.is_some() || claim.deleting.is_some() || claim.moved.is_some() {
+            // An uncommitted tail may still commit an alarm, and the claim's own `alarm_ms` is that tail, so the hint
+            // would not come back on the commit: keep it until the tail commits or is truncated.
+            if alarm.is_none() {
+                continue;
+            }
+            if claim.deleted.is_some() || claim.moved.is_some() {
                 continue;
             }
             if let Some(at_ms) = alarm.filter(|at| *at <= now_ms) {
