@@ -157,26 +157,34 @@ async fn until(what: &str, within: Duration, done: impl Fn(Option<(f64, f64, boo
     }
 }
 
-/// One `quicksilver` write through the API, retried until it commits.
+/// One `quicksilver` write through the API, retried with the same idempotency key until it commits.
 async fn write(key: &str) {
+    let within = Duration::from_secs(60);
+    let deadline = bedrock_lib::monotonic_now() + within;
+    let idempotency = format!("full-replica-{key}");
     loop {
         let request = hyper::Request::put(format!("/v1/quicksilver/infrastructure/{key}"))
             .header("host", "api")
             .header("authorization", format!("Bearer {TOKEN}"))
-            .header("idempotency-key", format!("full-replica-{key}"))
+            .header("idempotency-key", &idempotency)
             .body(Full::new(Bytes::from(key.as_bytes().to_vec())))
             .unwrap();
-        if let Ok((status, _)) = bedrock_lib::http::send(
+        let last = match bedrock_lib::http::send(
             &format!("{API}:7002"),
             None,
             request,
             Duration::from_secs(5),
         )
         .await
-            && status.is_success()
         {
-            return;
-        }
+            Ok((status, _)) if status.is_success() => return,
+            Ok((status, _)) => format!("HTTP {status}"),
+            Err(error) => error,
+        };
+        assert!(
+            bedrock_lib::monotonic_now() < deadline,
+            "write {key} (idempotency key {idempotency}) within {within:?}; last {last}"
+        );
         sleep(Duration::from_millis(200)).await;
     }
 }
@@ -266,7 +274,7 @@ async fn check(handle: Handle, victim: madsim::task::NodeId) -> Vec<String> {
     until(
         "rebuilt on the other owners",
         GRACE + Duration::from_secs(120),
-        complete,
+        |r| complete(r) && bedrock_lib::monotonic_now() >= killed + GRACE,
     )
     .await;
     mark("rebuilt");

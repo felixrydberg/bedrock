@@ -207,10 +207,12 @@ fn retain_readable(
 }
 
 /// The coverage of a `full_replica` dataset's directory (#87 / B-40). An owner holds a range only while it is connected
-/// to a cell relay (this one or a synced sibling) and its storage for the dataset is healthy, so a killed node is
-/// degraded at once, not after the grace period; members behind an unreachable sibling count as gone until they
-/// reconnect. Redundancy wants as many holders as placement gives each range: [`REPLICAS`], or every published member
-/// carrying the dataset when there are fewer.
+/// to a cell relay (this one or a synced sibling), still carries the dataset and its storage for it is healthy, so a
+/// killed node is degraded at once, not after the grace period; members behind an unreachable sibling count as gone
+/// until they reconnect. Each member is judged by one observation, local first as in [`plan`]. Redundancy wants as many
+/// holders as placement can give each range: [`REPLICAS`], or fewer when fewer published members are `ready` `l2`
+/// members carrying the dataset. Unlike placement, an unhealthy member still counts there: it keeps its ranges, so the
+/// cell stays degraded until it recovers.
 pub fn completeness(
     seen: &Observed,
     actual: &Members,
@@ -218,24 +220,36 @@ pub fn completeness(
     dataset: &str,
     directory: &Directory,
 ) -> coverage::Coverage {
+    let carries = |m: &pb::Member| m.datasets.iter().any(|d| d == dataset);
+    let mut observed: BTreeMap<&str, &pb::Member> = BTreeMap::new();
+    for list in std::iter::once(seen.local).chain(seen.remote.values().flatten()) {
+        for member in list.values() {
+            if member.cell == seen.cell && member.service == service {
+                observed.entry(member.node_id.as_str()).or_insert(member);
+            }
+        }
+    }
     // ponytail: B-62's per-range `damaged` spans would refine this; a partly quarantined dataset is already `unhealthy`,
     // so until then such a member counts as holding none of its ranges.
-    let holders: BTreeSet<&str> = std::iter::once(seen.local)
-        .chain(seen.remote.values().flatten())
-        .flat_map(|list| list.values())
-        .filter(|m| {
-            m.cell == seen.cell
-                && m.service == service
-                && m.status != pb::member::Status::Left as i32
+    let holders: BTreeSet<&str> = observed
+        .into_iter()
+        .filter(|(_, m)| {
+            m.status != pb::member::Status::Left as i32
+                && carries(m)
                 && !m.unhealthy.iter().any(|d| d == dataset)
         })
-        .map(|m| m.node_id.as_str())
+        .map(|(id, _)| id)
         .collect();
-    let carrying = actual
+    let placeable = actual
         .iter()
-        .filter(|((s, _), m)| s == service && m.datasets.iter().any(|d| d == dataset))
+        .filter(|((s, _), m)| {
+            s == service
+                && m.status == pb::member::Status::Ready as i32
+                && m.roles.iter().any(|r| r == "l2")
+                && carries(m)
+        })
         .count();
-    coverage::coverage(directory, REPLICAS.min(carrying), |node| {
+    coverage::coverage(directory, REPLICAS.min(placeable), |node| {
         holders.contains(node)
     })
 }
