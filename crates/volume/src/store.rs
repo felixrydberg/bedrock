@@ -1067,9 +1067,28 @@ impl Store {
         }
     }
 
+    /// The alarm as of the slot's commit point. A pending tail's clear or reschedule takes effect only once it commits,
+    /// so until then the committed alarm is the one a Wake must match.
+    fn committed_alarm(
+        &self,
+        actor: &Actor,
+        claim: &pb::ClaimRecord,
+    ) -> Result<Option<u64>, Error> {
+        if end(claim).seq <= claim.committed {
+            return Ok(claim.alarm_ms);
+        }
+        let mut alarm = claim.flushed_alarm_ms;
+        for entry in self.entries(actor, claim.flushed + 1, claim.committed)? {
+            if let Some(at) = &entry.alarm {
+                alarm = at.at_ms;
+            }
+        }
+        Ok(alarm)
+    }
+
     /// Released alarms use the durable time index. Held alarms are also scanned so a crashed holder's alarm can be
-    /// delivered after its host lease expires; the caller checks that lease. These are hints, including an uncommitted
-    /// tail, and never consume an alarm. Compute validates against recovered committed state under its input gate.
+    /// delivered after its host lease expires; the caller checks that lease. These are hints, and never consume an
+    /// alarm. Compute validates against recovered committed state under its input gate.
     pub fn due_alarms(&self, now_ms: u64) -> Result<Vec<AlarmCandidate>, Error> {
         let bad_key = || {
             Error::Storage(StorageError::Corruption(ErrorContext {
@@ -1132,7 +1151,9 @@ impl Store {
             let actor = Actor::new(&wire)?;
             let _stripe = self.lock(&actor);
             let claim = self.load(&actor)?;
-            if claim.alarm_ms.is_none() || claim.released {
+            // A pending clear or reschedule above the commit point leaves the committed alarm wakeable.
+            let alarm = self.committed_alarm(&actor, &claim)?;
+            if claim.released || alarm.is_none() {
                 self.alarms
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -1142,7 +1163,7 @@ impl Store {
             if claim.deleted.is_some() || claim.deleting.is_some() || claim.moved.is_some() {
                 continue;
             }
-            if let Some(at_ms) = claim.alarm_ms.filter(|at| *at <= now_ms) {
+            if let Some(at_ms) = alarm.filter(|at| *at <= now_ms) {
                 due.push(AlarmCandidate {
                     actor: pb::Actor {
                         kind: claim.kind,
@@ -2135,11 +2156,17 @@ impl Store {
                 let claim =
                     pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?;
                 kind = claim.kind;
-                if claim.alarm_ms.is_some() && !claim.released {
-                    self.alarms
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(key[..at].to_vec());
+                // A pending tail may have hidden the committed alarm from the claim's own `alarm_ms`.
+                if !claim.released
+                    && let Some(parsed) = Actor::parse(&key[..at], kind)
+                {
+                    let actor = Actor::new(&parsed)?;
+                    if self.committed_alarm(&actor, &claim)?.is_some() {
+                        self.alarms
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(key[..at].to_vec());
+                    }
                 }
                 self.mark(&key[..at], &claim);
             } else if name.starts_with(b"data/") {

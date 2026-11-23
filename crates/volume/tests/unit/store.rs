@@ -220,6 +220,42 @@ fn due_alarms_include_held_claim_hints_without_changing_the_release_index() {
 }
 
 #[test]
+fn a_pending_alarm_change_does_not_suppress_the_committed_alarm() {
+    let store = store();
+    let holder = host("a");
+    claimed(&store, &holder, 1);
+    let mut event = entry(1, 1, &[]);
+    event.alarm = Some(pb::Alarm { at_ms: Some(42) });
+    assert_eq!(slot_end(&append(&store, &holder, 1, 0, vec![event], 1)), 1);
+
+    // A clear above the commit point has not taken effect yet.
+    let mut clear = entry(2, 1, &[]);
+    clear.alarm = Some(pb::Alarm { at_ms: None });
+    append(&store, &holder, 1, 1, vec![clear.clone()], 1);
+    let due = store.due_alarms(42).unwrap();
+    assert_eq!(
+        (due.len(), due[0].at_ms),
+        (1, 42),
+        "a pending clear hid the committed alarm"
+    );
+
+    // Neither has a reschedule into the future.
+    let mut later = entry(3, 1, &[]);
+    later.alarm = Some(pb::Alarm { at_ms: Some(100) });
+    append(&store, &holder, 1, 1, vec![later.clone()], 1);
+    let due = store.due_alarms(42).unwrap();
+    assert_eq!((due.len(), due[0].at_ms), (1, 42));
+
+    // Once the clear commits, the pending reschedule is not an alarm yet.
+    assert_eq!(slot_end(&append(&store, &holder, 1, 1, vec![clear], 2)), 3);
+    assert!(store.due_alarms(99).unwrap().is_empty());
+
+    // Committing the reschedule makes it the alarm.
+    append(&store, &holder, 1, 1, vec![later], 3);
+    assert_eq!(store.due_alarms(100).unwrap()[0].at_ms, 100);
+}
+
+#[test]
 fn due_alarm_scan_reports_corrupt_keys() {
     let store = store();
     let mut batch = WriteBatch::default();

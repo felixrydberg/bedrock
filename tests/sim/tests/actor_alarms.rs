@@ -326,7 +326,7 @@ async fn scenario() -> Vec<&'static str> {
     let at = now_ms() + 12_500;
     awake.invoke(at.to_be_bytes().to_vec()).await.unwrap();
     awake.alarm(at).await.unwrap(); // Future Wake does not run early.
-    awake.alarm(at - 1).await.unwrap(); // Stale Wake does not run.
+    awake.alarm(now_ms() - 1).await.unwrap(); // A due Wake that is not the committed alarm does not run.
     assert!(trace.lock().unwrap().is_empty());
     tokio::time::sleep(Duration::from_secs(12)).await;
     assert_eq!(
