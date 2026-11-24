@@ -1292,7 +1292,9 @@ impl Store {
             {
                 let claim =
                     pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?;
-                if claim.alarm_ms.is_some() && !claim.released {
+                if !claim.released
+                    && (claim.alarm_ms.is_some() || end(&claim).seq > claim.committed)
+                {
                     alarms.push(key[..at].to_vec());
                 }
             }

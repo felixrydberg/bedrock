@@ -387,6 +387,35 @@ fn a_pending_clear_keeps_a_released_alarm_indexed_until_commit_or_truncation() {
 }
 
 #[test]
+fn appending_a_held_alarm_tail_keeps_it_discoverable_until_the_clear_commits() {
+    for committed in 0..=2 {
+        let store = store();
+        let holder = host("a");
+        claimed(&store, &holder, 1);
+        let mut set = entry(1, 1, &[]);
+        set.alarm = Some(pb::Alarm { at_ms: Some(42) });
+        let mut clear = entry(2, 1, &[]);
+        clear.alarm = Some(pb::Alarm { at_ms: None });
+        append(&store, &holder, 1, 0, vec![set, clear.clone()], committed);
+        if committed == 2 {
+            assert!(store.alarms.lock().unwrap().is_empty());
+            assert!(store.due_alarms(42).unwrap().is_empty());
+            continue;
+        }
+        if committed == 0 {
+            assert!(store.due_alarms(42).unwrap().is_empty());
+            append(&store, &holder, 1, 1, vec![clear.clone()], 1);
+        }
+        let due = store.due_alarms(42).unwrap();
+        assert_eq!(due.len(), 1, "committed={committed}");
+        assert_eq!(due[0].at_ms, 42);
+        append(&store, &holder, 1, 1, vec![clear], 2);
+        assert!(store.due_alarms(42).unwrap().is_empty());
+        assert!(store.alarms.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn recovery_restores_a_pending_alarm_hint_before_any_alarm_has_committed() {
     let original = store();
     let holder = host("a");
