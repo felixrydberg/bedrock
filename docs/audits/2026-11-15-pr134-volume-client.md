@@ -10,7 +10,7 @@ base: 24581fc
 head: b9c95015
 audited: 2026-11-15
 kind: technical-decision audit — read-only, independent; not a code review, no verdict
-open: 6
+open: 5
 principles: ARCHITECTURAL-PRINCIPLES.md, still on its suggested defaults; P-* ids cited below
 not-verified: whether the madsim acceptance scenarios were run; whether the four "user decision 2026-11-15" calls were actually made; any deployment or traffic behaviour
 
@@ -85,7 +85,8 @@ settled-by: a test that reads concurrently with a commit and states what a calle
 question: until S-07 lands, is there any consumer of `Writer::read`, and if not should it refuse to answer above the commit point?
 
 ## F2 — Oversized replies are managed in the client, not the server
-status: open
+status: answered
+answer: 2026-11-24 — #126 / S-18 adds server byte bounds and matching 256 MiB transport limits. A real HTTP/2 check recovered two 209,709,211-byte entries across pages; the measured page was 209,709,276 bytes. Whole-actor recovery memory remains a separate limit. See [S-18 validation](../implementation-prototype/statefull/s18-validation.md).
 decision: C5
 defensible: keeps the freshly merged server untouched; splitting was CodeRabbit's own stated fallback.
 contestable: the sizing knowledge ends up on the wrong side — `MAX_ENTRY_BYTES = 3 MiB` exists only to stay under tonic's 4 MiB default, the recovery decode limit is ~192 MiB, and a split read is two snapshots, not one. Diverges from the pattern the server already uses for `Scan`, clamped to 1,000 keys (P-CPLX-2, P-PAT-1).

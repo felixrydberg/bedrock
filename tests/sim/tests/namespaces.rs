@@ -431,11 +431,24 @@ async fn scenario() -> Vec<String> {
             .await;
             sleep(PURGE_GRACE + Duration::from_secs(60)).await;
             let purge = format!("{legacy_path}/purge");
-            until("legacy purge", Duration::from_secs(60), 200, || {
-                call(kv_a, "POST", &purge, "")
-            })
+            // This fixture has no Compute/volume/Gateway: purge must preserve the directory until the actor's
+            // durable deletion succeeds. The complete actor lifecycle is exercised in kv_actor.rs.
+            until(
+                "purge needs the actor Gateway",
+                Duration::from_secs(60),
+                503,
+                || call(kv_a, "POST", &purge, ""),
+            )
             .await;
-            trace.push("legacy deletion purged".into());
+            assert!(
+                databases
+                    .namespaces()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|(dataset, _)| dataset != "kv")
+            );
+            trace.push("purge waits for actor deletion".into());
             let unknown = call(kv_a, "GET", &format!("{mine}/{}", "0".repeat(32)), "").await;
             assert_eq!(unknown.0, 404);
             // A wrong token never reaches the directory.

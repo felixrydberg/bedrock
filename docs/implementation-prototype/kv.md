@@ -1,5 +1,11 @@
 # Unified Distributed Metadata & KV Architecture
 
+> Customer-KV write/read storage below is superseded by decision 16 and
+> [stateful actors §8 KV](statefull/v2.md#8-execution-workers-and-products-on-actors) (#126 / S-18).
+> Each namespace now has a built-in Compute actor, acknowledged by its volume-slot SSD quorum; its bytes join volume
+> range databases. `bedrock-kv` serves the REST API and per-cell value caches, with misses routed through the Gateway
+> to that holder. It opens no S3 namespace reader. Quicksilver retains the shared pushed-data protocol described here.
+
 ## 1. Overview
 
 A globally distributed, S3-backed key-value platform inspired by Cloudflare Quicksilver v2.

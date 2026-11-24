@@ -167,7 +167,9 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let router = bedrock_lib::transport::server(tls.as_ref()).add_service(
-        bedrock_lib::volume::volume_server::VolumeServer::new(service),
+        bedrock_lib::volume::volume_server::VolumeServer::new(service)
+            .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES),
     );
     let mut serving = bedrock_lib::transport::serve(router, node.listen, tls);
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));

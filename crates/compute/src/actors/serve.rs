@@ -4,6 +4,8 @@
 use bedrock_lib::datasets::capabilities::GATEWAY;
 use bedrock_lib::transport::Caller;
 use bedrock_lib::volume as pb;
+use prost::Message;
+use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use super::host::ActorHost;
@@ -13,11 +15,62 @@ pub struct Actors {
     host: ActorHost,
     /// This host, as its claims name it.
     holder: pb::Holder,
+    kv: Option<Arc<bedrock_lib::client::Client>>,
 }
 
 impl Actors {
     pub fn new(host: ActorHost, holder: pb::Holder) -> Self {
-        Self { host, holder }
+        Self {
+            host,
+            holder,
+            kv: None,
+        }
+    }
+
+    /// Enables namespace administrative lifecycle admission against the authoritative directory.
+    pub fn with_kv(mut self, client: Arc<bedrock_lib::client::Client>) -> Self {
+        self.kv = Some(client);
+        self
+    }
+
+    async fn admit_purge(
+        &self,
+        actor: &pb::Actor,
+        request: &bedrock_lib::kv::Request,
+    ) -> Result<(), Status> {
+        use bedrock_lib::{actors, kv};
+        let client = self
+            .kv
+            .as_ref()
+            .ok_or_else(|| Status::unimplemented("KV lifecycle admission is not configured"))?;
+        if request.operation != Some(kv::request::Operation::Purge(true)) {
+            return Err(Status::invalid_argument("invalid purge request"));
+        }
+        let record = kv::record(client, &actor.namespace).await?;
+        if request.tenant != record.tenant {
+            return Err(Status::permission_denied(
+                "namespace belongs to another tenant",
+            ));
+        }
+        const GRACE_MS: u64 = 20 * 60 * 1000;
+        if record.state != kv::Lifecycle::Deleting as i32
+            || record.deleting_at == 0
+            || record.deleting_at.saturating_add(GRACE_MS) > super::storage::now_ms()
+        {
+            return Err(Status::failed_precondition(
+                "namespace purge grace has not elapsed",
+            ));
+        }
+        let (topology, _) = actors::Topology::read(client, &record.home_region, 0)
+            .await
+            .map_err(|e| Status::unavailable(e.to_string()))?;
+        let regions = std::collections::BTreeMap::from([(record.home_region.clone(), topology)]);
+        let canonical = kv::actor(&regions, &record.home_region, &record.id)
+            .map_err(|e| Status::data_loss(e.to_string()))?;
+        if *actor != canonical {
+            return Err(Status::permission_denied("noncanonical KV actor identity"));
+        }
+        Ok(())
     }
 }
 
@@ -52,6 +105,36 @@ impl pb::actors_server::Actors for Actors {
         let actor = request
             .actor
             .ok_or_else(|| Status::invalid_argument("missing actor"))?;
+        if actor.kind == bedrock_lib::actors::Kind::Kv as i32
+            && let Ok(kv) = bedrock_lib::kv::Request::decode(request.payload.as_slice())
+            && matches!(
+                kv.operation,
+                Some(bedrock_lib::kv::request::Operation::Purge(_))
+            )
+        {
+            if let Err(error) = self.admit_purge(&actor, &kv).await {
+                return Ok(Response::new(pb::InvokeReply {
+                    holder: Some(self.holder.clone()),
+                    code: error.code() as i32,
+                    message: error.message().into(),
+                    ..Default::default()
+                }));
+            }
+            let reply = match self.host.delete(&actor).await {
+                Ok(()) => pb::InvokeReply {
+                    holder: Some(self.holder.clone()),
+                    payload: bedrock_lib::kv::Reply::default().encode_to_vec(),
+                    ..Default::default()
+                },
+                Err(Error::Redirect(holder)) => pb::InvokeReply {
+                    holder: Some(holder),
+                    redirect: true,
+                    ..Default::default()
+                },
+                Err(error) => failed(&self.holder, error),
+            };
+            return Ok(Response::new(reply));
+        }
         let reply = match self.host.acquire(&actor).await {
             Ok(awake) => match awake.invoke(request.payload).await {
                 Ok(payload) => pb::InvokeReply {

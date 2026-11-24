@@ -39,6 +39,8 @@ use prost::Message;
 const STRIPES: u64 = 64;
 /// The most entries one `Scan` or `Repair` answer carries.
 pub const MAX_LIMIT: u32 = 1000;
+/// A response page fits one largest atomic entry plus its envelope, under the transport limit.
+pub const PAGE_BYTES: usize = bedrock_lib::kv::MAX_ENTRY_BYTES + (64 << 10);
 
 /// Log entries an actor may hold beyond its flushed point before its appends are refused (S-05 backpressure). It keeps
 /// one actor whose range database cannot flush from filling the node.
@@ -52,6 +54,8 @@ pub enum Error {
     Invalid(String),
     /// Too much is not yet flushed to S3; the holder retries later. Nothing was written.
     Backpressure,
+    /// A multi-key read must be split before it can fit in one response.
+    ReplyTooLarge,
     /// A range handoff sealed the actor's range here (S-06); its new owner serves it once ready.
     Sealed,
 }
@@ -997,40 +1001,64 @@ impl Store {
             .collect()
     }
 
-    /// What a flush of `actor` writes: its keys as of its commit point, or `None` when nothing committed is unflushed.
+    /// What a flush writes: a prefix of complete committed entries under `max_bytes` (one larger entry is atomic),
+    /// or `None` when nothing committed is unflushed.
     /// Keys come from the log, not the overlay, which may already hold a newer, uncommitted value.
-    pub fn pending(&self, actor: &Actor) -> Result<Option<Pending>, Error> {
+    pub fn pending(&self, actor: &Actor, max_bytes: u64) -> Result<Option<Pending>, Error> {
         let _lock = self.lock(actor);
         let claim = self.load(actor)?;
         if claim.committed <= claim.flushed {
             return Ok(None);
         }
-        let log = self.entries(actor, claim.flushed + 1, claim.committed)?;
         let mut changes = BTreeMap::new();
         let mut alarm = claim.flushed_alarm_ms;
-        for entry in &log {
-            for change in &entry.changes {
-                changes.insert(change.key.clone(), change.value.clone());
+        let mut through = claim.flushed;
+        let mut epoch = claim.flushed_epoch;
+        let mut moved = claim.moved;
+        let mut bytes = 0;
+        let mut limited = false;
+        let range = KeyRange::new(
+            log_key(actor, claim.flushed + 1),
+            log_key(actor, claim.committed + 1),
+        );
+        for item in self.engine.scan(&range)? {
+            let (_, raw) = item?;
+            let entry = pb::Entry::decode(raw.as_slice()).map_err(|e| corrupt("a log entry", e))?;
+            if entry.seq != through + 1 {
+                return Err(missing(through + 1));
             }
-            if let Some(at) = &entry.alarm {
+            let size = entry.encoded_len() as u64;
+            if through > claim.flushed && bytes + size > max_bytes {
+                limited = true;
+                break;
+            }
+            bytes += size;
+            through = entry.seq;
+            epoch = entry.epoch;
+            if entry.kind == EntryKind::Move as i32 {
+                moved.get_or_insert(pb::LogEnd {
+                    seq: through,
+                    epoch,
+                });
+            }
+            for change in entry.changes {
+                changes.insert(change.key, change.value);
+            }
+            if let Some(at) = entry.alarm {
                 alarm = at.at_ms;
             }
+        }
+        if !limited && through != claim.committed {
+            return Err(missing(through + 1));
         }
         Ok(Some(Pending {
             actor: Actor::parse(&actor.prefix, claim.kind)
                 .ok_or_else(|| Error::Invalid("an actor prefix does not parse".into()))?,
             flushed: claim.flushed,
-            through: claim.committed,
-            epoch: self.epoch_at(actor, &claim, claim.committed)?,
+            through,
+            epoch,
             alarm,
-            moved: claim.moved.or_else(|| {
-                log.iter()
-                    .find(|e| e.kind == EntryKind::Move as i32)
-                    .map(|e| pb::LogEnd {
-                        seq: e.seq,
-                        epoch: e.epoch,
-                    })
-            }),
+            moved,
             changes: changes.into_iter().collect(),
         }))
     }
@@ -1350,6 +1378,9 @@ impl Store {
         };
         let mut epoch = request.prev_epoch;
         for (i, entry) in request.entries.iter().enumerate() {
+            if entry.encoded_len() > bedrock_lib::kv::MAX_ENTRY_BYTES {
+                return invalid("entry exceeds the byte limit");
+            }
             if first.seq == 0 || entry.seq != first.seq + i as u64 {
                 return invalid("entries are consecutive from sequence 1 or later");
             }
@@ -1823,6 +1854,7 @@ impl Store {
         }
         let mut values = Vec::with_capacity(keys.len());
         let mut cold = Vec::new();
+        let mut bytes = 0;
         for key in keys {
             let value = match self.overlay(&data_key(actor, key))? {
                 Some(record) => record.value,
@@ -1832,10 +1864,15 @@ impl Store {
                     None
                 }
             };
-            values.push(pb::Value {
+            let value = pb::Value {
                 key: key.clone(),
                 value,
-            });
+            };
+            bytes += value.encoded_len() + 10;
+            if bytes > PAGE_BYTES {
+                return Err(Error::ReplyTooLarge);
+            }
+            values.push(value);
         }
         Ok((answer(Refusal::None, &claim, voting), values, cold))
     }
@@ -1867,6 +1904,7 @@ impl Store {
             end: KeyRange::prefix(prefix.clone()).end,
         };
         let mut values = Vec::new();
+        let mut page_bytes = 0;
         for item in self.engine.scan(&range)? {
             let (key, bytes) = item?;
             let record = pb::OverlayRecord::decode(bytes.as_slice())
@@ -1874,13 +1912,16 @@ impl Store {
             if record.value.is_none() && !cold {
                 continue;
             }
-            if values.len() == limit {
-                return Ok((answer(Refusal::None, &claim, voting), values, true));
-            }
-            values.push(pb::Value {
+            let value = pb::Value {
                 key: key[prefix.len()..].to_vec(),
                 value: record.value,
-            });
+            };
+            let size = value.encoded_len() + 10;
+            if values.len() == limit || (!values.is_empty() && page_bytes + size > PAGE_BYTES) {
+                return Ok((answer(Refusal::None, &claim, voting), values, true));
+            }
+            page_bytes += size;
+            values.push(value);
         }
         Ok((answer(Refusal::None, &claim, voting), values, false))
     }
@@ -1911,12 +1952,19 @@ impl Store {
         let from = from.max(claim.flushed + 1);
         let end = end(&claim).seq;
         let through = end.min(from.saturating_add(u64::from(limit.clamp(1, MAX_LIMIT)) - 1));
-        let entries = self.entries(actor, from, through)?;
-        Ok((
-            answer(Refusal::None, &claim, voting),
-            entries,
-            through < end,
-        ))
+        let mut entries = Vec::new();
+        let mut bytes = 0;
+        for seq in from..=through {
+            let entry = self.entry(actor, seq)?;
+            let size = entry.encoded_len() + 10;
+            if !entries.is_empty() && bytes + size > PAGE_BYTES {
+                break;
+            }
+            bytes += size;
+            entries.push(entry);
+        }
+        let last = from + entries.len() as u64 - 1;
+        Ok((answer(Refusal::None, &claim, voting), entries, last < end))
     }
 
     /// Up to `limit` raw records of `[start, end)` after `after`, for a peer's repair copy (S-06), and whether more
@@ -1943,12 +1991,16 @@ impl Store {
         };
         let limit = limit.clamp(1, MAX_LIMIT) as usize;
         let mut records = Vec::new();
+        let mut bytes = 0;
         for item in self.engine.scan(&range)? {
             let (key, value) = item?;
-            if records.len() == limit {
+            let record = pb::Record { key, value };
+            let size = record.encoded_len() + 10;
+            if records.len() == limit || (!records.is_empty() && bytes + size > PAGE_BYTES) {
                 return Ok((records, true));
             }
-            records.push(pb::Record { key, value });
+            bytes += size;
+            records.push(record);
         }
         Ok((records, false))
     }

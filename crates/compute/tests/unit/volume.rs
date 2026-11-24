@@ -139,6 +139,19 @@ fn committed_entries_kept_for_a_lagging_slot_stay_within_the_byte_budget() {
 }
 
 #[test]
+fn the_largest_committed_entry_stays_available_to_announce_its_commit() {
+    let mut state = state(1, RETAIN_BYTES + 1);
+    state.ack(0, 1, true, 0);
+    state.ack(1, 1, true, 0);
+    assert_eq!(state.commit, 1);
+    assert!(
+        state.entry(1).is_some(),
+        "an idle commit-only append must still name entry 1"
+    );
+    assert_eq!(state.base, 0);
+}
+
+#[test]
 fn a_join_guard_leaves_the_heartbeat_set_when_dropped() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

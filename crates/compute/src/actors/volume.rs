@@ -49,29 +49,26 @@ pub const HEARTBEAT: Duration = Duration::from_secs(1);
 /// A writer stops serving once fewer than two slots acknowledged a heartbeat sent within this; slots wait 5 s.
 pub const FENCE: Duration = Duration::from_secs(4);
 /// Uncommitted entries a writer keeps in flight.
-// ponytail: fixed window; tune entries and bytes with S-18's measurements (§12.6).
 pub const WINDOW_ENTRIES: u64 = 128;
 /// Encoded bytes of uncommitted entries in flight.
-pub const WINDOW_BYTES: usize = 8 << 20;
-/// The largest entry a writer admits, and the most one append carries: below the 4 MiB default decode limit of the
-/// volume server, with room for the request's other fields.
-pub const MAX_ENTRY_BYTES: usize = 3 << 20;
+pub const WINDOW_BYTES: usize = bedrock_lib::kv::MAX_MESSAGE_BYTES;
+/// Current values plus the original retained event of a 100 MiB atomic KV bulk, including envelopes.
+pub const MAX_ENTRY_BYTES: usize = bedrock_lib::kv::MAX_ENTRY_BYTES;
 /// Pages one SQLite read miss fetches, aligned (user decision 2026-11-15).
 pub const CHUNK_PAGES: u32 = 64;
 const CALL: Duration = Duration::from_secs(2);
 const RETRY: Duration = Duration::from_millis(100);
 /// Committed entries, and their encoded bytes, kept for a lagging slot. A slot further behind waits for S-06's repair.
-// ponytail: a slot down for good pins at most this much; S-05's truncation bounds what a slot needs.
+// The latest committed entry stays even when larger, so an idle slot can learn its commit point.
 const RETAIN: u64 = 4096;
 const RETAIN_BYTES: usize = 64 << 20;
 /// Reserve and claim rounds before [`Writer::open`] gives up.
 const ATTEMPTS: usize = 8;
-/// Log entries per recovery page. `Store::log` bounds a page by entries only, so the client's decode limit covers a
-/// page of the largest entries.
+/// Log entries per recovery page; the server also bounds pages by encoded bytes (#126 / S-18).
 const LOG_PAGE: u32 = 64;
 /// The most keys one `Scan` answer carries (`Store::scan` clamps to it).
 const SCAN_LIMIT: u32 = 1000;
-const LOG_PAGE_BYTES: usize = LOG_PAGE as usize * (MAX_ENTRY_BYTES + 1024) + (64 << 10);
+const LOG_PAGE_BYTES: usize = bedrock_lib::kv::MAX_MESSAGE_BYTES;
 const VOLUME: &str = bedrock_lib::datasets::capabilities::VOLUME;
 
 #[derive(Debug)]
@@ -179,7 +176,9 @@ where
             &slot.address,
             Class::Control,
             CALL,
-            f(VolumeClient::new(channel)),
+            f(VolumeClient::new(channel)
+                .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)),
         )
         .await?;
     Ok(reply.into_inner())
@@ -214,7 +213,7 @@ where
 
 /// The reply exceeded the client's decode limit.
 fn too_large(status: &Status) -> bool {
-    status.code() == Code::OutOfRange
+    matches!(status.code(), Code::OutOfRange | Code::ResourceExhausted)
 }
 
 /// Why the slot refused, `Some(Refusal::None)` for an acceptance. A code this client does not know (a newer slot) is
@@ -451,7 +450,9 @@ impl State {
             .commit
             .min(slowest.saturating_sub(1))
             .max(self.commit.saturating_sub(RETAIN));
-        while self.base < self.commit && (self.base < floor || self.retained > RETAIN_BYTES) {
+        while self.base < self.commit
+            && (self.base < floor || (self.retained > RETAIN_BYTES && self.base + 1 < self.commit))
+        {
             let entry = self
                 .log
                 .pop_front()

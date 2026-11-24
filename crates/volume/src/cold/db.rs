@@ -21,6 +21,31 @@ pub trait Database: Send + Sync {
     async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
     /// Up to `limit` entries of `[start, end)`, in key order.
     async fn scan(&self, start: &[u8], end: &[u8], limit: usize) -> StorageResult<Vec<Entry>>;
+    /// A bounded read-response page, unlike the complete scans used for internal state transitions.
+    async fn page(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        limit: usize,
+    ) -> StorageResult<(Vec<Entry>, bool)> {
+        let mut from = start.to_vec();
+        let mut entries = Vec::new();
+        let mut bytes = 0;
+        loop {
+            let Some(entry) = self.scan(&from, end, 1).await?.pop() else {
+                return Ok((entries, false));
+            };
+            let size = entry.0.len() + entry.1.len() + 32;
+            if entries.len() == limit
+                || (!entries.is_empty() && bytes + size > crate::store::PAGE_BYTES)
+            {
+                return Ok((entries, true));
+            }
+            from = [entry.0.as_slice(), &[0]].concat();
+            bytes += size;
+            entries.push(entry);
+        }
+    }
     /// Closes the handle. Closing never deletes database data.
     async fn close(&self) -> StorageResult<()>;
 }
@@ -216,6 +241,26 @@ mod slate {
         Ok(entries)
     }
 
+    async fn collect_page(
+        name: &str,
+        mut iter: slatedb::DbIterator,
+        limit: usize,
+    ) -> StorageResult<(Vec<Entry>, bool)> {
+        let mut entries = Vec::new();
+        let mut bytes = 0;
+        while let Some(entry) = iter.next().await.map_err(|e| error(name, "scan", e))? {
+            let size = entry.key.len() + entry.value.len() + 32;
+            if entries.len() == limit
+                || (!entries.is_empty() && bytes + size > crate::store::PAGE_BYTES)
+            {
+                return Ok((entries, true));
+            }
+            bytes += size;
+            entries.push((entry.key.to_vec(), entry.value.to_vec()));
+        }
+        Ok((entries, false))
+    }
+
     struct SlateWriter {
         db: Db,
         name: String,
@@ -228,6 +273,19 @@ mod slate {
 
     #[async_trait]
     impl Database for SlateWriter {
+        async fn page(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: usize,
+        ) -> StorageResult<(Vec<Entry>, bool)> {
+            let iter = self
+                .db
+                .scan(start.to_vec()..end.to_vec())
+                .await
+                .map_err(|e| error(&self.name, "scan", e))?;
+            collect_page(&self.name, iter, limit).await
+        }
         async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
             let value = self.db.get(key).await;
             Ok(value
@@ -291,6 +349,19 @@ mod slate {
 
     #[async_trait]
     impl Database for SlateReader {
+        async fn page(
+            &self,
+            start: &[u8],
+            end: &[u8],
+            limit: usize,
+        ) -> StorageResult<(Vec<Entry>, bool)> {
+            let iter = self
+                .reader
+                .scan(start.to_vec()..end.to_vec())
+                .await
+                .map_err(|e| error(&self.name, "reader scan", e))?;
+            collect_page(&self.name, iter, limit).await
+        }
         async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
             let value = self.reader.get(key).await;
             Ok(value

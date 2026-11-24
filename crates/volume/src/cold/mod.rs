@@ -708,7 +708,7 @@ impl Cold {
             let store = self.store.clone();
             let pending = {
                 let parsed = Actor::new(&actor).map_err(status)?;
-                crate::serve::blocking(move || store.pending(&parsed))
+                crate::serve::blocking(move || store.pending(&parsed, FLUSH_BYTES))
                     .await?
                     .map_err(status)?
             };
@@ -1086,12 +1086,17 @@ impl Cold {
         let (first, name, db) = self.holding(cell, actor, &parsed, flushed).await?;
         let read = async {
             let mut values = Vec::with_capacity(keys.len());
+            let mut bytes = 0;
             for key in keys {
-                values.push(
-                    db.get(&data_key(parsed.name(), key))
-                        .await
-                        .map_err(storage)?,
-                );
+                let value = db
+                    .get(&data_key(parsed.name(), key))
+                    .await
+                    .map_err(storage)?;
+                bytes += key.len() + value.as_ref().map_or(0, Vec::len) + 32;
+                if bytes > crate::store::PAGE_BYTES {
+                    return Err(Status::out_of_range("read response exceeds the byte limit"));
+                }
+                values.push(value);
             }
             Ok(values)
         };
@@ -1118,11 +1123,10 @@ impl Cold {
             let end = KeyRange::prefix(prefix.clone())
                 .end
                 .expect("an actor prefix ends in NUL, so it has an end");
-            let page = db
-                .scan(&data_key(parsed.name(), start), &end, limit + 1)
+            let (page, more) = db
+                .page(&data_key(parsed.name(), start), &end, limit)
                 .await
                 .map_err(storage)?;
-            let more = page.len() > limit;
             Ok((
                 page.into_iter()
                     .take(limit)

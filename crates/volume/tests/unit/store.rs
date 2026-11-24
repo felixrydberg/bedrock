@@ -1137,7 +1137,7 @@ fn a_truncated_move_stays_known_and_ends_the_claim() {
     assert_eq!(slot(&answer).moved, None, "not truncated yet");
     let first = Some(pb::LogEnd { seq: 2, epoch: 1 });
     assert_eq!(
-        store.pending(&actor()).unwrap().unwrap().moved,
+        store.pending(&actor(), u64::MAX).unwrap().unwrap().moved,
         first,
         "a flush carries the MOVE to S3"
     );
@@ -1159,6 +1159,37 @@ fn a_truncated_move_stays_known_and_ends_the_claim() {
         first,
         "the first MOVE stays the import point"
     );
+}
+
+#[test]
+fn flush_budget_selects_complete_entries_and_only_their_alarm_and_move() {
+    let store = store();
+    let holder = host("a");
+    claimed(&store, &holder, 1);
+    let first = entry(1, 1, &[("a", Some("one")), ("b", Some("two"))]);
+    let mut second = entry(2, 1, &[]);
+    second.kind = EntryKind::Move as i32;
+    second.alarm = Some(pb::Alarm { at_ms: Some(123) });
+    append(&store, &holder, 1, 0, vec![first, second], 2);
+    let pending = store.pending(&actor(), 1).unwrap().unwrap();
+    assert_eq!(
+        pending.through, 1,
+        "one atomic entry may exceed the byte budget"
+    );
+    assert_eq!(
+        pending.changes,
+        vec![
+            (b"a".to_vec(), Some(b"one".to_vec())),
+            (b"b".to_vec(), Some(b"two".to_vec()))
+        ]
+    );
+    assert_eq!(pending.alarm, None);
+    assert_eq!(pending.moved, None);
+    store.truncate(&actor(), 1).unwrap();
+    let remaining = store.pending(&actor(), 1).unwrap().unwrap();
+    assert_eq!(remaining.through, 2);
+    assert_eq!(remaining.alarm, Some(123));
+    assert_eq!(remaining.moved, Some(pb::LogEnd { seq: 2, epoch: 1 }));
 }
 
 /// S-17: an import starts the actor at the given point on a slot that holds nothing of it, is idempotent, and is
@@ -1328,7 +1359,7 @@ fn a_committed_delete_leaves_only_a_tombstone_that_refuses_everything() {
     );
     assert_eq!(store.unflushed(), 0);
     assert!(store.dirty(0, 0).is_empty());
-    assert_eq!(store.pending(&actor()).unwrap(), None);
+    assert_eq!(store.pending(&actor(), u64::MAX).unwrap(), None);
     assert_buried(&store, &a);
     // A restart finds no flush work in a tombstone.
     let engine = store.engine.clone();

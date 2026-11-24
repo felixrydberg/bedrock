@@ -1425,6 +1425,50 @@ mod slate {
         std::array::from_fn(|k| after[k] - before[k])
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_maximum_kv_value_survives_flush_truncation_and_cold_page_reads() {
+        use bedrock_lib::kv;
+        use prost::Message;
+        let objects = Arc::new(Counting::default());
+        let n = slate_node(&objects, "n1");
+        claim(&n.store, 0);
+        let key = b"d/large".to_vec();
+        let stored = kv::Stored {
+            value: vec![0x5a; kv::MAX_VALUE],
+            metadata: Some("{\"large\":true}".into()),
+            expiration: 0,
+        };
+        let bytes = stored.encode_to_vec();
+        append(
+            &n.store,
+            0,
+            0,
+            vec![pb::Entry {
+                seq: 1,
+                epoch: 1,
+                committed_at: 1234,
+                changes: vec![pb::Change {
+                    key: key.clone(),
+                    value: Some(bytes),
+                }],
+                ..Default::default()
+            }],
+            1,
+        )
+        .unwrap();
+        n.cold.tick(&n.directory).await;
+        assert_eq!(flushed(&n.store, 0), 1);
+        let keys = vec![key.clone()];
+        let values = n.cold.get("cell-1", &actor(0), 1, &keys).await.unwrap();
+        let restored = kv::Stored::decode(values[0].as_deref().unwrap()).unwrap();
+        assert_eq!(restored, stored);
+        let (page, more) = n.cold.scan("cell-1", &actor(0), 1, b"d/", 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, key);
+        assert_eq!(kv::Stored::decode(page[0].1.as_slice()).unwrap(), stored);
+        assert!(!more);
+    }
+
     /// On SlateDB, a split and a merge by clone copy no object and keep every actor readable at its flushed sequence,
     /// through the maintainer and through another node's readers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -138,6 +138,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 pub(crate) fn status(error: store::Error) -> Status {
     match error {
         store::Error::Invalid(detail) => Status::invalid_argument(detail),
+        store::Error::ReplyTooLarge => Status::out_of_range("read response exceeds the byte limit"),
         store::Error::Backpressure => {
             Status::resource_exhausted("too much is not yet flushed to S3; retry later")
         }

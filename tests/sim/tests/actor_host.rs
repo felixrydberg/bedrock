@@ -149,10 +149,10 @@ impl Rows {
 impl Instance for Rows {
     async fn invoke(&mut self, request: Vec<u8>) -> Result<Vec<u8>, Error> {
         let count = if request == b"big" {
-            let big = vec![1; 4 << 20];
+            let big = vec![1; volume::MAX_ENTRY_BYTES + 1];
             match self.count(Some(&big)).await {
                 Err(volume::Error::TooLarge(_)) => {}
-                other => panic!("a 4 MiB transaction: {:?}", other.map(|r| r.ok())),
+                other => panic!("an oversized transaction: {:?}", other.map(|r| r.ok())),
             }
             self.count(None).await?
         } else {

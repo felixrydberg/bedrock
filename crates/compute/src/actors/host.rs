@@ -162,6 +162,35 @@ impl ActorHost {
         result
     }
 
+    /// Administrative deletion shares the wake lock and input gate with normal events.
+    pub async fn delete(&self, actor: &pb::Actor) -> Result<(), Error> {
+        let key = (actor.namespace.clone(), actor.id.clone());
+        let cell = self.0.lock().entry(key.clone()).or_default().clone();
+        let result = {
+            let mut current = cell.lock().await;
+            if let Some(awake) = current.take()
+                && let Some(storage) = awake.stop().await
+            {
+                release(storage).await;
+            }
+            match self.0.placement.slots(actor).await {
+                Ok((slots, version)) => Writer::delete(
+                    self.0.volume.clone(),
+                    actor.clone(),
+                    slots,
+                    version,
+                    super::storage::now_ms(),
+                )
+                .await
+                .map_err(Error::from),
+                Err(error) => Err(error),
+            }
+        };
+        drop(cell);
+        self.0.forget(&key);
+        result
+    }
+
     /// How many actors are awake here.
     pub async fn awake(&self) -> usize {
         let cells: Vec<Cell> = self.0.lock().values().cloned().collect();

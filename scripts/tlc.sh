@@ -39,6 +39,34 @@ materialized crash OrderedPositions
 materialized cleanup YoungEventsSurvive
 materialized retry RetryProtection
 materialized event PendingRetained
+kv_actor bulk AtomicBuffered
+kv_actor torn AtomicCommitted
+kv_actor ack NoLostAck
+kv_actor claim AtomicCommitted
+kv_actor bytes ExactQuota
+kv_actor quota ExactQuota
+kv_actor retry-drop RetryProtection
+kv_actor retry-expiry AtomicCommitted
+kv_actor retry-result RetryOriginalResult
+kv_actor events YoungEventsSurvive
+kv_actor cache-regress CacheMonotonic
+kv_actor cache-ttl CacheLifetime
+kv_actor minimum ReadMinimum
+kv_actor expired ReadVisibility
+kv_actor-local bulk AtomicBuffered
+kv_actor-local torn AtomicCommitted
+kv_actor-local ack NoLostAck
+kv_actor-local claim AtomicCommitted
+kv_actor-local bytes ExactQuota
+kv_actor-local quota ExactQuota
+kv_actor-local retry-drop RetryProtection
+kv_actor-local retry-expiry AtomicCommitted
+kv_actor-local retry-result RetryOriginalResult
+kv_actor-local events YoungEventsSurvive
+kv_actor-local cache-regress CacheMonotonic
+kv_actor-local cache-ttl CacheLifetime
+kv_actor-local minimum ReadMinimum
+kv_actor-local expired ReadVisibility
 publisher unconditional NoLostUpdate
 publisher unconditional NoRegression
 publisher ahead ViewsLag
@@ -156,7 +184,7 @@ bug() {
     fi
 }
 
-models="relays cells follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
+models="relays cells follows merge materialized kv_actor kv_actor-local publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

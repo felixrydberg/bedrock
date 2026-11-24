@@ -9,9 +9,8 @@
 //! - **Commits.** Each committed transaction becomes one entry of its written pages (and size), and [`Storage::sql`]
 //!   returns only once that entry has its quorum. Every commit returns only after its quorum, so a response that waits
 //!   for its storage calls never precedes durability (the output gate). One entry holds at most
-//!   [`super::volume::MAX_ENTRY_BYTES`], about 750 pages per transaction.
-// ponytail: each storage call awaits its own quorum, one at a time; pipeline commits behind the output gate if
-// per-event latency matters (S-10, S-18 measurements).
+//!   [`super::volume::MAX_ENTRY_BYTES`], including the change envelopes.
+// Each event commits its complete KV batch in one call; customer execution may pipeline calls in S-10 if measured.
 //! - **Pending pages.** A transaction's pages enter the cache before their entry commits. A commit that fails drops the
 //!   database (cache and connection). A commit whose caller is cancelled may still commit later, so it fences the
 //!   storage instead: every later call fails and the actor host claims the actor again, recovering from the slots.
@@ -95,11 +94,26 @@ impl Storage {
     /// Commits `changes` as one entry; returns its sequence once two voting slots hold it.
     /// If the caller is cancelled before the answer, the storage fences: the entry may still commit.
     pub async fn commit(&self, changes: Vec<pb::Change>) -> Result<u64, Error> {
+        self.commit_at(changes, now_ms()).await
+    }
+
+    /// A built-in event's timestamp is sampled once and preserved in both the log and its stored records.
+    pub async fn commit_at(
+        &self,
+        changes: Vec<pb::Change>,
+        committed_at: u64,
+    ) -> Result<u64, Error> {
         self.check()?;
         let barrier = Barrier(&self.0.fenced);
-        let committed = self.0.writer.commit(changes, None, now_ms()).await;
+        let committed = self.0.writer.commit(changes, None, committed_at).await;
         std::mem::forget(barrier);
         committed
+    }
+
+    /// Up to `limit` values starting at `start`, in key order, at least at this writer's commit point.
+    pub async fn scan(&self, start: Vec<u8>, limit: u32) -> Result<(Vec<pb::Value>, bool), Error> {
+        self.check()?;
+        self.0.writer.scan(start, limit).await
     }
 
     /// Runs `f` in a SQLite transaction and commits what it wrote as one entry; returns once that entry has its
@@ -193,13 +207,7 @@ fn run<R>(
     Ok(result)
 }
 
-/// Wall-clock milliseconds for an entry's `committed_at`. madsim simulates the system clock.
-#[allow(clippy::disallowed_methods)]
-pub(crate) fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
+pub(crate) use bedrock_lib::wall_ms as now_ms;
 
 /// One actor's SQLite file and its connection, opened on first use and again after a miss.
 struct Db {
