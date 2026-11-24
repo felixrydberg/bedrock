@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -161,13 +161,20 @@ impl ActorHost {
                         }
                         let woken = host.0.wake(&actor).await;
                         if let Ok(woken) = &woken {
-                            *awake = Some(woken.clone());
                             let cleanup = woken.storage().expect("a newly woken actor has storage");
+                            let timer = AlarmTimer(tokio::spawn(alarms(
+                                Arc::downgrade(&host.0),
+                                woken.clone(),
+                            )));
+                            // Register before publishing: an expired Acquire can stop a hung alarm under the wake lock.
+                            assert!(woken.timer.set(timer.0.abort_handle()).is_ok());
+                            *awake = Some(woken.clone());
                             tokio::spawn(watch(
                                 Arc::downgrade(&host.0),
                                 key.clone(),
                                 woken.clone(),
                                 cleanup,
+                                timer,
                             ));
                         }
                         drop(awake);
@@ -248,6 +255,7 @@ impl Inner {
             instance: tokio::sync::Mutex::new(Some(instance)),
             last: Mutex::new(bedrock_lib::monotonic_now()),
             busy: AtomicUsize::new(0),
+            timer: OnceLock::new(),
         }))
     }
 
@@ -270,9 +278,14 @@ async fn release(storage: Storage) {
 }
 
 /// Sleeps `awake` once idle, and drops it once its holder stops serving.
-async fn watch(host: Weak<Inner>, key: Key, awake: Arc<Awake>, storage: Storage) {
+async fn watch(
+    host: Weak<Inner>,
+    key: Key,
+    awake: Arc<Awake>,
+    storage: Storage,
+    timer: AlarmTimer,
+) {
     // Keep cleanup ownership even if a cancelled or panicked event removes Awake's storage.
-    let timer = AlarmTimer(tokio::spawn(alarms(host.clone(), awake.clone())));
     loop {
         sleep(HEARTBEAT).await;
         let Some(host) = host.upgrade() else {
@@ -369,6 +382,7 @@ pub struct Awake {
     instance: tokio::sync::Mutex<Option<Box<dyn Instance>>>,
     last: Mutex<Instant>,
     busy: AtomicUsize,
+    timer: OnceLock<tokio::task::AbortHandle>,
 }
 
 impl Awake {
@@ -451,22 +465,28 @@ impl Awake {
                 other => other,
             }
         };
+        busy.armed = false;
+        drop(busy);
         if matches!(result, Err(Error::Volume(_))) {
             self.stop().await;
         }
-        busy.armed = false;
-        drop(busy);
         result
     }
 
     /// Drops the instance and returns the storage, once no event runs.
     async fn stop(&self) -> Option<Storage> {
-        let instance = self.instance.lock().await.take();
-        drop(instance);
-        self.storage
+        // Stop serving before cancellation: a timer finishing its own failed event may abort itself at the gate.
+        let storage = self
+            .storage
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
+            .take();
+        if let Some(timer) = self.timer.get() {
+            timer.abort();
+        }
+        let instance = self.instance.lock().await.take();
+        drop(instance);
+        storage
     }
 }
 

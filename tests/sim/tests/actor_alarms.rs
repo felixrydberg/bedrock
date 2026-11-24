@@ -333,13 +333,18 @@ async fn scenario() -> Vec<&'static str> {
     awake.alarm(at).await.unwrap(); // Future Wake does not run early.
     awake.alarm(now_ms() - 1).await.unwrap(); // A due Wake that is not the committed alarm does not run.
     assert!(trace.lock().unwrap().is_empty());
-    tokio::time::sleep(Duration::from_secs(12)).await;
+    let sleep_deadline = bedrock_lib::monotonic_now() + Duration::from_secs(12);
+    while host.awake().await != 0 && bedrock_lib::monotonic_now() < sleep_deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_eq!(
         host.awake().await,
         0,
         "pending future alarm kept actor in memory"
     );
-    let until = bedrock_lib::monotonic_now() + Duration::from_secs(3);
+    let until = bedrock_lib::monotonic_now()
+        + Duration::from_millis(at.saturating_sub(now_ms()))
+        + Duration::from_secs(3);
     while trace.lock().unwrap().len() < 2 && bedrock_lib::monotonic_now() < until {
         scanner.tick(&directory).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -455,6 +460,127 @@ async fn scenario() -> Vec<&'static str> {
         "a Wake with another due time dispatched the alarm"
     );
     trace.lock().unwrap().clone()
+}
+
+struct HungAlarm {
+    storage: Storage,
+    started: Arc<tokio::sync::Notify>,
+    dropped: Arc<AtomicBool>,
+    hang: bool,
+}
+
+impl Drop for HungAlarm {
+    fn drop(&mut self) {
+        if self.hang {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[async_trait]
+impl Instance for HungAlarm {
+    async fn invoke(&mut self, request: Vec<u8>) -> Result<Vec<u8>, Error> {
+        if request == b"schedule" {
+            self.storage
+                .commit_with_alarm(Vec::new(), Some(now_ms()))
+                .await?;
+        }
+        Ok(request)
+    }
+
+    async fn alarm(&mut self, _: u64) -> Result<(), Error> {
+        if self.hang {
+            // Cancelling a real in-flight commit fences Storage while this handler keeps the input gate.
+            tokio::select! {
+                biased;
+                _ = self.storage.commit(vec![pb::Change {
+                    key: b"cancelled".to_vec(),
+                    value: Some(vec![1]),
+                }]) => panic!("a storage commit completed without yielding to its volume RPCs"),
+                () = std::future::ready(()) => {}
+            }
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.storage.commit_with_alarm(Vec::new(), None).await?;
+        Ok(())
+    }
+}
+
+async fn expired_acquire_scenario() {
+    let (a, _, _, _) = volume(0).await;
+    let (b, _, _, _) = volume(1).await;
+    let (c, _, _, _) = volume(2).await;
+    let admin = Admin::new();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicBool::new(false));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let handler: Handler = {
+        let (started, dropped, starts) = (started.clone(), dropped.clone(), starts.clone());
+        Arc::new(move |_, storage| {
+            Box::new(HungAlarm {
+                storage,
+                started: started.clone(),
+                dropped: dropped.clone(),
+                hang: starts.fetch_add(1, Ordering::SeqCst) == 0,
+            })
+        })
+    };
+    let volume = Host::start(
+        Arc::new(Peers::new(&admin)),
+        pb::Holder {
+            cell: "cell".into(),
+            host: "compute".into(),
+        },
+    );
+    let host = ActorHost::new(
+        &admin,
+        "cell",
+        "dc",
+        volume,
+        Arc::new(Fixed([a, b, c])),
+        Arc::new(RustExecutor::new([(Kind::Cron, handler)])),
+        Arc::new(RustExecutor::new([])),
+    );
+    let target = actor('h');
+    let awake = host.acquire(&target).await.unwrap();
+    awake.invoke(b"schedule".to_vec()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), started.notified())
+        .await
+        .expect("the holder timer did not start its alarm");
+    assert!(
+        !awake.serving(),
+        "the cancelled commit did not fence storage"
+    );
+    // Acquire holds the wake lock while stopping: the watcher cannot acquire it to abort the hung timer.
+    let recovered = tokio::time::timeout(Duration::from_secs(3), host.acquire(&target))
+        .await
+        .expect("expired Acquire waited forever for the hung alarm's input gate")
+        .unwrap();
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(starts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        recovered.invoke(b"recovered".to_vec()).await.unwrap(),
+        b"recovered"
+    );
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn expired_acquire_cancels_a_hung_holder_alarm() {
+    expired_acquire_scenario().await;
+}
+
+#[cfg(madsim)]
+#[madsim::test]
+async fn expired_acquire_cancels_a_hung_holder_alarm() {
+    madsim::runtime::Handle::current()
+        .create_node()
+        .ip("10.9.0.1".parse().unwrap())
+        .build()
+        .spawn(expired_acquire_scenario())
+        .await
+        .unwrap();
 }
 
 #[cfg(not(madsim))]

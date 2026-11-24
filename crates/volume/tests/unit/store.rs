@@ -263,6 +263,138 @@ fn a_pending_alarm_change_does_not_suppress_the_committed_alarm() {
 }
 
 #[test]
+fn alarm_scans_read_only_newly_committed_entries_and_refresh_after_flush() {
+    use bedrock_lib::storage::{Scan, Snapshot, StorageStats};
+    use std::sync::atomic::AtomicUsize;
+
+    struct Counted {
+        inner: MemoryEngine,
+        logs: AtomicUsize,
+    }
+    impl Counted {
+        fn count(&self, key: &[u8]) {
+            if prefix_len(key).is_some_and(|at| key[at..].starts_with(b"log/")) {
+                self.logs.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn take_reads(&self) -> usize {
+            self.logs.swap(0, Ordering::Relaxed)
+        }
+    }
+    impl StorageEngine for Counted {
+        fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+            self.count(key);
+            self.inner.get(key)
+        }
+        fn scan(&self, range: &KeyRange) -> StorageResult<Scan<'_>> {
+            Ok(Box::new(self.inner.scan(range)?.inspect(|row| {
+                if let Ok((key, _)) = row {
+                    self.count(key);
+                }
+            })))
+        }
+        fn write(&self, batch: WriteBatch) -> StorageResult<()> {
+            self.inner.write(batch)
+        }
+        fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
+            self.inner.revision(name)
+        }
+        fn snapshot(&self) -> StorageResult<Box<dyn Snapshot + '_>> {
+            self.inner.snapshot()
+        }
+        fn restore(&self, from: &dyn Snapshot) -> StorageResult<()> {
+            self.inner.restore(from)
+        }
+        fn stats(&self) -> StorageResult<StorageStats> {
+            self.inner.stats()
+        }
+        fn disk_usage(&self) -> StorageResult<u64> {
+            self.inner.disk_usage()
+        }
+        fn health(&self) -> StorageResult<()> {
+            self.inner.health()
+        }
+    }
+    let engine = Arc::new(Counted {
+        inner: MemoryEngine::new("counted"),
+        logs: AtomicUsize::new(0),
+    });
+    let store = Store::new(engine.clone());
+    let holder = host("a");
+    claimed(&store, &holder, 1);
+    let mut log: Vec<_> = (1..=66).map(|seq| entry(seq, 1, &[])).collect();
+    log[0].alarm = Some(pb::Alarm { at_ms: Some(42) });
+    log[64].alarm = Some(pb::Alarm { at_ms: None });
+    let clear = log[64].clone();
+    append(&store, &holder, 1, 0, log, 64);
+    assert_eq!(store.due_alarms(42).unwrap()[0].at_ms, 42);
+    engine.take_reads();
+    assert_eq!(store.due_alarms(42).unwrap()[0].at_ms, 42);
+    assert_eq!(
+        engine.take_reads(),
+        0,
+        "unchanged commits must not reread the log"
+    );
+    append(&store, &holder, 1, 1, vec![clear], 65);
+    engine.take_reads();
+    assert!(store.due_alarms(42).unwrap().is_empty());
+    assert_eq!(
+        engine.take_reads(),
+        1,
+        "only the newly committed clear is read"
+    );
+
+    let mut set = entry(67, 1, &[]);
+    set.alarm = Some(pb::Alarm { at_ms: Some(100) });
+    let mut clear = entry(68, 1, &[]);
+    clear.alarm = Some(pb::Alarm { at_ms: Some(200) });
+    append(&store, &holder, 1, 1, vec![set, clear], 67);
+    engine.take_reads();
+    assert_eq!(store.due_alarms(100).unwrap()[0].at_ms, 100);
+    assert_eq!(
+        engine.take_reads(),
+        2,
+        "only entries beyond the cached commit are read"
+    );
+    store.truncate(&actor(), 66).unwrap();
+    engine.take_reads();
+    assert_eq!(store.due_alarms(100).unwrap()[0].at_ms, 100);
+    assert_eq!(
+        engine.take_reads(),
+        1,
+        "a flush rebuild starts at its new boundary"
+    );
+    assert_eq!(store.due_alarms(100).unwrap()[0].at_ms, 100);
+    assert_eq!(engine.take_reads(), 0);
+
+    let mut release = entry(69, 1, &[]);
+    release.kind = EntryKind::Release as i32;
+    append(&store, &holder, 1, 1, vec![release], 67);
+    engine.take_reads();
+    assert!(store.due_alarms(100).unwrap()[0].released);
+    assert!(store.due_alarms(100).unwrap()[0].released);
+    assert_eq!(
+        engine.take_reads(),
+        0,
+        "released scans reuse the same summary"
+    );
+    assert!(
+        !store.alarms.lock().unwrap().is_empty(),
+        "a released pending tail keeps its hint"
+    );
+
+    let copy = records(&store);
+    store.clear(0, 0).unwrap();
+    assert!(store.due_alarms(100).unwrap().is_empty());
+    store.install(&copy, false).unwrap();
+    assert_eq!(store.due_alarms(100).unwrap()[0].at_ms, 100);
+    let reopened = Store::new(engine);
+    reopened.recover().unwrap();
+    assert_eq!(reopened.due_alarms(100).unwrap()[0].at_ms, 100);
+    assert!(!reopened.alarms.lock().unwrap().is_empty());
+}
+
+#[test]
 fn an_uncommitted_tail_keeps_the_hint_until_its_alarm_commits() {
     let store = store();
     let holder = host("a");
@@ -319,70 +451,110 @@ fn due_alarm_scan_reports_corrupt_keys() {
 }
 
 #[test]
-fn a_pending_clear_keeps_a_released_alarm_indexed_until_commit_or_truncation() {
-    for kind in [EntryKind::Release, EntryKind::Move, EntryKind::Delete] {
-        for batched in [false, true] {
-            for truncate in [false, true] {
-                let store = store();
-                let holder = host("a");
-                claimed(&store, &holder, 1);
-                let mut set = entry(1, 1, &[]);
-                set.alarm = Some(pb::Alarm { at_ms: Some(42) });
-                let mut clear = entry(2, 1, &[]);
-                clear.alarm = Some(pb::Alarm { at_ms: None });
-                let mut finish = entry(3, 1, &[]);
-                finish.kind = kind as i32;
-                if batched {
-                    append(&store, &holder, 1, 0, vec![set, clear, finish.clone()], 1);
-                } else {
-                    append(&store, &holder, 1, 0, vec![set], 1);
-                    append(&store, &holder, 1, 1, vec![clear, finish.clone()], 1);
-                }
-                let due = store.due_alarms(42).unwrap();
-                assert_eq!(
-                    due.len(),
-                    1,
-                    "{kind:?}, batched={batched}, truncate={truncate}"
-                );
-                assert_eq!((due[0].at_ms, due[0].released), (42, true));
-                let indexed: Vec<_> = store
-                    .engine
-                    .scan(&KeyRange::prefix(*b"alarm/"))
-                    .unwrap()
-                    .map(|row| row.unwrap().0)
-                    .collect();
-                assert_eq!(indexed.len(), 1);
-                assert_eq!(&indexed[0][6..14], &42u64.to_be_bytes());
-
-                let copied = Store::new(Arc::new(MemoryEngine::new("copied")));
-                copied.install(&records(&store), false).unwrap();
-                let copied_due = copied.due_alarms(42).unwrap();
-                assert_eq!(copied_due.len(), 1);
-                assert_eq!((copied_due[0].at_ms, copied_due[0].released), (42, true));
-
-                if truncate {
-                    let next = host("b");
-                    claimed(&store, &next, 2);
-                    let mut noop = entry(2, 2, &[]);
-                    noop.kind = EntryKind::Noop as i32;
-                    append(&store, &next, 2, 1, vec![noop], 2);
+fn a_pending_alarm_change_keeps_a_released_alarm_indexed_until_commit_or_truncation() {
+    for alarm_ms in [None, Some(100)] {
+        for kind in [EntryKind::Release, EntryKind::Move, EntryKind::Delete] {
+            for batched in [false, true] {
+                for truncate in [false, true] {
+                    let store = store();
+                    let holder = host("a");
+                    claimed(&store, &holder, 1);
+                    let mut set = entry(1, 1, &[]);
+                    set.alarm = Some(pb::Alarm { at_ms: Some(42) });
+                    let mut clear = entry(2, 1, &[]);
+                    clear.alarm = Some(pb::Alarm { at_ms: alarm_ms });
+                    let mut finish = entry(3, 1, &[]);
+                    finish.kind = kind as i32;
+                    if batched {
+                        append(&store, &holder, 1, 0, vec![set, clear, finish.clone()], 1);
+                    } else {
+                        append(&store, &holder, 1, 0, vec![set], 1);
+                        append(&store, &holder, 1, 1, vec![clear, finish.clone()], 1);
+                    }
                     let due = store.due_alarms(42).unwrap();
-                    assert_eq!((due.len(), due[0].at_ms, due[0].released), (1, 42, false));
-                } else {
-                    // Only the clear commits; the ending entry remains a pending tail.
-                    append(&store, &holder, 1, 1, vec![finish], 2);
-                    assert!(store.due_alarms(42).unwrap().is_empty());
-                }
-                assert_eq!(
-                    store
+                    assert_eq!(
+                        due.len(),
+                        1,
+                        "{kind:?}, batched={batched}, truncate={truncate}"
+                    );
+                    assert_eq!((due[0].at_ms, due[0].released), (42, true));
+                    let indexed: Vec<_> = store
                         .engine
                         .scan(&KeyRange::prefix(*b"alarm/"))
                         .unwrap()
-                        .count(),
-                    0
-                );
+                        .map(|row| row.unwrap().0)
+                        .collect();
+                    assert_eq!(indexed.len(), 1);
+                    assert_eq!(&indexed[0][6..14], &42u64.to_be_bytes());
+
+                    let copied = Store::new(Arc::new(MemoryEngine::new("copied")));
+                    copied.install(&records(&store), false).unwrap();
+                    let copied_due = copied.due_alarms(42).unwrap();
+                    assert_eq!(copied_due.len(), 1);
+                    assert_eq!((copied_due[0].at_ms, copied_due[0].released), (42, true));
+
+                    if truncate {
+                        let next = host("b");
+                        claimed(&store, &next, 2);
+                        let mut noop = entry(2, 2, &[]);
+                        noop.kind = EntryKind::Noop as i32;
+                        append(&store, &next, 2, 1, vec![noop], 2);
+                        let due = store.due_alarms(42).unwrap();
+                        assert_eq!((due.len(), due[0].at_ms, due[0].released), (1, 42, false));
+                    } else {
+                        // Only the alarm change commits; the ending entry remains a pending tail.
+                        append(&store, &holder, 1, 1, vec![finish], 2);
+                        assert!(store.due_alarms(42).unwrap().is_empty());
+                        if let Some(at) = alarm_ms {
+                            assert_eq!(store.due_alarms(at).unwrap()[0].at_ms, at);
+                        }
+                    }
+                    assert_eq!(
+                        store
+                            .engine
+                            .scan(&KeyRange::prefix(*b"alarm/"))
+                            .unwrap()
+                            .count(),
+                        usize::from(!truncate && alarm_ms.is_some())
+                    );
+                }
             }
         }
+    }
+}
+
+#[test]
+fn recovery_keeps_released_pending_hints_when_an_older_index_used_the_tail_alarm() {
+    let original = store();
+    let holder = host("a");
+    claimed(&original, &holder, 1);
+    let mut set = entry(1, 1, &[]);
+    set.alarm = Some(pb::Alarm { at_ms: Some(42) });
+    let mut later = entry(2, 1, &[]);
+    later.alarm = Some(pb::Alarm { at_ms: Some(100) });
+    let mut release = entry(3, 1, &[]);
+    release.kind = EntryKind::Release as i32;
+    append(&original, &holder, 1, 0, vec![set, later, release], 1);
+    // This is the durable index written by the previous implementation for this pending reschedule.
+    let at = |time: u64| {
+        [
+            b"alarm/".as_slice(),
+            &time.to_be_bytes(),
+            &actor().prefix[2..],
+        ]
+        .concat()
+    };
+    let mut legacy = WriteBatch::default();
+    legacy.delete(at(42));
+    legacy.put(at(100), Vec::new());
+    original.engine.write(legacy).unwrap();
+    let reopened = Store::new(original.engine.clone());
+    reopened.recover().unwrap();
+    for now in [42, 100] {
+        let due = reopened.due_alarms(now).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!((due[0].at_ms, due[0].released), (42, true));
+        assert!(!reopened.alarms.lock().unwrap().is_empty());
     }
 }
 
