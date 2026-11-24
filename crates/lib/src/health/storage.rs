@@ -454,7 +454,7 @@ pub fn release(engine: &dyn StorageEngine) -> StorageResult<()> {
 }
 
 /// `ranges` sorted, with overlapping and adjacent ones joined.
-fn merged(mut ranges: Vec<Range>) -> Vec<Range> {
+pub fn merged(mut ranges: Vec<Range>) -> Vec<Range> {
     ranges.sort_unstable();
     let mut out: Vec<Range> = Vec::with_capacity(ranges.len());
     for range in ranges {

@@ -156,15 +156,30 @@ impl Reconcile for Rebuild {
 /// Recreates an engine instance empty, or only some of its L2 ranges, then, for a relay-fed dataset, waits until those
 /// subscriptions installed verified bootstraps again. Finally every restored record must read back cleanly.
 pub struct Reinitialise {
-    pub engine: Arc<dyn StorageEngine>,
-    pub resubscribe: Option<Rebuilder>,
+    engine: Arc<dyn StorageEngine>,
+    resubscribe: Option<Rebuilder>,
+    /// Held by a verification pass until it ends, even after a timed-out repair stopped waiting for it, so a retry
+    /// cannot verify, discard or restore the same engine alongside it.
+    busy: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Reinitialise {
+    pub fn new(engine: Arc<dyn StorageEngine>, resubscribe: Option<Rebuilder>) -> Self {
+        Reinitialise {
+            engine,
+            resubscribe,
+            busy: Arc::default(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
 impl Restore for Reinitialise {
     async fn narrow(&self) -> StorageResult<Option<Vec<Range>>> {
+        let busy = self.busy.clone().lock_owned().await;
         let (engine, rebuilder) = (self.engine.clone(), self.resubscribe.clone());
         let pass = move || {
+            let _busy = busy;
             verify(engine.as_ref(), &|ranges: &[Range]| match &rebuilder {
                 Some(rebuilder) => rebuilder.widen(engine.as_ref(), ranges),
                 None => Ok(ranges.to_vec()),
@@ -181,6 +196,7 @@ impl Restore for Reinitialise {
     }
 
     async fn restore(&self, ranges: &[Range]) -> StorageResult<()> {
+        let _busy = self.busy.lock().await;
         if ranges.is_empty() {
             let empty = MemoryEngine::new("empty");
             self.engine.restore(&*empty.snapshot()?)?;
@@ -249,7 +265,8 @@ fn verify(
         discarded.push(range);
         ranges.push(range);
     }
-    let Ok(ranges) = widen(&ranges) else {
+    // Merged, so a damaged span inside a held range counts once towards the width.
+    let Ok(ranges) = widen(&ranges).map(storage::merged) else {
         return Ok(None);
     };
     let width: u128 = ranges
@@ -291,10 +308,10 @@ pub fn start(
     let sources = engines
         .iter()
         .map(|(dataset, engine)| {
-            let restore: Arc<dyn Restore> = Arc::new(Reinitialise {
-                engine: engine.clone(),
-                resubscribe: Some(session.rebuilder(dataset)),
-            });
+            let restore: Arc<dyn Restore> = Arc::new(Reinitialise::new(
+                engine.clone(),
+                Some(session.rebuilder(dataset)),
+            ));
             (((*dataset).to_owned(), layer), restore)
         })
         .collect();

@@ -283,10 +283,10 @@ async fn corrupted_cache_entry_is_quarantined_refetched_and_rebuilt_before_use()
         Err(StorageError::Unavailable(_))
     ));
 
-    let restore: Arc<dyn Restore> = Arc::new(Reinitialise {
-        engine: health.wrap_replication("cdn", "l1", raw.clone()),
-        resubscribe: None,
-    });
+    let restore: Arc<dyn Restore> = Arc::new(Reinitialise::new(
+        health.wrap_replication("cdn", "l1", raw.clone()),
+        None,
+    ));
     let rebuild = Rebuild::new(
         health.clone(),
         BTreeMap::from([(("cdn".to_owned(), "l1"), restore)]),

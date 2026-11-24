@@ -203,22 +203,16 @@ async fn reinitialise_recreates_the_instance_without_old_data_or_revisions() {
     let mut batch = WriteBatch::default();
     batch.put(b"a", b"1").set_revision("artifacts", 9);
     engine.write(batch).unwrap();
-    Reinitialise {
-        engine: engine.clone(),
-        resubscribe: None,
-    }
-    .restore(&[])
-    .await
-    .unwrap();
+    Reinitialise::new(engine.clone(), None)
+        .restore(&[])
+        .await
+        .unwrap();
     assert_eq!(engine.get(b"a").unwrap(), None);
     assert_eq!(engine.revision("artifacts").unwrap(), None);
 
     // A record that cannot be read back fails validation.
     engine.corrupt(b"b");
-    let check = Reinitialise {
-        engine: Arc::new(Unrestorable(engine)),
-        resubscribe: None,
-    };
+    let check = Reinitialise::new(Arc::new(Unrestorable(engine)), None);
     assert!(matches!(
         check.restore(&[]).await,
         Err(StorageError::Corruption(_))
@@ -307,10 +301,7 @@ mod ranges {
     }
 
     fn reinitialise(node: &Node) -> Reinitialise {
-        Reinitialise {
-            engine: node.replica.clone(),
-            resubscribe: None,
-        }
+        Reinitialise::new(node.replica.clone(), None)
     }
 
     #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
@@ -349,6 +340,20 @@ mod ranges {
         assert_eq!(node.disk.revision("health:quarantined"), Ok(None));
     }
 
+    /// A damaged span inside the held range around it counts once: half the hash space is still narrowed.
+    #[test]
+    fn a_span_inside_its_held_range_counts_once_towards_the_width() {
+        let node = node(sim());
+        node.disk.damage(&low(0));
+        assert!(node.serving.get(&low(0)).is_err());
+        assert!(node.health.rebuilding(SOURCE.0, SOURCE.1));
+        let held = |ranges: &[Range]| Ok([ranges, &[(0, HALF)]].concat());
+        assert_eq!(
+            verify(node.replica.as_ref(), &held).unwrap(),
+            Some(vec![(0, HALF)])
+        );
+    }
+
     #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
     #[cfg_attr(madsim, tokio::test)]
     async fn a_restart_during_a_range_rebuild_still_refuses_the_range() {
@@ -368,10 +373,7 @@ mod ranges {
         assert!(serving.get(&low(0)).is_err());
         assert_eq!(serving.get(&high()), Ok(Some(b"h".to_vec())));
 
-        let restore: Arc<dyn Restore> = Arc::new(Reinitialise {
-            engine: replica,
-            resubscribe: None,
-        });
+        let restore: Arc<dyn Restore> = Arc::new(Reinitialise::new(replica, None));
         let source = (SOURCE.0.to_owned(), SOURCE.1);
         let rebuild = Rebuild::new(health.clone(), BTreeMap::from([(source.clone(), restore)]));
         rebuild.repair(&source, &()).await.unwrap();

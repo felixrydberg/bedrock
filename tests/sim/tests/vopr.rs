@@ -32,7 +32,6 @@ use bedrock_lib::node::{
 };
 use bedrock_lib::placement::{Directory, Owner, State, hash_of};
 use bedrock_lib::relays::client::{Selection, Session, Target, applied_at, applied_ranges};
-use bedrock_lib::relays::ranges;
 use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::pb;
 use bedrock_lib::s3::S3Config;
@@ -434,16 +433,17 @@ impl Cell {
         let members = || self.members.values();
         let id = |member: &pb::Member| member.node_id.clone();
         let unhealthy = members().filter(sick).map(id).collect();
-        let healthy = |owner: &str, range| {
-            self.members.values().any(|member| {
-                member.node_id == owner
-                    && carries(&member)
-                    && membership::quarantined(member, dataset)
-                        .is_none_or(|quarantined| !ranges::hits(&quarantined, range))
-            })
+        let quarantined = |owner: &str| {
+            let member = members().find(|member| member.node_id == owner && carries(member));
+            match member.map(|member| membership::quarantined(member, dataset)) {
+                Some(None) => Vec::new(),
+                Some(Some(spans)) if !spans.is_empty() => spans,
+                // Gone, not carrying the dataset, or quarantined whole.
+                _ => vec![(0, 0)],
+            }
         };
         let checked = check_coverage(&after)
-            .and_then(|()| check_handoff_by(&before, &after, healthy))
+            .and_then(|()| check_handoff_by(&before, &after, quarantined))
             .and_then(|()| check_routing(&before, &after, &unhealthy));
         if let Err(violation) = checked {
             self.violation.get_or_insert(violation);

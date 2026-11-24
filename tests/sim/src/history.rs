@@ -360,40 +360,74 @@ pub fn check_handoff(
     after: &Placement,
     healthy: &BTreeSet<String>,
 ) -> Result<(), Violation> {
-    check_handoff_by(before, after, |owner, _| healthy.contains(owner))
+    check_handoff_by(before, after, |owner| {
+        if healthy.contains(owner) {
+            Vec::new()
+        } else {
+            vec![(0, 0)]
+        }
+    })
 }
 
-/// [`check_handoff`] where `healthy(owner, range)` says whether the owner's copy of that range is healthy: an owner
-/// quarantined in part is healthy outside its quarantined ranges (#103 / B-62).
+/// The exclusive end of `range` as a number, 2⁶⁴ for 0.
+fn end(range: Range) -> u128 {
+    if range.1 == 0 {
+        1 << 64
+    } else {
+        u128::from(range.1)
+    }
+}
+
+/// [`check_handoff`] where `quarantined(owner)` lists the ranges where the owner's copy is unhealthy, `(0, 0)` for all of
+/// it: an owner quarantined in part still holds the rest of its ranges (#103 / B-62), so each range is checked piece by
+/// piece between quarantine boundaries.
 pub fn check_handoff_by(
     before: &Placement,
     after: &Placement,
-    healthy: impl Fn(&str, Range) -> bool,
+    quarantined: impl Fn(&str) -> Vec<Range>,
 ) -> Result<(), Violation> {
     for (range, owners) in before {
-        let ready = |(owner, state): &(String, OwnerState)| {
-            *state == OwnerState::Ready && healthy(owner, *range)
-        };
-        if !owners.iter().any(ready) {
-            continue;
-        }
-        let serving = owners_at(after, range.0).any(|(_, state)| *state != OwnerState::Populating)
-            && after[after.partition_point(|(later, _)| later.0 < range.0)..]
+        let sick: Vec<(&String, Vec<Range>)> = owners
+            .iter()
+            .filter(|(_, state)| *state == OwnerState::Ready)
+            .map(|(owner, _)| (owner, quarantined(owner)))
+            .collect();
+        let (start, stop) = (u128::from(range.0), end(*range));
+        let mut cuts: Vec<u128> = sick
+            .iter()
+            .flat_map(|(_, spans)| spans.iter().flat_map(|s| [u128::from(s.0), end(*s)]))
+            .filter(|cut| start < *cut && *cut < stop)
+            .chain([start, stop])
+            .collect();
+        cuts.sort_unstable();
+        cuts.dedup();
+        for piece in cuts.windows(2) {
+            let (from, to) = (piece[0], piece[1]);
+            let healthy = sick
                 .iter()
-                .take_while(|(later, _)| range.1 == 0 || later.0 < range.1)
-                .all(|(_, owners)| {
-                    owners
-                        .iter()
-                        .any(|(_, state)| *state != OwnerState::Populating)
-                });
-        if !serving {
-            return violation(
-                "NoDropBeforeReady",
-                format!("range {range:x?} went from {owners:?} to {after:?}"),
-            );
+                .any(|(_, spans)| !spans.iter().any(|s| u128::from(s.0) < to && from < end(*s)));
+            if healthy && !serving(after, (from as u64, to as u64)) {
+                return violation(
+                    "NoDropBeforeReady",
+                    format!("range {range:x?} went from {owners:?} to {after:?}"),
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Every hash of `range` has an owner in `placement` that is not `Populating`.
+fn serving(placement: &Placement, range: Range) -> bool {
+    owners_at(placement, range.0).any(|(_, state)| *state != OwnerState::Populating)
+        && placement[placement.partition_point(|(later, _)| later.0 < range.0)..]
+            .iter()
+            .take_while(|(later, _)| range.1 == 0 || later.0 < range.1)
+            .all(|(_, owners)| {
+                owners
+                    .iter()
+                    .any(|(_, state)| *state != OwnerState::Populating)
+            })
 }
 
 /// `node` stores data only in ranges it owns or is leaving.

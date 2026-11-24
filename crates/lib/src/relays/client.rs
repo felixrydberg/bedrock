@@ -635,7 +635,9 @@ impl Rebuilder {
 
     /// Abandons each subscription's current coverage, recovers it from a new bootstrap, and returns once every one is
     /// validated again: bootstrap checksum verified, then confirmed through the relay's head. With `ranges`, only the
-    /// range subscriptions overlapping them. The caller bounds the wait.
+    /// range subscriptions overlapping them. The caller bounds the wait. A range no subscription covers waits for
+    /// nothing: its data was discarded and [`Rebuilder::forget`] removed its markers, so this node no longer holds it
+    /// and a later subscription bootstraps it (#103 / B-62).
     pub async fn rebuild(&self, ranges: &[Range]) {
         let mut generation = 0;
         self.rebuilds.update(|requested| {

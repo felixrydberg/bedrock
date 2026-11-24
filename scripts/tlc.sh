@@ -4,6 +4,8 @@
 #
 #   scripts/tlc.sh          Every model, then every bug: many hours since per-point health (#103 / B-62); `handoff` alone
 #                           took 2 hours at 4 workers, and `handoff-volume-faulty` did not finish in 2.5 (membership.md).
+#                           It leaves out handoff-ranges, which did not finish (its bugs only run with it).
+#   scripts/tlc.sh handoff-ranges   That model and its bugs.
 #   scripts/tlc.sh bugs     Only the bugs: about 40 minutes, mostly volume-base's previous.
 #   scripts/tlc.sh relays   One model and its bugs.
 #
