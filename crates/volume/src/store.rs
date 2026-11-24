@@ -170,12 +170,6 @@ fn owed_key(actor: &Actor) -> Vec<u8> {
     actor.key(b"owed")
 }
 
-/// The alarm index entry of a released actor with an alarm.
-fn alarm_key(actor: &Actor, claim: &pb::ClaimRecord) -> Option<Vec<u8>> {
-    let at = claim.alarm_ms.filter(|_| claim.released)?;
-    Some([b"alarm/".as_slice(), &at.to_be_bytes(), &actor.prefix[2..]].concat())
-}
-
 /// The tombstone index entry of a deleted actor (S-05b).
 fn gone_key(actor: &Actor, claim: &pb::ClaimRecord) -> Option<Vec<u8>> {
     claim.deleted?;
@@ -874,8 +868,14 @@ impl Store {
             new.repaired = true;
         }
         let old = here.unwrap_or_default();
-        Self::save(&mut batch, &actor, &old, &new);
+        self.save(&mut batch, &actor, &old, &new)?;
         self.commit(batch)?;
+        if !new.released && (end(&new).seq > new.committed || new.alarm_ms.is_some()) {
+            self.alarms
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(actor.prefix.clone());
+        }
         self.unflushed.fetch_add(logged, Ordering::Relaxed);
         // The copy's commit point can reach the kept log's `DELETE`.
         if deletes(&new) {
@@ -913,7 +913,7 @@ impl Store {
         }
         let mut batch = WriteBatch::default();
         batch.delete_range(KeyRange::prefix(actor.prefix.clone()));
-        Self::save(&mut batch, actor, &old, &tomb);
+        self.save(&mut batch, actor, &old, &tomb)?;
         self.commit(batch)?;
         self.unflushed.fetch_sub(logged, Ordering::Relaxed);
         self.mark(&actor.prefix, &tomb);
@@ -1124,9 +1124,11 @@ impl Store {
             }
             let prefix = [b"s/".as_slice(), &key[14..]].concat();
             let wire = parse(&prefix, 0)?;
-            let claim = self.load(&Actor::new(&wire)?)?;
+            let actor = Actor::new(&wire)?;
+            let _stripe = self.lock(&actor);
+            let claim = self.load(&actor)?;
             if claim.released
-                && claim.alarm_ms == Some(at_ms)
+                && self.alarm_key(&actor, &claim, &[])?.as_ref() == Some(&key)
                 && claim.deleted.is_none()
                 && claim.moved.is_none()
             {
@@ -1192,6 +1194,45 @@ impl Store {
             .get(&log_key(actor, seq))?
             .ok_or_else(|| missing(seq))?;
         pb::Entry::decode(bytes.as_slice()).map_err(|e| corrupt("a log entry", e))
+    }
+
+    /// The batch's last operation on this log entry wins, including a copied or truncated range.
+    fn entry_in(&self, actor: &Actor, seq: u64, pending: &[WriteOp]) -> Result<pb::Entry, Error> {
+        let at = log_key(actor, seq);
+        for op in pending.iter().rev() {
+            match op {
+                WriteOp::Put { key, value } if key == &at => {
+                    return pb::Entry::decode(value.as_slice())
+                        .map_err(|e| corrupt("a log entry", e));
+                }
+                WriteOp::Delete { key } if key == &at => return Err(missing(seq)),
+                WriteOp::DeleteRange(range) if range.contains(&at) => return Err(missing(seq)),
+                _ => {}
+            }
+        }
+        self.entry(actor, seq)
+    }
+
+    /// Keep the existing released index, falling back to the committed alarm only while a clear is pending.
+    fn alarm_key(
+        &self,
+        actor: &Actor,
+        claim: &pb::ClaimRecord,
+        pending: &[WriteOp],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if !claim.released {
+            return Ok(None);
+        }
+        let mut alarm = claim.alarm_ms;
+        if alarm.is_none() && end(claim).seq > claim.committed {
+            alarm = claim.flushed_alarm_ms;
+            for seq in claim.flushed + 1..=claim.committed {
+                if let Some(at) = self.entry_in(actor, seq, pending)?.alarm {
+                    alarm = at.at_ms;
+                }
+            }
+        }
+        Ok(alarm.map(|at| [b"alarm/".as_slice(), &at.to_be_bytes(), &actor.prefix[2..]].concat()))
     }
 
     /// The log from `from` through `through`, in order. One scan, failing like [`Store::entry`] on a missing entry.
@@ -1266,10 +1307,19 @@ impl Store {
     }
 
     /// Adds the claim, and its alarm and tombstone index entries if they changed, to `batch`.
-    fn save(batch: &mut WriteBatch, actor: &Actor, old: &pb::ClaimRecord, new: &pb::ClaimRecord) {
-        Self::index(batch, alarm_key(actor, old), alarm_key(actor, new));
+    fn save(
+        &self,
+        batch: &mut WriteBatch,
+        actor: &Actor,
+        old: &pb::ClaimRecord,
+        new: &pb::ClaimRecord,
+    ) -> Result<(), Error> {
+        let was = self.alarm_key(actor, old, &[])?;
+        let is = self.alarm_key(actor, new, &batch.ops)?;
+        Self::index(batch, was, is);
         Self::index(batch, gone_key(actor, old), gone_key(actor, new));
         batch.put(claim_key(actor), new.encode_to_vec());
+        Ok(())
     }
 
     fn index(batch: &mut WriteBatch, was: Option<Vec<u8>>, is: Option<Vec<u8>>) {
@@ -1370,7 +1420,7 @@ impl Store {
             ..old.clone()
         };
         let mut batch = WriteBatch::default();
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         self.commit(batch)?;
         Ok(answer(refused, &new, voting))
     }
@@ -1426,7 +1476,7 @@ impl Store {
             ..old.clone()
         };
         let mut batch = WriteBatch::default();
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         self.commit(batch)?;
         Ok(answer(Refusal::None, &new, voting))
     }
@@ -1482,7 +1532,7 @@ impl Store {
             ..old.clone()
         };
         let mut batch = WriteBatch::default();
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         self.commit(batch)?;
         Ok((answer(refused, &new, voting), other.is_some()))
     }
@@ -1579,7 +1629,7 @@ impl Store {
                     return self.bury(actor, &old, new, &[]);
                 }
                 let mut batch = WriteBatch::default();
-                Self::save(&mut batch, actor, &old, &new);
+                self.save(&mut batch, actor, &old, &new)?;
                 self.commit(batch)?;
                 self.mark(&actor.prefix, &new);
             }
@@ -1655,7 +1705,7 @@ impl Store {
                 None => batch.delete(key),
             };
         }
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         let fsync = self.commit(batch)?;
         self.unflushed.fetch_add(logged, Ordering::Relaxed);
         self.mark(&actor.prefix, &new);
@@ -1763,7 +1813,7 @@ impl Store {
         };
         let mut batch = WriteBatch::default();
         batch.delete_range(KeyRange::prefix(actor.prefix.clone()));
-        Self::save(&mut batch, actor, old, &tomb);
+        self.save(&mut batch, actor, old, &tomb)?;
         let fsync = self.commit(batch)?;
         self.unflushed.fetch_sub(logged, Ordering::Relaxed);
         self.mark(&actor.prefix, &tomb);
@@ -1853,7 +1903,7 @@ impl Store {
         }
         new.flushed = through;
         new.flushed_epoch = self.epoch_at(actor, &old, through)?;
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         let fsync = self.commit(batch)?;
         let freed: i64 = log.iter().map(|e| log_bytes(actor, e)).sum();
         self.unflushed.fetch_sub(freed, Ordering::Relaxed);
@@ -1930,7 +1980,7 @@ impl Store {
             deleting: None,
             ..old.clone()
         };
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         let fsync = self.commit(batch)?;
         let freed: i64 = log.iter().map(|e| log_bytes(actor, e)).sum();
         self.unflushed.fetch_sub(freed, Ordering::Relaxed);
@@ -2169,7 +2219,9 @@ impl Store {
                     && let Some(parsed) = Actor::parse(&key[..at], kind)
                 {
                     let actor = Actor::new(&parsed)?;
-                    if self.committed_alarm(&actor, &claim)?.is_some() {
+                    if self.committed_alarm(&actor, &claim)?.is_some()
+                        || end(&claim).seq > claim.committed
+                    {
                         self.alarms
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
