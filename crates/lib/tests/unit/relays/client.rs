@@ -68,11 +68,11 @@ async fn storage_health_is_announced_and_quarantined_scopes_do_not_block_readine
     };
     let quarantined = BTreeSet::from(["auth".to_string(), "cdn".to_string()]);
     // A dataset the member never announced is dropped, or the relay would refuse the update.
-    session.set_unhealthy(&quarantined);
+    session.set_unhealthy(&quarantined, &BTreeMap::new());
     assert_eq!(member.get().unhealthy, ["auth"]);
     assert!(!session.ready());
     assert!(session.ready_except(&quarantined));
-    session.set_unhealthy(&BTreeSet::new());
+    session.set_unhealthy(&BTreeSet::new(), &BTreeMap::new());
     assert!(member.get().unhealthy.is_empty());
 }
 
@@ -541,7 +541,7 @@ fn splitting_unconfirmed_coverage_requires_the_kept_range_to_recover() {
     let requests = narrow(
         "auth",
         &engine,
-        ranges::confirm(Some(&directory), "me", &change, &BTreeSet::new()).unwrap(),
+        ranges::confirm(Some(&directory), "me", &change, &Default::default()).unwrap(),
         &mut consumers,
         &mut pushed,
         &progress,
@@ -878,6 +878,39 @@ fn a_quarantined_scope_asks_for_no_recovery_until_its_rebuild() {
     // Starting the rebuild requests again by itself; a request that then fails retries as usual.
     assert!(health.rebuilding("auth", "engine"));
     assert_eq!(intake.due(&consumers), BTreeSet::from([scope]));
+}
+
+/// #103 / B-62: once a quarantine is narrowed, a range scope outside it retries at once and one inside it waits.
+#[test]
+fn only_scopes_in_a_narrowed_quarantine_wait_to_retry() {
+    const HALF: u64 = 1 << 63;
+    let health = crate::health::storage::StorageHealth::new(&crate::admin::Admin::new());
+    let engine = health.wrap_replication("auth", "engine", Arc::new(MemoryEngine::new("auth")));
+    let mut intake = Intake::default();
+    let mut consumers = BTreeMap::new();
+    for range in [(0, HALF), (HALF, 0)] {
+        let mut consumer = ranged(engine.clone(), range);
+        let scope = consumer.scope();
+        intake.fail(&scope, &mut consumer, Status::unavailable("busy"));
+        consumers.insert(scope, consumer);
+    }
+    let damage = crate::storage::StorageError::Corruption(crate::storage::ErrorContext {
+        engine: "memory",
+        instance: "auth".into(),
+        file: None,
+        partition: None,
+        detail: "damaged".into(),
+    });
+    health.report("auth", "engine", &damage);
+    assert!(health.rebuilding("auth", "engine"));
+    assert!(health.narrow("auth", "engine", vec![(0, HALF)]));
+    assert!(health.rebuild_failed("auth", "engine"));
+    let due = intake.due(&consumers);
+    assert_eq!(due.len(), 1);
+    assert!(
+        due.iter().all(|scope| scope.2 == Some((HALF, 0))),
+        "{due:?}"
+    );
 }
 
 #[test]
@@ -1358,10 +1391,10 @@ async fn rebuild_counts_only_after_a_fresh_verified_bootstrap() {
         reports: Default::default(),
     };
     let rebuilder = session.rebuilder("auth");
-    let rebuilding = tokio::spawn(async move { rebuilder.rebuild().await });
+    let rebuilding = tokio::spawn(async move { rebuilder.rebuild(&[]).await });
     let requested = session
         .rebuilds
-        .wait_until(|requested| requested.get("auth") == Some(&1))
+        .wait_until(|requested| requested.get("auth").map(|r| r.0) == Some(1))
         .await;
     assert!(consumer.start_rebuild(&requested));
     assert!(
@@ -1584,7 +1617,7 @@ fn a_revoke_with_an_unknown_outcome_stops_trusting_the_consumer() {
     let revoked = narrow(
         "auth",
         &engine,
-        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        ranges::confirm(Some(&replaced()), "me", &change, &Default::default()).unwrap(),
         &mut consumers,
         &mut pushed,
         &Mutex::new(Progress::default()),
@@ -1620,7 +1653,7 @@ fn a_revoke_retires_stored_progress_no_consumer_holds() {
     narrow(
         "auth",
         &engine,
-        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        ranges::confirm(Some(&replaced()), "me", &change, &Default::default()).unwrap(),
         &mut BTreeMap::new(),
         &mut pushed,
         &Mutex::new(Progress::default()),
@@ -1669,7 +1702,7 @@ fn a_revoke_retires_progress_stored_for_part_of_the_range() {
     narrow(
         "auth",
         &engine,
-        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        ranges::confirm(Some(&replaced()), "me", &change, &Default::default()).unwrap(),
         &mut BTreeMap::new(),
         &mut pushed,
         &Mutex::new(Progress::default()),
@@ -1704,7 +1737,7 @@ fn a_split_without_a_consumer_still_marks_what_it_keeps() {
     narrow(
         "auth",
         &engine,
-        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        ranges::confirm(Some(&replaced()), "me", &change, &Default::default()).unwrap(),
         &mut BTreeMap::new(),
         &mut pushed,
         &Mutex::new(Progress::default()),
@@ -1750,7 +1783,7 @@ fn a_retried_split_retires_progress_an_earlier_attempt_left_on_a_part() {
     narrow(
         "auth",
         &engine,
-        ranges::confirm(Some(&replaced()), "me", &change, &BTreeSet::new()).unwrap(),
+        ranges::confirm(Some(&replaced()), "me", &change, &Default::default()).unwrap(),
         &mut consumers,
         &mut pushed,
         &Mutex::new(Progress::default()),
@@ -1944,4 +1977,112 @@ fn unexplained_range_data_is_never_held_at_revision_zero() {
             .unwrap()
             .is_empty()
     );
+}
+
+/// #103 / B-62: rebuilding some ranges re-bootstraps only the scopes overlapping them and waits only for those; the others
+/// keep their coverage and are never distrusted.
+#[tokio::test]
+async fn a_range_rebuild_recovers_only_the_overlapping_scopes() {
+    const HALF: u64 = 1 << 63;
+    let engine: Arc<dyn StorageEngine> = Arc::new(MemoryEngine::new("auth"));
+    let mut low = ranged(engine.clone(), (0, HALF));
+    let mut high = ranged(engine, (HALF, 0));
+    let progress = Arc::new(Mutex::new(Progress {
+        connected: true,
+        scopes: BTreeMap::from([
+            (low.scope(), (5, Some(5), true)),
+            (high.scope(), (5, Some(5), true)),
+        ]),
+        ..Default::default()
+    }));
+    let changes = Arc::new(Watched::new(0));
+    let session = Session {
+        progress: progress.clone(),
+        changes: changes.clone(),
+        rebuilds: Rebuilds::default(),
+        task: tokio::spawn(std::future::pending()),
+        member: None,
+        reports: Default::default(),
+    };
+    let rebuilder = session.rebuilder("auth");
+    let rebuilding = tokio::spawn(async move { rebuilder.rebuild(&[(10, 20)]).await });
+    let requested = session
+        .rebuilds
+        .wait_until(|requested| requested.get("auth").map(|r| r.0) == Some(1))
+        .await;
+    assert!(!high.rebuild_requested(&requested));
+    assert!(
+        !high.start_rebuild(&requested),
+        "a scope outside the ranges keeps its coverage"
+    );
+    assert!(low.start_rebuild(&requested));
+    tokio::task::yield_now().await;
+    assert!(
+        !rebuilding.is_finished(),
+        "the overlapping scope has not rebuilt"
+    );
+
+    // Only the overlapping scope has to validate again.
+    changed(&progress, &changes, |state| {
+        state.rebuilt.insert(low.scope(), low.rebuild);
+    });
+    tokio::time::timeout(Duration::from_secs(1), rebuilding)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// Found by the simulation (#103 / B-62, seed 67): a node restarted with a narrowed quarantine, its rebuild discarded the
+/// range before the session had a consumer for it, and the consumer then resumed from a position whose data was gone.
+/// Forgetting the range's revisions makes it bootstrap; other ranges keep theirs.
+#[tokio::test]
+async fn forgetting_a_range_removes_only_its_subscriptions_revisions() {
+    const HALF: u64 = 1 << 63;
+    let engine = MemoryEngine::new("auth");
+    let mut batch = WriteBatch::default();
+    for range in [(0, HALF), (HALF, 0)] {
+        let names = Names::of("auth", "users", &[], Some(range));
+        for name in [
+            names.active,
+            names.revision,
+            names.pending,
+            names.marker.unwrap(),
+        ] {
+            batch.set_revision(name, 1);
+        }
+    }
+    engine.write(batch).unwrap();
+    let session = Session {
+        progress: Default::default(),
+        changes: Arc::new(Watched::new(0)),
+        rebuilds: Rebuilds::default(),
+        task: tokio::spawn(std::future::pending()),
+        member: None,
+        reports: Default::default(),
+    };
+    // Damage in a held range quarantines and rebuilds that whole range (found by seeds 35 and 328).
+    let rebuilder = session.rebuilder("auth");
+    assert_eq!(
+        rebuilder.widen(&engine, &[(10, 20)]).unwrap(),
+        vec![(10, 20), (0, HALF)]
+    );
+    rebuilder.forget(&engine, &[(10, 20)]).unwrap();
+    let low = Names::of("auth", "users", &[], Some((0, HALF)));
+    let high = Names::of("auth", "users", &[], Some((HALF, 0)));
+    for name in [
+        &low.active,
+        &low.revision,
+        &low.pending,
+        low.marker.as_ref().unwrap(),
+    ] {
+        assert_eq!(engine.revision(name).unwrap(), None, "{name}");
+    }
+    for name in [
+        &high.active,
+        &high.revision,
+        &high.pending,
+        high.marker.as_ref().unwrap(),
+    ] {
+        assert_eq!(engine.revision(name).unwrap(), Some(1), "{name}");
+    }
 }

@@ -696,12 +696,59 @@ fn l2_op(op: &WriteOp) -> bool {
     matches!(op, WriteOp::Put { key, .. } | WriteOp::Delete { key } if key.starts_with(b"l2/"))
 }
 
+/// What fails verification on a simulated disk. A damaged record names its block, the span of keys around it that
+/// rebuilding must discard, as a RocksDB error names its table file (#103 / B-62). Damage can be wider than one record:
+/// a block holds every stored key it spans, and revisions are damaged alone.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Damage {
+    records: BTreeMap<Vec<u8>, KeyRange>,
+    revisions: BTreeSet<String>,
+}
+
+impl Damage {
+    fn is_empty(&self) -> bool {
+        self.records.is_empty() && self.revisions.is_empty()
+    }
+
+    fn clear(&mut self) {
+        *self = Damage::default();
+    }
+}
+
+/// A block as an error's file name: `sim:{start}-{end}` in hex, the end empty when unbounded.
+fn block_name(block: &KeyRange) -> String {
+    let hex = |key: &[u8]| key.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    format!(
+        "sim:{}-{}",
+        hex(&block.start),
+        block.end.as_deref().map_or(String::new(), hex)
+    )
+}
+
+fn block_of(name: &str) -> Option<KeyRange> {
+    let (start, end) = name.strip_prefix("sim:")?.split_once('-')?;
+    let bytes = |hex: &str| -> Option<Vec<u8>> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+            .collect()
+    };
+    Some(KeyRange {
+        start: bytes(start)?,
+        end: if end.is_empty() {
+            None
+        } else {
+            Some(bytes(end)?)
+        },
+    })
+}
+
 /// A state copy that owns its data, so it can outlive the engine's borrow and be restored later.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frozen {
     entries: Entries,
     revisions: BTreeMap<String, u64>,
-    damaged: BTreeSet<Vec<u8>>,
+    damaged: Damage,
 }
 
 impl Snapshot for Frozen {
@@ -750,7 +797,7 @@ pub struct SimEngine {
     first: Mutex<Entries>,
     /// How to undo each recent commit, newest last. Only an engine that may lose commits keeps them.
     committed: Option<Mutex<VecDeque<Undo>>>,
-    damaged: Mutex<BTreeSet<Vec<u8>>>,
+    damaged: Mutex<Damage>,
     /// Every call fails from now on.
     wedged: AtomicBool,
     fingerprint: Option<Fingerprint>,
@@ -815,9 +862,31 @@ impl SimEngine {
         }
     }
 
-    fn damage_error(&self, key: &[u8]) -> StorageError {
-        let key = format!("key {}", key.escape_ascii());
-        self.failure(StorageError::Corruption, Some(key))
+    fn damage_error(&self, key: &[u8], block: &KeyRange) -> StorageError {
+        let mut error = self.failure(
+            StorageError::Corruption,
+            Some(format!("key {}", key.escape_ascii())),
+        );
+        if let StorageError::Corruption(context) = &mut error {
+            context.file = Some(block_name(block));
+        }
+        error
+    }
+
+    fn revision_error(&self, name: &str) -> StorageError {
+        self.failure(StorageError::Corruption, Some(format!("revision {name}")))
+    }
+
+    /// Fails reads of any damaged revision among `names`.
+    fn check_revisions<'a>(
+        &self,
+        damaged: &Damage,
+        mut names: impl Iterator<Item = &'a String>,
+    ) -> StorageResult<()> {
+        match names.find(|name| damaged.revisions.contains(*name)) {
+            Some(name) => Err(self.revision_error(name)),
+            None => Ok(()),
+        }
     }
 
     /// Fails a read as faults decide; `Ok` may carry a partial scan.
@@ -846,12 +915,34 @@ impl SimEngine {
         self.read_fault().map(|_| ())
     }
 
-    /// Damages `key`, which then fails verification on every read of it. Nothing else shows the damage.
+    /// Damages `key`, which then fails verification on every read of it until it is written again. Nothing else shows
+    /// the damage.
     pub fn damage(&self, key: &[u8]) {
-        self.lock_damaged().insert(key.to_vec());
+        let mut end = key.to_vec();
+        end.push(0);
+        self.damage_block(KeyRange::new(key, end));
     }
 
-    fn lock_damaged(&self) -> std::sync::MutexGuard<'_, BTreeSet<Vec<u8>>> {
+    /// Damages every record stored in `block`, as a bad block damages its neighbours. Errors name the block.
+    pub fn damage_block(&self, block: KeyRange) {
+        let keys: Vec<Vec<u8>> = self
+            .inner
+            .scan(&block)
+            .expect("memory scans are infallible")
+            .map(|entry| entry.expect("damage is tracked by this wrapper").0)
+            .collect();
+        let mut damaged = self.lock_damaged();
+        for key in keys {
+            damaged.records.insert(key, block.clone());
+        }
+    }
+
+    /// Damages revision `name`: reading it fails, naming no block, until it is written again.
+    pub fn damage_revision(&self, name: &str) {
+        self.lock_damaged().revisions.insert(name.to_owned());
+    }
+
+    fn lock_damaged(&self) -> std::sync::MutexGuard<'_, Damage> {
         self.damaged.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -963,15 +1054,12 @@ impl SimEngine {
         batch
     }
 
-    fn scanned<'a>(
-        &self,
-        damaged: &BTreeSet<Vec<u8>>,
-        partial: Option<usize>,
-        scan: Scan<'a>,
-    ) -> Scan<'a> {
+    fn scanned<'a>(&self, damaged: &Damage, partial: Option<usize>, scan: Scan<'a>) -> Scan<'a> {
         let mut entries: Vec<_> = scan
             .map(|entry| match entry {
-                Ok((key, _)) if damaged.contains(&key) => Err(self.damage_error(&key)),
+                Ok((key, _)) if damaged.records.contains_key(&key) => {
+                    Err(self.damage_error(&key, &damaged.records[&key]))
+                }
                 entry => entry,
             })
             .collect();
@@ -990,7 +1078,7 @@ enum Undo {
     Batch {
         keys: Vec<(Vec<u8>, Option<Vec<u8>>)>,
         revisions: Vec<(String, Option<u64>)>,
-        damaged: BTreeSet<Vec<u8>>,
+        damaged: Damage,
     },
     /// A restore replaces everything, so it keeps everything.
     Whole(Frozen),
@@ -1028,14 +1116,14 @@ impl Undo {
 struct SimSnapshot<'a> {
     owner: &'a SimEngine,
     inner: Box<dyn Snapshot + 'a>,
-    damaged: BTreeSet<Vec<u8>>,
+    damaged: Damage,
 }
 
 impl Snapshot for SimSnapshot<'_> {
     fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.owner.check_read()?;
-        if self.damaged.contains(key) {
-            return Err(self.owner.damage_error(key));
+        if let Some(block) = self.damaged.records.get(key) {
+            return Err(self.owner.damage_error(key, block));
         }
         self.inner.get(key)
     }
@@ -1048,25 +1136,33 @@ impl Snapshot for SimSnapshot<'_> {
 
     fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
         self.owner.check_read()?;
+        self.owner
+            .check_revisions(&self.damaged, std::iter::once(&name.to_owned()))?;
         self.inner.revision(name)
     }
 
     fn revisions(&self) -> StorageResult<BTreeMap<String, u64>> {
         self.owner.check_read()?;
-        self.inner.revisions()
+        let revisions = self.inner.revisions()?;
+        self.owner
+            .check_revisions(&self.damaged, revisions.keys())?;
+        Ok(revisions)
     }
 
     fn revisions_in(&self, ranges: &[super::Names]) -> StorageResult<BTreeMap<String, u64>> {
         self.owner.check_read()?;
-        self.inner.revisions_in(ranges)
+        let revisions = self.inner.revisions_in(ranges)?;
+        self.owner
+            .check_revisions(&self.damaged, revisions.keys())?;
+        Ok(revisions)
     }
 }
 
 impl StorageEngine for SimEngine {
     fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.check_read()?;
-        if self.lock_damaged().contains(key) {
-            return Err(self.damage_error(key));
+        if let Some(block) = self.lock_damaged().records.get(key) {
+            return Err(self.damage_error(key, block));
         }
         self.inner.get(key)
     }
@@ -1088,15 +1184,20 @@ impl StorageEngine for SimEngine {
         self.mix_batch(&batch);
         self.remember(&batch);
         {
-            // Overwriting a damaged record repairs it.
+            // Overwriting a damaged record or revision repairs it.
             let mut damaged = self.lock_damaged();
             for op in &batch.ops {
                 match op {
                     WriteOp::Put { key, .. } | WriteOp::Delete { key } => {
-                        damaged.remove(key);
+                        damaged.records.remove(key);
                     }
-                    WriteOp::DeleteRange(range) => damaged.retain(|key| !range.contains(key)),
+                    WriteOp::DeleteRange(range) => {
+                        damaged.records.retain(|key, _| !range.contains(key));
+                    }
                 }
+            }
+            for name in batch.revisions.keys() {
+                damaged.revisions.remove(name);
             }
         }
         self.inner.write(batch)?;
@@ -1105,6 +1206,9 @@ impl StorageEngine for SimEngine {
 
     fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
         self.check_read()?;
+        if self.lock_damaged().revisions.contains(name) {
+            return Err(self.revision_error(name));
+        }
         self.inner.revision(name)
     }
 
@@ -1142,6 +1246,17 @@ impl StorageEngine for SimEngine {
 
     fn compact(&self, range: &KeyRange) -> StorageResult<()> {
         self.inner.compact(range)
+    }
+
+    fn damaged(&self, failure: &StorageError) -> Option<KeyRange> {
+        block_of(failure.context().file.as_deref()?)
+    }
+
+    /// A range delete, as one commit; it removes the damage inside too.
+    fn discard(&self, range: &KeyRange) -> StorageResult<()> {
+        let mut batch = WriteBatch::default();
+        batch.delete_range(range.clone());
+        self.write(batch)
     }
 }
 

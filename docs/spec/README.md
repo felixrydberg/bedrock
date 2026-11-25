@@ -115,6 +115,8 @@ this result does not establish the full hardening gate.
 A model with several configs names each `model-variant.cfg`. `volume` has five, which all passed on 2026-11-18:
 `volume-base`, `volume-handoff`, `volume-wipe`, `volume-topology`, and `volume-truncate`, which also checks `Skip`
 ([volume.md](volume.md)).
+`handoff-ranges-restart` checks quarantine narrowed to damaged ranges (#103 / B-62) with two points and one node;
+`handoff-ranges`, with two nodes, has not finished and is left out of the default run.
 `handoff` has three more configs for readiness of `volume` ranges, which the node reports and its relay checks (#114 /
 S-06, [membership.md](membership.md#node-reported-readiness-volume-114--s-06)): `handoff-volume`, `handoff-volume-split`
 with two points, which has not finished and is left out of the default run, and `handoff-volume-faulty` with partitions
@@ -123,7 +125,9 @@ and faulty revokes.
 On 2026-11-09, `service_isolation` passed 2,640,649 generated states / 182,408 distinct states; its six deliberate
 fault checks also detected their intended violations. The model checks independent enabling, not eventual progress.
 
-On 2026-11-08, TLC 1.8.0 passed every config and caught all 38 bugs:
+On 2026-11-08, TLC 1.8.0 passed every config and caught all 38 bugs. Per-point health (#103 / B-62) has since grown
+`membership` to 10,868,256 and `handoff` to 124,264,914 distinct states; [membership.md](membership.md#checks) has the
+record, including `handoff-volume-faulty`, which did not finish locally:
 
 | Model | Generated states | Distinct states | Time |
 |---|---:|---:|---:|
@@ -145,6 +149,7 @@ The models and the simulation (`tests/sim`) use the same names for the shared in
 | `DirectoryCoverage`, `NoDropBeforeReady` | `membership`, `handoff` | yes |
 | `NoUnhealthyRouting` | `membership` | yes |
 | `OwnedOrLeaving` | `handoff` | yes |
+| `DamageRefused` | `handoff` | no |
 | `MinRevisionReads` | none: no model has a read path | yes |
 | `Converged`, `RedundancyRestored` | none: liveness, and the models have no fairness | yes |
 

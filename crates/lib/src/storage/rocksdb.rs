@@ -7,13 +7,19 @@
 //! [`StorageEngine::restore`] moves to a new generation of both column families, because a damaged table file can only leave
 //! with its column family: range deletes hide its records, and every later compaction would read the bad block and fail.
 //! Dropping the old `data` column family is the commit, so the lowest generation with both column families is current.
+//!
+//! A rebuild of part of the instance (#103 / B-62) finds damage with RocksDB's `VerifyChecksum`, which reads every table
+//! file directly: scans are served from the block cache and skip range-deleted blocks, so they miss damage that the next
+//! compaction would still hit. It names the first damaged file only. [`StorageEngine::discard`] then drops that file with
+//! `DeleteFilesInRange` over its key span, which leaves files in level 0, so damage there rebuilds the whole instance.
 
 use std::collections::BTreeSet;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString, c_char, c_int};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use ::rocksdb::checkpoint::Checkpoint;
 use ::rocksdb::{
     BlockBasedOptions, BoundColumnFamily, Cache, ColumnFamilyDescriptor, DBCompressionType,
     DBWithThreadMode, Direction, ErrorKind, IteratorMode, MultiThreaded, Options, ReadOptions,
@@ -177,6 +183,33 @@ impl RocksDbAdapter {
         self.db
             .write_opt(batch, &options)
             .map_err(|e| error(&self.instance, e))
+    }
+
+    /// Runs `VerifyChecksum` over a hard-linked checkpoint of the instance, opened read-only through the C API: the
+    /// `rocksdb` crate exposes neither the call nor its raw handle (user decision 2026-11-22).
+    #[allow(clippy::disallowed_methods)] // adapter code: the checkpoint is a directory beside the instance
+    fn verify_checksums(&self) -> StorageResult<()> {
+        let path = self.db.path().with_extension("verify");
+        let io_error = |e: std::io::Error| {
+            StorageError::IoError(ErrorContext {
+                engine: ENGINE,
+                instance: self.instance.clone(),
+                file: Some(path.display().to_string()),
+                partition: None,
+                detail: e.to_string(),
+            })
+        };
+        // Left by a run that stopped part way; a checkpoint needs a new directory.
+        match std::fs::remove_dir_all(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(io_error(e)),
+            _ => {}
+        }
+        Checkpoint::new(&self.db)
+            .and_then(|checkpoint| checkpoint.create_checkpoint(&path))
+            .map_err(|e| error(&self.instance, e))?;
+        let verified = verify_checkpoint(&path, &self.instance);
+        let removed = std::fs::remove_dir_all(&path).map_err(io_error);
+        verified.and(removed)
     }
 
     fn property(&self, name: &CStr) -> StorageResult<u64> {
@@ -445,6 +478,50 @@ impl StorageEngine for RocksDbAdapter {
         Ok(sizes[0])
     }
 
+    fn verify(&self) -> StorageResult<()> {
+        self.verify_checksums()?;
+        super::read_all(self)
+    }
+
+    /// The key span of the damaged table file `failure` names, when it holds data outside level 0 of the current
+    /// generation: `DeleteFilesInRange` leaves level 0 files, and revisions are not keys.
+    fn damaged(&self, failure: &StorageError) -> Option<KeyRange> {
+        let file = Path::new(failure.context().file.as_deref()?)
+            .file_name()?
+            .to_str()?;
+        let data = name(DATA, *self.generation.read().unwrap());
+        let live = self.db.live_files().ok()?;
+        let found = live.iter().find(|f| {
+            f.name.trim_start_matches('/') == file && f.column_family_name == data && f.level > 0
+        })?;
+        let start = found.start_key.as_deref()?.strip_prefix(&[0])?.to_vec();
+        let mut end = found.end_key.as_deref()?.strip_prefix(&[0])?.to_vec();
+        end.push(0);
+        Some(KeyRange::new(start, end))
+    }
+
+    /// Drops the table files wholly inside `range`, then deletes what is left of its records.
+    fn discard(&self, range: &KeyRange) -> StorageResult<()> {
+        if range.bounds().is_none() {
+            return Ok(());
+        }
+        // Errors counted so far came from the damage this removes, as after a restore. ponytail: forgives an unrelated
+        // background error too; read the background error status if that hides one.
+        let errors = self.background_errors()?;
+        {
+            let data = self.data();
+            let end = range.end.as_deref().map_or(KEY_END.to_vec(), data_key);
+            self.db
+                .delete_file_in_range_cf(&data, data_key(&range.start), end)
+                .map_err(|e| error(&self.instance, e))?;
+        }
+        let mut batch = WriteBatch::default();
+        batch.delete_range(range.clone());
+        self.write(batch)?;
+        self.restored_errors.store(errors, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn health(&self) -> StorageResult<()> {
         // RocksDB's counter never falls, so only errors since the last restore count. ponytail: one transient flush error
         // keeps the instance unhealthy until its rebuild; read the background error status if that rebuilds too much.
@@ -517,6 +594,65 @@ fn error(instance: &str, e: ::rocksdb::Error) -> StorageError {
         | ErrorKind::ColumnFamilyDropped => StorageError::Unavailable(context),
         _ => StorageError::IoError(context),
     }
+}
+
+/// `VerifyChecksum` over the instance at `path`, opened read-only with every column family.
+fn verify_checkpoint(path: &Path, instance: &str) -> StorageResult<()> {
+    use librocksdb_sys as ffi;
+    let families = Db::list_cf(&Options::default(), path).map_err(|e| error(instance, e))?;
+    let utf8 = |s: &str| CString::new(s).expect("paths and column family names hold no NUL");
+    let c_path = utf8(&path.to_string_lossy());
+    let names: Vec<CString> = families.iter().map(|f| utf8(f)).collect();
+    let name_ptrs: Vec<*const c_char> = names.iter().map(|n| n.as_ptr()).collect();
+    let count = c_int::try_from(names.len()).expect("few column families");
+    let mut failure: *mut c_char = std::ptr::null_mut();
+    // SAFETY: every pointer passed lives until the call returns; the handles, database and options created here are
+    // destroyed once each, after their last use, and the error string is freed by `rocksdb_free`.
+    let message = unsafe {
+        let options = ffi::rocksdb_options_create();
+        let family_options = vec![options.cast_const(); names.len()];
+        let mut handles = vec![std::ptr::null_mut(); names.len()];
+        let db = ffi::rocksdb_open_for_read_only_column_families(
+            options,
+            c_path.as_ptr(),
+            count,
+            name_ptrs.as_ptr(),
+            family_options.as_ptr(),
+            handles.as_mut_ptr(),
+            0,
+            &mut failure,
+        );
+        if failure.is_null() {
+            ffi::rocksdb_verify_checksum(db, &mut failure);
+        }
+        for handle in handles.into_iter().filter(|h| !h.is_null()) {
+            ffi::rocksdb_column_family_handle_destroy(handle);
+        }
+        if !db.is_null() {
+            ffi::rocksdb_close(db);
+        }
+        ffi::rocksdb_options_destroy(options);
+        (!failure.is_null()).then(|| {
+            let message = CStr::from_ptr(failure).to_string_lossy().into_owned();
+            ffi::rocksdb_free(failure.cast());
+            message
+        })
+    };
+    let Some(detail) = message else {
+        return Ok(());
+    };
+    let context = ErrorContext {
+        engine: ENGINE,
+        instance: instance.to_owned(),
+        file: file_in(&detail),
+        partition: None,
+        detail,
+    };
+    Err(if context.detail.starts_with("Corruption") {
+        StorageError::Corruption(context)
+    } else {
+        StorageError::IoError(context)
+    })
 }
 
 /// The RocksDB file a message names, e.g. `.../000012.sst` in a checksum mismatch.

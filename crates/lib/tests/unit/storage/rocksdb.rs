@@ -402,3 +402,92 @@ fn a_snapshot_keeps_reading_through_a_restore() {
     assert_eq!(snapshot.get(b"old"), Ok(Some(b"1".to_vec())));
     assert_eq!(engine.get(b"old"), Ok(None));
 }
+
+mod ranges {
+    //! #103 / B-62: find damage with VerifyChecksum, name its file's span, and discard it.
+    use super::*;
+    use crate::storage::{l2_key, l2_span};
+
+    const HALF: u64 = 1 << 63;
+
+    /// Writes a thousand records under `hash` and flushes them into their own table file, in level 0 or, with
+    /// `compact`, moved below it.
+    fn fill(engine: &RocksDbAdapter, hash: u64, compact: bool) {
+        let mut batch = WriteBatch::default();
+        for i in 0u32..1_000 {
+            batch.put(l2_key(hash, "n", &i.to_be_bytes()), [b'v'; 200].to_vec());
+        }
+        engine.write(batch).unwrap();
+        engine.db.flush_cf(&engine.data()).unwrap();
+        if compact {
+            engine.compact(&l2_span(hash, hash + 1)).unwrap();
+        }
+    }
+
+    /// Flips bytes in the middle of the table file holding `hash`, while the engine is open.
+    #[allow(clippy::disallowed_methods)] // test fault injection rewrites the instance's files
+    fn damage(engine: &RocksDbAdapter, hash: u64) {
+        let key = data_key(&l2_key(hash, "n", &0u32.to_be_bytes()));
+        let file = engine
+            .db
+            .live_files()
+            .unwrap()
+            .into_iter()
+            .find(|f| {
+                f.start_key.as_deref() <= Some(&key[..]) && Some(&key[..]) <= f.end_key.as_deref()
+            })
+            .unwrap();
+        let path = engine.db.path().join(file.name.trim_start_matches('/'));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle..middle + 64]
+            .iter_mut()
+            .for_each(|b| *b ^= 0xFF);
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_discarded_damaged_file_leaves_compaction_and_writes_working() {
+        let mut harness = Rocks::default();
+        let engine = harness.open();
+        fill(&engine, 1, true);
+        fill(&engine, HALF, true);
+        // Warm the block cache, so reads alone could miss the damage.
+        for entry in engine.scan(&KeyRange::all()).unwrap() {
+            entry.unwrap();
+        }
+        damage(&engine, 1);
+
+        let failure = engine.verify().unwrap_err();
+        assert!(matches!(failure, StorageError::Corruption(_)), "{failure}");
+        let span = engine
+            .damaged(&failure)
+            .expect("a level 1+ file names its span");
+        assert!(l2_span(1, 2).contains(&span.start), "{span:?}");
+        engine.discard(&l2_span(1, 2)).unwrap();
+        engine.verify().unwrap();
+
+        // The damaged file left, so compaction over its range and later writes work.
+        engine.put(&l2_key(1, "n", b"new"), b"1").unwrap();
+        engine.db.flush_cf(&engine.data()).unwrap();
+        engine.compact(&KeyRange::all()).unwrap();
+        engine.health().unwrap();
+        engine.put(b"later", b"1").unwrap();
+        assert_eq!(engine.get(&l2_key(1, "n", &0u32.to_be_bytes())), Ok(None));
+        assert_eq!(engine.get(&l2_key(1, "n", b"new")), Ok(Some(b"1".to_vec())));
+        let kept = l2_key(HALF, "n", &7u32.to_be_bytes());
+        assert_eq!(engine.get(&kept), Ok(Some([b'v'; 200].to_vec())));
+    }
+
+    /// `DeleteFilesInRange` leaves level 0 files, so damage there names no span and rebuilds the whole instance.
+    #[test]
+    fn damage_in_level_zero_names_no_span() {
+        let mut harness = Rocks::default();
+        let engine = harness.open();
+        fill(&engine, 1, false);
+        damage(&engine, 1);
+        let failure = engine.verify().unwrap_err();
+        assert!(matches!(failure, StorageError::Corruption(_)), "{failure}");
+        assert_eq!(engine.damaged(&failure), None);
+    }
+}

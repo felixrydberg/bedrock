@@ -257,3 +257,119 @@ fn contained_corruption_quarantines_only_when_repeated() {
     health.report_contained("a", LAYER, &corrupt);
     assert_eq!(health.get("a", LAYER).unwrap().state, State::Unhealthy);
 }
+
+const HALF: u64 = 1 << 63;
+
+/// A quarantined source narrowed to the lower half of the hash space (#103 / B-62), with a record on each side.
+fn narrowed() -> (
+    Arc<MemoryEngine>,
+    Arc<StorageHealth>,
+    Arc<dyn StorageEngine>,
+) {
+    let raw = Arc::new(MemoryEngine::new("a"));
+    let health = StorageHealth::new(&Admin::new());
+    let engine = health.wrap("a", ENGINE, raw.clone());
+    engine
+        .put(&crate::storage::l2_key(1, "n", b"low"), b"v")
+        .unwrap();
+    engine
+        .put(&crate::storage::l2_key(HALF, "n", b"high"), b"v")
+        .unwrap();
+    health.report(
+        "a",
+        ENGINE,
+        &StorageError::Corruption(io().context().clone()),
+    );
+    assert!(health.rebuilding("a", ENGINE));
+    list(raw.as_ref(), &[(0, HALF)], true).unwrap();
+    assert!(health.narrow("a", ENGINE, vec![(0, HALF)]));
+    (raw, health, engine)
+}
+
+#[test]
+fn a_narrowed_quarantine_refuses_only_its_ranges() {
+    let (_raw, health, engine) = narrowed();
+    let (low, high) = (
+        crate::storage::l2_key(1, "n", b"low"),
+        crate::storage::l2_key(HALF, "n", b"high"),
+    );
+    assert!(matches!(
+        engine.get(&low),
+        Err(StorageError::Unavailable(_))
+    ));
+    assert_eq!(engine.get(&high), Ok(Some(b"v".to_vec())));
+    assert_eq!(engine.get(b"outside"), Ok(None));
+    // A scan or write reaching into a quarantined range is refused whole, never served in part.
+    assert!(engine.scan(&KeyRange::all()).is_err());
+    assert!(engine.put(&low, b"w").is_err());
+    engine.put(&high, b"w").unwrap();
+    assert!(
+        engine
+            .restore(&*MemoryEngine::new("e").snapshot().unwrap())
+            .is_err()
+    );
+    assert_eq!(health.unhealthy(), BTreeSet::from(["a".to_string()]));
+    assert_eq!(
+        health.damaged(),
+        BTreeMap::from([("a".to_string(), vec![(0, HALF)])])
+    );
+}
+
+#[test]
+fn a_failure_while_narrowed_quarantines_the_whole_source() {
+    let (_raw, health, engine) = narrowed();
+    health.rebuild_failed("a", ENGINE);
+    health.report(
+        "a",
+        ENGINE,
+        &StorageError::Corruption(io().context().clone()),
+    );
+    let high = crate::storage::l2_key(HALF, "n", b"high");
+    assert!(matches!(
+        engine.get(&high),
+        Err(StorageError::Unavailable(_))
+    ));
+    assert!(health.damaged().is_empty());
+    assert!(health.get("a", ENGINE).unwrap().ranges.is_empty());
+}
+
+#[test]
+fn a_restart_refuses_the_ranges_its_record_lists() {
+    let (raw, _health, _engine) = narrowed();
+    let restarted = StorageHealth::new(&Admin::new());
+    let engine = restarted.wrap("a", ENGINE, raw.clone());
+    assert!(engine.get(&crate::storage::l2_key(1, "n", b"low")).is_err());
+    assert_eq!(
+        engine.get(&crate::storage::l2_key(HALF, "n", b"high")),
+        Ok(Some(b"v".to_vec()))
+    );
+    assert_eq!(restarted.get("a", ENGINE).unwrap().ranges, vec![(0, HALF)]);
+
+    // A listing that cannot be read as a range means the whole instance.
+    let mut bad = WriteBatch::default();
+    bad.set_revision(format!("{LISTED}nonsense"), 1);
+    raw.write(bad).unwrap();
+    let restarted = StorageHealth::new(&Admin::new());
+    let engine = restarted.wrap("a", ENGINE, raw.clone());
+    assert!(
+        engine
+            .get(&crate::storage::l2_key(HALF, "n", b"high"))
+            .is_err()
+    );
+    assert!(restarted.get("a", ENGINE).unwrap().ranges.is_empty());
+
+    // Released once a rebuild validated the ranges.
+    release(raw.as_ref()).unwrap();
+    let rebuilt = StorageHealth::new(&Admin::new());
+    let _engine = rebuilt.wrap("a", ENGINE, raw);
+    assert!(rebuilt.unhealthy().is_empty());
+}
+
+#[test]
+fn merged_ranges_join_overlaps_and_the_end() {
+    assert_eq!(
+        merged(vec![(5, 9), (0, 3), (3, 4), (8, 12)]),
+        vec![(0, 4), (5, 12)]
+    );
+    assert_eq!(merged(vec![(5, 0), (7, 9), (1, 2)]), vec![(1, 2), (5, 0)]);
+}

@@ -30,7 +30,7 @@ struct Scripted {
 
 #[async_trait::async_trait]
 impl Restore for Scripted {
-    async fn restore(&self) -> StorageResult<()> {
+    async fn restore(&self, _: &[Range]) -> StorageResult<()> {
         if self.serving.get(b"k").is_ok() {
             self.served_while_rebuilding.store(true, Ordering::Relaxed);
         }
@@ -159,7 +159,7 @@ struct Blocked {
 
 #[async_trait::async_trait]
 impl Restore for Blocked {
-    async fn restore(&self) -> StorageResult<()> {
+    async fn restore(&self, _: &[Range]) -> StorageResult<()> {
         self.health.report(SOURCE.0, SOURCE.1, &corruption());
         std::future::pending().await
     }
@@ -203,24 +203,18 @@ async fn reinitialise_recreates_the_instance_without_old_data_or_revisions() {
     let mut batch = WriteBatch::default();
     batch.put(b"a", b"1").set_revision("artifacts", 9);
     engine.write(batch).unwrap();
-    Reinitialise {
-        engine: engine.clone(),
-        resubscribe: None,
-    }
-    .restore()
-    .await
-    .unwrap();
+    Reinitialise::new(engine.clone(), None)
+        .restore(&[])
+        .await
+        .unwrap();
     assert_eq!(engine.get(b"a").unwrap(), None);
     assert_eq!(engine.revision("artifacts").unwrap(), None);
 
     // A record that cannot be read back fails validation.
     engine.corrupt(b"b");
-    let check = Reinitialise {
-        engine: Arc::new(Unrestorable(engine)),
-        resubscribe: None,
-    };
+    let check = Reinitialise::new(Arc::new(Unrestorable(engine)), None);
     assert!(matches!(
-        check.restore().await,
+        check.restore(&[]).await,
         Err(StorageError::Corruption(_))
     ));
 }
@@ -255,5 +249,351 @@ impl StorageEngine for Unrestorable {
     }
     fn health(&self) -> StorageResult<()> {
         self.0.health()
+    }
+}
+
+/// Verification blocks until released; records whether any call ran while a verification was in progress.
+#[cfg(not(madsim))]
+struct Gated {
+    inner: MemoryEngine,
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    verifying: AtomicBool,
+    overlapped: AtomicBool,
+    restored: AtomicBool,
+}
+
+#[cfg(not(madsim))]
+impl Gated {
+    fn check(&self) {
+        if self.verifying.load(Ordering::SeqCst) {
+            self.overlapped.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(madsim))]
+impl StorageEngine for Gated {
+    fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.get(key)
+    }
+    fn scan(&self, range: &KeyRange) -> StorageResult<crate::storage::Scan<'_>> {
+        self.inner.scan(range)
+    }
+    fn write(&self, batch: WriteBatch) -> StorageResult<()> {
+        self.check();
+        self.inner.write(batch)
+    }
+    fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
+        self.inner.revision(name)
+    }
+    fn snapshot(&self) -> StorageResult<Box<dyn crate::storage::Snapshot + '_>> {
+        self.inner.snapshot()
+    }
+    fn restore(&self, snapshot: &dyn crate::storage::Snapshot) -> StorageResult<()> {
+        self.check();
+        self.restored.store(true, Ordering::SeqCst);
+        self.inner.restore(snapshot)
+    }
+    fn stats(&self) -> StorageResult<crate::storage::StorageStats> {
+        self.inner.stats()
+    }
+    fn disk_usage(&self) -> StorageResult<u64> {
+        self.inner.disk_usage()
+    }
+    fn health(&self) -> StorageResult<()> {
+        self.inner.health()
+    }
+    fn verify(&self) -> StorageResult<()> {
+        self.check();
+        self.verifying.store(true, Ordering::SeqCst);
+        self.entered.send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+        self.verifying.store(false, Ordering::SeqCst);
+        self.inner.verify()
+    }
+}
+
+/// Review of #103 / B-62: a timed-out repair stops waiting for its verification pass, which runs on; a retry must not
+/// verify, discard or restore the engine until that pass ends.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_waits_for_an_abandoned_verification_pass() {
+    let (entered, on_enter) = std::sync::mpsc::channel();
+    let (release, on_release) = std::sync::mpsc::channel();
+    let engine = Arc::new(Gated {
+        inner: MemoryEngine::new("auth"),
+        entered,
+        release: Mutex::new(on_release),
+        verifying: AtomicBool::new(false),
+        overlapped: AtomicBool::new(false),
+        restored: AtomicBool::new(false),
+    });
+    let restore = Arc::new(Reinitialise::new(engine.clone(), None));
+    let on_enter = Arc::new(Mutex::new(on_enter));
+    let wait_entered = || {
+        let on_enter = on_enter.clone();
+        tokio::task::spawn_blocking(move || on_enter.lock().unwrap().recv().unwrap())
+    };
+
+    let first = tokio::spawn({
+        let restore = restore.clone();
+        async move { restore.narrow().await }
+    });
+    wait_entered().await.unwrap();
+    // The repair's timeout drops its waiter; the blocking pass keeps going.
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let retry = tokio::spawn({
+        let restore = restore.clone();
+        async move {
+            let ranges = restore.narrow().await?;
+            restore.restore(&[]).await.map(|()| ranges)
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!retry.is_finished(), "the retry waits for the first pass");
+    assert!(
+        on_enter.lock().unwrap().try_recv().is_err(),
+        "no second verification"
+    );
+    assert!(!engine.restored.load(Ordering::SeqCst), "no restore");
+
+    release.send(()).unwrap();
+    wait_entered().await.unwrap();
+    release.send(()).unwrap();
+    assert_eq!(retry.await.unwrap(), Ok(None));
+    assert!(engine.restored.load(Ordering::SeqCst));
+    assert!(!engine.overlapped.load(Ordering::SeqCst));
+}
+
+mod ranges {
+    //! #103 / B-62: verify, then narrow the quarantine to the damaged ranges.
+    use super::*;
+    use crate::storage::sim::{Fault, SimEngine};
+    use crate::storage::{Scan, Snapshot, StorageStats, l2_key};
+
+    const HALF: u64 = 1 << 63;
+
+    struct Node {
+        health: Arc<StorageHealth>,
+        disk: Arc<SimEngine>,
+        replica: Arc<dyn StorageEngine>,
+        serving: Arc<dyn StorageEngine>,
+    }
+
+    fn low(n: u8) -> Vec<u8> {
+        l2_key(10 + u64::from(n), "n", &[n])
+    }
+
+    fn high() -> Vec<u8> {
+        l2_key(HALF + 5, "n", b"high")
+    }
+
+    /// Records in two low hashes, one high one, one outside L2 and a revision.
+    fn node(disk: Arc<SimEngine>) -> Node {
+        let health = StorageHealth::new(&Admin::new());
+        let replica = health.wrap_replication(SOURCE.0, SOURCE.1, disk.clone());
+        let serving = health.wrap(SOURCE.0, SOURCE.1, disk.clone());
+        let mut batch = WriteBatch::default();
+        batch
+            .put(low(0), b"0")
+            .put(low(1), b"1")
+            .put(high(), b"h")
+            .put(b"meta", b"m")
+            .set_revision("kept", 3);
+        replica.write(batch).unwrap();
+        Node {
+            health,
+            disk,
+            replica,
+            serving,
+        }
+    }
+
+    fn sim() -> Arc<SimEngine> {
+        Arc::new(SimEngine::new("auth", Arc::new(|_| None), None, false))
+    }
+
+    fn reinitialise(node: &Node) -> Reinitialise {
+        Reinitialise::new(node.replica.clone(), None)
+    }
+
+    #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+    #[cfg_attr(madsim, tokio::test)]
+    async fn damage_in_one_range_rebuilds_only_that_range_while_the_rest_serves() {
+        let node = node(sim());
+        // A bad block takes its neighbour with it.
+        node.disk.damage_block(l2_span(10, 12));
+        assert!(matches!(
+            node.serving.get(&low(1)),
+            Err(StorageError::Corruption(_))
+        ));
+        assert!(
+            node.serving.get(&high()).is_err(),
+            "while the extent is unknown the whole instance is refused"
+        );
+
+        assert!(node.health.rebuilding(SOURCE.0, SOURCE.1));
+        let restore = reinitialise(&node);
+        let ranges = restore.narrow().await.unwrap().expect("one L2 range");
+        assert_eq!(ranges, vec![(10, 13)]);
+        assert!(node.health.narrow(SOURCE.0, SOURCE.1, ranges.clone()));
+        assert_eq!(node.serving.get(&high()), Ok(Some(b"h".to_vec())));
+        assert_eq!(node.serving.get(b"meta"), Ok(Some(b"m".to_vec())));
+        assert!(matches!(
+            node.serving.get(&low(0)),
+            Err(StorageError::Unavailable(_))
+        ));
+
+        restore.restore(&ranges).await.unwrap();
+        assert!(node.health.recovered(SOURCE.0, SOURCE.1));
+        // Without a relay nothing re-bootstraps, so the discarded range is empty; everything else stayed.
+        assert_eq!(node.serving.get(&low(0)), Ok(None));
+        assert_eq!(node.serving.get(&high()), Ok(Some(b"h".to_vec())));
+        assert_eq!(node.serving.revision("kept"), Ok(Some(3)));
+        assert_eq!(node.disk.revision("health:quarantined"), Ok(None));
+    }
+
+    /// A damaged span inside the held range around it counts once: half the hash space is still narrowed.
+    #[test]
+    fn a_span_inside_its_held_range_counts_once_towards_the_width() {
+        let node = node(sim());
+        node.disk.damage(&low(0));
+        assert!(node.serving.get(&low(0)).is_err());
+        assert!(node.health.rebuilding(SOURCE.0, SOURCE.1));
+        let held = |ranges: &[Range]| Ok([ranges, &[(0, HALF)]].concat());
+        assert_eq!(
+            verify(node.replica.as_ref(), &held).unwrap(),
+            Some(vec![(0, HALF)])
+        );
+    }
+
+    #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+    #[cfg_attr(madsim, tokio::test)]
+    async fn a_restart_during_a_range_rebuild_still_refuses_the_range() {
+        let first = node(sim());
+        first.disk.damage(&low(0));
+        assert!(first.serving.get(&low(0)).is_err());
+        assert!(first.health.rebuilding(SOURCE.0, SOURCE.1));
+        let ranges = reinitialise(&first).narrow().await.unwrap().unwrap();
+        assert!(first.health.narrow(SOURCE.0, SOURCE.1, ranges));
+
+        // The process stops before the range rebuilt.
+        let disk = first.disk.clone();
+        drop(first);
+        let health = StorageHealth::new(&Admin::new());
+        let replica = health.wrap_replication(SOURCE.0, SOURCE.1, disk.clone());
+        let serving = health.wrap(SOURCE.0, SOURCE.1, disk);
+        assert!(serving.get(&low(0)).is_err());
+        assert_eq!(serving.get(&high()), Ok(Some(b"h".to_vec())));
+
+        let restore: Arc<dyn Restore> = Arc::new(Reinitialise::new(replica, None));
+        let source = (SOURCE.0.to_owned(), SOURCE.1);
+        let rebuild = Rebuild::new(health.clone(), BTreeMap::from([(source.clone(), restore)]));
+        rebuild.repair(&source, &()).await.unwrap();
+        assert_eq!(
+            health.get(SOURCE.0, SOURCE.1).unwrap().state,
+            State::Healthy
+        );
+        assert_eq!(serving.get(&high()), Ok(Some(b"h".to_vec())));
+    }
+
+    fn same(ranges: &[Range]) -> StorageResult<Vec<Range>> {
+        Ok(ranges.to_vec())
+    }
+
+    /// Forwards everything but [`StorageEngine::discard`].
+    struct NoDiscard(Arc<SimEngine>);
+
+    impl StorageEngine for NoDiscard {
+        fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+            self.0.get(key)
+        }
+        fn scan(&self, range: &KeyRange) -> StorageResult<Scan<'_>> {
+            self.0.scan(range)
+        }
+        fn write(&self, batch: WriteBatch) -> StorageResult<()> {
+            self.0.write(batch)
+        }
+        fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
+            self.0.revision(name)
+        }
+        fn snapshot(&self) -> StorageResult<Box<dyn Snapshot + '_>> {
+            self.0.snapshot()
+        }
+        fn restore(&self, from: &dyn Snapshot) -> StorageResult<()> {
+            self.0.restore(from)
+        }
+        fn stats(&self) -> StorageResult<StorageStats> {
+            self.0.stats()
+        }
+        fn disk_usage(&self) -> StorageResult<u64> {
+            self.0.disk_usage()
+        }
+        fn health(&self) -> StorageResult<()> {
+            self.0.health()
+        }
+        fn damaged(&self, failure: &StorageError) -> Option<KeyRange> {
+            self.0.damaged(failure)
+        }
+    }
+
+    /// Each fallback of #103 rebuilds the whole instance.
+    #[test]
+    fn verification_falls_back_to_the_whole_instance() {
+        let case = |damage: &dyn Fn(&SimEngine)| {
+            let disk = sim();
+            let node = node(disk.clone());
+            damage(&disk);
+            verify(node.replica.as_ref(), &same).unwrap()
+        };
+        assert_eq!(
+            case(&|_| {}),
+            None,
+            "a failure that names nothing to discard"
+        );
+        assert_eq!(case(&|d| d.damage(b"meta")), None, "a record outside L2");
+        assert_eq!(case(&|d| d.damage_revision("kept")), None, "a revision");
+        assert_eq!(
+            case(&|d| d.damage_block(KeyRange::all())),
+            None,
+            "a block reaching outside L2"
+        );
+        assert_eq!(
+            case(&|d| {
+                for n in 0..=MAX_SPANS as u64 {
+                    let key = l2_key(n * 1000, "n", b"x");
+                    d.put(&key, b"x").unwrap();
+                    d.damage(&key);
+                }
+            }),
+            None,
+            "too many damaged spans"
+        );
+        assert_eq!(
+            case(&|d| d.damage_block(l2_span(0, HALF + 1))),
+            None,
+            "too much of the hash space"
+        );
+
+        let disk = sim();
+        let _node = node(disk.clone());
+        disk.damage(&low(0));
+        assert_eq!(verify(&NoDiscard(disk), &same).unwrap(), None, "no discard");
+
+        let failing = Arc::new(AtomicBool::new(false));
+        let faults = {
+            let failing = failing.clone();
+            Arc::new(move |_| failing.load(Ordering::Relaxed).then_some(Fault::Io))
+        };
+        let node = node(Arc::new(SimEngine::new("auth", faults, None, false)));
+        failing.store(true, Ordering::Relaxed);
+        assert_eq!(
+            verify(node.replica.as_ref(), &same).unwrap(),
+            None,
+            "verification fails"
+        );
     }
 }
