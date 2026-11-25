@@ -125,6 +125,51 @@ fn pruning_keeps_the_entry_each_slot_holds_last() {
 }
 
 #[test]
+fn alarms_follow_the_commit_point_and_survive_log_pruning() {
+    let mut state = state(8, 0);
+    for (seq, at_ms) in [
+        (2, Some(100)),
+        (3, None),
+        (4, Some(200)),
+        (6, None),
+        (7, Some(300)),
+    ] {
+        let entry = &mut state.log[seq - 1];
+        entry.kind = Kind::Data as i32;
+        entry.alarm = Some(pb::Alarm { at_ms });
+    }
+    state.pending = state.log.iter().map(Message::encoded_len).sum();
+
+    state.ack(0, 2, true, 0);
+    state.ack(1, 1, true, 0);
+    assert_eq!(state.commit, 1);
+    assert_eq!(state.alarm_ms, None, "the pending set is not committed");
+    state.ack(1, 2, true, 0);
+    assert_eq!(state.alarm_ms, Some(100));
+
+    for i in 0..SLOTS {
+        state.ack(i, 3, true, 0);
+    }
+    assert_eq!(
+        state.alarm_ms, None,
+        "the clear precedes a pending reschedule"
+    );
+    for i in 0..SLOTS {
+        state.ack(i, 5, true, 0);
+    }
+    assert!(state.entry(4).is_none(), "the reschedule was pruned");
+    assert_eq!(state.alarm_ms, Some(200));
+
+    // A quorum commits both a clear and a reschedule in one advance; the later entry wins.
+    for i in 0..SLOTS {
+        state.ack(i, 8, true, 0);
+    }
+    assert_eq!(state.commit, 8);
+    assert!(state.entry(7).is_none(), "the final reschedule was pruned");
+    assert_eq!(state.alarm_ms, Some(300));
+}
+
+#[test]
 fn committed_entries_kept_for_a_lagging_slot_stay_within_the_byte_budget() {
     let mut state = state(30, 3 << 20);
     for i in 0..2 {

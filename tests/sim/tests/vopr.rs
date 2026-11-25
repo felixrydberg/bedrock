@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bedrock_lib::admin::Admin;
-use bedrock_lib::membership::View;
+use bedrock_lib::membership::{self, View};
 use bedrock_lib::node::{
     ApiConfig, Budget, ConfigError, Location, MembershipSettings, NodeConfig, RelayConfig,
     ReplaySettings, Role, ServiceConfig, Tier,
@@ -45,7 +45,7 @@ use bedrock_lib::storage::{KeyRange, Snapshot, StorageEngine, l2_parts, l2_span}
 use bedrock_lib::transport::Peers;
 use bedrock_sim::history::{
     History, Key, OwnerState, Placement, Range, Stream, Value, Violation, check_coverage,
-    check_handoff, check_held, check_routing, within,
+    check_handoff_by, check_held, check_routing, within,
 };
 use bedrock_sim::rpc;
 use http_body_util::{BodyExt, Full};
@@ -146,6 +146,21 @@ const REGRESSIONS: &[(u64, &str)] = &[
     // long run could not recover its ranges in time. Traced, at BEDROCK_VOPR_SECONDS=86400; passes at 43200 with the fix, and
     // the full day has not been rerun. `only_the_relay_a_recovery_entered_needs_a_slot`.
     (90003, ALL),
+    // reconciliation/rebuild.rs (#103 / B-62): a range rebuild discarded a range before a restarted session had its consumer,
+    // and the consumer resumed from revisions whose data was gone. Traced.
+    // `forgetting_a_range_removes_only_its_subscriptions_revisions`.
+    (67, ALL),
+    // reconciliation/rebuild.rs (#103 / B-62): a quarantine narrowed to the damaged hashes alone left the rest of their held
+    // range unmarked after its rebuild, so a later revoke missed it or a resumed consumer lacked keys. Each fails again with
+    // `widen` returning only the damaged hashes, after a narrowed rebuild on that run.
+    // `forgetting_a_range_removes_only_its_subscriptions_revisions` (its `widen` step).
+    (35, ALL),
+    (328, ALL),
+    (427, ALL),
+    (192, ALL),
+    // health/scrub.rs (#103 / B-62): a damaged revision nothing read again stayed hidden after faults stopped. Traced.
+    // `the_walk_reads_revisions_so_hidden_damage_there_quarantines`.
+    (481, ALL),
 ];
 
 /// Seeds that never failed: a quick sample of every fault class.
@@ -418,13 +433,17 @@ impl Cell {
         let members = || self.members.values();
         let id = |member: &pb::Member| member.node_id.clone();
         let unhealthy = members().filter(sick).map(id).collect();
-        let healthy = members()
-            .filter(carries)
-            .filter(|member| !sick(member))
-            .map(id)
-            .collect();
+        let quarantined = |owner: &str| {
+            let member = members().find(|member| member.node_id == owner && carries(member));
+            match member.map(|member| membership::quarantined(member, dataset)) {
+                Some(None) => Vec::new(),
+                Some(Some(spans)) if !spans.is_empty() => spans,
+                // Gone, not carrying the dataset, or quarantined whole.
+                _ => vec![(0, 0)],
+            }
+        };
         let checked = check_coverage(&after)
-            .and_then(|()| check_handoff(&before, &after, &healthy))
+            .and_then(|()| check_handoff_by(&before, &after, quarantined))
             .and_then(|()| check_routing(&before, &after, &unhealthy));
         if let Err(violation) = checked {
             self.violation.get_or_insert(violation);
@@ -1182,8 +1201,10 @@ fn release(run: &Run, process: &Process) {
     run.busy.lock().unwrap().remove(&process.name);
 }
 
-/// Damages a random record of `engine`.
-fn damage(engine: &SimEngine) -> Option<Key> {
+/// Damages `engine` and describes what: one random record, a block of it and its neighbours, or a revision. A real disk
+/// damages a block of many keys and sometimes metadata, so one record alone would overstate what a range rebuild saves
+/// (#103 / B-62). Without `wide`, always one record.
+fn damage(engine: &SimEngine, wide: bool) -> Option<String> {
     let frozen = engine.frozen();
     let keys: Vec<Key> = frozen
         .scan(&KeyRange::all())
@@ -1193,9 +1214,36 @@ fn damage(engine: &SimEngine) -> Option<Key> {
     if keys.is_empty() {
         return None;
     }
-    let key = keys[thread_rng().gen_range(0..keys.len())].clone();
-    engine.damage(&key);
-    Some(key)
+    let at = thread_rng().gen_range(0..keys.len());
+    let key = &keys[at];
+    match if wide {
+        thread_rng().gen_range(0..20)
+    } else {
+        0
+    } {
+        0..10 => {
+            engine.damage(key);
+            Some(format!("record {}", key.escape_ascii()))
+        }
+        10..17 => {
+            // The block ends past up to 8 neighbours, or with the key space.
+            let end = keys.get(at + thread_rng().gen_range(1..=8)).cloned();
+            engine.damage_block(KeyRange {
+                start: key.clone(),
+                end: end.clone(),
+            });
+            let end = end.map_or("end".into(), |end| end.escape_ascii().to_string());
+            Some(format!("block {}..{end}", key.escape_ascii()))
+        }
+        _ => {
+            let revisions = frozen.revisions().unwrap();
+            let name = revisions
+                .keys()
+                .nth(thread_rng().gen_range(0..revisions.len().max(1)))?;
+            engine.damage_revision(name);
+            Some(format!("revision {name}"))
+        }
+    }
 }
 
 /// Kills `process`, loses what a power failure may take, and restarts it.
@@ -1213,7 +1261,7 @@ async fn crash(run: &Run, process: &Process, down: Duration) {
             }
             // A torn write: the log truncated, and the record at its end fails verification.
             if lost > 0 && process.probed && thread_rng().gen_bool(0.25) {
-                damage(&engine);
+                damage(&engine, false);
             }
             run.record(format!("{} lost {lost} batches", process.name));
         }
@@ -1436,8 +1484,8 @@ async fn driver(run: Arc<Run>, processes: Vec<Process>, deadline: Instant) {
                             continue;
                         }
                     }
-                    if let Some(key) = damage(&engine) {
-                        run.record(format!("corrupt {} {}", a.name, key.escape_ascii()));
+                    if let Some(what) = damage(&engine, true) {
+                        run.record(format!("corrupt {} {what}", a.name));
                         chaos.count(Class::Corruption);
                     }
                 }
@@ -1828,7 +1876,7 @@ async fn drive(
         }
         let process = processes.iter().find(|p| !p.datasets.is_empty()).unwrap();
         for engine in run.disks.of(&process.dir) {
-            damage(&engine);
+            damage(&engine, false);
         }
     }
     for process in kv() {

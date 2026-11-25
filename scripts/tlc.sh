@@ -2,7 +2,10 @@
 # Checks the TLA+ models in docs/spec with TLC (#25 / B-23 Layer 1): every model's config must pass, and every
 # deliberate bug must break the invariant it names, checked alone so no other invariant fires first.
 #
-#   scripts/tlc.sh          Every model, then every bug: about 2 hours, mostly the volume configs (2 workers).
+#   scripts/tlc.sh          Every model, then every bug: many hours since per-point health (#103 / B-62); `handoff` alone
+#                           took 2 hours at 4 workers, and `handoff-volume-faulty` did not finish in 2.5 (membership.md).
+#                           It leaves out handoff-ranges, which did not finish (its bugs only run with it).
+#   scripts/tlc.sh handoff-ranges   That model and its bugs.
 #   scripts/tlc.sh bugs     Only the bugs: about 40 minutes, mostly volume-base's previous.
 #   scripts/tlc.sh relays   One model and its bugs.
 #
@@ -21,6 +24,10 @@ rm -rf "$work" && mkdir -p "$work"
 # catches mistakes in the model itself. handoff's single point cannot split a range, so membership checks
 # DirectoryCoverage.
 BUGS='
+alarms consume CommitOnly
+alarms stale CurrentAlarmOnly
+alarms early-fallback LateFallbackOnly
+alarms released-only CrashRecoverable
 cell buffered DurableCommit
 cell uncommitted CommittedApply
 cell cas OrderedCAS
@@ -123,6 +130,7 @@ membership early-drop NoDropBeforeReady
 membership early-removal NoEarlyRemoval
 membership minority-write Freeze
 membership merge-unequal NoDropBeforeReady
+membership range-only NoUnhealthyRouting
 service_isolation global-freeze HealthyServiceEnabled
 service_isolation stale-clock ClockBound
 service_isolation stale-clock NoEarlyRemoval
@@ -136,6 +144,10 @@ handoff absent NewOwnersPublished
 handoff early-drop NoDropBeforeReady
 handoff any-ready KeepsHealthyHolder
 handoff minority-write Freeze
+handoff-ranges start-only KeepsHealthyHolder
+handoff-ranges unverified DamageRefused
+handoff-ranges-restart forget DamageRefused
+handoff-ranges-restart unverified DamageRefused
 handoff-volume early-report ReadyCopied
 handoff-volume no-gen ReadyCopied
 handoff-volume-split early-report ReadyCopied
@@ -228,7 +240,7 @@ bug() {
     fi
 }
 
-models="relays cells follows merge materialized kv_actor kv_actor-local kv_actor-overwrite kv_actor-review kv_admission publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
+models="alarms relays cells follows merge materialized kv_actor kv_actor-local kv_actor-overwrite kv_actor-review kv_admission publisher membership service_isolation handoff handoff-ranges-restart handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

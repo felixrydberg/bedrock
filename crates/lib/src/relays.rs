@@ -718,6 +718,7 @@ impl Hub {
         };
         current.status = member.status;
         current.unhealthy = member.unhealthy;
+        current.damaged = member.damaged;
         current.sizes = member.sizes;
         drop(subscribers);
         self.members_changed();

@@ -5,6 +5,9 @@ edition = "2024"
 rust-version.workspace = true
 description = "Compute hosts: the `bedrock-compute` binary, the actor host, its volume client and SQLite storage, and the one execution seam (#112 / S-04, #115 / S-07, #147 / S-20)."
 
+[features]
+test-support = []
+
 [dependencies]
 async-trait.workspace = true
 bedrock-lib.workspace = true

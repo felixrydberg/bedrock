@@ -114,7 +114,8 @@ finishing.
   which a lost message already covers, so the model leaves that out.
 - **Log truncation after a flush** is modeled as a truncation point (`volume-truncate`); slots keep their whole log
   beside it, and `TruncatedInS3` checks that the truncated prefix is S3's. Alarms, reads and the overlay are out of
-  scope. The next section says what the code needs so that this abstraction stays sound.
+  scope. Alarm delivery is checked separately by [alarms.tla (#117 / S-09)](alarms.md).
+  The next section says what the code needs so that this abstraction stays sound.
 
 ## Truncation and `Slot.flushed_epoch` (#112 / S-04)
 

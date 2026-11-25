@@ -91,6 +91,17 @@ impl Storage {
         self.0.writer.read(keys).await
     }
 
+    /// Ordered keys at the commit point or later; `more` means another page follows.
+    pub async fn scan(&self, start: Vec<u8>, limit: u32) -> Result<(Vec<pb::Value>, bool), Error> {
+        self.check()?;
+        self.0.writer.scan(start, limit).await
+    }
+
+    /// The current acknowledged alarm, in Unix milliseconds.
+    pub fn alarm_ms(&self) -> Option<u64> {
+        self.0.writer.alarm_ms()
+    }
+
     /// Commits `changes` as one entry; returns its sequence once two voting slots hold it.
     /// If the caller is cancelled before the answer, the storage fences: the entry may still commit.
     pub async fn commit(&self, changes: Vec<pb::Change>) -> Result<u64, Error> {
@@ -103,17 +114,37 @@ impl Storage {
         changes: Vec<pb::Change>,
         committed_at: u64,
     ) -> Result<u64, Error> {
-        self.check()?;
-        let barrier = Barrier(&self.0.fenced);
-        let committed = self.0.writer.commit(changes, None, committed_at).await;
-        std::mem::forget(barrier);
-        committed
+        self.write_at(changes, None, committed_at).await
     }
 
-    /// Up to `limit` values starting at `start`, in key order, at least at this writer's commit point.
-    pub async fn scan(&self, start: Vec<u8>, limit: u32) -> Result<(Vec<pb::Value>, bool), Error> {
+    /// Commits state and an alarm clear (`None`) or reschedule atomically.
+    pub async fn commit_with_alarm(
+        &self,
+        changes: Vec<pb::Change>,
+        at_ms: Option<u64>,
+    ) -> Result<u64, Error> {
+        self.write(changes, Some(pb::Alarm { at_ms })).await
+    }
+
+    async fn write(
+        &self,
+        changes: Vec<pb::Change>,
+        alarm: Option<pb::Alarm>,
+    ) -> Result<u64, Error> {
+        self.write_at(changes, alarm, now_ms()).await
+    }
+
+    async fn write_at(
+        &self,
+        changes: Vec<pb::Change>,
+        alarm: Option<pb::Alarm>,
+        committed_at: u64,
+    ) -> Result<u64, Error> {
         self.check()?;
-        self.0.writer.scan(start, limit).await
+        let barrier = Barrier(&self.0.fenced);
+        let committed = self.0.writer.commit(changes, alarm, committed_at).await;
+        std::mem::forget(barrier);
+        committed
     }
 
     /// Runs `f` in a SQLite transaction and commits what it wrote as one entry; returns once that entry has its
@@ -121,6 +152,23 @@ impl Storage {
     pub async fn sql<R>(
         &self,
         f: impl Fn(&Transaction<'_>) -> rusqlite::Result<R>,
+    ) -> Result<rusqlite::Result<R>, Error> {
+        self.transaction(f, None).await
+    }
+
+    /// Commits SQLite pages and the alarm atomically; a failed transaction changes neither.
+    pub async fn sql_with_alarm<R>(
+        &self,
+        f: impl Fn(&Transaction<'_>) -> rusqlite::Result<R>,
+        at_ms: Option<u64>,
+    ) -> Result<rusqlite::Result<R>, Error> {
+        self.transaction(f, Some(pb::Alarm { at_ms })).await
+    }
+
+    async fn transaction<R>(
+        &self,
+        f: impl Fn(&Transaction<'_>) -> rusqlite::Result<R>,
+        alarm: Option<pb::Alarm>,
     ) -> Result<rusqlite::Result<R>, Error> {
         self.check()?;
         if self.lock().is_none() {
@@ -177,8 +225,9 @@ impl Storage {
                     }
                 }
                 Ok((result, changes)) => {
-                    if !changes.is_empty()
-                        && let Err(error) = self.commit(changes).await
+                    if result.is_ok()
+                        && (!changes.is_empty() || alarm.is_some())
+                        && let Err(error) = self.write(changes, alarm).await
                     {
                         // The pages are cached but not committed (too large, or the writer stopped): drop the
                         // database, so the next transaction reads the committed state from the slots.

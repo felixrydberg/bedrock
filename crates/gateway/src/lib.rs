@@ -307,7 +307,10 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
         let actor = request
             .actor
             .ok_or_else(|| Status::invalid_argument("missing actor"))?;
-        let result = router.route(actor, request.payload).await;
+        let result = match request.alarm_ms {
+            Some(at_ms) => router.alarm(actor, at_ms).await.map(|()| Vec::new()),
+            None => router.route(actor, request.payload).await,
+        };
         self.count(COMPUTE, if result.is_ok() { "served" } else { "failed" });
         Ok(Response::new(bedrock_lib::volume::InvokeReply {
             payload: result?,

@@ -177,3 +177,34 @@ remain as recorded above.
 Cleanup on 2026-11-25 removed the review's two unique target directories (`~/bedrock-126-b840-review1` and
 `~/bedrock-126-b840-review1-madsim`, about 36 GiB), temporary seed reports/logs/helpers and generated TLC states.
 Sibling targets, shared harness files, Docker artifacts and sccache were left untouched. No VHDX compaction ran.
+
+## Main integration (2026-11-25)
+
+Merged `origin/main` at `4330e139db07a106704138609d8c08c76d885a1c` (S-09 / #117 and B-62 / #103).
+The storage conflict preserves both explicit KV commit timestamps and atomic alarm changes behind the same
+cancellation barrier. The model registry retains both parents' configs and deliberate bugs. Main stops an actor's
+output before waiting for its input gate, so the deletion-cancellation regression now checks a fenced old response,
+reachable cleanup, and a fresh instance recovering the committed counter from the slots.
+
+Final `cargo fmt --all -- --check`, normal workspace/all-target Clippy with `-D warnings`, full normal workspace
+tests, and madsim workspace/all-target Clippy passed. Checks ran sequentially with one build job and one test thread.
+Madsim passed 99 volume, 18 KV and 26 supported Compute unit tests, plus all 15 tests across `actor_alarms`,
+`actor_host`, `compute_binary`, `kv_actor`, `namespaces`, `volume_client`, `volume_cold` and `volume_repair`, including
+their seed/replay cases. Its dependency tree excludes RocksDB. Four existing Compute unit tests cannot run under
+madsim because they construct a blocking Tokio runtime; those functions and their helper are unchanged in both
+parents, and all four passed in the normal suite. The supported unit continuation used `MADSIM_TEST_SEED=1` and
+explicitly skipped those four mode-incompatible cases.
+
+`actor_routing` fails seed 1 at `alarm redelivery after holder crash within 20s`. An untouched source archive of
+the exact main commit, built in a third isolated target directory, fails at the identical assertion and seed.
+This upstream alarm acceptance failure remains open; the merge does not change or suppress its test.
+
+TLC passed `alarms` (252 distinct states, depth 17), `kv_admission` (8, depth 5) and `volume_cold-move` (400,
+depth 15), with all eight registered deliberate-bug checks. Each used one worker and a 4 GiB heap. The merge
+preserves the other models and bounds; their larger configurations and the 500-seed sweep were not rerun for
+this integration. Earlier implementation/review results above remain historical checks of those revisions.
+
+Cleanup removed this merge's normal and madsim target directories and the isolated main reproduction target
+(`~/bedrock-126-b840-main-merge`, `~/bedrock-126-b840-main-merge-madsim` and
+`~/bedrock-126-b840-main-baseline-madsim`, about 31 GiB), plus its temporary source archive, helpers, logs and TLC
+states. Other checkouts' targets, Docker artifacts and sccache were untouched; no VHDX compaction ran.

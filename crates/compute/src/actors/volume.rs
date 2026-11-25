@@ -387,6 +387,8 @@ struct State {
     voting: [bool; SLOTS],
     told: [u64; SLOTS],
     commit: u64,
+    /// The alarm at `commit`, including the flushed baseline; pending entries never change it.
+    alarm_ms: Option<u64>,
     /// Encoded bytes of this writer's entries above the commit point, and of committed entries still kept.
     pending: usize,
     retained: usize,
@@ -431,6 +433,9 @@ impl State {
             && point > self.commit
         {
             for seq in self.commit + 1..=point {
+                if let Some(alarm) = self.entry(seq).and_then(|entry| entry.alarm.as_ref()) {
+                    self.alarm_ms = alarm.at_ms;
+                }
                 let size = self.entry(seq).map_or(0, Message::encoded_len);
                 if seq >= self.noop {
                     self.pending -= size;
@@ -961,6 +966,11 @@ impl Writer {
         self.shared.lock().commit
     }
 
+    /// The alarm as of the acknowledged commit point.
+    pub fn alarm_ms(&self) -> Option<u64> {
+        self.shared.lock().alarm_ms
+    }
+
     /// Whether this writer may still serve: it has not stopped, and two of the slots still taking its appends
     /// acknowledged a heartbeat sent within [`FENCE`]. Once false it stays false; the actor host claims again.
     pub fn serving(&self) -> bool {
@@ -1190,6 +1200,7 @@ impl State {
             voting: [true; SLOTS],
             told: [0; SLOTS],
             commit: 0,
+            alarm_ms: None,
             pending: 0,
             retained: 0,
             lost: [false; SLOTS],
@@ -1411,6 +1422,7 @@ async fn recover(
     // 0 asks for the first entry after the slot's flushed point.
     let mut from = 0;
     let mut flushed = pb::LogEnd::default();
+    let mut alarm_ms = None;
     loop {
         let request = pb::LogRequest {
             actor: Some(actor.clone()),
@@ -1451,6 +1463,7 @@ async fn recover(
                 seq: slot.flushed,
                 epoch: slot.flushed_epoch,
             };
+            alarm_ms = slot.flushed_alarm_ms;
         }
         for entry in reply.entries {
             if log.last().is_some_and(|last| entry.seq != last.seq + 1) {
@@ -1492,6 +1505,7 @@ async fn recover(
         base,
         base_epoch,
         commit: base,
+        alarm_ms,
         noop: noop.seq,
         pending: noop.encoded_len(),
         next: [noop.seq; SLOTS],

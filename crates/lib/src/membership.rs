@@ -57,8 +57,24 @@ pub fn token(identity: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-/// An entry a node may announce: a known service, plain identities, `ready` or `draining`, and unhealthy datasets
-/// that are its own, in order and without repeats (so equal health compares equal), and range sizes in order.
+/// Where `member`'s copy of `dataset` is quarantined (#13 / B-14, #103 / B-62): `None` when it is healthy, empty when
+/// the whole copy is, otherwise only those ranges.
+pub fn quarantined(
+    member: &pb::Member,
+    dataset: &str,
+) -> Option<Vec<crate::relays::ranges::Range>> {
+    if !member.unhealthy.iter().any(|d| d == dataset) {
+        return None;
+    }
+    let damaged = member.damaged.iter().find(|d| d.dataset == dataset);
+    Some(damaged.map_or_else(Vec::new, |d| {
+        d.spans.iter().map(|s| (s.start, s.end)).collect()
+    }))
+}
+
+/// An entry a node may announce: a known service, plain identities, `ready` or `draining`, unhealthy datasets that are
+/// its own, in order and without repeats (so equal health compares equal), damaged ranges of unhealthy datasets in the
+/// same way, and range sizes in order.
 pub fn validate(member: &pb::Member) -> Result<(), Status> {
     let status = pb::member::Status::try_from(member.status);
     if !SERVICES.contains(&member.service.as_str())
@@ -70,6 +86,11 @@ pub fn validate(member: &pb::Member) -> Result<(), Status> {
         )
         || !member.unhealthy.is_sorted_by(|a, b| a < b)
         || !member.unhealthy.iter().all(|d| member.datasets.contains(d))
+        || !member.damaged.is_sorted_by(|a, b| a.dataset < b.dataset)
+        || !member
+            .damaged
+            .iter()
+            .all(|d| member.unhealthy.contains(&d.dataset) && spans_valid(&d.spans))
         || !sizes_valid(&member.sizes)
     {
         return Err(Status::invalid_argument("invalid membership entry"));
@@ -99,8 +120,25 @@ pub fn member(config: &ServiceConfig, service: &str) -> pb::Member {
         status: pb::member::Status::Ready as i32,
         address: node.advertised(),
         unhealthy: Vec::new(),
+        damaged: Vec::new(),
         sizes: Vec::new(),
     }
+}
+
+/// Damaged ranges are disjoint, non-empty spans in order, at least one.
+fn spans_valid(spans: &[pb::Span]) -> bool {
+    let mut from = 0u128;
+    !spans.is_empty()
+        && spans.iter().all(|span| {
+            let end = if span.end == 0 {
+                1 << 64
+            } else {
+                u128::from(span.end)
+            };
+            let ok = u128::from(span.start) >= from && end > u128::from(span.start);
+            from = end;
+            ok
+        })
 }
 
 /// Range sizes are disjoint, non-empty spans in order, each with its middle inside or 0.

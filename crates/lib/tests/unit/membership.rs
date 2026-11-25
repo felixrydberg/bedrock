@@ -82,6 +82,30 @@ fn announced_entries_are_validated() {
     assert!(health(&["quicksilver", "auth"]).is_err());
     assert!(health(&["auth", "auth"]).is_err());
     assert!(health(&["cdn"]).is_err());
+    // Damaged ranges belong to unhealthy datasets, in dataset order, each with disjoint non-empty spans in order.
+    let damaged = |damaged: &[(&str, &[(u64, u64)])]| {
+        validate(&pb::Member {
+            datasets: vec!["auth".into(), "quicksilver".into()],
+            unhealthy: vec!["auth".into(), "quicksilver".into()],
+            damaged: damaged
+                .iter()
+                .map(|(dataset, spans)| pb::Damaged {
+                    dataset: dataset.to_string(),
+                    spans: spans
+                        .iter()
+                        .map(|&(start, end)| pb::Span { start, end })
+                        .collect(),
+                })
+                .collect(),
+            ..ready("kv-1")
+        })
+    };
+    assert!(damaged(&[("auth", &[(0, 10), (20, 0)]), ("quicksilver", &[(5, 6)])]).is_ok());
+    assert!(damaged(&[("quicksilver", &[(5, 6)]), ("auth", &[(0, 10)])]).is_err());
+    assert!(damaged(&[("cdn", &[(0, 10)])]).is_err());
+    assert!(damaged(&[("auth", &[])]).is_err());
+    assert!(damaged(&[("auth", &[(0, 10), (5, 20)])]).is_err());
+    assert!(damaged(&[("auth", &[(5, 5)])]).is_err());
     // Range sizes are disjoint, non-empty spans in order, each with its middle inside or 0 (#111 / S-03).
     let sizes = |spans: &[(u64, u64, u64)]| {
         validate(&pb::Member {

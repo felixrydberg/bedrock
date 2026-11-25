@@ -81,6 +81,14 @@ pub trait Executor: Send + Sync {
 #[async_trait]
 pub trait Instance: Send {
     async fn invoke(&mut self, request: Vec<u8>) -> Result<Vec<u8>, Error>;
+
+    /// A due alarm, dispatched by the actor host through the same input and output gates.
+    /// The handler must commit its clear or reschedule together with its state changes.
+    async fn alarm(&mut self, _at_ms: u64) -> Result<(), Error> {
+        Err(Error::Unsupported(
+            "this instance has no alarm handler".into(),
+        ))
+    }
 }
 
 /// Builds a built-in kind's instance over the actor's storage.

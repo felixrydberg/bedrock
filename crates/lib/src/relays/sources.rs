@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
+use super::ranges::hits;
 use crate::health::Health;
 use crate::placement::{self, Directory, State};
 use crate::replication::pb;
@@ -91,7 +92,10 @@ impl Sources {
                 })
             })
             .filter_map(|o| Some((&o.state, members.get(&o.node)?)))
-            .filter(|(_, m)| !m.unhealthy.iter().any(|d| d == dataset))
+            .filter(|(_, m)| {
+                crate::membership::quarantined(m, dataset)
+                    .is_none_or(|quarantined| !hits(&quarantined, (hash, hash.wrapping_add(1))))
+            })
             .collect();
         drop(behind);
         // Stable, so equal candidates keep directory order.

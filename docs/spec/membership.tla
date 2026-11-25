@@ -8,6 +8,8 @@ EXTENDS Naturals, FiniteSets
 \* one dataset's directory: each dataset has its own, given only to its Carriers.
 \* Current ranged services place quicksilver and cdn; auth awaits the Gateway and has no Quicksilver carriers.
 \* #13 / B-14: a member's update also carries its storage health; unhealthy members get no new ranges.
+\* #103 / B-62: health is per point, since a verified quarantine names only its damaged ranges. A member with any
+\* unhealthy point still gets no new ranges; handoff.tla checks what the points change.
 \* #22 / B-21: handoff.tla checks how owners become ready and how ranges are revoked.
 \* #68 / B-21b: an operator writes a drain record into the same namespace (pubDrain), and deletes it to cancel.
 \* CompleteDrain marks it drained only after the node owns no ranges; the record still excludes it from new assignments.
@@ -35,13 +37,15 @@ Clocks(u, sd, c) ==
     [r \in Relays |-> [n \in Nodes |->
         IF ~u[r] \/ (c[n] # None /\ u[c[n]] /\ sd[c[n]] = sd[r]) THEN 0 ELSE gone[r][n]]]
 
+Span(S, p) == {h \in Points : h >= p /\ \A s \in S : s <= h => s <= p}
+
 Init == /\ up = [r \in Relays |-> TRUE] /\ side = [r \in Relays |-> 1]
         /\ conn = [n \in Nodes |-> None] /\ drain = [n \in Nodes |-> FALSE]
         /\ leftAt = [n \in Nodes |-> None]
         /\ gone = [r \in Relays |-> [n \in Nodes |-> 0]]
         /\ gap = [n \in Nodes |-> 0] /\ pub = [n \in Nodes |-> "absent"] /\ split = FALSE
         /\ starts = {0} /\ own = [p \in Points |-> [n \in Nodes |-> "none"]]
-        /\ sick = [n \in Nodes |-> FALSE] /\ pubSick = [n \in Nodes |-> FALSE]
+        /\ sick = [n \in Nodes |-> {}] /\ pubSick = [n \in Nodes |-> {}]
         /\ pubDrain = [n \in Nodes |-> FALSE]
         /\ pubDone = [n \in Nodes |-> FALSE]
 
@@ -65,9 +69,9 @@ Leave(n) == /\ conn[n] # None /\ drain[n]
 \* The process restarts with the same identity and is ready again.
 Restart(n) == /\ conn[n] = None /\ drain[n] /\ drain' = [drain EXCEPT ![n] = FALSE]
               /\ UNCHANGED <<up, side, conn, leftAt, gone, gap, pub, split, starts, own, sick, pubSick, pubDrain, pubDone>>
-\* The node's local storage is quarantined or recovers (B-14); its session announces the change.
-Sicken(n) == /\ sick' = [sick EXCEPT ![n] = ~sick[n]]
-             /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, pub, split, starts, own, pubSick, pubDrain, pubDone>>
+\* The node's local storage at point h is quarantined or recovers (B-14, B-62); its session announces the change.
+Sicken(n, h) == /\ sick' = [sick EXCEPT ![n] = IF h \in @ THEN @ \ {h} ELSE @ \cup {h}]
+                /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, pub, split, starts, own, pubSick, pubDrain, pubDone>>
 \* An operator writes or deletes the drain record through the cell's embedded Raft authority.
 \* This atomic model abstracts the durable-quorum boundary checked by cell.tla.
 Order(n) == /\ \E r \in Relays : Quorum(r)
@@ -106,7 +110,7 @@ Set(r, n) == /\ Publisher(r) /\ Held(r, n) /\ <<pub[n], pubSick[n]>> # <<Status(
 Delete(r, n) == /\ Publisher(r) /\ pub[n] # "absent" /\ ~Held(r, n)
                 /\ (leftAt[n] \in Live(r) \/ gone[r][n] >= Grace \/ (Bug = "early-removal" /\ pub[n] = "draining"))
                 /\ pub' = [pub EXCEPT ![n] = "absent"]
-                /\ pubSick' = [pubSick EXCEPT ![n] = FALSE]
+                /\ pubSick' = [pubSick EXCEPT ![n] = {}]
                 /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, split, starts, own, sick, pubDrain, pubDone>>
 \* The assigner (B-15 `assign` plus the interim promotion) writes one range entry `o` at
 \* start p, splitting the covering range when p is new. Any plan within these rules:
@@ -118,7 +122,10 @@ Write(r, p, o) ==
     /\ \A n \in Nodes :
         /\ o[n] = "populating" => \/ cur[n] = "populating"
                                   \/ cur[n] = "none" /\ (pub[n] = "ready" \/ (Bug = "draining" /\ pub[n] = "draining"))
-                                     /\ n \in Carriers /\ (~pubSick[n] \/ Bug = "sick")
+                                     /\ n \in Carriers
+                                     \* Bug "range-only" lets a member take a range clear of its unhealthy points.
+                                     /\ \/ pubSick[n] = {} \/ Bug = "sick"
+                                        \/ Bug = "range-only" /\ pubSick[n] \cap Span(starts \cup {p}, p) = {}
                                      /\ (~pubDrain[n] \/ Bug = "drain-record")
         /\ o[n] = "ready" => cur[n] \in {"ready", "populating"}
         /\ o[n] = "leaving" => cur[n] \in Holds
@@ -140,10 +147,11 @@ Merge(r, p) == /\ (Publisher(r) \/ (Bug = "minority-write" /\ up[r])) /\ p \in s
                /\ UNCHANGED <<up, side, conn, drain, leftAt, gone, gap, pub, split, sick, pubSick, pubDrain, pubDone>>
 
 Next == \/ Tick
-        \/ \E n \in Nodes : Disconnect(n) \/ Drain(n) \/ Leave(n) \/ Restart(n) \/ Sicken(n) \/ Order(n) \/ CompleteDrain(n)
+        \/ \E n \in Nodes : Disconnect(n) \/ Drain(n) \/ Leave(n) \/ Restart(n) \/ Order(n) \/ CompleteDrain(n)
         \/ \E n \in Nodes, r \in Relays : Connect(n, r) \/ Set(r, n) \/ Delete(r, n)
         \/ \E r \in Relays : Crash(r) \/ Recover(r) \/ Move(r)
         \/ \E r \in Relays, p \in Points : Merge(r, p)
+        \/ \E n \in Nodes, h \in Points : Sicken(n, h)
         \/ \E r \in Relays, p \in Points, o \in [Nodes -> {"none", "populating"} \cup Holds] :
             Write(r, p, o)
 Spec == Init /\ [][Next]_vars
@@ -153,7 +161,7 @@ TypeOK == /\ conn \in [Nodes -> Relays \cup {None}] /\ leftAt \in [Nodes -> Rela
           /\ gone \in [Relays -> [Nodes -> 0..Grace]] /\ gap \in [Nodes -> 0..Grace]
           /\ starts \subseteq Points
           /\ own \in [Points -> [Nodes -> {"none", "populating"} \cup Holds]]
-          /\ sick \in [Nodes -> BOOLEAN] /\ pubSick \in [Nodes -> BOOLEAN]
+          /\ sick \in [Nodes -> SUBSET Points] /\ pubSick \in [Nodes -> SUBSET Points]
           /\ pubDrain \in [Nodes -> BOOLEAN] /\ pubDone \in [Nodes -> BOOLEAN]
 \* Ends are implicit, so the directory covers the hash space after every write.
 DirectoryCoverage == 0 \in starts
@@ -163,7 +171,7 @@ NewOwnersPublished == [][\A h \in Points, n \in Nodes :
                                 => pub[n] = "ready" /\ n \in Carriers /\ ~pubDrain[n]]_vars
 \* No member whose published storage is unhealthy is given a new range.
 NoUnhealthyRouting == [][\A h \in Points, n \in Nodes :
-                            (Entry(h)'[n] = "populating" /\ Entry(h)[n] # "populating") => ~pubSick[n]]_vars
+                            (Entry(h)'[n] = "populating" /\ Entry(h)[n] # "populating") => pubSick[n] = {}]_vars
 \* A range that has a holder still in membership keeps a holder: a leaving owner goes only
 \* once a new owner is ready.
 NoDropBeforeReady == [][\A h \in Points :

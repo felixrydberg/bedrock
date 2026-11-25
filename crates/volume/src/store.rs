@@ -4,7 +4,7 @@
 //! with `s/` and the actor's big-endian hash, so a hash range is one scan and dropping it one `delete_range`:
 //! `s/{hash}{namespace}\0{id}\0` followed by `claim`, `log/{seq}`, `data/{key}` (the overlay) or `owed` (a flush's
 //! truncation the actor's other slots have not confirmed, kept by its maintainer). Released actors with an
-//! alarm are also indexed by time, `alarm/{when}{hash}{namespace}\0{id}`, removed with the claim's release, and
+//! alarm are also indexed by time, `alarm/{when}{hash}{namespace}\0{id}`, removed when claimed again, and
 //! tombstones of deleted actors (S-05b) by their `DELETE`'s time under `gone/`, removed with the tombstone.
 //!
 //! Each request is one atomic batch: log entries, overlay changes and the claim together. The engine syncs every batch
@@ -19,7 +19,7 @@
 //! `m/repaired` (spans where an actor with no claim record here starts `repaired`, with floor 0) and `m/fresh` (the
 //! store started empty while this node owned no range, so a range it is first given `ready` has nothing to copy).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -27,7 +27,7 @@ use std::time::Duration;
 use bedrock_lib::actors::ActorId;
 use bedrock_lib::replication::pb::{RangeSize, Span};
 use bedrock_lib::storage::{
-    ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, WriteBatch,
+    ErrorContext, KeyRange, StorageEngine, StorageError, StorageResult, WriteBatch, WriteOp,
 };
 use bedrock_lib::volume as pb;
 use pb::Refusal;
@@ -90,11 +90,30 @@ fn missing(seq: u64) -> Error {
     }))
 }
 
+fn bad_alarm_key() -> Error {
+    Error::Storage(StorageError::Corruption(ErrorContext {
+        engine: "volume",
+        instance: "volume".into(),
+        file: None,
+        partition: None,
+        detail: "an alarm candidate has an invalid actor key".into(),
+    }))
+}
+
 /// An actor's key prefix, hash and metrics kind.
 pub struct Actor {
     hash: u64,
     prefix: Vec<u8>,
     kind: i32,
+}
+
+/// A due alarm hint. The receiving holder validates it against its recovered, committed alarm before invoking.
+#[derive(Clone, Debug)]
+pub struct AlarmCandidate {
+    pub actor: pb::Actor,
+    pub at_ms: u64,
+    pub released: bool,
+    pub holder: Option<pb::Holder>,
 }
 
 impl Actor {
@@ -153,6 +172,15 @@ pub fn claim_key(actor: &Actor) -> Vec<u8> {
     actor.key(b"claim")
 }
 
+fn alarm_actor(prefix: &[u8]) -> Result<pb::Actor, Error> {
+    let wire = Actor::parse(prefix, 0).ok_or_else(bad_alarm_key)?;
+    let actor = Actor::new(&wire).map_err(|_| bad_alarm_key())?;
+    if actor.prefix != prefix {
+        return Err(bad_alarm_key());
+    }
+    Ok(wire)
+}
+
 fn log_key(actor: &Actor, seq: u64) -> Vec<u8> {
     actor.key(&[b"log/".as_slice(), &seq.to_be_bytes()].concat())
 }
@@ -163,12 +191,6 @@ fn data_key(actor: &Actor, key: &[u8]) -> Vec<u8> {
 
 fn owed_key(actor: &Actor) -> Vec<u8> {
     actor.key(b"owed")
-}
-
-/// The alarm index entry of a released actor with an alarm.
-fn alarm_key(actor: &Actor, claim: &pb::ClaimRecord) -> Option<Vec<u8>> {
-    let at = claim.alarm_ms.filter(|_| claim.released)?;
-    Some([b"alarm/".as_slice(), &at.to_be_bytes(), &actor.prefix[2..]].concat())
 }
 
 /// The tombstone index entry of a deleted actor (S-05b).
@@ -408,12 +430,26 @@ pub struct Store {
     locks: Vec<Mutex<()>>,
     /// Actors with committed entries not yet flushed, by slot-store prefix: the maintainer's flush candidates.
     dirty: Mutex<BTreeMap<Vec<u8>, pb::Actor>>,
+    /// Volatile hints for held alarms and pending tails. Rebuilt at startup; updated after a claim write succeeds. Stale
+    /// prefixes are harmless and pruned while holding the actor stripe, which serializes repair and range deletion.
+    alarms: Mutex<BTreeSet<Vec<u8>>>,
+    /// Committed-alarm summaries; actor stripes serialize reads, replacements and invalidation.
+    alarm_summaries: Mutex<BTreeMap<Vec<u8>, AlarmSummary>>,
     /// Log bytes beyond the flushed points, for backpressure.
     unflushed: AtomicI64,
     max_unflushed: u64,
     /// Truncations the actors' other slots owe after a flush, by slot-store prefix; stored as `owed` records too.
     owed: Mutex<BTreeMap<Vec<u8>, (pb::Actor, u64)>>,
     marks: Mutex<Marks>,
+}
+
+#[derive(Clone, Copy)]
+struct AlarmSummary {
+    flushed: u64,
+    flushed_epoch: u64,
+    flushed_alarm_ms: Option<u64>,
+    committed: u64,
+    alarm_ms: Option<u64>,
 }
 
 /// What a flush writes for one actor: its keys as of `through` (its commit point), rebuilt from the log.
@@ -495,6 +531,8 @@ impl Store {
             engine,
             locks: (0..STRIPES).map(|_| Mutex::new(())).collect(),
             dirty: Mutex::default(),
+            alarms: Mutex::default(),
+            alarm_summaries: Mutex::default(),
             unflushed: AtomicI64::new(0),
             max_unflushed: MAX_UNFLUSHED_BYTES,
             owed: Mutex::default(),
@@ -721,6 +759,10 @@ impl Store {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|k, _| outside(k));
+        self.alarm_summaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|k, _| outside(k));
         Ok(())
     }
 
@@ -867,8 +909,19 @@ impl Store {
             new.repaired = true;
         }
         let old = here.unwrap_or_default();
-        Self::save(&mut batch, &actor, &old, &new);
+        self.save(&mut batch, &actor, &old, &new)?;
         self.commit(batch)?;
+        // A copied log may replace an earlier summary at the same sequence boundaries.
+        self.alarm_summaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&actor.prefix);
+        if end(&new).seq > new.committed || (!new.released && new.alarm_ms.is_some()) {
+            self.alarms
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(actor.prefix.clone());
+        }
         self.unflushed.fetch_add(logged, Ordering::Relaxed);
         // The copy's commit point can reach the kept log's `DELETE`.
         if deletes(&new) {
@@ -906,7 +959,7 @@ impl Store {
         }
         let mut batch = WriteBatch::default();
         batch.delete_range(KeyRange::prefix(actor.prefix.clone()));
-        Self::save(&mut batch, actor, &old, &tomb);
+        self.save(&mut batch, actor, &old, &tomb)?;
         self.commit(batch)?;
         self.unflushed.fetch_sub(logged, Ordering::Relaxed);
         self.mark(&actor.prefix, &tomb);
@@ -1085,12 +1138,212 @@ impl Store {
         }
     }
 
+    /// The alarm as of the slot's commit point. A pending tail's clear or reschedule takes effect only once it commits,
+    /// so until then the committed alarm is the one a Wake must match.
+    fn committed_alarm(
+        &self,
+        actor: &Actor,
+        claim: &pb::ClaimRecord,
+    ) -> Result<Option<u64>, Error> {
+        self.committed_alarm_in(actor, claim, None)
+    }
+
+    fn committed_alarm_in(
+        &self,
+        actor: &Actor,
+        claim: &pb::ClaimRecord,
+        pending: Option<&[WriteOp]>,
+    ) -> Result<Option<u64>, Error> {
+        let remember = pending.is_none();
+        let pending = pending.unwrap_or_default();
+        let cached = self
+            .alarm_summaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&actor.prefix)
+            .copied()
+            .filter(|s| {
+                s.flushed == claim.flushed
+                    && s.flushed_epoch == claim.flushed_epoch
+                    && s.flushed_alarm_ms == claim.flushed_alarm_ms
+                    && s.committed <= claim.committed
+                    // A repair's batch view may replace committed log entries too.
+                    && !pending.iter().any(|op| matches!(op, WriteOp::DeleteRange(range)
+                        if range.contains(&claim_key(actor))))
+            });
+        let (from, mut alarm) = if end(claim).seq <= claim.committed {
+            (claim.committed, claim.alarm_ms)
+        } else if let Some(cached) = cached {
+            (cached.committed, cached.alarm_ms)
+        } else {
+            (claim.flushed, claim.flushed_alarm_ms)
+        };
+        if from < claim.committed {
+            let log = if pending.is_empty() {
+                self.entries(actor, from + 1, claim.committed)?
+            } else {
+                (from + 1..=claim.committed)
+                    .map(|seq| self.entry_in(actor, seq, pending))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for entry in log {
+                if let Some(at) = entry.alarm {
+                    alarm = at.at_ms;
+                }
+            }
+        }
+        // A prospective batch must never publish a summary before its storage write succeeds.
+        if remember {
+            self.alarm_summaries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(
+                    actor.prefix.clone(),
+                    AlarmSummary {
+                        flushed: claim.flushed,
+                        flushed_epoch: claim.flushed_epoch,
+                        flushed_alarm_ms: claim.flushed_alarm_ms,
+                        committed: claim.committed,
+                        alarm_ms: alarm,
+                    },
+                );
+        }
+        Ok(alarm)
+    }
+
+    /// Released alarms use the durable time index. Held alarms are also scanned so a crashed holder's alarm can be
+    /// delivered after its host lease expires; the caller checks that lease. These are hints, and never consume an
+    /// alarm. Compute validates against recovered committed state under its input gate.
+    ///
+    /// Only an actor whose `DELETE` committed, or that moved to another DC, is skipped. An uncommitted `DELETE` is an
+    /// old epoch's tail: a wake may make the next claim truncate it, exactly as any other request would, so the actor
+    /// still serves and its committed alarm still fires.
+    pub fn due_alarms(&self, now_ms: u64) -> Result<Vec<AlarmCandidate>, Error> {
+        let mut due = Vec::new();
+        let mut indexed = BTreeSet::new();
+        for item in self.engine.scan(&KeyRange::prefix(*b"alarm/"))? {
+            let (key, _) = item?;
+            let at = key
+                .get(6..14)
+                .and_then(|v| <[u8; 8]>::try_from(v).ok())
+                .ok_or_else(bad_alarm_key)?;
+            let at_ms = u64::from_be_bytes(at);
+            if at_ms > now_ms {
+                break;
+            }
+            let prefix = [b"s/".as_slice(), &key[14..]].concat();
+            let wire = alarm_actor(&prefix)?;
+            let actor = Actor::new(&wire)?;
+            let _stripe = self.lock(&actor);
+            let claim = self.load(&actor)?;
+            if claim.released
+                && self.alarm_key(&actor, &claim, None)?.as_ref() == Some(&key)
+                && claim.deleted.is_none()
+                && claim.moved.is_none()
+            {
+                indexed.insert(prefix);
+                due.push(AlarmCandidate {
+                    actor: pb::Actor {
+                        kind: claim.kind,
+                        ..wire
+                    },
+                    at_ms,
+                    released: true,
+                    holder: claim.holder,
+                });
+            }
+        }
+        // Never hold the hint lock while waiting for a stripe: every writer takes them in the other order.
+        let prefixes: Vec<_> = self
+            .alarms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        for prefix in prefixes {
+            let wire = alarm_actor(&prefix)?;
+            let actor = Actor::new(&wire)?;
+            let _stripe = self.lock(&actor);
+            let claim = self.load(&actor)?;
+            // A pending clear or reschedule above the commit point leaves the committed alarm wakeable.
+            let alarm = self.committed_alarm(&actor, &claim)?;
+            if end(&claim).seq <= claim.committed && (claim.released || alarm.is_none()) {
+                self.alarms
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&prefix);
+                if alarm.is_none() && end(&claim).seq <= claim.committed {
+                    self.alarm_summaries
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&prefix);
+                }
+                continue;
+            }
+            // An uncommitted tail may still commit an alarm, and the claim's own `alarm_ms` is that tail, so the hint
+            // would not come back on the commit: keep it until the tail commits or is truncated.
+            if alarm.is_none() || indexed.contains(&prefix) {
+                continue;
+            }
+            if claim.deleted.is_some() || claim.moved.is_some() {
+                continue;
+            }
+            if let Some(at_ms) = alarm.filter(|at| *at <= now_ms) {
+                due.push(AlarmCandidate {
+                    actor: pb::Actor {
+                        kind: claim.kind,
+                        ..wire
+                    },
+                    at_ms,
+                    released: claim.released,
+                    holder: claim.holder,
+                });
+            }
+        }
+        Ok(due)
+    }
+
     fn entry(&self, actor: &Actor, seq: u64) -> Result<pb::Entry, Error> {
         let bytes = self
             .engine
             .get(&log_key(actor, seq))?
             .ok_or_else(|| missing(seq))?;
         pb::Entry::decode(bytes.as_slice()).map_err(|e| corrupt("a log entry", e))
+    }
+
+    /// The batch's last operation on this log entry wins, including a copied or truncated range.
+    fn entry_in(&self, actor: &Actor, seq: u64, pending: &[WriteOp]) -> Result<pb::Entry, Error> {
+        let at = log_key(actor, seq);
+        for op in pending.iter().rev() {
+            match op {
+                WriteOp::Put { key, value } if key == &at => {
+                    return pb::Entry::decode(value.as_slice())
+                        .map_err(|e| corrupt("a log entry", e));
+                }
+                WriteOp::Delete { key } if key == &at => return Err(missing(seq)),
+                WriteOp::DeleteRange(range) if range.contains(&at) => return Err(missing(seq)),
+                _ => {}
+            }
+        }
+        self.entry(actor, seq)
+    }
+
+    /// A pending clear or reschedule keeps the committed alarm indexed; otherwise preserve released hints.
+    fn alarm_key(
+        &self,
+        actor: &Actor,
+        claim: &pb::ClaimRecord,
+        pending: Option<&[WriteOp]>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if !claim.released {
+            return Ok(None);
+        }
+        let mut alarm = claim.alarm_ms;
+        if end(claim).seq > claim.committed {
+            alarm = self.committed_alarm_in(actor, claim, pending)?.or(alarm);
+        }
+        Ok(alarm.map(|at| [b"alarm/".as_slice(), &at.to_be_bytes(), &actor.prefix[2..]].concat()))
     }
 
     /// The log from `from` through `through`, in order. One scan, failing like [`Store::entry`] on a missing entry.
@@ -1142,16 +1395,72 @@ impl Store {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<Duration, Error> {
+        let mut alarms = Vec::new();
+        let mut cleared = Vec::new();
+        for op in &batch.ops {
+            if let WriteOp::Put { key, value } = op
+                && let Some(at) = prefix_len(key)
+                && &key[at..] == b"claim"
+            {
+                let claim =
+                    pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?;
+                if end(&claim).seq > claim.committed
+                    || (!claim.released && claim.alarm_ms.is_some())
+                {
+                    alarms.push(key[..at].to_vec());
+                }
+                if claim.alarm_ms.is_none() && end(&claim).seq <= claim.committed {
+                    cleared.push(key[..at].to_vec());
+                }
+            }
+        }
         let started = bedrock_lib::monotonic_now();
         self.engine.write(batch)?;
+        let mut summaries = self
+            .alarm_summaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for prefix in cleared {
+            summaries.remove(&prefix);
+        }
+        drop(summaries);
+        self.alarms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(alarms);
         Ok(started.elapsed())
     }
 
-    /// Adds the claim, and its alarm and tombstone index entries if they changed, to `batch`.
-    fn save(batch: &mut WriteBatch, actor: &Actor, old: &pb::ClaimRecord, new: &pb::ClaimRecord) {
-        Self::index(batch, alarm_key(actor, old), alarm_key(actor, new));
+    /// Adds the claim and its alarm and tombstone index entries to `batch`.
+    fn save(
+        &self,
+        batch: &mut WriteBatch,
+        actor: &Actor,
+        old: &pb::ClaimRecord,
+        new: &pb::ClaimRecord,
+    ) -> Result<(), Error> {
+        let was = self.alarm_key(actor, old, None)?;
+        let is = self.alarm_key(actor, new, Some(&batch.ops))?;
+        if was != is
+            && let Some(was) = was
+        {
+            batch.delete(was);
+        }
+        // Older stores indexed the pending tail's alarm instead of the committed alarm.
+        if old.released
+            && let Some(at) = old.alarm_ms
+        {
+            let legacy = [b"alarm/".as_slice(), &at.to_be_bytes(), &actor.prefix[2..]].concat();
+            if Some(&legacy) != is.as_ref() {
+                batch.delete(legacy);
+            }
+        }
+        if let Some(is) = is {
+            batch.put(is, Vec::new());
+        }
         Self::index(batch, gone_key(actor, old), gone_key(actor, new));
         batch.put(claim_key(actor), new.encode_to_vec());
+        Ok(())
     }
 
     fn index(batch: &mut WriteBatch, was: Option<Vec<u8>>, is: Option<Vec<u8>>) {
@@ -1252,7 +1561,7 @@ impl Store {
             ..old.clone()
         };
         let mut batch = WriteBatch::default();
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         self.commit(batch)?;
         Ok(answer(refused, &new, voting))
     }
@@ -1308,7 +1617,7 @@ impl Store {
             ..old.clone()
         };
         let mut batch = WriteBatch::default();
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         self.commit(batch)?;
         Ok(answer(Refusal::None, &new, voting))
     }
@@ -1364,7 +1673,7 @@ impl Store {
             ..old.clone()
         };
         let mut batch = WriteBatch::default();
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         self.commit(batch)?;
         Ok((answer(refused, &new, voting), other.is_some()))
     }
@@ -1464,7 +1773,7 @@ impl Store {
                     return self.bury(actor, &old, new, &[]);
                 }
                 let mut batch = WriteBatch::default();
-                Self::save(&mut batch, actor, &old, &new);
+                self.save(&mut batch, actor, &old, &new)?;
                 self.commit(batch)?;
                 self.mark(&actor.prefix, &new);
             }
@@ -1540,7 +1849,7 @@ impl Store {
                 None => batch.delete(key),
             };
         }
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         let fsync = self.commit(batch)?;
         self.unflushed.fetch_add(logged, Ordering::Relaxed);
         self.mark(&actor.prefix, &new);
@@ -1648,7 +1957,7 @@ impl Store {
         };
         let mut batch = WriteBatch::default();
         batch.delete_range(KeyRange::prefix(actor.prefix.clone()));
-        Self::save(&mut batch, actor, old, &tomb);
+        self.save(&mut batch, actor, old, &tomb)?;
         let fsync = self.commit(batch)?;
         self.unflushed.fetch_sub(logged, Ordering::Relaxed);
         self.mark(&actor.prefix, &tomb);
@@ -1738,7 +2047,7 @@ impl Store {
         }
         new.flushed = through;
         new.flushed_epoch = self.epoch_at(actor, &old, through)?;
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         let fsync = self.commit(batch)?;
         let freed: i64 = log.iter().map(|e| log_bytes(actor, e)).sum();
         self.unflushed.fetch_sub(freed, Ordering::Relaxed);
@@ -1815,7 +2124,7 @@ impl Store {
             deleting: None,
             ..old.clone()
         };
-        Self::save(&mut batch, actor, &old, &new);
+        self.save(&mut batch, actor, &old, &new)?;
         let fsync = self.commit(batch)?;
         let freed: i64 = log.iter().map(|e| log_bytes(actor, e)).sum();
         self.unflushed.fetch_sub(freed, Ordering::Relaxed);
@@ -2034,11 +2343,14 @@ impl Store {
         })
     }
 
-    /// Rebuilds the in-memory flush state (unflushed actors, log bytes, owed truncations) and returns overlay bytes per
-    /// actor kind, for
-    /// the gauge: one pass over every slot record at startup.
+    /// Rebuilds the in-memory flush state and alarm hints, repairs the released-alarm index, and returns overlay bytes
+    /// per actor kind for the gauge: one pass over every slot record at startup.
     // ponytail: a full scan at startup; keep running totals in a record if startup time matters.
     pub fn recover(&self) -> Result<BTreeMap<i32, i64>, Error> {
+        self.alarm_summaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         {
             let mut guard = self.marks();
             let marks = &mut *guard;
@@ -2059,6 +2371,14 @@ impl Store {
         let mut bytes = BTreeMap::new();
         let mut kind = 0;
         let mut logged = 0;
+        let mut alarm_keys = BTreeSet::new();
+        for item in self.engine.scan(&KeyRange::prefix(*b"alarm/"))? {
+            let (key, _) = item?;
+            let suffix = key.get(14..).ok_or_else(bad_alarm_key)?;
+            alarm_actor(&[b"s/".as_slice(), suffix].concat())?;
+            alarm_keys.insert(key);
+        }
+        let mut alarm_repairs = WriteBatch::default();
         for item in self.engine.scan(&KeyRange::prefix(*b"s/"))? {
             let (key, value) = item?;
             // `s/`, the hash, then `{namespace}\0{id}\0` and the record's name.
@@ -2070,6 +2390,24 @@ impl Store {
                 let claim =
                     pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?;
                 kind = claim.kind;
+                let pending = end(&claim).seq > claim.committed;
+                if (pending || claim.alarm_ms.is_some())
+                    && let Some(parsed) = Actor::parse(&key[..at], kind)
+                {
+                    let actor = Actor::new(&parsed)?;
+                    // Pending tails may commit an alarm even when the current claim field is clear.
+                    if pending || !claim.released {
+                        self.alarms
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .insert(key[..at].to_vec());
+                    }
+                    if let Some(key) = self.alarm_key(&actor, &claim, None)?
+                        && !alarm_keys.remove(&key)
+                    {
+                        alarm_repairs.put(key, Vec::new());
+                    }
+                }
                 self.mark(&key[..at], &claim);
             } else if name.starts_with(b"data/") {
                 *bytes.entry(kind).or_default() += (key.len() + value.len()) as i64;
@@ -2087,6 +2425,12 @@ impl Store {
                 })?;
                 self.owe(&key[..at], kind, u64::from_be_bytes(through));
             }
+        }
+        for key in alarm_keys {
+            alarm_repairs.delete(key);
+        }
+        if !alarm_repairs.ops.is_empty() {
+            self.commit(alarm_repairs)?;
         }
         self.unflushed.store(logged, Ordering::Relaxed);
         Ok(bytes)

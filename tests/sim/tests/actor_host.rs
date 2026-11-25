@@ -450,7 +450,7 @@ async fn cancelled(fingerprint: &Fingerprint, next: &mut usize, sandbox: &Arc<At
     Handle::current().kill(node.id());
 }
 
-/// Cancelling administrative deletion while an event owns the input gate keeps the live actor reachable for cleanup.
+/// Cancelling administrative deletion keeps the stopped actor reachable for cleanup and recovers its committed state.
 async fn cancelled_delete(fingerprint: &Fingerprint, next: &mut usize, sandbox: &Arc<AtomicUsize>) {
     let target = actor(*next, Kind::Kv);
     *next += 1;
@@ -501,19 +501,30 @@ async fn cancelled_delete(fingerprint: &Fingerprint, next: &mut usize, sandbox: 
                     .is_err(),
                 "deletion must wait for the active input gate"
             );
-            resume.notify_one();
-            assert_eq!(number(&event.await.unwrap().unwrap()), 1);
             assert_eq!(
                 host.awake().await,
                 1,
-                "cancelled deletion lost the live actor from its cell"
+                "cancelled deletion lost the actor before gate cleanup"
             );
-            let same = host.acquire(&target).await.unwrap();
             assert!(
-                Arc::ptr_eq(&awake, &same),
-                "the still-serving instance remains reachable"
+                !awake.serving(),
+                "deletion stops output before waiting for the gate"
             );
-            assert_eq!(number(&same.invoke(b"peek".to_vec()).await.unwrap()), 1);
+            resume.notify_one();
+            assert!(
+                event.await.unwrap().is_err(),
+                "the stopped event must not answer"
+            );
+            let recovered = host.acquire(&target).await.unwrap();
+            assert!(
+                !Arc::ptr_eq(&awake, &recovered),
+                "a stopped instance must be recovered"
+            );
+            assert_eq!(
+                number(&recovered.invoke(b"incr".to_vec()).await.unwrap()),
+                2,
+                "recovery reads the committed event from the slots"
+            );
             sleep(Duration::from_secs(12)).await;
             assert_eq!(
                 host.awake().await,
@@ -521,7 +532,7 @@ async fn cancelled_delete(fingerprint: &Fingerprint, next: &mut usize, sandbox: 
                 "the retained actor remains eligible for normal idle cleanup"
             );
             let next = number(&call(&host, &target, b"incr").await);
-            assert_eq!(next, 2, "reacquisition recovers the committed event");
+            assert_eq!(next, 3, "idle reacquisition recovers the next commit");
             next
         })
         .await

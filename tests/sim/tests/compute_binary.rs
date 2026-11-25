@@ -469,6 +469,7 @@ async fn scenario() -> Vec<String> {
                             actor: Some(actor),
                             payload: b"incr".to_vec(),
                             host: String::new(),
+                            alarm_ms: None,
                         })
                         .await
                         .ok()
