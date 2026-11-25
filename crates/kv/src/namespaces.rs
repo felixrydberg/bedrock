@@ -7,7 +7,8 @@
 //!   range database (#126 / S-18). Bindings reference the ID; `tenant` and `title` are descriptive only.
 //! - **Nothing locational** is recorded: no cell, origin or cache holder. Adding a cell changes no record.
 //! - **Create** writes only the record, so an empty namespace creates no storage objects.
-//! - **Delete** marks the record `Deleting` and stamps `deleting_at`, which closes it to new opens and writes at once.
+//! - **Delete** marks the record `Deleting` and stamps `deleting_at`. Reads at its publication revision close admission;
+//!   callers without that floor learn deletion through ordinary directory propagation.
 //!   Explicit **purge** ([`Directory::purge`]) after [`PURGE_GRACE`] tombstones the actor before removing the record;
 //!   volume reclaims its range keys after its own deletion grace. There is no undelete.
 //! - Writes are planned from a read and committed with `If-Match` on the `infrastructure` head. The answering range may
@@ -263,6 +264,7 @@ impl Api {
 
 pub struct Directory {
     client: Arc<Client>,
+    directory: Arc<bedrock_lib::kv::DirectoryView>,
     api: Api,
     /// Home region of namespaces created without a jurisdiction: this node's region.
     region: String,
@@ -270,7 +272,12 @@ pub struct Directory {
 }
 
 impl Directory {
-    pub fn new(admin: &Admin, client: Arc<Client>, api: Api, region: String) -> Self {
+    pub fn new(
+        admin: &Admin,
+        directory: Arc<bedrock_lib::kv::DirectoryView>,
+        api: Api,
+        region: String,
+    ) -> Self {
         let operations = Family::default();
         admin.register(
             "kv_namespace_operations",
@@ -278,7 +285,8 @@ impl Directory {
             operations.clone(),
         );
         Self {
-            client,
+            client: directory.client.clone(),
+            directory,
             api,
             region,
             operations,
@@ -317,9 +325,16 @@ impl Directory {
         }
         let found = self
             .client
-            .get(SERVICE, DATASET, NAMESPACE, &key(id), min_revision)
+            .get(
+                SERVICE,
+                DATASET,
+                NAMESPACE,
+                &key(id),
+                min_revision.max(self.directory.minimum()),
+            )
             .await
             .map_err(|status| Error::Unavailable(status.message().to_owned()))?;
+        self.directory.observe(found.revision);
         let record = found.value.map(|bytes| decode(id, &bytes)).transpose()?;
         Ok((record, found.revision))
     }
@@ -341,7 +356,7 @@ impl Directory {
                     PREFIX.as_bytes(),
                     &start_after,
                     0,
-                    min_revision,
+                    min_revision.max(self.directory.minimum()),
                 )
                 .await
                 .map_err(|status| Error::Unavailable(status.message().to_owned()))?;
@@ -353,6 +368,7 @@ impl Directory {
                 start_after = key;
             }
             if !page.more {
+                self.directory.observe(revision);
                 return Ok((records, revision));
             }
         }
@@ -374,7 +390,10 @@ impl Directory {
                 bedrock_lib::placement::hash_of(DATASET, NAMESPACE, &record.encode_to_vec());
             let idempotency = format!("{operation}:{}:{revision}:{payload:016x}", record.id);
             match self.api.put(&record, revision, &idempotency).await? {
-                Put::Committed { revision } => return Ok((record, revision)),
+                Put::Committed { revision } => {
+                    self.directory.observe(revision);
+                    return Ok((record, revision));
+                }
                 Put::Conflict { head } => floor = head,
             }
         }
@@ -407,6 +426,7 @@ impl Directory {
                         state: Lifecycle::Active as i32,
                         created_at: wall_ms(),
                         deleting_at: 0,
+                        purge_grant_hash: String::new(),
                     })
                 })
                 .await
@@ -472,14 +492,17 @@ impl Directory {
                 .await?
             {
                 // Storage stays until a purge after `PURGE_GRACE`.
-                Put::Committed { revision } => return Ok((record, revision)),
+                Put::Committed { revision } => {
+                    self.directory.observe(revision);
+                    return Ok((record, revision));
+                }
                 Put::Conflict { head } => floor = head,
             }
         }
         Err(Error::Contended)
     }
 
-    /// Tombstones the tenant's `Deleting` namespace actor once [`PURGE_GRACE`] has passed, then deletes
+    /// Publishes an unguessable management grant, tombstones the tenant's `Deleting` actor after [`PURGE_GRACE`], then deletes
     /// its record, and returns the directory revision without it. Retrying after a failure repeats only what is left.
     pub async fn purge(&self, tenant: &str, id: &str) -> Result<u64, Error> {
         let purged = self.try_purge(tenant, id).await;
@@ -490,7 +513,7 @@ impl Directory {
         let mut floor = 0;
         for _ in 0..ATTEMPTS {
             let (record, revision) = self.read(id, floor).await?;
-            let record = record
+            let mut record = record
                 .filter(|r| r.tenant == tenant)
                 .ok_or(Error::NotFound)?;
             if !purgeable(&record, wall_ms()) {
@@ -498,15 +521,36 @@ impl Directory {
                     "only a namespace deleted at least PURGE_GRACE ago can be purged".into(),
                 ));
             }
-            bedrock_lib::kv::purge(&self.client, &record)
+            let grant = bedrock_lib::uuid();
+            record.purge_grant_hash = bedrock_lib::kv::purge_grant_hash(&grant);
+            let revision = match self
+                .api
+                .put(
+                    &record,
+                    revision,
+                    &format!("purge-grant:{id}:{revision}:{}", record.purge_grant_hash),
+                )
+                .await?
+            {
+                Put::Committed { revision } => revision,
+                Put::Conflict { head } => {
+                    floor = head;
+                    continue;
+                }
+            };
+            self.directory.observe(revision);
+            bedrock_lib::kv::purge(&self.directory, &record, &grant)
                 .await
-                .map_err(|error| Error::Unavailable(error.to_string()))?;
+                .map_err(|error| Error::Unavailable(format!("actor purge: {error}")))?;
             match self
                 .api
                 .delete(id, revision, &format!("purge:{id}"))
                 .await?
             {
-                Put::Committed { revision } => return Ok(revision),
+                Put::Committed { revision } => {
+                    self.directory.observe(revision);
+                    return Ok(revision);
+                }
                 Put::Conflict { head } => floor = head,
             }
         }

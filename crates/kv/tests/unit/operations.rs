@@ -34,6 +34,26 @@ async fn multipart_keeps_binary_value_and_json_metadata_and_rejects_duplicate_fi
     let (value, metadata) = value_and_metadata(&headers, body).await.unwrap();
     assert_eq!(value, [0, 255]);
     assert_eq!(metadata.as_deref(), Some("{\"n\":1}"));
+    for media in [
+        "Multipart/Form-Data",
+        "MULTIPART/FORM-DATA",
+        "multipart/form-data-extra",
+    ] {
+        let headers = HeaderMap::from_iter([(
+            header::CONTENT_TYPE,
+            format!("{media}; boundary=bedrock").parse().unwrap(),
+        )]);
+        let body = Bytes::from_static(b"--bedrock\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\nbinary\r\n--bedrock--\r\n");
+        let parsed = value_and_metadata(&headers, body.clone()).await.unwrap();
+        assert_eq!(
+            parsed.0,
+            if media.ends_with("extra") {
+                body.to_vec()
+            } else {
+                b"binary".to_vec()
+            }
+        );
+    }
     // The reconstructed multipart request must keep the REST body's 100 MiB limit, not axum's 2 MiB default.
     let mut large = b"--bedrock\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\n".to_vec();
     large.extend(vec![0xff; (2 << 20) + 1]);

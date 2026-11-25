@@ -26,6 +26,8 @@ Latest(id, s) == LET matches == {i \in 1..s : history[i].id = id}
 RetryAt(id, s) == LET i == Latest(id, s)
                  IN IF i = 0 THEN EmptyRetry
                     ELSE [revision |-> i, expiry |-> history[i].at + RetryWindow]
+OriginalResult(id, s) == LET i == Latest(id, s)
+                        IN [revision |-> i, committedAt |-> history[i].at]
 LiveRetry(id) == durable.retries[id].revision > 0 /\ durable.retries[id].expiry > now
 NewRow(k, s) == [value |-> s, expiry |-> now + ValueWindow, bytes |-> k + s]
 Mutate(rows, mode, s) == CASE mode = "put" -> [rows EXCEPT ![1] = NewRow(1, s)]
@@ -51,10 +53,12 @@ Stage(id, mode) ==
                 rows |-> IF Bug = "bulk" /\ mode = "bulk"
                          THEN [rows EXCEPT ![2] = durable.rows[2]] ELSE rows,
                 bytes |-> IF Bug = "bytes" THEN durable.bytes + Bytes(rows) ELSE Bytes(rows),
-                retries |-> [durable.retries EXCEPT
-                    ![id] = [revision |-> s, expiry |-> now + RetryWindow]],
-                events |-> [i \in DOMAIN durable.events \cup {s} |->
-                              IF i = s THEN event ELSE durable.events[i]]]
+                retries |-> IF Bug = "staged-retry" THEN durable.retries
+                            ELSE [durable.retries EXCEPT
+                                ![id] = [revision |-> s, expiry |-> now + RetryWindow]],
+                events |-> IF Bug = "staged-event" THEN durable.events
+                           ELSE [i \in DOMAIN durable.events \cup {s} |->
+                                   IF i = s THEN event ELSE durable.events[i]]]
           /\ pending' = s
     /\ UNCHANGED <<durable, acknowledged, now, holder, flight, cache,
                     highWater, minimumOK, visibilityOK, retryOK>>
@@ -81,9 +85,11 @@ Move == /\ holder < MaxHolders /\ holder' = holder + 1
                         minimumOK, visibilityOK, retryOK>>
 
 Retry(id) == /\ pending = 0 /\ buffered = durable /\ LiveRetry(id)
-             /\ retryOK' = (retryOK /\
-                    ((IF Bug = "retry-result" THEN durable.revision
-                      ELSE durable.retries[id].revision) = RetryAt(id, durable.revision).revision))
+             /\ LET result == [revision |-> IF Bug = "retry-result" THEN durable.revision
+                                            ELSE durable.retries[id].revision,
+                               committedAt |-> IF Bug = "retry-time" THEN now
+                                               ELSE history[durable.retries[id].revision].at]
+                IN retryOK' = (retryOK /\ result = OriginalResult(id, durable.revision))
              /\ durable' = IF Bug = "retry-expiry" THEN
                    [durable EXCEPT !.retries[id].expiry = now + RetryWindow] ELSE durable
              /\ buffered' = durable'
@@ -150,7 +156,13 @@ Consistent(db) == /\ db.revision \in 0..Len(history)
                   /\ db.bytes = Bytes(db.rows)
                   /\ \A id \in Ids : db.retries[id] \in {EmptyRetry, RetryAt(id, db.revision)}
                   /\ \A s \in DOMAIN db.events : s \in 1..db.revision /\ db.events[s] = history[s]
-AtomicBuffered == Consistent(buffered)
+AtomicBuffered == /\ Consistent(buffered)
+                  /\ pending > durable.revision =>
+                       LET staged == history[pending]
+                       IN /\ buffered.retries[staged.id] =
+                               [revision |-> pending, expiry |-> staged.at + RetryWindow]
+                          /\ pending \in DOMAIN buffered.events
+                          /\ buffered.events[pending] = staged
 AtomicCommitted == Consistent(durable)
 OrderedRevisions == /\ durable.revision <= buffered.revision
                     /\ buffered.revision = Len(history)

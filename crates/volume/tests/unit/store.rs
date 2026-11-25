@@ -1185,9 +1185,11 @@ fn flush_budget_selects_complete_entries_and_only_their_alarm_and_move() {
     );
     assert_eq!(pending.alarm, None);
     assert_eq!(pending.moved, None);
+    assert!(pending.more);
     store.truncate(&actor(), 1).unwrap();
     let remaining = store.pending(&actor(), 1).unwrap().unwrap();
     assert_eq!(remaining.through, 2);
+    assert!(!remaining.more);
     assert_eq!(remaining.alarm, Some(123));
     assert_eq!(remaining.moved, Some(pb::LogEnd { seq: 2, epoch: 1 }));
 }

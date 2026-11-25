@@ -216,3 +216,46 @@ fn absent_values_use_namespace_progress_and_key_prefixes_cannot_alias_metadata()
     assert!(after <= prefixed(DATA, b"a\0"));
     assert!(after < prefixed(DATA, b"aa"));
 }
+
+#[test]
+fn previous_values_match_keys_and_reject_incomplete_or_duplicate_replies() {
+    let meta = Meta {
+        version: 1,
+        revision: 1,
+        ..Default::default()
+    };
+    let keys = vec![b"d/a".to_vec(), b"d/b".to_vec()];
+    let row = Row {
+        version: 1,
+        revision: 1,
+        value: Some(value(3, 0)),
+    }
+    .encode_to_vec();
+    let a = pb::Value {
+        key: keys[0].clone(),
+        value: Some(row),
+    };
+    let b = pb::Value {
+        key: keys[1].clone(),
+        value: None,
+    };
+    let matched = previous_rows(&keys, vec![b.clone(), a.clone()], &meta).unwrap();
+    assert_eq!(matched[&keys[0]], Some(value(3, 0)));
+    assert_eq!(matched[&keys[1]], None);
+    for reply in [
+        vec![a.clone()],
+        vec![a.clone(), a],
+        vec![
+            b,
+            pb::Value {
+                key: b"d/unknown".to_vec(),
+                value: None,
+            },
+        ],
+    ] {
+        assert_eq!(
+            previous_rows(&keys, reply, &meta).unwrap_err().code(),
+            tonic::Code::DataLoss
+        );
+    }
+}

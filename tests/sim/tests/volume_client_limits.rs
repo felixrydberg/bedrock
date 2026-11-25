@@ -108,6 +108,40 @@ async fn a_full_kv_bulk_and_its_retained_event_fit_one_quorum_entry() {
     let sequence = writer.commit(changes.clone(), None, 1234).await.unwrap();
     let commit = started.elapsed();
     writer.commit(changes, None, 1235).await.unwrap();
+    let assert_bulk = |entry: &pb::Entry, expected_seq| {
+        assert_eq!(entry.seq, expected_seq);
+        assert_eq!(entry.changes.len(), 5);
+        for n in 0..4u8 {
+            let key = [b'd', b'/', b'a' + n];
+            let value = entry
+                .changes
+                .iter()
+                .find(|change| change.key == key)
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap();
+            assert_eq!(value.len(), kv::MAX_VALUE - if n == 0 { 0 } else { 1024 });
+            assert!(value.iter().all(|byte| *byte == n + 1));
+        }
+        let event = entry
+            .changes
+            .iter()
+            .find(|change| change.key == b"e/1")
+            .unwrap();
+        let retained = kv::Write::decode(event.value.as_deref().unwrap()).unwrap();
+        assert_eq!(retained.changes.len(), 4);
+        for (n, change) in retained.changes.into_iter().enumerate() {
+            assert_eq!(change.key, [b'd', b'/', b'a' + n as u8]);
+            let stored = change.value.unwrap();
+            let value = entry
+                .changes
+                .iter()
+                .find(|value| value.key == change.key)
+                .unwrap();
+            assert_eq!(Some(stored.value.as_slice()), value.value.as_deref());
+        }
+    };
     let mut caught_up = None;
     for slot in recovery_slots {
         let mut client =
@@ -154,6 +188,13 @@ async fn a_full_kv_bulk_and_its_retained_event_fit_one_quorum_entry() {
     );
     let recovery_page_bytes = page.encoded_len();
     assert!(recovery_page_bytes < kv::MAX_MESSAGE_BYTES);
+    assert_bulk(
+        page.entries
+            .iter()
+            .find(|entry| entry.seq == sequence)
+            .unwrap(),
+        sequence,
+    );
     let next = page.entries.last().unwrap().seq + 1;
     drop(page);
     let final_page = volume
@@ -169,6 +210,7 @@ async fn a_full_kv_bulk_and_its_retained_event_fit_one_quorum_entry() {
         .into_inner();
     assert!(!final_page.more);
     assert_eq!(final_page.entries.last().unwrap().seq, sequence + 1);
+    assert_bulk(final_page.entries.last().unwrap(), sequence + 1);
     drop(final_page);
     let keys: Vec<_> = (0..4u8).map(|n| vec![b'd', b'/', b'a' + n]).collect();
     let read_started = bedrock_lib::monotonic_now();

@@ -15,7 +15,7 @@ pub struct Actors {
     host: ActorHost,
     /// This host, as its claims name it.
     holder: pb::Holder,
-    kv: Option<Arc<bedrock_lib::client::Client>>,
+    kv: Option<Arc<bedrock_lib::kv::DirectoryView>>,
 }
 
 impl Actors {
@@ -28,8 +28,8 @@ impl Actors {
     }
 
     /// Enables namespace administrative lifecycle admission against the authoritative directory.
-    pub fn with_kv(mut self, client: Arc<bedrock_lib::client::Client>) -> Self {
-        self.kv = Some(client);
+    pub fn with_kv(mut self, directory: Arc<bedrock_lib::kv::DirectoryView>) -> Self {
+        self.kv = Some(directory);
         self
     }
 
@@ -39,17 +39,27 @@ impl Actors {
         request: &bedrock_lib::kv::Request,
     ) -> Result<(), Status> {
         use bedrock_lib::{actors, kv};
-        let client = self
+        let directory = self
             .kv
             .as_ref()
             .ok_or_else(|| Status::unimplemented("KV lifecycle admission is not configured"))?;
         if request.operation != Some(kv::request::Operation::Purge(true)) {
             return Err(Status::invalid_argument("invalid purge request"));
         }
-        let record = kv::record(client, &actor.namespace).await?;
+        let record = directory
+            .record(&actor.namespace, request.directory_min_revision)
+            .await?;
         if request.tenant != record.tenant {
             return Err(Status::permission_denied(
                 "namespace belongs to another tenant",
+            ));
+        }
+        if request.purge_grant.len() != 32
+            || record.purge_grant_hash.is_empty()
+            || kv::purge_grant_hash(&request.purge_grant) != record.purge_grant_hash
+        {
+            return Err(Status::permission_denied(
+                "namespace-management purge grant required",
             ));
         }
         const GRACE_MS: u64 = 20 * 60 * 1000;
@@ -61,7 +71,7 @@ impl Actors {
                 "namespace purge grace has not elapsed",
             ));
         }
-        let (topology, _) = actors::Topology::read(client, &record.home_region, 0)
+        let (topology, _) = actors::Topology::read(&directory.client, &record.home_region, 0)
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
         let regions = std::collections::BTreeMap::from([(record.home_region.clone(), topology)]);

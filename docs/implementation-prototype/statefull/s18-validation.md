@@ -61,6 +61,8 @@ paths is separate shared-core work. This change does not claim a whole-actor mem
 
 ## Validation and remaining deployment checks
 
+The results in this section describe the original implementation at `6352e93`, before the review corrections below.
+
 The focused simulation runs the real API, relays, Quicksilver, Gateway and KV nodes with Compute actor hosts and three
 durable simulated volume services. The slot placement is fixed and cold maintenance is omitted to isolate write-path
 S3 dependence. It covers retries after holder movement, ambiguous minority writes, bulk/quota isolation, minimum reads,
@@ -112,3 +114,66 @@ two-worker, 4 GiB run was stopped at 24,061,202 distinct states with 10,318,417 
 Subsequent local model checks use one worker after that interruption. No full-bound result is claimed.
 The local run passed on 2026-11-23 with 10,188,440 distinct states at depth 16 in 12 minutes 46 seconds; all fourteen
 deliberate bugs broke their named invariants (one worker, 4 GiB heap).
+
+## Review corrections
+
+The namespace-management bearer credential is the existing administration authority; data-plane tenant text is not
+permission. Purge now publishes only a random grant's SHA-256 hash through the management API's authenticated CAS.
+The secret grant travels through the existing actor request, and Compute checks its preimage, tenant, canonical actor,
+Deleting state and grace before deletion. It is never stored in the readable directory. Direct bindings cannot issue
+grants. The same secret can retry an ambiguous deletion safely against the permanent actor tombstone.
+
+The user selected known-revision fencing rather than a new authoritative read barrier. A shared `kv::DirectoryView`
+retains observed infrastructure progress per process, including management publications; actor requests and cache RPCs
+propagate that floor. REST reads/list/bulk get accept `directory_min_revision`, and value writes accept the
+`bedrock-kv-directory-revision` header. A supplied future floor cannot poison other requests: only successful reads
+and authenticated publications raise observed progress. A deletion is enforced at its publication revision; a process
+that has not observed it and a caller without its floor still has ordinary control-plane propagation delay.
+
+Lowering storage quota now permits nonincreasing writes while usage is above the limit. Rejected growth still commits
+expired-row/event/retry cleanup with no namespace revision or committed-time change. Old-row reads are matched by key
+in batches of eight: the requested single lookup for all 10,000 replacements could accumulate about 250 GiB of old
+values even for a small incoming bulk. These batches bound collected old values while avoiding one RPC per key.
+
+The review also fixes cancellation during actor deletion, case-insensitive multipart detection, combined hot/cold
+reply budgets, encoded merged-scan paging, and continued cold flush of complete committed prefixes. Strengthened
+acceptance probes held S3 handles after fault activation, actual purge of an unpurged actor, retained directory state
+after actor-purge failure, warm-cache deletion before TTL, ambiguous-bulk values after retry, and both recovered bulk
+entries with their retained events. The models now check staged retention completeness and retry response timestamps,
+permit bounded flush prefixes, and separately model the grant/floor admission policy. Original model results above
+are historical; updated review validation is recorded after the fresh checks.
+
+Fresh model checks on 2026-11-24 passed with one worker and a 4 GiB heap: strengthened KV local (10,188,440 states,
+17 bugs), admission (8 states, 2 bugs), and cold move (400 states, 2 bugs). Separate temporary smoke bounds passed
+quota-7 overwrite (2 revisions / 1 time / 2 holders, 215,752 states) and cold split (2 maintainers / 2 sequences /
+1 generation / 1 epoch, 174,573 states). A negative reachability check proved an accepted bulk can overwrite committed
+data. All three cold-split bugs broke at the original full bounds. The full split base and the larger quota-7/three-
+revision configurations were not run. See the model documents for exact commands and historical results.
+
+The review's normal `cargo fmt --all -- --check`, workspace/all-target Clippy with `-D warnings`, and full
+`cargo test --workspace` passed on 2026-11-24 (two jobs). The first madsim run could not be verified after the approval
+service hit a usage limit and WSL restarted, clearing `/tmp`; it is not claimed as passing. Following the interruption
+rule, the repeat on 2026-11-25 used one build job and one test thread. Madsim workspace/all-target Clippy passed,
+as did 82 volume unit tests, 18 KV unit tests, nine built-in KV contracts and all thirteen tests across eight focused
+integration targets (`actor_host`, `actor_routing`, `compute_binary`, `kv_actor`, `namespaces`, `volume_client`,
+`volume_cold`, `volume_repair`). Their seed/replay cases ran; KV seeds 1–2 and namespace seeds 1, 2 and 42 replayed.
+The madsim dependency tree again excludes RocksDB. Review targets remain separate from normal builds and every other
+checkout; subsequent heavy checks use the reduced one-job/one-worker cap.
+
+Eight mutation negative controls on 2026-11-25 failed for their intended regression assertions when the corresponding
+fix was temporarily disabled: combined read budget, merged scan budget, partial-flush continuation, multipart media
+case, purge grant, reduced quota, rejected-write cleanup and delete cancellation. Each repaired contract passed after
+restoring the exact source bytes. These are controlled mutations of the integrated patch, not a claim that the new
+tests compiled against the old APIs unchanged. No production test-only flags or alternate runtime seams were added.
+
+The final shared-core VOPR checks passed on 2026-11-25: all six quick checks (retained seeds and deliberate bugs),
+two-process replay of seeds 1 and 42, and all 500 seeds 1–500, covering 41,356 reported simulated seconds with no
+failure. The run used one CPU, one build job, one test thread and one seed worker after the interruption. It reused
+the checked-in harness functions with libtest's terse output solely to keep replay markers parseable at one thread;
+the shared harness itself was not edited. The 717-second sweep wall time includes a hold between seeds while another
+checkout ran workspace checks. No seed was interrupted during that hold. Full deployment and larger-model limits
+remain as recorded above.
+
+Cleanup on 2026-11-25 removed the review's two unique target directories (`~/bedrock-126-b840-review1` and
+`~/bedrock-126-b840-review1-madsim`, about 36 GiB), temporary seed reports/logs/helpers and generated TLC states.
+Sibling targets, shared harness files, Docker artifacts and sccache were left untouched. No VHDX compaction ran.

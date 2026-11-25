@@ -126,6 +126,7 @@ pub async fn run(config: ComputeConfig, builtin: Arc<dyn Executor>) -> Result<()
         config.relays.clone(),
         node.location.failure_domain.clone(),
     ));
+    let directory = Arc::new(bedrock_lib::kv::DirectoryView::new(client.clone()));
     // Volume slots accept a holder only as the node its certificate names.
     let holder = pb::Holder {
         cell: cell.clone(),
@@ -142,7 +143,7 @@ pub async fn run(config: ComputeConfig, builtin: Arc<dyn Executor>) -> Result<()
         dc,
         volume::Host::start(peers.clone(), holder.clone()),
         Arc::new(placement),
-        Arc::new(builtin::KvExecutor::new(&admin, client.clone(), builtin)),
+        Arc::new(builtin::KvExecutor::new(&admin, directory.clone(), builtin)),
         // The sandbox executor is S-10; until then customer code is refused as unsupported.
         Arc::new(RustExecutor::new([])),
     );
@@ -157,7 +158,7 @@ pub async fn run(config: ComputeConfig, builtin: Arc<dyn Executor>) -> Result<()
     .map_err(|e| ConfigError(e.to_string()))?;
     let router = bedrock_lib::transport::server(tls.as_ref()).add_service(
         pb::actors_server::ActorsServer::new(
-            actors::serve::Actors::new(host, holder).with_kv(client),
+            actors::serve::Actors::new(host, holder).with_kv(directory),
         )
         .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES),

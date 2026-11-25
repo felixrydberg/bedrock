@@ -97,9 +97,10 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         config.relays.clone(),
         config.node.location.failure_domain.clone(),
     ));
+    let directory_view = Arc::new(bedrock_lib::kv::DirectoryView::new(client));
     let values = Arc::new(operations::Values::new(
         &admin,
-        client.clone(),
+        directory_view.clone(),
         members.clone(),
         peers.clone(),
         config.node.node_id.clone(),
@@ -116,7 +117,7 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         (Some(listen), Some(token)) => {
             let directory = Arc::new(namespaces::Directory::new(
                 &admin,
-                client,
+                directory_view,
                 namespaces::Api {
                     address: config.api.clone(),
                     token: token.clone(),

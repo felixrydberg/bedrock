@@ -28,9 +28,11 @@ use bedrock_lib::placement::{Owner, State};
 use bedrock_lib::replication::pb as rpb;
 use bedrock_lib::s3::S3Config;
 use bedrock_lib::sim::{Hooks, install};
-use bedrock_lib::storage::namespace::{NamespaceDatabase, NamespaceFactory, NamespaceReader};
+use bedrock_lib::storage::namespace::{
+    Changes, NamespaceDatabase, NamespaceFactory, NamespaceReader, NamespaceScan,
+};
 use bedrock_lib::storage::sim::{Disks, Fingerprint, MemoryFactory, SimEngine};
-use bedrock_lib::storage::{ErrorContext, StorageEngine, StorageError, StorageResult};
+use bedrock_lib::storage::{Entry, ErrorContext, StorageEngine, StorageError, StorageResult};
 use bedrock_lib::transport::{Peers, tls};
 use bedrock_lib::volume as pb;
 use bedrock_volume::{serve::Service, store::Store};
@@ -52,6 +54,8 @@ const COMPUTES: [&str; 2] = ["10.0.18.51", "10.0.18.52"];
 const NS: &str = "11111111111111111111111111111111";
 const OTHER: &str = "22222222222222222222222222222222";
 const REST_NS: &str = "33333333333333333333333333333333";
+const PURGE_NS: &str = "44444444444444444444444444444444";
+const QUOTA_NS: &str = "55555555555555555555555555555555";
 const CACHES: [&str; 2] = ["10.0.18.61", "10.0.18.62"];
 
 fn node(name: &str, ip: &str) -> NodeConfig {
@@ -144,11 +148,16 @@ where
 /// This adapter only injects I/O failure. All namespace and KV behavior comes from production code.
 struct NoCustomerS3 {
     inner: MemoryFactory,
+    fault: Arc<CustomerS3Fault>,
+}
+
+#[derive(Default)]
+struct CustomerS3Fault {
     blocked: AtomicBool,
     attempts: AtomicU64,
 }
 
-impl NoCustomerS3 {
+impl CustomerS3Fault {
     fn check(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
         if self.blocked.load(Ordering::Relaxed) && matches!(dataset, "kv" | "volume") {
             self.attempts.fetch_add(1, Ordering::Relaxed);
@@ -164,6 +173,93 @@ impl NoCustomerS3 {
     }
 }
 
+struct FaultedDatabase {
+    inner: Arc<dyn NamespaceDatabase>,
+    fault: Arc<CustomerS3Fault>,
+    dataset: String,
+    namespace: String,
+}
+
+#[async_trait]
+impl NamespaceDatabase for FaultedDatabase {
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.get(key).await
+    }
+    async fn scan(&self, prefix: &[u8]) -> StorageResult<Vec<Entry>> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.scan(prefix).await
+    }
+    async fn snapshot(
+        &self,
+        prefix: &[u8],
+        lifetime: Duration,
+    ) -> StorageResult<Box<dyn NamespaceScan>> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        Ok(Box::new(FaultedScan {
+            inner: self.inner.snapshot(prefix, lifetime).await?,
+            fault: self.fault.clone(),
+            dataset: self.dataset.clone(),
+            namespace: self.namespace.clone(),
+        }))
+    }
+    async fn write(&self, changes: Changes) -> StorageResult<()> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.write(changes).await
+    }
+    async fn flush(&self) -> StorageResult<()> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.flush().await
+    }
+    async fn close(&self) -> StorageResult<()> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.close().await
+    }
+}
+
+struct FaultedReader {
+    inner: Arc<dyn NamespaceReader>,
+    fault: Arc<CustomerS3Fault>,
+    dataset: String,
+    namespace: String,
+}
+
+#[async_trait]
+impl NamespaceReader for FaultedReader {
+    async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.get(key).await
+    }
+    async fn scan(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StorageResult<Vec<Entry>> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.scan(prefix, after, limit).await
+    }
+    async fn close(&self) -> StorageResult<()> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.close().await
+    }
+}
+
+struct FaultedScan {
+    inner: Box<dyn NamespaceScan>,
+    fault: Arc<CustomerS3Fault>,
+    dataset: String,
+    namespace: String,
+}
+
+#[async_trait]
+impl NamespaceScan for FaultedScan {
+    async fn next(&mut self) -> StorageResult<Option<Entry>> {
+        self.fault.check(&self.dataset, &self.namespace)?;
+        self.inner.next().await
+    }
+}
+
 #[async_trait]
 impl NamespaceFactory for NoCustomerS3 {
     async fn namespaces(&self) -> StorageResult<Vec<(String, String)>> {
@@ -174,35 +270,53 @@ impl NamespaceFactory for NoCustomerS3 {
         dataset: &str,
         namespace: &str,
     ) -> StorageResult<Arc<dyn NamespaceDatabase>> {
-        self.check(dataset, namespace)?;
-        self.inner.open(dataset, namespace).await
+        self.fault.check(dataset, namespace)?;
+        let inner = self.inner.open(dataset, namespace).await?;
+        if !matches!(dataset, "kv" | "volume") {
+            return Ok(inner);
+        }
+        Ok(Arc::new(FaultedDatabase {
+            inner,
+            fault: self.fault.clone(),
+            dataset: dataset.into(),
+            namespace: namespace.into(),
+        }))
     }
     async fn open_reader(
         &self,
         dataset: &str,
         namespace: &str,
     ) -> StorageResult<Option<Arc<dyn NamespaceReader>>> {
-        self.check(dataset, namespace)?;
-        self.inner.open_reader(dataset, namespace).await
+        self.fault.check(dataset, namespace)?;
+        let inner = self.inner.open_reader(dataset, namespace).await?;
+        if !matches!(dataset, "kv" | "volume") {
+            return Ok(inner);
+        }
+        Ok(inner.map(|inner| {
+            Arc::new(FaultedReader {
+                inner,
+                fault: self.fault.clone(),
+                dataset: dataset.into(),
+                namespace: namespace.into(),
+            }) as Arc<dyn NamespaceReader>
+        }))
     }
     async fn destroy(&self, dataset: &str, namespace: &str) -> StorageResult<()> {
-        self.check(dataset, namespace)?;
+        self.fault.check(dataset, namespace)?;
         self.inner.destroy(dataset, namespace).await
     }
 }
 
-fn slot(i: usize, engine: Arc<dyn StorageEngine>) -> NodeHandle {
+fn slot(i: usize, store: Arc<Store>) -> NodeHandle {
     let name = format!("volume-{i}");
     Handle::current()
         .create_node()
         .name(&name)
         .ip(VOLUMES[i].parse().unwrap())
         .init(move || {
-            let (engine, name) = (engine.clone(), name.clone());
+            let (store, name) = (store.clone(), name.clone());
             async move {
-                let service =
-                    Service::new(&Admin::new(), Arc::new(Store::new(engine)), &name, CELL, DC)
-                        .unwrap();
+                let service = Service::new(&Admin::new(), store, &name, CELL, DC).unwrap();
                 *service.directory.write().unwrap() = BTreeMap::from([(
                     0,
                     vec![Owner {
@@ -266,6 +380,7 @@ fn compute(ip: &'static str) -> NodeHandle {
                     addresses(&RELAYS),
                     String::new(),
                 ));
+                let directory = Arc::new(kv::DirectoryView::new(client));
                 let fallback = Arc::new(RustExecutor::new([]));
                 let host = ActorHost::new(
                     &admin,
@@ -273,7 +388,7 @@ fn compute(ip: &'static str) -> NodeHandle {
                     DC,
                     Host::start(peers.clone(), holder.clone()),
                     Arc::new(Fixed),
-                    Arc::new(KvExecutor::new(&admin, client.clone(), fallback.clone())),
+                    Arc::new(KvExecutor::new(&admin, directory.clone(), fallback.clone())),
                     fallback,
                 );
                 let member = rpb::Member {
@@ -299,7 +414,7 @@ fn compute(ip: &'static str) -> NodeHandle {
                 tonic::transport::Server::builder()
                     .add_service(
                         pb::actors_server::ActorsServer::new(
-                            Actors::new(host, holder).with_kv(client),
+                            Actors::new(host, holder).with_kv(directory),
                         )
                         .max_decoding_message_size(kv::MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(kv::MAX_MESSAGE_BYTES),
@@ -398,6 +513,7 @@ fn record(id: &str) -> Record {
         state: Lifecycle::Active as i32,
         created_at: 1,
         deleting_at: 0,
+        ..Default::default()
     }
 }
 
@@ -405,6 +521,7 @@ fn request(operation: Operation) -> Request {
     Request {
         tenant: "tenant".into(),
         operation: Some(operation),
+        ..Default::default()
     }
 }
 fn set(key: &str, value: &str, expiration: u64) -> Mutation {
@@ -431,7 +548,7 @@ fn get(keys: &[&str], min_revision: u64) -> Operation {
         min_revision,
     })
 }
-async fn call(client: &Client, namespace: &Record, operation: Operation) -> Reply {
+async fn call(client: &kv::DirectoryView, namespace: &Record, operation: Operation) -> Reply {
     kv::call(client, namespace, request(operation))
         .await
         .unwrap()
@@ -445,6 +562,132 @@ fn now_seconds() -> u64 {
         .as_secs()
 }
 
+/// A lowered authoritative quota still permits shrinking the namespace, and rejected growth commits only cleanup.
+async fn reduced_quota(
+    client: &kv::DirectoryView,
+    regions: &BTreeMap<String, Topology>,
+    slots: &[Arc<Store>],
+) {
+    let mut namespace = record(QUOTA_NS);
+    let published = until("quota namespace bootstrap", || async {
+        put(
+            format!("kv/namespaces/{QUOTA_NS}").as_bytes(),
+            namespace.encode_to_vec(),
+        )
+        .await
+    })
+    .await;
+    client.observe(published);
+    let expires = now_seconds() + 61;
+    let value = "v".repeat(64);
+    let initial = call(
+        client,
+        &namespace,
+        write(
+            vec![
+                set("keep", &value, 0),
+                set("remove", &value, 0),
+                set("expired", &value, expires),
+            ],
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(initial.revision, 1);
+    namespace.storage_bytes = Some(1);
+    let lowered = until("lower authoritative namespace quota", || async {
+        put(
+            format!("kv/namespaces/{QUOTA_NS}").as_bytes(),
+            namespace.encode_to_vec(),
+        )
+        .await
+    })
+    .await;
+    client.observe(lowered);
+    let smaller = "s".repeat(63);
+    assert_eq!(
+        call(
+            client,
+            &namespace,
+            write(vec![set("keep", &smaller, 0)], None)
+        )
+        .await
+        .revision,
+        2,
+        "a nonincreasing overwrite succeeds above the lowered quota"
+    );
+    let deletion = call(
+        client,
+        &namespace,
+        write(
+            vec![Mutation {
+                key: b"remove".to_vec(),
+                ..Default::default()
+            }],
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        deletion.revision, 3,
+        "deletion succeeds while other data still exceeds the quota"
+    );
+    let actor =
+        bedrock_volume::store::Actor::new(&kv::actor(regions, "eu", QUOTA_NS).unwrap()).unwrap();
+    let physical_expired = |present| {
+        slots
+            .iter()
+            .filter(|slot| {
+                let (answer, values, _) = slot.read(&actor, &[b"d/expired".to_vec()], 0).unwrap();
+                answer.refused == pb::Refusal::None as i32 && values[0].value.is_some() == present
+            })
+            .count()
+    };
+    assert!(
+        physical_expired(true) >= 2,
+        "the expiring row was physically persisted before cleanup"
+    );
+    sleep(Duration::from_secs(
+        expires.saturating_sub(now_seconds()) + 1,
+    ))
+    .await;
+    let rejected = kv::call(
+        client,
+        &namespace,
+        request(write(
+            vec![
+                set("keep", "must not leak", 0),
+                set("growth", &"g".repeat(256), 0),
+            ],
+            None,
+        )),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        physical_expired(false) >= 2,
+        "the rejected growth still durably reclaimed the expired row on a quorum"
+    );
+    let after = call(
+        client,
+        &namespace,
+        get(&["keep", "remove", "expired", "growth"], 3),
+    )
+    .await;
+    assert_eq!(
+        (after.revision, after.committed_at),
+        (3, deletion.committed_at),
+        "rejected growth and expiry cleanup allocate no namespace revision or new commit timestamp"
+    );
+    assert_eq!(
+        after.items[0].value.as_ref().unwrap().value,
+        smaller.as_bytes(),
+        "the rejected bulk did not partially overwrite existing data"
+    );
+    assert!(after.items[1..].iter().all(|item| item.value.is_none()));
+}
+
 async fn scenario() -> Vec<String> {
     let handle = Handle::current();
     let fingerprint = Fingerprint::new();
@@ -456,8 +699,7 @@ async fn scenario() -> Vec<String> {
     ));
     let databases = Arc::new(NoCustomerS3 {
         inner: MemoryFactory::default(),
-        blocked: AtomicBool::new(false),
-        attempts: AtomicU64::new(0),
+        fault: Arc::new(CustomerS3Fault::default()),
     });
     let factories = databases.clone();
     install(Hooks {
@@ -466,9 +708,12 @@ async fn scenario() -> Vec<String> {
         rpc: Box::new(|_| Box::pin(async { Ok(None) })),
     });
     let mut slot_nodes = Vec::new();
+    let mut slot_stores = Vec::new();
     for i in 0..3 {
         let disk = SimEngine::new(&format!("volume-{i}"), Arc::new(|_| None), None, false);
-        slot_nodes.push(slot(i, Arc::new(disk.recorded(fingerprint.clone()))));
+        let store = Arc::new(Store::new(Arc::new(disk.recorded(fingerprint.clone()))));
+        slot_nodes.push(slot(i, store.clone()));
+        slot_stores.push(store);
     }
     spawn("api", API, || bedrock_api::run(api()));
     for ip in RELAYS {
@@ -517,6 +762,8 @@ async fn scenario() -> Vec<String> {
     let namespace = record(NS);
     let other_namespace = record(OTHER);
     let rest_namespace = record(REST_NS);
+    let purge_namespace = record(PURGE_NS);
+    let purge_actor = kv::actor(&regions, "eu", PURGE_NS).unwrap();
     let actor = kv::actor(&regions, "eu", NS).unwrap();
     let id = ActorId::parse(&regions, &actor.id).unwrap();
     let members: Vec<_> = COMPUTES
@@ -542,12 +789,12 @@ async fn scenario() -> Vec<String> {
         .ip("10.0.18.90".parse().unwrap())
         .build()
         .spawn(async move {
-            let client = Arc::new(client());
+            let client = Arc::new(kv::DirectoryView::new(Arc::new(client())));
             until("topology bootstrap", || async {
                 put(&topology_key("eu"), topology.encode_to_vec()).await
             })
             .await;
-            for namespace in [&namespace, &other_namespace, &rest_namespace] {
+            for namespace in [&namespace, &other_namespace, &rest_namespace, &purge_namespace] {
                 until("namespace bootstrap", || async {
                     put(
                         format!("kv/namespaces/{}", namespace.id).as_bytes(),
@@ -567,18 +814,34 @@ async fn scenario() -> Vec<String> {
             .await;
             // Reading through the real Quicksilver client confirms replicated directory readiness before blocking S3.
             until("namespace directory readable", || async {
-                kv::record(&client, NS).await.ok()?;
-                kv::record(&client, OTHER).await.ok()?;
-                Topology::read(&client, "eu", 0).await.ok()
+                client.record(NS, 0).await.ok()?;
+                client.record(OTHER, 0).await.ok()?;
+                Topology::read(&client.client, "eu", 0).await.ok()
             })
             .await;
-            databases.blocked.store(true, Ordering::Relaxed);
+            let held_writer = databases.open("volume", "fault-probe").await.unwrap();
+            held_writer.write(vec![(b"k".to_vec(), Some(b"v".to_vec()))]).await.unwrap();
+            held_writer.flush().await.unwrap();
+            let held_reader = databases.open_reader("volume", "fault-probe").await.unwrap().unwrap();
+            assert_eq!(held_reader.get(b"k").await.unwrap(), Some(b"v".to_vec()));
+            let mut held_scan = held_writer.snapshot(b"", Duration::from_secs(30)).await.unwrap();
+            databases.fault.blocked.store(true, Ordering::Relaxed);
             assert!(
                 databases.open("kv", NS).await.is_err(),
                 "S3 failure injection is armed"
             );
-            assert_eq!(databases.attempts.load(Ordering::Relaxed), 1);
-            databases.attempts.store(0, Ordering::Relaxed);
+            assert!(held_writer.get(b"k").await.is_err());
+            assert!(held_writer.scan(b"").await.is_err());
+            assert!(held_writer.snapshot(b"", Duration::from_secs(30)).await.is_err());
+            assert!(held_writer.write(Vec::new()).await.is_err());
+            assert!(held_writer.flush().await.is_err());
+            assert!(held_writer.close().await.is_err());
+            assert!(held_reader.get(b"k").await.is_err());
+            assert!(held_reader.scan(b"", None, 1).await.is_err());
+            assert!(held_reader.close().await.is_err());
+            assert!(held_scan.next().await.is_err());
+            assert_eq!(databases.fault.attempts.load(Ordering::Relaxed), 11);
+            databases.fault.attempts.store(0, Ordering::Relaxed);
             let mut trace = Vec::new();
 
             let root = format!("/client/v4/accounts/tenant/storage/kv/namespaces/{REST_NS}");
@@ -595,6 +858,12 @@ async fn scenario() -> Vec<String> {
                     .unwrap()
             );
             let cached_path = format!("{root}/values/cached?min_revision=1");
+            assert_eq!(rest(CACHES[0], "GET", &format!("{root}/values/cached?directory_min_revision={}", u64::MAX), "").await.0, 503);
+            let healthy = until("ordinary reads recover after an unreachable caller directory floor", || async {
+                let reply = rest(CACHES[0], "GET", &cached_path, "").await;
+                (reply.0 == 200).then_some(reply.1)
+            }).await;
+            assert_eq!(healthy, b"rest-value", "a caller's unreachable floor cannot poison shared observed progress");
             for cache in CACHES {
                 let (status, body) = rest(cache, "GET", &cached_path, "").await;
                 assert_eq!((status, body), (200, b"rest-value".to_vec()));
@@ -675,7 +944,7 @@ async fn scenario() -> Vec<String> {
                 rest(
                     CACHES[0],
                     "GET",
-                    &format!("{absent_path}?min_revision=2"),
+                    &absent_path,
                     ""
                 )
                 .await,
@@ -719,12 +988,15 @@ async fn scenario() -> Vec<String> {
             );
             sleep(Duration::from_secs(61)).await;
             assert_eq!(rest(CACHES[0], "GET", &format!("{root}/values/ttl?min_revision=5"), "").await.0, 404);
+            let warm_started = bedrock_lib::monotonic_now();
             assert_eq!(rest(CACHES[1], "GET", &format!("{root}/values/cached?min_revision=5"), "").await,
                 (200, b"new-value".to_vec()), "warm the cache again after the expiry check");
+            let warm_deadline = warm_started + Duration::from_secs(60);
             let mut rest_retired = rest_namespace.clone();
             rest_retired.state = Lifecycle::Deleting as i32;
             rest_retired.deleting_at = now_seconds() * 1000;
-            until("retire warm REST cache", || async {
+            let retired_revision = until("retire warm REST cache", || async {
+                assert!(bedrock_lib::monotonic_now() < warm_deadline, "warm cache expired before retirement");
                 put(
                     format!("kv/namespaces/{REST_NS}").as_bytes(),
                     rest_retired.encode_to_vec(),
@@ -732,10 +1004,20 @@ async fn scenario() -> Vec<String> {
                 .await
             })
             .await;
-            until("warm cache checks namespace deletion", || async {
-                (rest(CACHES[1], "GET", &cached_path, "").await.0 == 404).then_some(())
+            until("warm retirement directory revision visible", || async {
+                assert!(bedrock_lib::monotonic_now() < warm_deadline, "warm cache expired before directory visibility");
+                let found = client.client.get("quicksilver", "quicksilver", "infrastructure", format!("kv/namespaces/{REST_NS}").as_bytes(), retired_revision).await.ok()?;
+                let record = Record::decode(found.value.as_deref()?).ok()?;
+                (record.state == Lifecycle::Deleting as i32 && record.deleting_at > 0).then_some(())
             })
             .await;
+            client.observe(retired_revision);
+            assert!(bedrock_lib::monotonic_now() < warm_deadline, "warm cache expired before deletion check");
+            let deleted_warm = rest(CACHES[1], "GET", &format!("{root}/values/cached?directory_min_revision={retired_revision}"), "").await;
+            assert!(bedrock_lib::monotonic_now() < warm_deadline, "cache response arrived after expiry; deletion was not proved");
+            assert_eq!(deleted_warm.0, 404, "a still-warm value is rejected at the retiring directory revision");
+            assert_eq!(rest(CACHES[1], "GET", &format!("{root}/values/cached"), "").await.0, 404, "the cache retains its observed deletion floor without a caller minimum");
+            assert!(bedrock_lib::monotonic_now() < warm_deadline, "cache expired before the observed-floor check");
             trace.push("REST bulk HRW cache minimum absence deletion".into());
 
             let empty = until("empty namespace holder ready", || async {
@@ -768,7 +1050,7 @@ async fn scenario() -> Vec<String> {
             .await;
             assert_eq!(first.revision, 1, "claims are not namespace revisions");
             assert_eq!(
-                databases.attempts.load(Ordering::Relaxed),
+                databases.fault.attempts.load(Ordering::Relaxed),
                 0,
                 "write never asks customer S3"
             );
@@ -784,6 +1066,7 @@ async fn scenario() -> Vec<String> {
             let wrong_tenant = Request {
                 tenant: "someone-else".into(),
                 operation: Some(get(&["a"], 1)),
+                ..Default::default()
             };
             assert_eq!(
                 kv::call(&client, &namespace, wrong_tenant)
@@ -978,10 +1261,13 @@ async fn scenario() -> Vec<String> {
             trace.push("expiry and compaction revision2".into());
 
             // The authoritative directory retires the second namespace before its actor tombstone is installed.
+            call(&client, &purge_namespace, write(vec![set("live", "directory-purge", 0)], None)).await;
             let mut retired = other_namespace.clone();
             retired.state = Lifecycle::Deleting as i32;
             retired.deleting_at = now_seconds() * 1000;
-            until("retired directory record", || async {
+            let grant = bedrock_lib::uuid();
+            retired.purge_grant_hash = kv::purge_grant_hash(&grant);
+            let retired_revision = until("retired directory record", || async {
                 put(
                     format!("kv/namespaces/{OTHER}").as_bytes(),
                     retired.encode_to_vec(),
@@ -989,6 +1275,14 @@ async fn scenario() -> Vec<String> {
                 .await
             })
             .await;
+            client.observe(retired_revision);
+            let mut directory_retired = purge_namespace.clone();
+            directory_retired.state = Lifecycle::Deleting as i32;
+            directory_retired.deleting_at = retired.deleting_at;
+            let directory_retired_revision = until("separate namespace retired for directory purge", || async {
+                put(format!("kv/namespaces/{PURGE_NS}").as_bytes(), directory_retired.encode_to_vec()).await
+            }).await;
+            client.observe(directory_retired_revision);
             until("retirement visible to holders", || async {
                 let error = kv::call(
                     &client,
@@ -1001,25 +1295,24 @@ async fn scenario() -> Vec<String> {
             })
             .await;
             assert_eq!(
-                kv::purge(&client, &retired).await.unwrap_err().code(),
+                kv::purge(&client, &retired, &grant).await.unwrap_err().code(),
                 tonic::Code::FailedPrecondition,
                 "actor deletion respects the same directory grace"
             );
             sleep(bedrock_kv::namespaces::PURGE_GRACE + Duration::from_secs(1)).await;
-            kv::purge(&client, &retired).await.unwrap();
-            kv::purge(&client, &retired).await.unwrap();
-            let deleted = kv::call(
-                &client,
-                &retired,
-                request(write(vec![set("a", "revive", 0)], None)),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(deleted.code(), tonic::Code::Unavailable);
-            assert!(
-                deleted.message().contains("deleted"),
-                "volume tombstone prevents re-acquisition: {deleted}"
-            );
+            assert_eq!(kv::purge(&client, &retired, "").await.unwrap_err().code(), tonic::Code::PermissionDenied, "retirement alone does not authorize actor deletion");
+            let mut foreign = retired.clone();
+            foreign.tenant = "another-tenant".into();
+            assert_eq!(kv::purge(&client, &foreign, &grant).await.unwrap_err().code(), tonic::Code::PermissionDenied, "a purge grant is scoped to the directory tenant");
+            kv::purge(&client, &retired, &grant).await.unwrap();
+            kv::purge(&client, &retired, &grant).await.unwrap();
+            let other_actor = kv::actor(&regions, "eu", OTHER).unwrap();
+            let tombstones = |actor: &pb::Actor| {
+                let actor = bedrock_volume::store::Actor::new(actor).unwrap();
+                slot_stores.iter().filter(|store| store.read(&actor, &[], 0).unwrap().0.refused == pb::Refusal::Deleted as i32).count()
+            };
+            assert!(tombstones(&other_actor) >= 2, "direct purge is durably acknowledged by a quorum");
+            assert_eq!(tombstones(&purge_actor), 0, "Directory::purge starts with an existing unpurged actor");
 
             let admin = Admin::new();
             let directory = bedrock_kv::namespaces::Directory::new(
@@ -1032,12 +1325,13 @@ async fn scenario() -> Vec<String> {
                 },
                 "eu".into(),
             );
-            directory.purge("tenant", OTHER).await.unwrap();
+            let purged_revision = directory.purge("tenant", PURGE_NS).await.unwrap();
             until("purged directory record removed", || async {
-                (kv::record(&client, OTHER).await.err()?.code() == tonic::Code::NotFound)
+                (client.record(PURGE_NS, purged_revision).await.err()?.code() == tonic::Code::NotFound)
                     .then_some(())
             })
             .await;
+            assert!(tombstones(&purge_actor) >= 2, "Directory::purge durably deleted the actor before removing its record");
             assert_eq!(
                 call(&client, &namespace, get(&["a"], 2)).await.items[0]
                     .value
@@ -1103,6 +1397,13 @@ async fn scenario() -> Vec<String> {
                 (retried.revision, retried.committed_at),
                 (resolved.revision, resolved.committed_at)
             );
+            let resolved_values = call(&client, &namespace, get(&["unacked-left", "unacked-right"], 3)).await;
+            assert_eq!(resolved_values.revision, 3);
+            assert_eq!(resolved_values.items.len(), 2);
+            for (item, expected) in resolved_values.items.into_iter().zip([b"unacked-left".as_slice(), b"unacked-right".as_slice()]) {
+                assert_eq!(item.key, expected);
+                assert_eq!(item.value.unwrap().value, b"minority");
+            }
             assert_eq!(
                 call(
                     &client,
@@ -1117,8 +1418,10 @@ async fn scenario() -> Vec<String> {
                 "minority recovery{} retry3 next4",
                 recovered.revision
             ));
+            reduced_quota(&client, &regions, &slot_stores).await;
+            trace.push("lowered quota shrinks and rejected growth persists expiry cleanup at revision3".into());
             assert_eq!(
-                databases.attempts.load(Ordering::Relaxed),
+                databases.fault.attempts.load(Ordering::Relaxed),
                 0,
                 "all holder I/O used volume quorum"
             );

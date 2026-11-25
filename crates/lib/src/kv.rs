@@ -4,6 +4,11 @@
 use crate::actors::{ActorId, Kind, Regions};
 use crate::volume;
 use prost::Message;
+use sha2::{Digest, Sha256};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 pub const MAX_KEY: usize = 512;
 pub const MAX_VALUE: usize = 25 << 20;
@@ -16,15 +21,88 @@ pub const MAX_ENTRY_BYTES: usize = 224 << 20;
 pub const MAX_MESSAGE_BYTES: usize = 256 << 20;
 pub const RETRY_MS: u64 = 24 * 60 * 60 * 1000;
 pub const EVENT_MS: u64 = 60 * 1000;
+pub const DIRECTORY_REVISION: &str = "bedrock-kv-directory-revision";
+
+/// One process's observed infrastructure progress, shared by management, caches and holders.
+/// A caller floor is enforced before it can raise this observed floor.
+pub struct DirectoryView {
+    pub client: Arc<crate::client::Client>,
+    minimum: AtomicU64,
+}
+
+impl DirectoryView {
+    pub fn new(client: Arc<crate::client::Client>) -> Self {
+        Self {
+            client,
+            minimum: AtomicU64::new(0),
+        }
+    }
+    pub fn minimum(&self) -> u64 {
+        self.minimum.load(Ordering::Relaxed)
+    }
+    pub fn observe(&self, revision: u64) {
+        self.minimum.fetch_max(revision, Ordering::Relaxed);
+    }
+
+    pub async fn record(&self, id: &str, minimum: u64) -> Result<Record, tonic::Status> {
+        for _ in 0..3 {
+            let found = self
+                .client
+                .get(
+                    "quicksilver",
+                    "quicksilver",
+                    "infrastructure",
+                    format!("kv/namespaces/{id}").as_bytes(),
+                    minimum.max(self.minimum()),
+                )
+                .await?;
+            if found.revision < minimum.max(self.minimum()) {
+                continue;
+            }
+            self.observe(found.revision);
+            return decode_record(
+                id,
+                found
+                    .value
+                    .as_deref()
+                    .ok_or_else(|| tonic::Status::not_found("namespace not found"))?,
+            );
+        }
+        Err(tonic::Status::unavailable(
+            "namespace directory advanced during lookup",
+        ))
+    }
+}
+
+pub fn directory_revision(metadata: &tonic::metadata::MetadataMap) -> Result<u64, tonic::Status> {
+    metadata
+        .get(DIRECTORY_REVISION)
+        .map(|v| {
+            v.to_str().ok().and_then(|v| v.parse().ok()).ok_or_else(|| {
+                tonic::Status::invalid_argument("invalid directory minimum revision")
+            })
+        })
+        .transpose()
+        .map(|v| v.unwrap_or(0))
+}
+
+pub fn purge_grant_hash(grant: &str) -> String {
+    format!("{:x}", Sha256::digest(grant.as_bytes()))
+}
 
 /// Worker binding read contract: select this cell's KV value cache by HRW; misses reach the actor through that cache.
 /// The host validates the binding's namespace before calling; the KV service rechecks directory deletion on every read.
 pub async fn get(
-    client: &crate::client::Client,
+    directory: &DirectoryView,
     record: &Record,
     key: &[u8],
     min_revision: u64,
 ) -> Result<(Option<Stored>, u64), tonic::Status> {
+    let fresh = directory.record(&record.id, 0).await?;
+    if fresh.tenant != record.tenant || fresh.state != Lifecycle::Active as i32 {
+        return Err(tonic::Status::not_found("namespace not found"));
+    }
+    let client = &directory.client;
     let mut last = tonic::Status::unavailable("no KV cache answered");
     let mut seen = None;
     for _ in 0..2 {
@@ -40,23 +118,29 @@ pub async fn get(
         let addresses: Vec<_> = ranked.iter().map(|m| m.address.clone()).collect();
         let usable = client.route(&addresses);
         for member in ranked.iter().filter(|m| usable.contains(&&m.address)) {
-            let request = crate::replication::pb::GetRequest {
+            let mut request = tonic::Request::new(crate::replication::pb::GetRequest {
                 dataset: "kv".into(),
                 namespace: record.id.clone(),
                 key: key.to_vec(),
                 min_revision,
-            };
+            });
+            request
+                .metadata_mut()
+                .insert(DIRECTORY_REVISION, directory.minimum().into());
             match client
                 .call_member(member, |channel| async move {
-                    crate::replication::pb::reads_client::ReadsClient::new(channel)
+                    let response = crate::replication::pb::reads_client::ReadsClient::new(channel)
                         .max_decoding_message_size(MAX_MESSAGE_BYTES)
                         .max_encoding_message_size(MAX_MESSAGE_BYTES)
                         .get(request)
-                        .await
+                        .await?;
+                    let observed = directory_revision(response.metadata())?;
+                    Ok(tonic::Response::new((response.into_inner(), observed)))
                 })
                 .await
             {
-                Ok(reply) => {
+                Ok((reply, observed)) => {
+                    directory.observe(observed);
                     if reply.revision < min_revision {
                         return Err(tonic::Status::data_loss(
                             "KV cache returned an old revision",
@@ -95,13 +179,19 @@ pub fn terminal_read_error(error: &tonic::Status) -> bool {
 }
 
 /// Delete a retired namespace actor through its normal Gateway route.
-pub async fn purge(client: &crate::client::Client, record: &Record) -> Result<(), tonic::Status> {
+pub async fn purge(
+    directory: &DirectoryView,
+    record: &Record,
+    grant: &str,
+) -> Result<(), tonic::Status> {
     call(
-        client,
+        directory,
         record,
         Request {
             tenant: record.tenant.clone(),
             operation: Some(request::Operation::Purge(true)),
+            purge_grant: grant.into(),
+            ..Default::default()
         },
     )
     .await?;
@@ -110,10 +200,12 @@ pub async fn purge(client: &crate::client::Client, record: &Record) -> Result<()
 
 /// Shared binding transport. No write is automatically retried after an ambiguous outcome.
 pub async fn call(
-    client: &crate::client::Client,
+    directory: &DirectoryView,
     record: &Record,
-    request: Request,
+    mut request: Request,
 ) -> Result<Reply, tonic::Status> {
+    request.directory_min_revision = request.directory_min_revision.max(directory.minimum());
+    let client = &directory.client;
     let (topology, _) = crate::actors::Topology::read(client, &record.home_region, 0)
         .await
         .map_err(|e| tonic::Status::unavailable(e.to_string()))?;
@@ -152,28 +244,15 @@ pub async fn call(
     }
     let reply = Reply::decode(reply.payload.as_slice())
         .map_err(|e| tonic::Status::data_loss(e.to_string()))?;
+    directory.observe(reply.directory_revision);
     if reply.code != 0 {
         return Err(tonic::Status::new(reply.code.into(), reply.message));
     }
     Ok(reply)
 }
 
-/// A fresh directory lookup, shared by the REST front and the built-in holder.
-pub async fn record(client: &crate::client::Client, id: &str) -> Result<Record, tonic::Status> {
-    let found = client
-        .get(
-            "quicksilver",
-            "quicksilver",
-            "infrastructure",
-            format!("kv/namespaces/{id}").as_bytes(),
-            0,
-        )
-        .await?;
-    let bytes = found
-        .value
-        .ok_or_else(|| tonic::Status::not_found("namespace not found"))?;
-    let record =
-        Record::decode(bytes.as_slice()).map_err(|e| tonic::Status::data_loss(e.to_string()))?;
+fn decode_record(id: &str, bytes: &[u8]) -> Result<Record, tonic::Status> {
+    let record = Record::decode(bytes).map_err(|e| tonic::Status::data_loss(e.to_string()))?;
     if record.id != id
         || id.len() != 32
         || !id
@@ -270,6 +349,11 @@ pub struct Request {
     pub tenant: String,
     #[prost(oneof = "request::Operation", tags = "2, 3, 4, 5, 6")]
     pub operation: Option<request::Operation>,
+    #[prost(uint64, tag = "7")]
+    pub directory_min_revision: u64,
+    /// Secret preimage of the management workflow's published grant hash.
+    #[prost(string, tag = "8")]
+    pub purge_grant: String,
 }
 
 pub mod request {
@@ -316,6 +400,8 @@ pub struct Reply {
     /// Original successful write count, retained with the retry result.
     #[prost(uint32, tag = "7")]
     pub written_keys: u32,
+    #[prost(uint64, tag = "8")]
+    pub directory_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -362,6 +448,9 @@ pub struct Record {
     /// before this was recorded.
     #[prost(uint64, tag = "13")]
     pub deleting_at: u64,
+    /// Only the authorized namespace-management CAS publishes this hash; the secret is never stored here.
+    #[prost(string, tag = "14")]
+    pub purge_grant_hash: String,
 }
 
 #[cfg(test)]

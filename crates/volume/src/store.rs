@@ -423,6 +423,8 @@ pub struct Pending {
     /// The slot's flushed point: the changes start after it.
     pub flushed: u64,
     pub through: u64,
+    /// More committed entries remain after this bounded flush prefix.
+    pub more: bool,
     pub epoch: u64,
     pub alarm: Option<u64>,
     /// The log's first `MOVE`, when it is at or before `through` (S-17).
@@ -1056,6 +1058,7 @@ impl Store {
                 .ok_or_else(|| Error::Invalid("an actor prefix does not parse".into()))?,
             flushed: claim.flushed,
             through,
+            more: through < claim.committed,
             epoch,
             alarm,
             moved,

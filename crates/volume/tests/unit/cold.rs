@@ -481,6 +481,72 @@ async fn a_slow_s3_bounds_the_log_with_backpressure() {
     append(&n.store, 0, seq, vec![entry(seq + 1, &[])], seq + 1).unwrap();
 }
 
+/// The response page budget applies across both tiers, with duplicate requested keys counted each time.
+#[tokio::test]
+async fn a_read_limits_the_combined_hot_and_cold_values() {
+    use bedrock_lib::volume::volume_server::Volume;
+    use tonic::Request;
+
+    let bucket = Memory::default();
+    let n = node(&bucket, "n1", u64::MAX);
+    claim(&n.store, 0);
+    let large = "v".repeat(bedrock_lib::kv::MAX_VALUE);
+    append(&n.store, 0, 0, vec![entry(1, &[("cold", Some(&large))])], 1).unwrap();
+    n.cold.tick(&n.directory).await;
+    append(&n.store, 0, 1, vec![entry(2, &[("hot", Some(&large))])], 2).unwrap();
+    drop(large);
+    let service = crate::serve::Service::new(&Admin::new(), n.store, "n1", "cell-1", "dc1")
+        .unwrap()
+        .with_cold(Arc::new(n.cold));
+    *service.directory.write().unwrap() = n.directory;
+    let keys = |count| {
+        (0..count)
+            .map(|i| {
+                if i % 2 == 0 {
+                    b"cold".to_vec()
+                } else {
+                    b"hot".to_vec()
+                }
+            })
+            .collect()
+    };
+    // Every value is valid and each tier alone fits. Together ten 25 MiB values exceed PAGE_BYTES.
+    let Err(error) = service
+        .read(Request::new(pb::ReadRequest {
+            actor: Some(actor(0)),
+            keys: keys(10),
+            min_seq: 2,
+        }))
+        .await
+    else {
+        panic!("combined hot and cold values must exceed the reply budget");
+    };
+    assert_eq!(error.code(), tonic::Code::OutOfRange);
+    let reply = service
+        .read(Request::new(pb::ReadRequest {
+            actor: Some(actor(0)),
+            keys: keys(2),
+            min_seq: 2,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        reply
+            .values
+            .iter()
+            .map(|value| value.key.as_slice())
+            .collect::<Vec<_>>(),
+        [b"cold".as_slice(), b"hot".as_slice()]
+    );
+    assert!(
+        reply
+            .values
+            .iter()
+            .all(|value| value.value.as_ref().unwrap().len() == bedrock_lib::kv::MAX_VALUE)
+    );
+}
+
 /// After truncation a slot reads flushed keys from the range database, and scans merge it under the overlay.
 #[tokio::test]
 async fn cold_reads_and_scans_merge_the_range_database_under_the_overlay() {
@@ -505,12 +571,27 @@ async fn cold_reads_and_scans_merge_the_range_database_under_the_overlay() {
     .unwrap();
     let got = n
         .cold
-        .get("cell-1", &actor(0), 1, &[b"a".to_vec()])
+        .get(
+            "cell-1",
+            &actor(0),
+            1,
+            &[b"a".to_vec()],
+            crate::store::PAGE_BYTES,
+        )
         .await
         .unwrap();
     assert_eq!(got, vec![Some(b"1".to_vec())]);
     // A reader behind the slot's flushed point refuses rather than answering old state.
-    let behind = n.cold.get("cell-1", &actor(0), 5, &[b"a".to_vec()]).await;
+    let behind = n
+        .cold
+        .get(
+            "cell-1",
+            &actor(0),
+            5,
+            &[b"a".to_vec()],
+            crate::store::PAGE_BYTES,
+        )
+        .await;
     assert_eq!(behind.unwrap_err().code(), tonic::Code::Unavailable);
 
     let actor0 = Actor::new(&actor(0)).unwrap();
@@ -523,7 +604,14 @@ async fn cold_reads_and_scans_merge_the_range_database_under_the_overlay() {
             .scan("cell-1", &actor(0), 1, &start, 2)
             .await
             .unwrap();
-        let (values, more, next) = merge(overlay, more, stored, stored_more, 2);
+        let (values, more, next) = merge(
+            overlay,
+            more,
+            stored,
+            stored_more,
+            2,
+            bedrock_lib::kv::MAX_MESSAGE_BYTES,
+        );
         keys.extend(
             values
                 .iter()
@@ -558,16 +646,104 @@ fn a_merge_stops_where_a_page_with_more_ends() {
         stored(&["a", "c"]),
         false,
         10,
+        bedrock_lib::kv::MAX_MESSAGE_BYTES,
     );
     assert_eq!(values, vec![value("b", Some("o"))]);
     assert!(more);
     assert_eq!(next, b"b\0");
     // Deletes hide every certain key: nothing to return, but the next page starts past them.
-    let (values, more, next) = merge(vec![value("a", None)], true, stored(&["a"]), false, 10);
+    let (values, more, next) = merge(
+        vec![value("a", None)],
+        true,
+        stored(&["a"]),
+        false,
+        10,
+        bedrock_lib::kv::MAX_MESSAGE_BYTES,
+    );
     assert!(values.is_empty() && more);
     assert_eq!(next, b"a\0");
-    let (values, more, _) = merge(Vec::new(), false, stored(&["a", "b", "c"]), false, 2);
+    let (values, more, _) = merge(
+        Vec::new(),
+        false,
+        stored(&["a", "b", "c"]),
+        false,
+        2,
+        bedrock_lib::kv::MAX_MESSAGE_BYTES,
+    );
     assert_eq!((values.len(), more), (2, true));
+}
+
+#[test]
+fn a_merged_scan_page_fits_its_encoded_reply_and_continues() {
+    let answer = pb::Answer {
+        slot: Some(pb::Slot {
+            holder: Some(holder()),
+            committed: 123,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let expected = pb::Value {
+        key: b"a".to_vec(),
+        value: Some(b"cold".to_vec()),
+    };
+    let envelope = pb::ScanReply {
+        answer: Some(answer.clone()),
+        more: true,
+        ..Default::default()
+    }
+    .encoded_len();
+    let budget = pb::ScanReply {
+        answer: Some(answer.clone()),
+        values: vec![expected.clone()],
+        more: true,
+    }
+    .encoded_len();
+    let overlay = pb::Value {
+        key: b"b".to_vec(),
+        value: Some(b"hot".to_vec()),
+    };
+    let (values, more, next) = merge(
+        vec![overlay.clone()],
+        false,
+        vec![(b"a".to_vec(), b"cold".to_vec())],
+        false,
+        10,
+        budget - envelope,
+    );
+    assert_eq!(values, vec![expected]);
+    assert!(more);
+    assert_eq!(next, b"a\0");
+    assert_eq!(
+        pb::ScanReply {
+            answer: Some(answer),
+            values,
+            more
+        }
+        .encoded_len(),
+        budget
+    );
+    let (rest, more, _) = merge(
+        vec![overlay.clone()],
+        false,
+        Vec::new(),
+        false,
+        10,
+        budget - envelope,
+    );
+    assert_eq!(rest, vec![overlay]);
+    assert!(!more);
+
+    // One maximum KV value proves the real wire sizes without retaining eleven copies: each tier's six/five
+    // values fit PAGE_BYTES, while their combined reply exceeds the actual tonic limit.
+    let value = pb::Value {
+        key: b"k".to_vec(),
+        value: Some(vec![0; bedrock_lib::kv::MAX_VALUE]),
+    };
+    let encoded = prost::encoding::message::encoded_len(2, &value);
+    assert!(6 * (value.encoded_len() + 10) < crate::store::PAGE_BYTES);
+    assert!(5 * (value.encoded_len() + 10) < crate::store::PAGE_BYTES);
+    assert!(envelope + 11 * encoded > bedrock_lib::kv::MAX_MESSAGE_BYTES);
 }
 
 /// Opening the database elsewhere fences this maintainer, which then waits before opening it again.
@@ -735,9 +911,27 @@ fn an_interior_split_leaves_no_database_serving_two_spans() {
 /// behind; it fails, and the retry reads the new catalog.
 async fn read(cold: &Cold, i: usize, flushed: u64) -> Option<Vec<u8>> {
     let keys = [b"k".to_vec()];
-    let got = match cold.get("cell-1", &actor(i), flushed, &keys).await {
+    let got = match cold
+        .get(
+            "cell-1",
+            &actor(i),
+            flushed,
+            &keys,
+            crate::store::PAGE_BYTES,
+        )
+        .await
+    {
         Ok(got) => got,
-        Err(_) => cold.get("cell-1", &actor(i), flushed, &keys).await.unwrap(),
+        Err(_) => cold
+            .get(
+                "cell-1",
+                &actor(i),
+                flushed,
+                &keys,
+                crate::store::PAGE_BYTES,
+            )
+            .await
+            .unwrap(),
     };
     got.into_iter().next().unwrap()
 }
@@ -792,7 +986,7 @@ async fn a_stale_catalog_after_a_split_is_reloaded_not_waited_on() {
     assert_eq!(
         reader
             .cold
-            .get("cell-1", &actor(0), 1, &keys)
+            .get("cell-1", &actor(0), 1, &keys, crate::store::PAGE_BYTES)
             .await
             .unwrap(),
         vec![Some(b"1".to_vec())]
@@ -809,7 +1003,7 @@ async fn a_stale_catalog_after_a_split_is_reloaded_not_waited_on() {
     assert_eq!(
         reader
             .cold
-            .get("cell-1", &actor(0), 2, &keys)
+            .get("cell-1", &actor(0), 2, &keys, crate::store::PAGE_BYTES)
             .await
             .unwrap(),
         vec![Some(b"2".to_vec())]
@@ -891,7 +1085,13 @@ async fn a_first_slot_move_copies_the_actor_into_the_new_cell() {
     assert_eq!(Meta::decode(&cell2[&meta_key(name)]).unwrap().seq, 2);
     let got = after
         .cold
-        .get("cell-2", &actor(0), 2, &[b"y".to_vec()])
+        .get(
+            "cell-2",
+            &actor(0),
+            2,
+            &[b"y".to_vec()],
+            crate::store::PAGE_BYTES,
+        )
         .await
         .unwrap();
     assert_eq!(got, vec![Some(b"1".to_vec())]);
@@ -1049,10 +1249,16 @@ async fn a_moved_actor_read_skips_a_cell_it_cannot_read() {
         "n1",
     );
     let keys = [b"k".to_vec()];
-    let got = cold.get("cell-1", &actor(0), 1, &keys).await.unwrap();
+    let got = cold
+        .get("cell-1", &actor(0), 1, &keys, crate::store::PAGE_BYTES)
+        .await
+        .unwrap();
     assert_eq!(got, vec![Some(b"v".to_vec())]);
     // Nothing holds it at sequence 2: whether the unreadable cell does cannot be decided, so the caller retries.
-    let missed = cold.get("cell-1", &actor(0), 2, &keys).await.unwrap_err();
+    let missed = cold
+        .get("cell-1", &actor(0), 2, &keys, crate::store::PAGE_BYTES)
+        .await
+        .unwrap_err();
     assert_eq!(missed.code(), tonic::Code::Unavailable);
 }
 
@@ -1140,14 +1346,17 @@ async fn a_read_before_the_database_exists_succeeds_on_retry_once_it_does() {
     let n = node(&bucket, "n1", u64::MAX);
     let reader = node(&bucket, "n2", u64::MAX);
     let keys = [b"k".to_vec()];
-    let early = reader.cold.get("cell-1", &actor(0), 1, &keys).await;
+    let early = reader
+        .cold
+        .get("cell-1", &actor(0), 1, &keys, crate::store::PAGE_BYTES)
+        .await;
     assert_eq!(early.unwrap_err().code(), tonic::Code::Unavailable);
     claim(&n.store, 0);
     append(&n.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
     n.cold.tick(&n.directory).await;
     let got = reader
         .cold
-        .get("cell-1", &actor(0), 1, &keys)
+        .get("cell-1", &actor(0), 1, &keys, crate::store::PAGE_BYTES)
         .await
         .unwrap();
     assert_eq!(got, vec![Some(b"1".to_vec())]);
@@ -1171,7 +1380,13 @@ async fn an_idle_actor_whose_first_slot_moved_stays_readable() {
     after.cold.tick(&after.directory).await;
     let got = after
         .cold
-        .get("cell-2", &actor(0), 1, &[b"k".to_vec()])
+        .get(
+            "cell-2",
+            &actor(0),
+            1,
+            &[b"k".to_vec()],
+            crate::store::PAGE_BYTES,
+        )
         .await
         .unwrap();
     assert_eq!(got, vec![Some(b"1".to_vec())]);
@@ -1229,7 +1444,10 @@ async fn a_read_after_an_idle_move_rereads_a_catalog_cached_before_a_split() {
     );
     let keys = [b"k".to_vec()];
     assert_eq!(
-        moved.get("cell-2", &actor(0), 1, &keys).await.unwrap(),
+        moved
+            .get("cell-2", &actor(0), 1, &keys, crate::store::PAGE_BYTES)
+            .await
+            .unwrap(),
         vec![Some(b"1".to_vec())]
     );
     // The source range splits and its clone flushes a newer sequence.
@@ -1244,7 +1462,10 @@ async fn a_read_after_an_idle_move_rereads_a_catalog_cached_before_a_split() {
     // the catalog cell-2 cached still names the database the split retired.
     *placement.cell.lock().unwrap() = "cell-2".into();
     assert_eq!(
-        moved.get("cell-2", &actor(0), 2, &keys).await.unwrap(),
+        moved
+            .get("cell-2", &actor(0), 2, &keys, crate::store::PAGE_BYTES)
+            .await
+            .unwrap(),
         vec![Some(b"2".to_vec())]
     );
 }
@@ -1459,7 +1680,11 @@ mod slate {
         n.cold.tick(&n.directory).await;
         assert_eq!(flushed(&n.store, 0), 1);
         let keys = vec![key.clone()];
-        let values = n.cold.get("cell-1", &actor(0), 1, &keys).await.unwrap();
+        let values = n
+            .cold
+            .get("cell-1", &actor(0), 1, &keys, crate::store::PAGE_BYTES)
+            .await
+            .unwrap();
         let restored = kv::Stored::decode(values[0].as_deref().unwrap()).unwrap();
         assert_eq!(restored, stored);
         let (page, more) = n.cold.scan("cell-1", &actor(0), 1, b"d/", 1).await.unwrap();
@@ -1715,6 +1940,30 @@ async fn one_round_flushes_at_most_flush_rounds_batches_per_range() {
     assert!(n.store.dirty(0, 0).is_empty());
 }
 
+/// Repeated overwrites collapse to one small database value; the remaining committed log still needs another round.
+#[tokio::test]
+async fn a_bounded_flush_continues_after_an_overwrite_prefix() {
+    let bucket = Memory::default();
+    let n = node(&bucket, "n1", u64::MAX);
+    claim(&n.store, 0);
+    let value = "v".repeat(1024);
+    let count = FLUSH_BYTES as usize / value.len() + 1;
+    let mut entries: Vec<_> = (1..=count)
+        .map(|seq| entry(seq as u64, &[("k", Some(&value))]))
+        .collect();
+    entries.push(entry(count as u64 + 1, &[("k", Some("last"))]));
+    append(&n.store, 0, 0, entries, count as u64 + 1).unwrap();
+    n.cold.tick(&n.directory).await;
+    assert_eq!(flushed(&n.store, 0), count as u64 + 1);
+    assert_eq!(stored(&bucket, 0, "k"), Some(b"last".to_vec()));
+    assert!(n.store.dirty(0, 0).is_empty());
+    assert_eq!(
+        bucket.commits(),
+        2,
+        "only the remaining committed prefix starts another batch"
+    );
+}
+
 /// A hanging slot owner holds a tick up for at most the settlement budget, and the next tick starts after the hung
 /// actors, so the ones behind them still get settled.
 #[tokio::test(start_paused = true)]
@@ -1775,7 +2024,14 @@ fn a_merge_stopped_by_its_limit_resumes_after_the_last_key_it_consumed() {
         key: b"b".to_vec(),
         value: None,
     };
-    let (values, more, next) = merge(vec![deleted], false, stored, false, 1);
+    let (values, more, next) = merge(
+        vec![deleted],
+        false,
+        stored,
+        false,
+        1,
+        bedrock_lib::kv::MAX_MESSAGE_BYTES,
+    );
     assert_eq!(values.len(), 1);
     assert!(more);
     // `b` was consumed (a delete); `c` was not returned, so the next page starts right after `b`.

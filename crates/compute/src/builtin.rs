@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bedrock_lib::actors::{Kind, Topology};
-use bedrock_lib::client::Client;
 use bedrock_lib::kv::{self, Item, Lifecycle, Reply, Request, Stored, Write, request::Operation};
 use bedrock_lib::volume as pb;
 use prometheus_client::metrics::counter::Counter;
@@ -24,7 +23,7 @@ const CLEAN_PAGE: u32 = 32;
 
 /// Adds KV to an existing executor; every other execution spec keeps its original executor.
 pub struct KvExecutor {
-    client: Arc<Client>,
+    directory: Arc<kv::DirectoryView>,
     fallback: Arc<dyn runtime::Executor>,
     quota_rejections: Counter,
 }
@@ -32,7 +31,7 @@ pub struct KvExecutor {
 impl KvExecutor {
     pub fn new(
         admin: &bedrock_lib::admin::Admin,
-        client: Arc<Client>,
+        directory: Arc<kv::DirectoryView>,
         fallback: Arc<dyn runtime::Executor>,
     ) -> Self {
         let quota_rejections = Counter::default();
@@ -42,7 +41,7 @@ impl KvExecutor {
             quota_rejections.clone(),
         );
         Self {
-            client,
+            directory,
             fallback,
             quota_rejections,
         }
@@ -62,7 +61,7 @@ impl runtime::Executor for KvExecutor {
             unreachable!("builtin identified an actor")
         };
         Ok(Box::new(Kv {
-            client: self.client.clone(),
+            directory: self.directory.clone(),
             actor,
             storage,
             quota_rejections: self.quota_rejections.clone(),
@@ -72,7 +71,7 @@ impl runtime::Executor for KvExecutor {
 }
 
 struct Kv {
-    client: Arc<Client>,
+    directory: Arc<kv::DirectoryView>,
     actor: pb::Actor,
     storage: Storage,
     quota_rejections: Counter,
@@ -149,6 +148,10 @@ impl Instance for Kv {
             },
             Err(Failure::Volume(error)) => return Err(error.into()),
         };
+        let reply = Reply {
+            directory_revision: self.directory.minimum(),
+            ..reply
+        };
         Ok(reply.encode_to_vec())
     }
 }
@@ -157,14 +160,17 @@ impl Kv {
     async fn handle(&mut self, payload: &[u8]) -> Result<Reply> {
         let request =
             Request::decode(payload).map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let record = kv::record(&self.client, &self.actor.namespace).await?;
+        let record = self
+            .directory
+            .record(&self.actor.namespace, request.directory_min_revision)
+            .await?;
         if request.tenant != record.tenant {
             return Err(Status::permission_denied("namespace belongs to another tenant").into());
         }
         if record.state != Lifecycle::Active as i32 {
             return Err(Status::failed_precondition("namespace is deleting").into());
         }
-        let (topology, _) = Topology::read(&self.client, &record.home_region, 0)
+        let (topology, _) = Topology::read(&self.directory.client, &record.home_region, 0)
             .await
             .map_err(|e| Status::unavailable(e.to_string()))?;
         let regions = BTreeMap::from([(record.home_region.clone(), topology)]);
@@ -286,12 +292,28 @@ impl Kv {
             return Err(Status::aborted("namespace revision changed").into());
         }
         let mut changes = self.cleanup(&mut meta, now, &final_values).await?;
-        for (key, value) in &final_values {
-            let old = self.row(key, &meta).await?;
-            meta.bytes = replace_bytes(meta.bytes, key, old.as_ref(), value.as_ref())?;
+        let after_cleanup = meta.bytes;
+        // Old values can be much larger than their replacements; bound each collected batch too.
+        let requested: Vec<_> = final_values.keys().collect();
+        for batch in requested.chunks(8) {
+            let keys: Vec<_> = batch.iter().map(|key| prefixed(DATA, key)).collect();
+            let old = previous_rows(&keys, self.storage.get(keys.clone()).await?, &meta)?;
+            for key in batch {
+                let value = &final_values[*key];
+                let previous = &old[&prefixed(DATA, key)];
+                meta.bytes = replace_bytes(meta.bytes, key, previous.as_ref(), value.as_ref())?;
+            }
         }
-        if record.storage_bytes.is_some_and(|limit| meta.bytes > limit) {
+        if record
+            .storage_bytes
+            .is_some_and(|limit| meta.bytes > limit && meta.bytes > after_cleanup)
+        {
             self.quota_rejections.inc();
+            if !changes.is_empty() {
+                meta.bytes = after_cleanup;
+                changes.push(change(META.to_vec(), Some(meta.encode_to_vec())));
+                self.storage.commit_at(changes, now).await?;
+            }
             return Err(Status::resource_exhausted("namespace storage quota exceeded").into());
         }
         meta.revision = meta
@@ -604,6 +626,32 @@ fn decode_row(bytes: &[u8], meta: &Meta) -> std::result::Result<Stored, Status> 
         .ok_or_else(|| Status::data_loss("missing KV value"))?;
     validate_value(&value, None).map_err(|e| Status::data_loss(e.message().to_owned()))?;
     Ok(value)
+}
+
+fn previous_rows(
+    requested: &[Vec<u8>],
+    values: Vec<pb::Value>,
+    meta: &Meta,
+) -> std::result::Result<BTreeMap<Vec<u8>, Option<Stored>>, Status> {
+    let mut rows = BTreeMap::new();
+    for value in values {
+        if !requested.contains(&value.key) || rows.contains_key(&value.key) {
+            return Err(Status::data_loss(
+                "volume GET returned an unexpected or duplicate key",
+            ));
+        }
+        rows.insert(
+            value.key,
+            value
+                .value
+                .map(|bytes| decode_row(&bytes, meta))
+                .transpose()?,
+        );
+    }
+    if rows.len() != requested.len() {
+        return Err(Status::data_loss("volume GET omitted a requested key"));
+    }
+    Ok(rows)
 }
 
 fn decode_retained(

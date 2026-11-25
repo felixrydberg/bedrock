@@ -15,6 +15,7 @@ fn record(id: &str) -> Record {
         state: Lifecycle::Active as i32,
         created_at: 1,
         deleting_at: 0,
+        purge_grant_hash: String::new(),
     }
 }
 

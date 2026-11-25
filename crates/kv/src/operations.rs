@@ -30,6 +30,7 @@ type Landed = (u64, Result<pb::GetReply, Status>);
 #[derive(Clone)]
 pub struct Values {
     client: Arc<Client>,
+    directory: Arc<kv::DirectoryView>,
     members: Arc<membership::View>,
     peers: Arc<Peers>,
     node_id: String,
@@ -42,7 +43,7 @@ pub struct Values {
 impl Values {
     pub fn new(
         admin: &bedrock_lib::admin::Admin,
-        client: Arc<Client>,
+        directory: Arc<kv::DirectoryView>,
         members: Arc<membership::View>,
         peers: Arc<Peers>,
         node_id: String,
@@ -51,7 +52,8 @@ impl Values {
     ) -> Self {
         let metrics = protection::Metrics::new(admin);
         Self {
-            client,
+            client: directory.client.clone(),
+            directory,
             members,
             peers,
             node_id,
@@ -66,8 +68,8 @@ impl Values {
         }
     }
 
-    async fn record(&self, tenant: &str, id: &str) -> Result<Record, Status> {
-        let record = kv::record(&self.client, id).await?;
+    async fn record(&self, tenant: &str, id: &str, minimum: u64) -> Result<Record, Status> {
+        let record = self.directory.record(id, minimum).await?;
         if record.tenant != tenant || namespaces::admit_open(&record).is_err() {
             return Err(Status::not_found("namespace not found"));
         }
@@ -84,11 +86,12 @@ impl Values {
                 None
             };
         kv::call(
-            &self.client,
+            &self.directory,
             record,
             kv::Request {
                 tenant: record.tenant.clone(),
                 operation: Some(operation),
+                ..Default::default()
             },
         )
         .await
@@ -185,21 +188,31 @@ impl Values {
             let result = if member.node_id == self.node_id {
                 self.local(record, key, minimum).await
             } else {
-                let request = pb::GetRequest {
+                let mut request = tonic::Request::new(pb::GetRequest {
                     dataset: "kv".into(),
                     namespace: record.id.clone(),
                     key: key.to_vec(),
                     min_revision: minimum,
-                };
-                self.client
+                });
+                request
+                    .metadata_mut()
+                    .insert(kv::DIRECTORY_REVISION, self.directory.minimum().into());
+                let result = self
+                    .client
                     .call_member(member, |channel| async move {
-                        pb::reads_client::ReadsClient::new(channel)
+                        let response = pb::reads_client::ReadsClient::new(channel)
                             .max_decoding_message_size(kv::MAX_MESSAGE_BYTES)
                             .max_encoding_message_size(kv::MAX_MESSAGE_BYTES)
                             .get(request)
-                            .await
+                            .await?;
+                        let observed = kv::directory_revision(response.metadata())?;
+                        Ok(tonic::Response::new((response.into_inner(), observed)))
                     })
-                    .await
+                    .await;
+                result.map(|(reply, observed)| {
+                    self.directory.observe(observed);
+                    reply
+                })
             };
             match result {
                 Ok(reply) if reply.revision >= minimum => {
@@ -232,6 +245,7 @@ impl pb::reads_server::Reads for Values {
         if let Some(caller) = Caller::of(&request) {
             caller.require(&["kv", "compute", "gateway"], Some(&self.cell))?;
         }
+        let minimum = kv::directory_revision(request.metadata())?;
         let request = request.into_inner();
         if request.dataset != "kv" {
             return Err(Status::failed_precondition(
@@ -239,13 +253,18 @@ impl pb::reads_server::Reads for Values {
             ));
         }
         valid_key_bytes(&request.key)?;
-        let record = kv::record(&self.client, &request.namespace).await?;
+        let record = self.directory.record(&request.namespace, minimum).await?;
         if namespaces::admit_open(&record).is_err() {
             return Err(Status::not_found("namespace not found"));
         }
-        self.local(&record, &request.key, request.min_revision)
-            .await
-            .map(tonic::Response::new)
+        let mut response = tonic::Response::new(
+            self.local(&record, &request.key, request.min_revision)
+                .await?,
+        );
+        response
+            .metadata_mut()
+            .insert(kv::DIRECTORY_REVISION, self.directory.minimum().into());
+        Ok(response)
     }
 
     async fn list(
@@ -276,6 +295,8 @@ pub fn routes(values: Arc<Values>) -> Router {
 struct ReadQuery {
     #[serde(default)]
     min_revision: u64,
+    #[serde(default)]
+    directory_min_revision: u64,
 }
 
 async fn get_value(
@@ -285,7 +306,9 @@ async fn get_value(
 ) -> Response {
     let result = async {
         valid_key_bytes(key.as_bytes())?;
-        let record = values.record(&tenant, &id).await?;
+        let record = values
+            .record(&tenant, &id, query.directory_min_revision)
+            .await?;
         let reply = values
             .read(&record, key.as_bytes(), query.min_revision)
             .await?;
@@ -321,7 +344,9 @@ async fn get_metadata(
 ) -> Response {
     let result = async {
         valid_key_bytes(key.as_bytes())?;
-        let record = values.record(&tenant, &id).await?;
+        let record = values
+            .record(&tenant, &id, query.directory_min_revision)
+            .await?;
         let reply = values
             .read(&record, key.as_bytes(), query.min_revision)
             .await?;
@@ -501,7 +526,14 @@ async fn write(
                 .map_err(|_| Status::invalid_argument("If-Match must be a revision"))
         })
         .transpose()?;
-    let record = values.record(tenant, id).await?;
+    let minimum = text_header(headers, kv::DIRECTORY_REVISION)?
+        .map(|v| {
+            v.parse::<u64>()
+                .map_err(|_| Status::invalid_argument("invalid directory minimum revision"))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let record = values.record(tenant, id, minimum).await?;
     let reply = values
         .call(
             &record,
@@ -526,6 +558,8 @@ struct BulkGet {
     with_metadata: bool,
     #[serde(default)]
     min_revision: u64,
+    #[serde(default)]
+    directory_min_revision: u64,
     #[serde(default = "text_type")]
     r#type: String,
 }
@@ -549,7 +583,9 @@ async fn bulk_get(
             .iter()
             .map(|key| valid_key(key))
             .collect::<Result<Vec<_>, _>>()?;
-        let record = values.record(&tenant, &id).await?;
+        let record = values
+            .record(&tenant, &id, query.directory_min_revision)
+            .await?;
         // One holder snapshot preserves bulk atomicity; independent cache hits need not share a revision.
         let reply = values
             .call(
@@ -610,6 +646,8 @@ struct ListQuery {
     limit: Option<u32>,
     #[serde(default)]
     min_revision: u64,
+    #[serde(default)]
+    directory_min_revision: u64,
 }
 
 async fn list(
@@ -622,7 +660,7 @@ async fn list(
         if !(1..=1000).contains(&limit) || query.prefix.len() > kv::MAX_KEY { return Err(Status::invalid_argument("limit must be 1 to 1000 and prefix at most 512 bytes")); }
         let after = query.cursor.filter(|c| !c.is_empty()).map(|c| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(c).map_err(|_| Status::invalid_argument("invalid cursor"))).transpose()?;
         if let Some(after) = &after { valid_key_bytes(after)?; }
-        let record = values.record(&tenant, &id).await?;
+        let record = values.record(&tenant, &id, query.directory_min_revision).await?;
         let reply = values.call(&record, Operation::List(List { prefix: query.prefix.into_bytes(), after, limit, min_revision: query.min_revision })).await?;
         let keys = reply.items.into_iter().map(listed).collect::<Result<Vec<_>, _>>()?;
         let cursor = reply.cursor.map(|c| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(c)).unwrap_or_default();
@@ -754,7 +792,11 @@ async fn value_and_metadata(
     if !headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("multipart/form-data"))
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("multipart/form-data"))
+        })
     {
         return Ok((body.to_vec(), None));
     }

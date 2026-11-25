@@ -168,10 +168,12 @@ impl ActorHost {
         let cell = self.0.lock().entry(key.clone()).or_default().clone();
         let result = {
             let mut current = cell.lock().await;
-            if let Some(awake) = current.take()
-                && let Some(storage) = awake.stop().await
-            {
-                release(storage).await;
+            if let Some(awake) = current.as_ref() {
+                let storage = awake.stop().await;
+                *current = None;
+                if let Some(storage) = storage {
+                    release(storage).await;
+                }
             }
             match self.0.placement.slots(actor).await {
                 Ok((slots, version)) => Writer::delete(
