@@ -43,6 +43,7 @@ use bedrock_lib::placement::{Directory, State};
 use bedrock_lib::storage::namespace::Changes;
 use bedrock_lib::storage::{Entry, KeyRange, StorageError};
 use bedrock_lib::volume as pb;
+use prost::Message;
 use tokio::time::Instant;
 use tonic::Status;
 
@@ -708,7 +709,7 @@ impl Cold {
             let store = self.store.clone();
             let pending = {
                 let parsed = Actor::new(&actor).map_err(status)?;
-                crate::serve::blocking(move || store.pending(&parsed))
+                crate::serve::blocking(move || store.pending(&parsed, FLUSH_BYTES))
                     .await?
                     .map_err(status)?
             };
@@ -744,6 +745,7 @@ impl Cold {
                     }
                 }
             }
+            more |= pending.more;
             if pending.through <= known.seq {
                 truncate.push((actor, pending.through));
                 continue;
@@ -1075,23 +1077,34 @@ impl Cold {
     }
 
     /// Values of `keys` from the range database, at the slot's flushed point or later, for a caller in `cell`.
+    /// `max_bytes` is the response-page budget left after the overlay's values.
     pub async fn get(
         &self,
         cell: &str,
         actor: &pb::Actor,
         flushed: u64,
         keys: &[Vec<u8>],
+        max_bytes: usize,
     ) -> Result<Vec<Option<Vec<u8>>>, Status> {
         let parsed = Actor::new(actor).map_err(status)?;
         let (first, name, db) = self.holding(cell, actor, &parsed, flushed).await?;
         let read = async {
             let mut values = Vec::with_capacity(keys.len());
+            let mut bytes = 0;
             for key in keys {
-                values.push(
-                    db.get(&data_key(parsed.name(), key))
-                        .await
-                        .map_err(storage)?,
-                );
+                let value = db
+                    .get(&data_key(parsed.name(), key))
+                    .await
+                    .map_err(storage)?;
+                let value = pb::Value {
+                    key: key.clone(),
+                    value,
+                };
+                bytes += value.encoded_len() + 10;
+                if bytes > max_bytes.min(crate::store::PAGE_BYTES) {
+                    return Err(Status::out_of_range("read response exceeds the byte limit"));
+                }
+                values.push(value.value);
             }
             Ok(values)
         };
@@ -1118,11 +1131,10 @@ impl Cold {
             let end = KeyRange::prefix(prefix.clone())
                 .end
                 .expect("an actor prefix ends in NUL, so it has an end");
-            let page = db
-                .scan(&data_key(parsed.name(), start), &end, limit + 1)
+            let (page, more) = db
+                .page(&data_key(parsed.name(), start), &end, limit)
                 .await
                 .map_err(storage)?;
-            let more = page.len() > limit;
             Ok((
                 page.into_iter()
                     .take(limit)
@@ -1178,13 +1190,15 @@ async fn seq_in(db: &dyn Database, actor: &[u8]) -> Result<Option<u64>, Status> 
 
 /// Merges a page of overlay records (deletes included) over a page of range database entries, both from the same start:
 /// the overlay wins. Only keys up to the end of a page with more after it are certain, so the answer stops there.
-/// Returns up to `limit` live values, whether more follow, and where the next page starts.
+/// Returns up to `limit` live values within `max_bytes` of encoded repeated `ScanReply.values`, whether more follow,
+/// and where the next page starts. The caller reserves the answer envelope from the transport budget.
 pub fn merge(
     overlay: Vec<pb::Value>,
     overlay_more: bool,
     stored: Vec<(Vec<u8>, Vec<u8>)>,
     stored_more: bool,
     limit: usize,
+    max_bytes: usize,
 ) -> (Vec<pb::Value>, bool, Vec<u8>) {
     let cutoff = [
         overlay
@@ -1206,24 +1220,32 @@ pub fn merge(
     let mut values = Vec::new();
     // The last key consumed, deletes included: where the next page starts when the limit stops this one.
     let mut consumed = None;
+    let mut bytes = 0;
+    let mut stopped = false;
     for (key, value) in merged {
         if cutoff.as_ref().is_some_and(|c| key > *c) {
             break;
         }
-        if value.is_some() && values.len() == limit {
-            more = true;
-            break;
-        }
-        consumed = Some(key.clone());
         if let Some(value) = value {
-            values.push(pb::Value {
+            let value = pb::Value {
                 key,
                 value: Some(value),
-            });
+            };
+            let size = prost::encoding::message::encoded_len(2, &value);
+            if values.len() == limit || bytes + size > max_bytes {
+                more = true;
+                stopped = true;
+                break;
+            }
+            consumed = Some(value.key.clone());
+            bytes += size;
+            values.push(value);
+        } else {
+            consumed = Some(key);
         }
     }
     let after = |key: Vec<u8>| [key.as_slice(), &[0]].concat();
-    let next = if values.len() == limit && more {
+    let next = if stopped {
         consumed.map_or_else(Vec::new, after)
     } else {
         cutoff.map_or_else(Vec::new, after)

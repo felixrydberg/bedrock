@@ -11,8 +11,8 @@ EXTENDS Naturals, FiniteSets, TLC
 \* Otherwise a maintainer creates one, in steps: it fences and marks retired every database serving
 \* part of the span, clones the new database from them, and replaces the catalog if it has not
 \* changed since it read it. A writer that finds its database retired writes nothing; one fenced
-\* fails its flush. A flush writes the slot's entries after its flushed point up to the commit point;
-\* once durable, the slots truncate through it. A flush to a database behind the slot first copies
+\* fails its flush. A flush writes any complete prefix of committed entries after its flushed point;
+\* once durable, the slots truncate through that prefix only. A database behind the slot first copies
 \* the actor from another cell's database that holds it that far (a first-slot move).
 \*
 \* Database contents are the entry sequences they hold, so a flush over a gap shows.
@@ -129,10 +129,11 @@ Flush(m) ==
         ahead == {x \in holders : meta[x] >= fl}
     IN /\ d # NoDb /\ wep[d] = handle[m].ep /\ fv[m] = Cell(m) /\ com > fl
        /\ meta[d] >= fl \/ ahead # {} \/ Bug = "no-adopt"
-       /\ \E base \in IF meta[d] >= fl \/ Bug = "no-adopt" THEN {d} ELSE ahead :
-            /\ meta' = [meta EXCEPT ![d] = Max(meta[base], com)]
-            /\ content' = [content EXCEPT ![d] = content[base] \cup (fl + 1)..com]
-       /\ pend' = [pend EXCEPT ![m] = com]
+       /\ \E through \in (fl + 1)..com :
+            /\ \E base \in IF meta[d] >= fl \/ Bug = "no-adopt" THEN {d} ELSE ahead :
+                 /\ meta' = [meta EXCEPT ![d] = Max(meta[base], through)]
+                 /\ content' = [content EXCEPT ![d] = content[base] \cup (fl + 1)..through]
+            /\ pend' = [pend EXCEPT ![m] = IF Bug = "prefix-truncate" THEN com ELSE through]
        /\ UNCHANGED <<com, fl, first, moved, fv, view, cat, cv, nxt, dbs, wep, ret, handle, op>>
 \* Once the flush is durable, the slots drop the log through it.
 Truncate(m) == /\ pend[m] > fl /\ fl' = pend[m] /\ pend' = [pend EXCEPT ![m] = 0]

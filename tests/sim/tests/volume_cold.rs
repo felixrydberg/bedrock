@@ -361,7 +361,13 @@ async fn scenario() -> (u64, u64) {
         assert_eq!(slot.flushed, commit, "slot {i} truncated through the flush");
         let cold_keys: Vec<_> = missing.iter().map(|&m| keys[m].clone()).collect();
         let found = current
-            .get("cell-1", &actor(), slot.flushed, &cold_keys)
+            .get(
+                "cell-1",
+                &actor(),
+                slot.flushed,
+                &cold_keys,
+                bedrock_volume::store::PAGE_BYTES,
+            )
             .await
             .unwrap();
         for (m, value) in missing.into_iter().zip(found) {

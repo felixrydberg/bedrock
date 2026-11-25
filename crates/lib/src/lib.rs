@@ -6,6 +6,7 @@ pub mod client;
 pub mod datasets;
 pub mod health;
 pub mod http;
+pub mod kv;
 pub mod membership;
 pub mod node;
 pub mod placement;
@@ -27,6 +28,14 @@ pub mod volume {
 /// Returns the runtime's monotonic clock, including simulated time under madsim.
 pub fn monotonic_now() -> tokio::time::Instant {
     tokio::time::Instant::now()
+}
+
+/// Unix milliseconds for durable timestamps and expiry. madsim simulates the system clock.
+#[allow(clippy::disallowed_methods)]
+pub fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 /// A random version 4 UUID as 32 lowercase hex digits without dashes, the shape of a Cloudflare namespace ID. The

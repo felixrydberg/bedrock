@@ -25,6 +25,7 @@ use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
+use prost::Message;
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
@@ -138,6 +139,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 pub(crate) fn status(error: store::Error) -> Status {
     match error {
         store::Error::Invalid(detail) => Status::invalid_argument(detail),
+        store::Error::ReplyTooLarge => Status::out_of_range("read response exceeds the byte limit"),
         store::Error::Backpressure => {
             Status::resource_exhausted("too much is not yet flushed to S3; retry later")
         }
@@ -467,7 +469,14 @@ impl pb::volume_server::Volume for Service {
             let flushed = answer.slot.as_ref().map_or(0, |s| s.flushed);
             let keys: Vec<_> = missing.iter().map(|&i| values[i].key.clone()).collect();
             let actor = request.actor.as_ref().expect("checked by `actor`");
-            let found = self.cold()?.get(&cell, actor, flushed, &keys).await?;
+            let mut hot_bytes: usize = values.iter().map(|v| v.encoded_len() + 10).sum();
+            for &i in &missing {
+                hot_bytes -= values[i].encoded_len() + 10;
+            }
+            let found = self
+                .cold()?
+                .get(&cell, actor, flushed, &keys, store::PAGE_BYTES - hot_bytes)
+                .await?;
             for (i, value) in missing.into_iter().zip(found) {
                 values[i].value = value;
             }
@@ -510,14 +519,31 @@ impl pb::volume_server::Volume for Service {
                 .cold()?
                 .scan(&cell, actor, flushed, &start, limit as usize)
                 .await?;
-            let (values, more, next) =
-                cold::merge(overlay, more, stored, stored_more, limit as usize);
+            let envelope = pb::ScanReply {
+                answer: Some(answer.clone()),
+                more: true,
+                ..Default::default()
+            }
+            .encoded_len();
+            let (values, more, next) = cold::merge(
+                overlay,
+                more,
+                stored,
+                stored_more,
+                limit as usize,
+                bedrock_lib::kv::MAX_MESSAGE_BYTES.saturating_sub(envelope),
+            );
             if !values.is_empty() || !more {
                 return Ok(Response::new(pb::ScanReply {
                     answer: Some(answer),
                     values,
                     more,
                 }));
+            }
+            if next <= start {
+                return Err(Status::out_of_range(
+                    "scan value exceeds the reply byte limit",
+                ));
             }
             start = next;
         }

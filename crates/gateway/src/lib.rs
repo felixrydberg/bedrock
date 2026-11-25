@@ -284,8 +284,13 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
                         router.deliver(r).await
                     },
                     |channel, request| {
-                        dispatch
-                            .send(async move { ActorsClient::new(channel).invoke(request).await })
+                        dispatch.send(async move {
+                            ActorsClient::new(channel)
+                                .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+                                .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+                                .invoke(request)
+                                .await
+                        })
                     },
                 )
                 .await;
@@ -438,9 +443,11 @@ pub async fn run(config: GatewayConfig) -> Result<(), ConfigError> {
     let gateway = Arc::new(gateway);
     let router = bedrock_lib::transport::server(tls.as_ref())
         .add_service(pb::reads_server::ReadsServer::from_arc(gateway.clone()))
-        .add_service(bedrock_lib::volume::actors_server::ActorsServer::from_arc(
-            gateway,
-        ));
+        .add_service(
+            bedrock_lib::volume::actors_server::ActorsServer::from_arc(gateway)
+                .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES),
+        );
     let mut server = bedrock_lib::transport::serve(router, config.node.listen, tls);
     let mut readiness = tokio::time::interval(Duration::from_millis(100));
     let result = loop {

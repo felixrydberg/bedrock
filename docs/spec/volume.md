@@ -275,9 +275,10 @@ One actor sits in the middle of three hash points. Each cell's catalog names the
 - **Create:** any other span gets a new database in steps that interleave with everything else. The maintainer fences
   and marks retired every database serving part of the span, clones the new database from them, and replaces the
   catalog only if it is unchanged since it read it.
-- **Flush:** writes the slot's entries after its flushed point, up to the commit point. Once the flush is durable, the
-  slots truncate. A database behind the slot first copies the actor from another cell's database that holds it that
-  far.
+- **Flush:** writes any complete prefix of the slot's committed entries after its flushed point. Once the prefix is
+  durable, the slots truncate only through that prefix. A database behind the slot first copies the actor from
+  another cell's database that holds it that far. S-18's bounded flush path can leave the remaining committed tail
+  for later batches; the model chooses the prefix nondeterministically, retaining whole-tail flushes too.
 
 | Invariant | Meaning |
 | --- | --- |
@@ -292,18 +293,37 @@ Each guard has a bug that must break an invariant:
 | `volume_cold-split` | `no-retire` | `NoLostFlush` | A clone does not fence its sources, so a stale maintainer flushes after the clone's snapshot. |
 | `volume_cold-split` | `no-cas` | `NoLostFlush` | The catalog is replaced without the version check, so a concurrent clone's database is dropped after it was written. |
 | `volume_cold-move` | `no-adopt` | `Consistent` | The new first cell flushes without copying the actor, leaving a gap. |
+| Both cold configs | `prefix-truncate` | `NoLostFlush` | A partial flush tells slots to truncate the whole committed tail, dropping entries absent from every catalogued database. |
 
 The model takes each clone source per point, so it does not check SlateDB's rule that a clone takes each source path
 once. The unit tests cover that rule (the interior split and full merge in `crates/volume/tests/unit/cold.rs`). Relay
 `Routes` access for sibling cells is an authorization rule and is not modeled.
+An abstract sequence element is one complete committed entry: a prefix cannot
+split its data and metadata. Concrete byte limits, encoded-entry accounting and
+bounded request/adoption pages require Rust acceptance tests. Both committed
+configurations retain their existing bounds and invariants.
 
 ### Checks run
 
-On 2026-11-16 with `scripts/tla2tools.jar`, 4 workers and a 4 GB heap:
+Historical checks before S-18's nondeterministic-prefix change, on 2026-11-16 with
+`scripts/tla2tools.jar`, 4 workers and a 4 GB heap:
 
 | Config | Constants | Distinct states | Depth | Time | Result |
 | --- | --- | ---: | ---: | ---: | --- |
 | `volume_cold-split` | 2 maintainers in one cell, 3 directories, `MaxSeq` 2, `MaxGen` 2, `MaxEp` 2 | 23,844,105 | 38 | 785 s | Passed |
 | `volume_cold-move` | 2 cells with one maintainer each, `MaxSeq` 2, `MaxGen` 2, `MaxEp` 2 | 322 | 14 | 1 s | Passed |
 
-All three bugs broke their invariants (66,738, 12,287 and 314 distinct states).
+All three then-existing bugs broke their invariants (66,738, 12,287 and 314 distinct states).
+Those results do not validate the changed model. Reproduce fresh checks with
+`TLC_WORKERS=1 TLC_HEAP=4g scripts/tlc.sh volume_cold-split` and
+`TLC_WORKERS=1 TLC_HEAP=4g scripts/tlc.sh volume_cold-move`; each checks its original
+bugs and the new prefix-truncation bug.
+
+Fresh S-18 review checks on 2026-11-24 used one worker and a 4 GiB heap. The
+unchanged full `volume_cold-move` configuration passed 400 states at depth 15;
+its adoption and prefix-truncation bugs both broke the named invariants. A
+separate temporary split config retained both maintainers and `MaxSeq=2`, with
+`MaxGen=1` and `MaxEp=1`: it passed 174,573 states at depth 20 in 15 seconds.
+All three split bugs (`no-retire`, `no-cas`, `prefix-truncate`) were checked at
+the original full split bounds and broke `NoLostFlush`. The full split base
+configuration was not rerun; its committed bounds remain unchanged.

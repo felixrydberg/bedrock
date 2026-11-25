@@ -15,6 +15,7 @@ fn record(id: &str) -> Record {
         state: Lifecycle::Active as i32,
         created_at: 1,
         deleting_at: 0,
+        purge_grant_hash: String::new(),
     }
 }
 
@@ -85,21 +86,12 @@ fn a_namespaces_key_and_storage_never_cover_a_siblings() {
 }
 
 #[test]
-fn deletion_and_quota_are_checked_on_every_admission() {
+fn deletion_closes_namespace_admission() {
     let id = id(0);
     let mut namespace = record(&id);
     assert_eq!(admit_open(&namespace), Ok(()));
-    assert_eq!(admit_write(&namespace, 60, 40), Ok(()));
-    assert_eq!(admit_write(&namespace, 60, 41), Err(Rejected::StorageQuota));
-    assert_eq!(
-        admit_write(&namespace, u64::MAX, 1),
-        Err(Rejected::StorageQuota)
-    );
-    namespace.storage_bytes = None;
-    assert_eq!(admit_write(&namespace, u64::MAX, u64::MAX), Ok(()));
     namespace.set_state(Lifecycle::Deleting);
     assert_eq!(admit_open(&namespace), Err(Rejected::Deleted));
-    assert_eq!(admit_write(&namespace, 0, 0), Err(Rejected::Deleted));
 }
 
 #[test]

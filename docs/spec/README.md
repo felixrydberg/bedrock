@@ -6,6 +6,9 @@ The cell's relays now own this control authority through embedded Raft; `cell.tl
 `service_isolation.tla` checks that an unreadable service freezes independently, including recovery clocks and conditional writes.
 Actor storage on `bedrock-volume` (claims, quorum appends, lease, release, slot repair, range handoff and topology
 changes): [S-02 / #110](volume.md).
+Built-in customer-KV namespace semantics on that quorum protocol: [S-18 / #126](kv_actor.md), `kv_actor.tla`.
+The full `kv_actor.cfg` and separate `kv_actor-local.cfg` check atomic bulk/revision/retry/quota and cached reads.
+Namespace-management grants and observed directory revision floors: [S-18 admission](kv_admission.md).
 Alarm timers, released and expired-holder scans, and stale wake validation: [S-09 / #117](alarms.md).
 Its cold tier (range databases split and merged by clone, first-slot moves): [S-05 / #113](volume.md#cold-tier-range-databases-s-05-113), `volume_cold.tla`.
 Moving an actor to another DC (a committed MOVE entry fences the old DC, every new-DC slot is imported from S3 at the
