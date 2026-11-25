@@ -289,6 +289,16 @@ pub struct ApiConfig {
     pub s3: S3Config,
     #[serde(default)]
     pub retention: Retention,
+    /// The largest bulk write body accepted, in bytes (#76 / B-09c), at most
+    /// [`crate::replication::writer::MAX_BULK_BYTES`]. A larger write is split by its caller.
+    #[serde(default = "default_bulk_max_bytes")]
+    pub bulk_max_bytes: usize,
+}
+
+pub const DEFAULT_BULK_MAX_BYTES: usize = 1024 * 1024;
+
+fn default_bulk_max_bytes() -> usize {
+    DEFAULT_BULK_MAX_BYTES
 }
 
 impl fmt::Debug for ApiConfig {
@@ -299,6 +309,7 @@ impl fmt::Debug for ApiConfig {
             .field("write_token", &"<redacted>")
             .field("s3", &self.s3)
             .field("retention", &self.retention)
+            .field("bulk_max_bytes", &self.bulk_max_bytes)
             .finish()
     }
 }

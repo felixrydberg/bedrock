@@ -327,6 +327,12 @@ An event contains:
 }
 ```
 
+A bulk (#76 / B-09c) is one event that changes many keys of one namespace in one revision. It has no `key` or
+`value`; `changes` lists each key with its new value, or none for a delete. A range stream carries only the changes
+of its range, and a range with none of them receives coverage for that revision alone. A replica applies its share
+and the revision in one batch, so every key of a bulk is visible or none is. `bedrock-api` takes bulks on
+`POST /v1/{dataset}/{namespace}` up to the configured `bulk_max_bytes`; a caller splits a larger write.
+
 Replicas must:
 
 - Detect missing sequences.

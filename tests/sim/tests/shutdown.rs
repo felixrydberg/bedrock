@@ -81,6 +81,7 @@ async fn every_binary_boots_and_stops_on_ctrl_c() {
                     write_listen: format!("{ip}:7002").parse().unwrap(),
                     write_token: "simulation-writer-token".into(),
                     retention: Default::default(),
+                    bulk_max_bytes: bedrock_lib::node::DEFAULT_BULK_MAX_BYTES,
                     s3: S3Config {
                         endpoint: S3.into(),
                         bucket: "bedrock".into(),

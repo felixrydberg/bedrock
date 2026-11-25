@@ -8,6 +8,9 @@
 //! within the configured retry duration (24 hours by default). An expired retry is a new write. An `If-Match` header
 //! holding a revision commits only if that is still the namespace's head, otherwise it answers 412 with the head
 //! as the body and writes nothing.
+//! `POST /v1/{dataset}/{namespace}` is a bulk (#76 / B-09c): its body is a protobuf `bedrock.replication.Bulk` of
+//! distinct keys, which commit together as one revision with the same headers and response. A body over
+//! `bulk_max_bytes` is rejected with 413; the caller splits a larger write and records the last revision.
 //! Every write requires `Authorization: Bearer <write_token>`; the configured token grants access to all writes.
 //! With `tls` configured, both listeners use TLS (B-55): relays need a node certificate, while write callers may
 //! present one but still authenticate with the token.
@@ -17,15 +20,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
-use axum::routing::put;
+use axum::routing::{post, put};
 use bedrock_lib::node::{self, ApiConfig, ConfigError};
-use bedrock_lib::replication::Operation;
 use bedrock_lib::replication::writer::{
-    CommitError, Persistence, PersistenceMetrics, Write, Writer,
+    CommitError, MAX_BULK_BYTES, Persistence, PersistenceMetrics, Write, Writer,
 };
+use bedrock_lib::replication::{Operation, pb};
 use bedrock_lib::transport;
+use prost::Message;
 use tokio::net::TcpListener;
 
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
@@ -37,6 +41,11 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
         .retention
         .validate()
         .map_err(|error| ConfigError(error.to_string()))?;
+    if config.bulk_max_bytes == 0 || config.bulk_max_bytes > MAX_BULK_BYTES {
+        return Err(ConfigError(format!(
+            "bulk_max_bytes must be between 1 and {MAX_BULK_BYTES}"
+        )));
+    }
     #[cfg(not(madsim))]
     let factory = Arc::new(bedrock_lib::storage::slate::SlateFactory::new(
         bedrock_lib::s3::object_store(&config.s3)
@@ -54,7 +63,7 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     )
     .await
     .map_err(|e| ConfigError(format!("opening durable state: {e}")))?;
-    let app = app(writer.clone(), config.write_token)?;
+    let app = app(writer.clone(), config.write_token, config.bulk_max_bytes)?;
     let writes = TcpListener::bind(config.write_listen)
         .await
         .map_err(|e| ConfigError(format!("write_listen {}: {e}", config.write_listen)))?;
@@ -89,10 +98,18 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-/// The write routes over `writer`, restricted to holders of `write_token`.
-pub fn app(writer: Arc<Writer>, write_token: String) -> Result<Router, ConfigError> {
+/// The write routes over `writer`, restricted to holders of `write_token`, taking bulks of up to `bulk_max_bytes`.
+pub fn app(
+    writer: Arc<Writer>,
+    write_token: String,
+    bulk_max_bytes: usize,
+) -> Result<Router, ConfigError> {
     let routes = Router::new()
         .route("/v1/{dataset}/{namespace}/{*key}", put(write).delete(write))
+        .route(
+            "/v1/{dataset}/{namespace}",
+            post(bulk).layer(DefaultBodyLimit::max(bulk_max_bytes)),
+        )
         .with_state(writer);
     bedrock_lib::http::bearer(routes, &write_token)
 }
@@ -103,6 +120,50 @@ async fn write(
     method: Method,
     headers: HeaderMap,
     value: Bytes,
+) -> (StatusCode, String) {
+    let operation = match method {
+        Method::DELETE => Operation::Delete,
+        _ => Operation::Set(value.to_vec()),
+    };
+    commit(
+        writer,
+        dataset,
+        namespace,
+        key.into_bytes(),
+        operation,
+        &headers,
+    )
+    .await
+}
+
+async fn bulk(
+    State(writer): State<Arc<Writer>>,
+    Path((dataset, namespace)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, String) {
+    let Ok(bulk) = pb::Bulk::decode(body) else {
+        return (StatusCode::BAD_REQUEST, "invalid bulk protobuf".into());
+    };
+    let changes = bulk.changes.into_iter().map(|c| (c.key, c.value)).collect();
+    commit(
+        writer,
+        dataset,
+        namespace,
+        Vec::new(),
+        Operation::Bulk(changes),
+        &headers,
+    )
+    .await
+}
+
+async fn commit(
+    writer: Arc<Writer>,
+    dataset: String,
+    namespace: String,
+    key: Vec<u8>,
+    operation: Operation,
+    headers: &HeaderMap,
 ) -> (StatusCode, String) {
     if dataset == "kv" {
         return (
@@ -123,14 +184,10 @@ async fn write(
         Some(Some(revision)) => Some(revision),
         Some(None) => return (StatusCode::BAD_REQUEST, "invalid If-Match".into()),
     };
-    let operation = match method {
-        Method::DELETE => Operation::Delete,
-        _ => Operation::Set(value.to_vec()),
-    };
     let write = Write {
         dataset,
         namespace,
-        key: key.into_bytes(),
+        key,
         operation,
         idempotency_key,
         expected,

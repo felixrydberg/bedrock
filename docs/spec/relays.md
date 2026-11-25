@@ -87,10 +87,12 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
 ## Model
 
 relays.tla is a bounded safety abstraction: coverage is represented one revision at
-a time per namespace, with alternating revisions modeling range matches and omissions.
-One stream interleaves the namespaces' coverage. Its
-projection invariant requires all selected payloads through covered progress,
-while unselected revisions still advance coverage. `projected` is ghost history,
+a time per namespace. A revision is one event that may change many keys (a bulk, #76 / B-09c): odd revisions change
+only keys outside the range, even ones keys on both sides. The relay sends the range exactly its own operations of
+each revision, possibly none. One stream interleaves the namespaces' coverage. Its
+projection invariant requires exactly the range's operations through covered progress,
+while revisions with none of them still advance coverage. Bug `unfiltered` sends a bulk's foreign operations and
+`first-key` routes a bulk by its first key; `GapFreeApply` catches both. `projected` is ghost history,
 not a physical snapshot log or tombstone set. Cached events are disposable and the
 writer history is abstracted as recoverable while pinned. It checks consecutive
 coverage, queue bounds and protected bootstrap installation through disconnects.

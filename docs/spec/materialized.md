@@ -9,7 +9,8 @@ There is no separate raw S3 event journal or published/pruned object protocol.
 
 ## State and actions
 
-The bounded model has one namespace, one key and one retry identity. `history`
+The bounded model has one namespace, two keys and one retry identity. Even revisions are bulks (#76 / B-09c) that
+change both keys in one event; bug `half` stages only one of them, which `AtomicBuffered` catches. `history`
 is a reference oracle for expected event content and fixed expiry. It includes a
 staged candidate until crash; neither recovery nor retry lookup consults it.
 `buffered` and `durable` contain complete database records. `Stage` writes the

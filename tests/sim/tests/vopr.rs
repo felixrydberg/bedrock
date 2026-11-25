@@ -44,7 +44,7 @@ use bedrock_lib::storage::sim::{
 use bedrock_lib::storage::{KeyRange, Snapshot, StorageEngine, l2_parts, l2_span};
 use bedrock_lib::transport::Peers;
 use bedrock_sim::history::{
-    History, Key, OwnerState, Placement, Range, Stream, Value, Violation, check_coverage,
+    Change, History, Key, OwnerState, Placement, Range, Stream, Value, Violation, check_coverage,
     check_handoff_by, check_held, check_routing, within,
 };
 use bedrock_sim::rpc;
@@ -202,6 +202,9 @@ const PROGRESS: Duration = Duration::from_secs(600);
 const WRITERS: usize = 4;
 const KEYS: u32 = 64;
 const DELETES: f64 = 0.2;
+/// Writes sent as one bulk of several keys (#76 / B-09c), and how many keys a bulk draws.
+const BULKS: f64 = 0.1;
+const BULK_KEYS: std::ops::RangeInclusive<usize> = 2..=8;
 const PADDING: usize = 256;
 const WRITE_SPACING_MS: std::ops::Range<u64> = 10..200;
 /// How long everything has to converge after faults stop.
@@ -710,7 +713,7 @@ struct Run {
     last_ack: Mutex<Option<Acknowledged>>,
 }
 
-type Acknowledged = (Stream, String, Key, Option<Value>);
+type Acknowledged = (Stream, String, Vec<Change>);
 
 impl Run {
     fn record(&self, event: String) {
@@ -767,6 +770,7 @@ fn api(name: &str, ip: &str) -> ApiConfig {
         node: node(name, ip),
         write_listen: format!("{ip}:7002").parse().unwrap(),
         write_token: TOKEN.into(),
+        bulk_max_bytes: bedrock_lib::node::DEFAULT_BULK_MAX_BYTES,
         retention: Retention {
             event_retention_ms: EVENT_RETENTION_MS,
             retry_retention_ms: RETRY_RETENTION_MS,
@@ -1006,14 +1010,9 @@ fn start_observer(run: &Arc<Run>) {
     });
 }
 
-/// One write through `address`, returning its sequence. `None` means the outcome is unknown.
-async fn submit(
-    address: &str,
-    stream: &Stream,
-    id: &str,
-    key: &[u8],
-    value: Option<&[u8]>,
-) -> Option<u64> {
+/// One write through `address`, returning its sequence: a PUT or DELETE for one change, a bulk for more. `None` means
+/// the outcome is unknown.
+async fn submit(address: &str, stream: &Stream, id: &str, changes: &[Change]) -> Option<u64> {
     let attempt = async {
         let tcp = tokio::net::TcpStream::connect(address).await.ok()?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tcp))
@@ -1021,14 +1020,31 @@ async fn submit(
             .ok()?;
         tokio::spawn(connection);
         let (dataset, namespace) = stream;
-        let key = String::from_utf8(key.to_vec()).unwrap();
+        let (method, uri, body) = match changes {
+            [(key, value)] => (
+                if value.is_some() { "PUT" } else { "DELETE" },
+                format!(
+                    "/v1/{dataset}/{namespace}/{}",
+                    std::str::from_utf8(key).unwrap()
+                ),
+                value.clone().unwrap_or_default(),
+            ),
+            _ => {
+                let changes = changes.iter().cloned();
+                let changes = changes
+                    .map(|(key, value)| pb::Change { key, value })
+                    .collect();
+                let body = pb::Bulk { changes }.encode_to_vec();
+                ("POST", format!("/v1/{dataset}/{namespace}"), body)
+            }
+        };
         let request = hyper::Request::builder()
-            .method(if value.is_some() { "PUT" } else { "DELETE" })
-            .uri(format!("/v1/{dataset}/{namespace}/{key}"))
+            .method(method)
+            .uri(uri)
             .header("host", "api")
             .header("authorization", format!("Bearer {TOKEN}"))
             .header("idempotency-key", id)
-            .body(Full::new(Bytes::from(value.unwrap_or_default().to_vec())))
+            .body(Full::new(Bytes::from(body)))
             .unwrap();
         let response = sender.send_request(request).await.ok()?;
         let status = response.status();
@@ -1057,25 +1073,31 @@ async fn writer(run: Arc<Run>, id: usize) {
         n += 1;
         let operation = format!("w{id}-{n}");
         let stream = arrival.stream();
-        let key = arrival.key();
-        let delete = thread_rng().gen_bool(DELETES);
-        let value = (!delete).then(|| arrival.value(&operation));
+        let keys = if thread_rng().gen_bool(BULKS) {
+            thread_rng().gen_range(BULK_KEYS)
+        } else {
+            1
+        };
+        // Distinct keys, as a bulk requires; hot draws may leave fewer than drawn.
+        let changes: BTreeMap<Key, Option<Value>> = (0..keys)
+            .map(|_| {
+                let delete = thread_rng().gen_bool(DELETES);
+                (arrival.key(), (!delete).then(|| arrival.value(&operation)))
+            })
+            .collect();
+        let changes: Vec<Change> = changes.into_iter().collect();
         loop {
             let address = format!("{API}:7002");
-            let answer = submit(&address, &stream, &operation, &key, value.as_deref()).await;
+            let answer = submit(&address, &stream, &operation, &changes).await;
             if let Some(sequence) = answer {
                 let mut history = run.history.lock().unwrap();
                 let acknowledged =
-                    history.acknowledged(&stream, sequence, &operation, &key, value.as_deref());
+                    history.acknowledged_changes(&stream, sequence, &operation, &changes);
                 drop(history);
                 run.check(acknowledged);
                 run.record(format!("ack {operation} {stream:?} {sequence}"));
-                *run.last_ack.lock().unwrap() = Some((
-                    stream.clone(),
-                    operation.clone(),
-                    key.clone(),
-                    value.clone(),
-                ));
+                *run.last_ack.lock().unwrap() =
+                    Some((stream.clone(), operation.clone(), changes.clone()));
                 if !run.chaos.strikes(Class::Rpc) {
                     break;
                 }
@@ -1301,7 +1323,8 @@ async fn stale_publisher(run: &Arc<Run>, primary: &Process, processes: &[Process
     let key = arrival.key();
     let value = arrival.value(&operation);
     let address = format!("{STALE_API}:7002");
-    let mut answer = submit(&address, &stream, &operation, &key, Some(&value)).await;
+    let changes = [(key.clone(), Some(value.clone()))];
+    let mut answer = submit(&address, &stream, &operation, &changes).await;
     handle.kill(stale);
     handle.resume(primary.id);
     sleep(Duration::from_secs(2)).await;
@@ -1309,7 +1332,7 @@ async fn stale_publisher(run: &Arc<Run>, primary: &Process, processes: &[Process
     // An unknown outcome is resolved like any client's: retry the same key, here through the restarted writer.
     let address = format!("{API}:7002");
     while answer.is_none() && !run.failed() {
-        answer = submit(&address, &stream, &operation, &key, Some(&value)).await;
+        answer = submit(&address, &stream, &operation, &changes).await;
         sleep(Duration::from_millis(200)).await;
         // This driver may be the only one, and the writer may have exited. It also holds the writer, so nothing else can
         // replace it if a write gets it fenced.
@@ -1327,12 +1350,12 @@ async fn stale_publisher(run: &Arc<Run>, primary: &Process, processes: &[Process
 }
 
 /// Sends an acknowledged write again, as a client that lost the answer would.
-async fn retry(run: &Run, (stream, id, key, value): Acknowledged) {
+async fn retry(run: &Run, (stream, id, changes): Acknowledged) {
     while !run.failed() {
         let address = format!("{API}:7002");
-        if let Some(sequence) = submit(&address, &stream, &id, &key, value.as_deref()).await {
+        if let Some(sequence) = submit(&address, &stream, &id, &changes).await {
             let mut history = run.history.lock().unwrap();
-            let acknowledged = history.acknowledged(&stream, sequence, &id, &key, value.as_deref());
+            let acknowledged = history.acknowledged_changes(&stream, sequence, &id, &changes);
             drop(history);
             run.check(acknowledged);
             return;

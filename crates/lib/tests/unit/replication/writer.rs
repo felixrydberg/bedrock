@@ -442,3 +442,101 @@ async fn crashing_after_unknown_flush_outcome_recovers_only_remotely_durable_bat
         assert_eq!(sequences(&events(&reopened, "a").await), [1]);
     }
 }
+
+fn bulk(namespace: &str, changes: &[(&str, Option<&str>)]) -> Write {
+    let changes = changes
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.as_bytes().to_vec(),
+                value.map(|v| v.as_bytes().to_vec()),
+            )
+        })
+        .collect();
+    Write {
+        dataset: "kv".into(),
+        namespace: namespace.into(),
+        key: Vec::new(),
+        operation: Operation::Bulk(changes),
+        idempotency_key: None,
+        expected: None,
+    }
+}
+
+#[tokio::test]
+async fn a_bulk_commits_every_key_as_one_revision_that_survives_a_restart() {
+    let factory = Factory::default();
+    let writer = open(factory.clone()).await;
+    assert_eq!(writer.commit(set("a", "x", "old", None)).await, Ok(1));
+    let changes = [("x", None), ("y", Some("1")), ("z", Some("2"))];
+    assert_eq!(writer.commit(bulk("a", &changes)).await, Ok(2));
+    writer.close().await.unwrap();
+
+    // Reopening validates the retained bulk event against the stored values.
+    let reopened = open(factory).await;
+    let view = reopened.bootstrap("kv", "a").await.unwrap();
+    assert_eq!(view.sequence, 2);
+    assert!(!view.values.contains_key(b"x".as_slice()));
+    assert_eq!(view.values[b"y".as_slice()], b"1");
+    assert_eq!(view.values[b"z".as_slice()], b"2");
+    let events = events(&reopened, "a").await;
+    assert_eq!(sequences(&events), [1, 2]);
+    assert_eq!(events[1].changes().len(), 3);
+}
+
+#[tokio::test]
+async fn a_bulk_that_never_became_durable_leaves_none_of_its_keys_after_a_crash() {
+    let factory = Factory::default();
+    let writer = open(factory.clone()).await;
+    factory.controls.flush_fault.store(1, Ordering::SeqCst);
+    let changes = [("x", Some("1")), ("y", Some("2"))];
+    assert!(matches!(
+        writer.commit(bulk("a", &changes)).await,
+        Err(CommitError::Unavailable(_))
+    ));
+    factory.inner.crash().unwrap();
+    let view = open(factory).await.bootstrap("kv", "a").await.unwrap();
+    assert_eq!(view.sequence, 0);
+    assert!(view.values.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_and_oversized_bulks_are_refused() {
+    let writer = open(Factory::default()).await;
+    let big = "v".repeat(MAX_BULK_BYTES);
+    let keyed = Write {
+        key: b"k".to_vec(),
+        ..bulk("a", &[("x", None)])
+    };
+    for write in [
+        bulk("a", &[]),
+        bulk("a", &[("", Some("1"))]),
+        bulk("a", &[("x", Some("1")), ("x", None)]),
+        bulk("a", &[("x", Some(&big))]),
+        keyed,
+    ] {
+        assert!(matches!(
+            writer.commit(write).await,
+            Err(CommitError::Invalid(_))
+        ));
+    }
+    assert!(events(&writer, "a").await.is_empty());
+}
+
+#[test]
+fn a_bulks_counted_size_is_its_protobuf_size() {
+    use prost::Message;
+    for (key, value) in [(vec![1], None), (vec![2; 300], Some(vec![3; 70_000]))] {
+        let change = crate::replication::pb::Change {
+            key: key.clone(),
+            value: value.clone(),
+        };
+        let body = crate::replication::pb::Bulk {
+            changes: vec![change],
+        };
+        assert_eq!(
+            encoded_change_len(&key, value.as_deref()),
+            body.encoded_len()
+        );
+    }
+}

@@ -31,11 +31,15 @@ const RECOVERY_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 const RECOVERY_MAX: std::time::Duration = std::time::Duration::from_secs(600);
 /// Maximum writes waiting for the next namespace batch.
 pub const MAX_QUEUED: usize = 1024;
+/// The largest bulk the writer commits: its changes' protobuf size, the same as a `Bulk` request body holding them. A committed event must fit one relay delivery frame
+/// (4 MiB) with room to spare, or its stream stalls. `bedrock-api` caps bulks lower by configuration.
+pub const MAX_BULK_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Write {
     pub dataset: String,
     pub namespace: String,
+    /// Empty for an [`Operation::Bulk`], which commits all its keys as one revision.
     pub key: Vec<u8>,
     pub operation: Operation,
     /// Until fixed expiry, a retry returns its original sequence without applying again.
@@ -734,11 +738,41 @@ fn commit_error(error: StorageError) -> CommitError {
     }
 }
 
+/// One change's size inside a protobuf `Bulk` or `Event`, framing included.
+fn encoded_change_len(key: &[u8], value: Option<&[u8]>) -> usize {
+    let field = |len: usize| 1 + prost::length_delimiter_len(len) + len;
+    let change = field(key.len()) + value.map_or(0, |value| field(value.len()));
+    field(change)
+}
+
 fn validate(write: &Write) -> Result<(), CommitError> {
     validate_scope(&write.dataset, &write.namespace)
         .map_err(|error| CommitError::Invalid(error.to_string()))?;
-    if write.key.is_empty() {
-        return Err(CommitError::Invalid("key must not be empty".into()));
+    let Operation::Bulk(changes) = &write.operation else {
+        if write.key.is_empty() {
+            return Err(CommitError::Invalid("key must not be empty".into()));
+        }
+        return Ok(());
+    };
+    if !write.key.is_empty() || changes.is_empty() {
+        return Err(CommitError::Invalid(
+            "a bulk has no key of its own and at least one change".into(),
+        ));
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    let mut bytes = 0usize;
+    for (key, value) in changes {
+        if key.is_empty() || !keys.insert(key.as_slice()) {
+            return Err(CommitError::Invalid(
+                "bulk keys must be non-empty and distinct".into(),
+            ));
+        }
+        bytes += encoded_change_len(key, value.as_deref());
+    }
+    if bytes > MAX_BULK_BYTES {
+        return Err(CommitError::Invalid(format!(
+            "bulk of {bytes} bytes exceeds {MAX_BULK_BYTES}"
+        )));
     }
     Ok(())
 }

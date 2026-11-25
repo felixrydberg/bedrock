@@ -1448,3 +1448,39 @@ async fn a_volume_member_is_ready_for_a_range_only_from_its_report_with_the_late
         "a range forgotten since is not ready"
     );
 }
+
+#[test]
+fn a_range_stream_carries_exactly_its_own_changes_of_a_bulk() {
+    let bulk = Event {
+        key: Vec::new(),
+        operation: crate::replication::Operation::Bulk(vec![
+            (b"a".to_vec(), Some(b"1".to_vec())),
+            (b"b".to_vec(), None),
+        ]),
+        ..replay_event(1)
+    };
+    let encoded = EncodedEvent::new(bulk.clone());
+    let key: Key = ("auth".into(), "keys".into());
+    let only = |k: &[u8]| {
+        let hash = hash_of("auth", "keys", k);
+        (key.clone(), Some((hash, hash + 1)))
+    };
+    let carried = |stream: StreamKey| {
+        encoded
+            .clone()
+            .selected(&stream)
+            .map(|bytes| Event::from(pb::Event::decode(bytes).unwrap()))
+    };
+    assert_eq!(carried((key.clone(), None)), Some(bulk.clone()));
+    assert_eq!(carried((key.clone(), Some((0, 0)))), Some(bulk.clone()));
+    for (k, value) in [(b"a", Some(b"1".to_vec())), (b"b", None)] {
+        let part = carried(only(k)).expect("the range's own change");
+        assert_eq!(
+            part.operation,
+            crate::replication::Operation::Bulk(vec![(k.to_vec(), value)])
+        );
+        assert_eq!(part.sequence, 1);
+    }
+    // A range with none of the keys gets no event, so its delivery carries coverage of the revision alone.
+    assert_eq!(carried(only(b"c")), None);
+}

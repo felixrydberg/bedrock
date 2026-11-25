@@ -44,10 +44,12 @@ fn text(bytes: &[u8]) -> String {
 struct Operation {
     /// The client's identity for this operation, its idempotency key.
     id: String,
-    key: Key,
-    /// `None` deletes.
-    value: Option<Value>,
+    /// Every key it changed: one, or a bulk's many (#76 / B-09c).
+    changes: Vec<Change>,
 }
+
+/// A key and its new value, `None` deleting.
+pub type Change = (Key, Option<Value>);
 
 #[derive(Default)]
 pub struct History {
@@ -71,6 +73,18 @@ impl History {
         key: &[u8],
         value: Option<&[u8]>,
     ) -> Result<(), Violation> {
+        let change = (key.to_vec(), value.map(<[u8]>::to_vec));
+        self.acknowledged_changes(stream, sequence, id, &[change])
+    }
+
+    /// Records that the writer acknowledged operation `id`, which changed every key of `changes`, at `sequence`.
+    pub fn acknowledged_changes(
+        &mut self,
+        stream: &Stream,
+        sequence: u64,
+        id: &str,
+        changes: &[Change],
+    ) -> Result<(), Violation> {
         // A forgotten sequence's operation is gone too, so an answer there cannot be told from a reused sequence.
         self.kept(stream, sequence.saturating_sub(1))?;
         let earlier = self.sequences.entry((stream.clone(), id.to_owned()));
@@ -83,8 +97,7 @@ impl History {
         }
         let operation = Operation {
             id: id.to_owned(),
-            key: key.to_vec(),
-            value: value.map(<[u8]>::to_vec),
+            changes: changes.to_vec(),
         };
         let operations = self.streams.entry(stream.clone()).or_default();
         match operations.get(&sequence) {
@@ -102,8 +115,10 @@ impl History {
                     *known += 1;
                 }
                 let versions = self.versions.entry(stream.clone()).or_default();
-                let key = versions.entry(key.to_vec()).or_default();
-                key.insert(sequence, value.map(<[u8]>::to_vec));
+                for (key, value) in changes {
+                    let key = versions.entry(key.clone()).or_default();
+                    key.insert(sequence, value.clone());
+                }
                 self.forget(stream);
                 Ok(())
             }
@@ -122,8 +137,10 @@ impl History {
             let operation = operations.remove(&sequence).expect("it is below known");
             self.sequences.remove(&(stream.clone(), operation.id));
             let versions = self.versions.get_mut(stream).expect("it was just written");
-            let versions = versions.get_mut(&operation.key).expect("it was written");
-            *versions = versions.split_off(&sequence);
+            for (key, _) in &operation.changes {
+                let versions = versions.get_mut(key).expect("it was written");
+                *versions = versions.split_off(&sequence);
+            }
         }
     }
 

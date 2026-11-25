@@ -20,10 +20,10 @@ use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::placement::{hash_of, in_span, valid_span};
-use crate::replication::Event;
 use crate::replication::log::Watched;
 use crate::replication::pb;
 use crate::replication::writer::{RecoveryLease, Writer};
+use crate::replication::{Event, Operation};
 use crate::transport::{Caller, Class, Peers, host_of};
 use replay::Replay;
 
@@ -46,7 +46,78 @@ type ReplayItem = (Event, u64, usize);
 #[derive(Clone)]
 struct EncodedEvent {
     bytes: Bytes,
-    hash: u64,
+    placement: Placement,
+}
+
+#[derive(Clone)]
+enum Placement {
+    /// The key's placement hash.
+    Key(u64),
+    /// A bulk is encoded as the event without changes, `header` bytes long, followed by one `changes` field per
+    /// change. Each change keeps its hash and where its field ends, so a range stream copies the fields it selects
+    /// instead of decoding the bulk (#76 / B-09c).
+    Bulk {
+        header: usize,
+        changes: Arc<[(u64, usize)]>,
+    },
+}
+
+impl EncodedEvent {
+    fn new(event: Event) -> Self {
+        let (dataset, namespace) = (event.dataset.clone(), event.namespace.clone());
+        let mut event = pb::Event::from(event);
+        if event.changes.is_empty() {
+            return EncodedEvent {
+                placement: Placement::Key(hash_of(&dataset, &namespace, &event.key)),
+                bytes: Bytes::from(event.encode_to_vec()),
+            };
+        }
+        let changes = std::mem::take(&mut event.changes);
+        let mut bytes = event.encode_to_vec();
+        let header = bytes.len();
+        let ends = changes
+            .iter()
+            .map(|change| {
+                prost::encoding::message::encode(9, change, &mut bytes);
+                (hash_of(&dataset, &namespace, &change.key), bytes.len())
+            })
+            .collect();
+        EncodedEvent {
+            bytes: Bytes::from(bytes),
+            placement: Placement::Bulk {
+                header,
+                changes: ends,
+            },
+        }
+    }
+
+    /// What `stream` carries of the event: all of it, a bulk cut to the changes in its range, or nothing, which
+    /// leaves only coverage of this revision.
+    fn selected(self, stream: &StreamKey) -> Option<Bytes> {
+        let (header, changes) = match self.placement {
+            Placement::Key(hash) => return selects(stream, hash).then_some(self.bytes),
+            Placement::Bulk { header, changes } => (header, changes),
+        };
+        let kept = changes
+            .iter()
+            .filter(|(hash, _)| selects(stream, *hash))
+            .count();
+        if kept == 0 {
+            return None;
+        }
+        if kept == changes.len() {
+            return Some(self.bytes);
+        }
+        let mut part = self.bytes[..header].to_vec();
+        let mut start = header;
+        for &(hash, end) in changes.iter() {
+            if selects(stream, hash) {
+                part.extend_from_slice(&self.bytes[start..end]);
+            }
+            start = end;
+        }
+        Some(Bytes::from(part))
+    }
 }
 
 fn span(range: Option<(u64, u64)>) -> Option<pb::Span> {
@@ -988,11 +1059,7 @@ impl Hub {
         if let Some(bytes) = recent.records.get(&key) {
             return bytes.clone();
         }
-        let hash = hash_of(&event.dataset, &event.namespace, &event.key);
-        let bytes = EncodedEvent {
-            bytes: Bytes::from(pb::Event::from(event).encode_to_vec()),
-            hash,
-        };
+        let bytes = EncodedEvent::new(event);
         recent.bytes += bytes.bytes.len();
         recent.records.insert(key.clone(), bytes.clone());
         recent.order.push_back(key);
@@ -1022,8 +1089,12 @@ impl Hub {
                 + event.stream.len()
                 + event.key.len()
                 + match &event.operation {
-                    crate::replication::Operation::Set(value) => value.len(),
-                    crate::replication::Operation::Delete => 0,
+                    Operation::Set(value) => value.len(),
+                    Operation::Delete => 0,
+                    Operation::Bulk(changes) => changes
+                        .iter()
+                        .map(|(key, value)| 16 + key.len() + value.as_ref().map_or(0, Vec::len))
+                        .sum(),
                 };
             let mut queued = self.0.replay_bytes.load(Ordering::Relaxed);
             let mut reserved = false;
@@ -1064,16 +1135,7 @@ impl Hub {
             return control.read(&key.1, from, 256).map(|events| {
                 events
                     .into_iter()
-                    .map(|e| {
-                        let hash = hash_of(&e.dataset, &e.namespace, &e.key);
-                        (
-                            e.sequence,
-                            EncodedEvent {
-                                bytes: Bytes::from(pb::Event::from(e).encode_to_vec()),
-                                hash,
-                            },
-                        )
-                    })
+                    .map(|e| (e.sequence, EncodedEvent::new(e)))
                     .collect()
             });
         }
@@ -1438,9 +1500,7 @@ impl Hub {
                         };
                         let selected = events
                             .into_iter()
-                            .filter_map(|(_, event)| {
-                                selects(&key, event.hash).then_some(event.bytes)
-                            })
+                            .filter_map(|(_, event)| event.selected(&key))
                             .collect();
                         if !self
                             .send_scoped(

@@ -13,7 +13,7 @@ use tonic::Status;
 use super::ranges::{self, Range};
 use crate::placement::{hash_of, in_span, valid_span};
 use crate::replication::log::Watched;
-use crate::replication::pb;
+use crate::replication::{Event, pb};
 use crate::storage::{KeyRange, StorageEngine, WriteBatch, l2_key, l2_parts, l2_span};
 use crate::storage::{Snapshot, StorageResult, named, prefixed};
 use crate::transport::{Class, Peers};
@@ -1088,7 +1088,7 @@ impl Consumer {
         Ok(())
     }
 
-    fn delivery_events(&self, delivery: &pb::Delivery) -> Result<Vec<pb::Event>, Status> {
+    fn delivery_events(&self, delivery: &pb::Delivery) -> Result<Vec<Event>, Status> {
         if delivery.dataset != self.target.selection.dataset
             || delivery.namespace != self.target.selection.namespace
             || range(delivery.span.as_ref()) != self.target.span
@@ -1100,14 +1100,17 @@ impl Consumer {
         let mut events = Vec::with_capacity(delivery.events.len());
         let mut previous = delivery.from - 1;
         for encoded in &delivery.events {
-            let event = pb::Event::decode(encoded.clone())
-                .map_err(|error| Status::data_loss(error.to_string()))?;
+            let event = Event::from(
+                pb::Event::decode(encoded.clone())
+                    .map_err(|error| Status::data_loss(error.to_string()))?,
+            );
             if event.dataset != self.target.selection.dataset
                 || event.namespace != self.target.selection.namespace
                 || event.sequence <= previous
                 || event.sequence < delivery.from
                 || event.sequence > delivery.through
-                || !self.selected(&event.key)
+                || !event.well_formed()
+                || !event.changes().iter().all(|(key, _)| self.selected(key))
             {
                 return Err(Status::data_loss("event outside selected ordered coverage"));
             }
@@ -1141,14 +1144,17 @@ impl Consumer {
             return Ok(false);
         }
         let mut batch = WriteBatch::default();
-        for event in events {
-            let key = self.physical(&event.key);
-            match event.value {
-                Some(value) => {
-                    batch.put(key, value);
-                }
-                None => {
-                    batch.delete(key);
+        // A bulk's share of the range commits with the coverage, all of it or none (#76 / B-09c).
+        for event in &events {
+            for (key, value) in event.changes() {
+                let key = self.physical(key);
+                match value {
+                    Some(value) => {
+                        batch.put(key, value.to_vec());
+                    }
+                    None => {
+                        batch.delete(key);
+                    }
                 }
             }
         }
