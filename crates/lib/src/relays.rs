@@ -98,21 +98,25 @@ impl EncodedEvent {
             Placement::Key(hash) => return selects(stream, hash).then_some(self.bytes),
             Placement::Bulk { header, changes } => (header, changes),
         };
+        let kept = changes
+            .iter()
+            .filter(|(hash, _)| selects(stream, *hash))
+            .count();
+        if kept == 0 {
+            return None;
+        }
+        if kept == changes.len() {
+            return Some(self.bytes);
+        }
         let mut part = self.bytes[..header].to_vec();
         let mut start = header;
-        let mut kept = 0;
         for &(hash, end) in changes.iter() {
             if selects(stream, hash) {
                 part.extend_from_slice(&self.bytes[start..end]);
-                kept += 1;
             }
             start = end;
         }
-        match kept {
-            0 => None,
-            n if n == changes.len() => Some(self.bytes),
-            _ => Some(Bytes::from(part)),
-        }
+        Some(Bytes::from(part))
     }
 }
 
