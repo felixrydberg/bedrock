@@ -52,6 +52,7 @@ fn api() -> ApiConfig {
         write_listen: format!("{API}:7002").parse().unwrap(),
         write_token: TOKEN.into(),
         retention: Default::default(),
+        bulk_max_bytes: bedrock_lib::node::DEFAULT_BULK_MAX_BYTES,
         s3: S3Config {
             endpoint: "http://10.0.5.99:9000".into(),
             bucket: "bedrock".into(),

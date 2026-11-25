@@ -46,11 +46,13 @@ impl ApplyHook for Keyspace {
         event: &Event,
         batch: &mut WriteBatch,
     ) -> StorageResult<()> {
-        let key = [event.namespace.as_bytes(), b"\0", &event.key].concat();
-        match &event.operation {
-            Operation::Set(value) => batch.put(key, value.clone()),
-            Operation::Delete => batch.delete(key),
-        };
+        for (key, value) in event.changes() {
+            let key = [event.namespace.as_bytes(), b"\0", key].concat();
+            match value {
+                Some(value) => batch.put(key, value),
+                None => batch.delete(key),
+            };
+        }
         if self.rng.below(100) < self.fail_percent {
             return Err(StorageError::IoError(ErrorContext {
                 engine: "test",

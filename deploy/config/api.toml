@@ -5,9 +5,11 @@ advertise = "api.core:7000"
 admin_listen = "0.0.0.0:7001"
 write_listen = "0.0.0.0:7002"
 # Required via BEDROCK_WRITE_TOKEN. Clients send Authorization: Bearer <token>.
-# This credential grants PUT and DELETE access to all datasets/namespaces; use a random secret and a trusted network
-# or a TLS-terminating proxy for the HTTP write endpoint.
+# This credential grants PUT, DELETE and bulk POST access to all datasets/namespaces; use a random secret and a
+# trusted network or a TLS-terminating proxy for the HTTP write endpoint.
 data_dir = "/data"
+# The largest bulk write (POST /v1/{dataset}/{namespace}) body, at most 2 MiB. Callers split larger writes.
+bulk_max_bytes = 1048576
 
 # Credentials come from BEDROCK_S3__ACCESS_KEY_ID and BEDROCK_S3__SECRET_ACCESS_KEY.
 # SlateDB requires get, list, conditional put and delete permissions.

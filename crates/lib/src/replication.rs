@@ -48,6 +48,55 @@ pub struct Event {
 pub enum Operation {
     Set(Vec<u8>),
     Delete,
+    /// Many keys of the namespace in one revision, each with its new value or `None` for a delete (#76 / B-09c).
+    /// The event's own `key` is empty. A range stream carries only the changes in its range.
+    Bulk(Vec<(Vec<u8>, Option<Vec<u8>>)>),
+}
+
+impl Event {
+    /// Every key the event changes, with its new value or `None` for a delete: one, or a bulk's many.
+    pub fn changes(&self) -> Vec<(&[u8], Option<&[u8]>)> {
+        match &self.operation {
+            Operation::Set(value) => vec![(&self.key, Some(value))],
+            Operation::Delete => vec![(&self.key, None)],
+            Operation::Bulk(changes) => changes
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_deref()))
+                .collect(),
+        }
+    }
+
+    /// A single-key event has a key. A bulk has none and changes at least one key, none of them empty.
+    pub fn well_formed(&self) -> bool {
+        match &self.operation {
+            Operation::Bulk(changes) => {
+                self.key.is_empty()
+                    && !changes.is_empty()
+                    && changes.iter().all(|(key, _)| !key.is_empty())
+            }
+            _ => !self.key.is_empty(),
+        }
+    }
+
+    /// The part of the event a stream selecting `keep` carries: the event itself, a bulk cut to the changes `keep`
+    /// selects, or `None` when it selects none and the stream carries only coverage for this revision.
+    pub fn selected(&self, keep: impl Fn(&[u8]) -> bool) -> Option<Event> {
+        let Operation::Bulk(changes) = &self.operation else {
+            return keep(&self.key).then(|| self.clone());
+        };
+        let kept: Vec<_> = changes
+            .iter()
+            .filter(|(key, _)| keep(key))
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            return None;
+        }
+        Some(Event {
+            operation: Operation::Bulk(kept),
+            ..self.clone()
+        })
+    }
 }
 
 /// Road `partition` of `dataset`'s stream pool, e.g. `kv-0`. Datasets never share a stream.
@@ -336,9 +385,16 @@ impl From<Event> for pb::Event {
             epoch: e.epoch,
             committed_at: e.committed_at,
             key: e.key,
-            value: match e.operation {
-                Operation::Set(value) => Some(value),
-                Operation::Delete => None,
+            value: match &e.operation {
+                Operation::Set(value) => Some(value.clone()),
+                Operation::Delete | Operation::Bulk(_) => None,
+            },
+            changes: match e.operation {
+                Operation::Bulk(changes) => changes
+                    .into_iter()
+                    .map(|(key, value)| pb::Change { key, value })
+                    .collect(),
+                Operation::Set(_) | Operation::Delete => Vec::new(),
             },
         }
     }
@@ -354,7 +410,11 @@ impl From<pb::Event> for Event {
             epoch: e.epoch,
             committed_at: e.committed_at,
             key: e.key,
-            operation: e.value.map_or(Operation::Delete, Operation::Set),
+            operation: if e.changes.is_empty() {
+                e.value.map_or(Operation::Delete, Operation::Set)
+            } else {
+                Operation::Bulk(e.changes.into_iter().map(|c| (c.key, c.value)).collect())
+            },
         }
     }
 }

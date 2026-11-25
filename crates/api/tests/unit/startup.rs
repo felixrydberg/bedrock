@@ -13,6 +13,6 @@ async fn rejects_unusable_write_tokens() {
     .await
     .unwrap();
     for token in ["", " ", "with space", "with\nnewline", "non-ascii-å"] {
-        assert!(app(writer.clone(), token.into()).is_err());
+        assert!(app(writer.clone(), token.into(), 1).is_err());
     }
 }

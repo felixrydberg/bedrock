@@ -8,9 +8,13 @@ VARIABLES history, buffered, durable, now, epoch, bufferEpoch, pending,
 vars == <<history, buffered, durable, now, epoch, bufferEpoch, pending,
           acknowledged, cleanupRequested>>
 
-State(s) == IF s = 0 THEN FALSE ELSE s % 2 = 1
+\* #76 / B-09c: odd revisions change key "a"; even ones are bulks that change "a" and "b" in one event. A key's
+\* value is the revision that last changed it, 0 before any.
+Keys == {"a", "b"}
+Changed(s) == IF s % 2 = 0 THEN Keys ELSE {"a"}
+State(s) == [k \in Keys |-> IF k = "a" THEN s ELSE s - (s % 2)]
 EmptyRetry == [sequence |-> 0, expiry |-> 0]
-EmptyDB == [revision |-> 0, at |-> 0, value |-> FALSE,
+EmptyDB == [revision |-> 0, at |-> 0, value |-> State(0),
             events |-> [s \in {} |-> s], retry |-> EmptyRetry, position |-> 0]
 At(s) == IF s = 0 THEN 0 ELSE history[s].at
 Expiry(s) == IF s = 0 THEN 0 ELSE history[s].expiry
@@ -21,8 +25,9 @@ Init == /\ history = <<>> /\ buffered = EmptyDB /\ durable = EmptyDB
         /\ now = 0 /\ epoch = 1 /\ bufferEpoch = 1 /\ pending = 0
         /\ acknowledged = {} /\ cleanupRequested = FALSE
 
-\* One namespace, key and retry identity. Stage is one engine WriteBatch:
-\* original event + resolved SET/DELETE + revision/time + retry + optional position.
+\* One namespace and retry identity. Stage is one engine WriteBatch:
+\* original event + every key's resolved SET/DELETE + revision/time + retry + optional position.
+\* Bug "half" stages only the first key of a bulk.
 Stage == /\ buffered = durable /\ pending = 0
          /\ ~LiveRetry /\ durable.revision < MaxSeq
          /\ LET s == durable.revision + 1
@@ -30,7 +35,10 @@ Stage == /\ buffered = durable /\ pending = 0
                         value |-> State(s)]
             IN /\ history' = Append(history, row)
                /\ buffered' = [revision |-> s, at |-> now,
-                    value |-> IF Bug = "torn" THEN State(s - 1) ELSE State(s),
+                    value |-> IF Bug = "torn" THEN State(s - 1)
+                              ELSE IF Bug = "half" /\ Changed(s) = Keys
+                                   THEN [State(s) EXCEPT !["b"] = durable.value["b"]]
+                              ELSE State(s),
                     events |-> [i \in DOMAIN durable.events \cup (IF Bug = "event" THEN {} ELSE {s}) |->
                                   IF i = s THEN row ELSE durable.events[i]],
                     retry |-> [sequence |-> s, expiry |-> row.expiry],

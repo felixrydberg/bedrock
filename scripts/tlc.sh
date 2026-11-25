@@ -33,11 +33,14 @@ relays skip OrderedCoverage
 relays lease ProtectedBootstrap
 relays gc ProtectedTail
 relays payload GapFreeApply
+relays unfiltered GapFreeApply
+relays first-key GapFreeApply
 relays unconfirmed ReadyAfterConfirmation
 relays report ReportedHolds
 relays lost ReadyNotLost
 materialized torn AtomicBuffered
 materialized partial AtomicDurable
+materialized half AtomicBuffered
 materialized ack NoLostAck
 materialized crash OrderedPositions
 materialized cleanup YoungEventsSurvive

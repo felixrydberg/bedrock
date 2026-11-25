@@ -20,10 +20,10 @@ use tokio_stream::{Stream, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::placement::{hash_of, in_span, valid_span};
-use crate::replication::Event;
 use crate::replication::log::Watched;
 use crate::replication::pb;
 use crate::replication::writer::{RecoveryLease, Writer};
+use crate::replication::{Event, Operation};
 use crate::transport::{Caller, Class, Peers, host_of};
 use replay::Replay;
 
@@ -46,7 +46,38 @@ type ReplayItem = (Event, u64, usize);
 #[derive(Clone)]
 struct EncodedEvent {
     bytes: Bytes,
-    hash: u64,
+    /// The key's placement hash; `None` for a bulk, whose changes a range stream selects one by one (#76 / B-09c).
+    hash: Option<u64>,
+}
+
+impl EncodedEvent {
+    fn new(event: Event) -> Self {
+        let hash = match event.operation {
+            Operation::Bulk(_) => None,
+            _ => Some(hash_of(&event.dataset, &event.namespace, &event.key)),
+        };
+        EncodedEvent {
+            bytes: Bytes::from(pb::Event::from(event).encode_to_vec()),
+            hash,
+        }
+    }
+
+    /// What `stream` carries of the event: all of it, a bulk cut to the changes in its range, or nothing, which
+    /// leaves only coverage of this revision.
+    fn selected(self, stream: &StreamKey) -> Option<Bytes> {
+        match self.hash {
+            Some(hash) => selects(stream, hash).then_some(self.bytes),
+            None if stream.1.is_none() => Some(self.bytes),
+            None => {
+                let event =
+                    Event::from(pb::Event::decode(self.bytes).expect("encoded by this relay"));
+                let part = event.selected(|key| {
+                    selects(stream, hash_of(&event.dataset, &event.namespace, key))
+                })?;
+                Some(Bytes::from(pb::Event::from(part).encode_to_vec()))
+            }
+        }
+    }
 }
 
 fn span(range: Option<(u64, u64)>) -> Option<pb::Span> {
@@ -987,11 +1018,7 @@ impl Hub {
         if let Some(bytes) = recent.records.get(&key) {
             return bytes.clone();
         }
-        let hash = hash_of(&event.dataset, &event.namespace, &event.key);
-        let bytes = EncodedEvent {
-            bytes: Bytes::from(pb::Event::from(event).encode_to_vec()),
-            hash,
-        };
+        let bytes = EncodedEvent::new(event);
         recent.bytes += bytes.bytes.len();
         recent.records.insert(key.clone(), bytes.clone());
         recent.order.push_back(key);
@@ -1021,8 +1048,12 @@ impl Hub {
                 + event.stream.len()
                 + event.key.len()
                 + match &event.operation {
-                    crate::replication::Operation::Set(value) => value.len(),
-                    crate::replication::Operation::Delete => 0,
+                    Operation::Set(value) => value.len(),
+                    Operation::Delete => 0,
+                    Operation::Bulk(changes) => changes
+                        .iter()
+                        .map(|(key, value)| 16 + key.len() + value.as_ref().map_or(0, Vec::len))
+                        .sum(),
                 };
             let mut queued = self.0.replay_bytes.load(Ordering::Relaxed);
             let mut reserved = false;
@@ -1063,16 +1094,7 @@ impl Hub {
             return control.read(&key.1, from, 256).map(|events| {
                 events
                     .into_iter()
-                    .map(|e| {
-                        let hash = hash_of(&e.dataset, &e.namespace, &e.key);
-                        (
-                            e.sequence,
-                            EncodedEvent {
-                                bytes: Bytes::from(pb::Event::from(e).encode_to_vec()),
-                                hash,
-                            },
-                        )
-                    })
+                    .map(|e| (e.sequence, EncodedEvent::new(e)))
                     .collect()
             });
         }
@@ -1437,9 +1459,7 @@ impl Hub {
                         };
                         let selected = events
                             .into_iter()
-                            .filter_map(|(_, event)| {
-                                selects(&key, event.hash).then_some(event.bytes)
-                            })
+                            .filter_map(|(_, event)| event.selected(&key))
                             .collect();
                         if !self
                             .send_scoped(

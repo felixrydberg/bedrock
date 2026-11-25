@@ -2,7 +2,8 @@
 syntax = "proto3";
 package bedrock.replication;
 
-// `kv.md` §8. No value means DELETE.
+// `kv.md` §8. No value means DELETE. A bulk (#76 / B-09c) has no key or value and changes every key in `changes`
+// in one revision; a range stream carries only the changes of its range.
 message Event {
   string dataset = 1;
   string namespace = 2;
@@ -12,7 +13,12 @@ message Event {
   uint64 committed_at = 6;
   bytes key = 7;
   optional bytes value = 8;
+  repeated Change changes = 9;
 }
+// One key of a bulk. No value means DELETE.
+message Change { bytes key = 1; optional bytes value = 2; }
+// The body of a bulk write, `POST /v1/{dataset}/{namespace}` on `bedrock-api`.
+message Bulk { repeated Change changes = 1; }
 
 message Ack {
   string dataset = 1;

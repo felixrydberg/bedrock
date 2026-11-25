@@ -127,6 +127,7 @@ fn event(sequence: u64, key: &[u8], value: Option<&[u8]>) -> pb::Event {
         committed_at: 700,
         key: key.to_vec(),
         value: value.map(<[u8]>::to_vec),
+        changes: Vec::new(),
     }
 }
 
@@ -1944,4 +1945,61 @@ fn unexplained_range_data_is_never_held_at_revision_zero() {
             .unwrap()
             .is_empty()
     );
+}
+
+fn bulk(sequence: u64, changes: &[(&[u8], Option<&[u8]>)]) -> pb::Event {
+    pb::Event {
+        key: Vec::new(),
+        value: None,
+        changes: changes
+            .iter()
+            .map(|(key, value)| pb::Change {
+                key: key.to_vec(),
+                value: value.map(<[u8]>::to_vec),
+            })
+            .collect(),
+        ..event(sequence, b"", None)
+    }
+}
+
+#[test]
+fn a_replayed_bulk_never_brings_back_keys_a_later_revision_deleted() {
+    let engine = Arc::new(MemoryEngine::new("auth"));
+    let mut consumer = Consumer::new(target(engine.clone())).unwrap();
+    let first = bulk(1, &[(b"a", Some(b"1")), (b"b", Some(b"2"))]);
+    consumer
+        .delivery(delivery(1, 1, vec![first.clone()]))
+        .unwrap();
+    assert_eq!(engine.get(b"users\0b").unwrap(), Some(b"2".to_vec()));
+    consumer
+        .delivery(delivery(2, 2, vec![event(2, b"b", None)]))
+        .unwrap();
+    consumer.delivery(delivery(1, 1, vec![first])).unwrap();
+    assert_eq!(engine.get(b"users\0a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(engine.get(b"users\0b").unwrap(), None);
+    assert_eq!(consumer.applied, 2);
+}
+
+#[test]
+fn a_range_takes_its_share_of_a_bulk_and_refuses_one_holding_other_keys() {
+    let engine = Arc::new(MemoryEngine::new("auth"));
+    let range = only(b"k");
+    let set = |d: &mut pb::Delivery, s| d.span = s;
+    let mut consumer = ranged(engine.clone(), range);
+    consumer
+        .delivery(in_range(
+            delivery(1, 1, vec![bulk(1, &[(b"k", Some(b"v"))])]),
+            range,
+            set,
+        ))
+        .unwrap();
+    assert_eq!(engine.get(&stored_at(b"k")).unwrap(), Some(b"v".to_vec()));
+    let mixed = bulk(2, &[(b"k", None), (b"other", Some(b"v"))]);
+    assert!(
+        consumer
+            .delivery(in_range(delivery(2, 2, vec![mixed]), range, set))
+            .is_err()
+    );
+    assert_eq!(engine.get(&stored_at(b"k")).unwrap(), Some(b"v".to_vec()));
+    assert_eq!(consumer.applied, 1);
 }

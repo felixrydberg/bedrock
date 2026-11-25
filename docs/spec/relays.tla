@@ -12,8 +12,15 @@ VARIABLES head, applied, queued, connected, cached, boundary, pinned, staging, r
           pending, ready, assigned, frames, following, reported, lost
 vars == <<head, applied, queued, connected, cached, boundary, pinned, staging, retained, projected,
           pending, ready, assigned, frames, following, reported, lost>>
-\* Alternating revisions stand for payloads inside/outside the range.
-Selected(r) == r % 2 = 0
+\* #76 / B-09c: a revision is one event that may change many keys. Odd revisions change only keys outside the
+\* range, so the range receives coverage alone; even ones are bulks that change keys on both sides. The relay sends
+\* the range exactly its own operations of a revision, possibly none.
+Ops(r) == IF r % 2 = 1 THEN {"out"} ELSE {"in", "out"}
+Filtered(r) == IF Bug = "unfiltered" THEN Ops(r)
+               ELSE IF Bug = "first-key" /\ Cardinality(Ops(r)) > 1 THEN {}
+               ELSE Ops(r) \cap {"in"}
+\* The range's operations a receiver at revision a has applied.
+Expected(a) == {<<r, "in">> : r \in {s \in 1..a : "in" \in Ops(s)}}
 \* pinned: the source holds valid recovery leases. pending: an installed baseline awaits the
 \* source's recovered confirmation; it is persisted with the installed state.
 \* assigned: what the relay last pushed. frames: pushes the subscriber has not processed.
@@ -40,15 +47,16 @@ Commit(n) == /\ head[n] < MaxRevision /\ head' = [head EXCEPT ![n] = @ + 1]
 Send(n) == /\ connected /\ following /\ ~staging /\ Sent(n) < head[n]
            /\ Len(queued) < QueueLimit
            /\ Sent(n) + 1 \in cached[n] \cup retained[n]
-           /\ queued' = Append(queued, [ns |-> n, r |-> Sent(n) + IF Bug = "skip" THEN 2 ELSE 1])
+           /\ LET r == Sent(n) + IF Bug = "skip" THEN 2 ELSE 1
+              IN queued' = Append(queued, [ns |-> n, r |-> r, ops |-> Filtered(r)])
            /\ UNCHANGED <<head, applied, connected, cached, boundary, pinned, staging, retained, projected,
                           pending, ready, assigned, frames, following, reported, lost>>
 \* A receiver whose storage was lost drains coverage until a fresh baseline installs.
 ApplyCoverage == LET q == Head(queued) IN
                  /\ ~lost /\ Len(queued) > 0 /\ q.r = applied[q.ns] + 1
                  /\ applied' = [applied EXCEPT ![q.ns] = q.r] /\ queued' = Tail(queued)
-                 /\ projected' = IF Selected(q.r) /\ Bug # "payload" THEN [projected EXCEPT ![q.ns] = @ \cup {q.r}]
-                                 ELSE projected
+                 /\ projected' = IF Bug = "payload" THEN projected
+                                 ELSE [projected EXCEPT ![q.ns] = @ \cup {<<q.r, k>> : k \in q.ops}]
                  /\ UNCHANGED <<head, connected, cached, boundary, pinned, staging, retained, pending, ready,
                                 assigned, frames, following, reported, lost>>
 \* Disconnect aborts staging and releases the leases; an unconfirmed install stays pending.
@@ -79,7 +87,7 @@ BeginBootstrap == /\ connected /\ following /\ ~staging /\ boundary' = head
 \* Validated atomic installation of every namespace. It does not confirm recovery.
 InstallValidated == /\ staging /\ pinned /\ \A n \in Namespaces : boundary[n] >= applied[n]
                     /\ applied' = boundary /\ staging' = FALSE /\ pending' = TRUE
-                    /\ projected' = [n \in Namespaces |-> {r \in 1..boundary[n] : Selected(r)}] /\ lost' = FALSE
+                    /\ projected' = [n \in Namespaces |-> Expected(boundary[n])] /\ lost' = FALSE
                     /\ UNCHANGED <<head, queued, connected, cached, boundary, pinned, retained, ready,
                                    assigned, frames, following, reported>>
 \* The source's recovered Range: catch-up through head was acknowledged under valid leases.
@@ -138,8 +146,8 @@ OrderedCoverage == \A i \in 1..Len(queued) :
                                   + Cardinality({j \in 1..i : queued[j].ns = queued[i].ns})
 ProtectedBootstrap == staging => pinned
 ProtectedTail == pinned => \A n \in Namespaces : (boundary[n]+1..head[n]) \subseteq retained[n]
-\* Applied payload matches covered progress exactly: nothing missing, stale or resurrected.
-GapFreeApply == ~lost => \A n \in Namespaces : projected[n] = {r \in 1..applied[n] : Selected(r)}
+\* Applied payload matches covered progress exactly: nothing missing, stale, resurrected or outside the range.
+GapFreeApply == ~lost => \A n \in Namespaces : projected[n] = Expected(applied[n])
 ReadyAfterConfirmation == ready => (connected /\ following /\ ~staging /\ ~pending /\ Caught)
 \* A reported subscriber still follows the range it was assigned: it has not deleted it.
 ReportedHolds == reported => (assigned /\ following)

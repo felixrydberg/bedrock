@@ -9,8 +9,8 @@ use prost::Message;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use super::Event;
 use super::pb;
-use super::{Event, Operation};
 use crate::storage::namespace::{
     Changes, NamespaceDatabase, NamespaceFactory, NamespaceReader, NamespaceScan, valid_identity,
 };
@@ -600,7 +600,7 @@ impl Materialized {
             if event.dataset != self.dataset
                 || event.namespace != self.namespace
                 || event.sequence == 0
-                || event.key.is_empty()
+                || !event.well_formed()
             {
                 return Err(self.corrupt("committed event has invalid scope, sequence or key"));
             }
@@ -631,11 +631,9 @@ impl Materialized {
                     self.corrupt("committed retry expiry must follow its fixed commit time")
                 );
             }
-            let value = match &event.operation {
-                Operation::Set(value) => Some(value.clone()),
-                Operation::Delete => None,
-            };
-            changes.push((key(b'v', &event.key), value));
+            for (changed, value) in event.changes() {
+                changes.push((key(b'v', changed), value.map(<[u8]>::to_vec)));
+            }
             changes.push((
                 key(b'e', &event.sequence.to_be_bytes()),
                 Some(
@@ -713,7 +711,7 @@ impl Materialized {
             || event.sequence != u64::from_be_bytes(raw)
             || event.dataset != self.dataset
             || event.namespace != self.namespace
-            || event.key.is_empty()
+            || !event.well_formed()
             || (stored.retry_key.is_some() && stored.retry_expires_at <= event.committed_at)
             || (stored.retry_key.is_none() && stored.retry_expires_at != 0)
         {

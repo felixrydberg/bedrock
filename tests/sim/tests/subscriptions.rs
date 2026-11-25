@@ -159,6 +159,7 @@ async fn write(
                 value: value.clone(),
             },
             Operation::Delete => WriteOp::Delete { key: physical },
+            Operation::Bulk(_) => unreachable!("this workload writes single keys"),
         };
         let sequence = writer
             .commit(Write {

@@ -748,6 +748,7 @@ fn api(name: &str, ip: &str) -> ApiConfig {
         node: node(name, ip),
         write_listen: format!("{ip}:7002").parse().unwrap(),
         write_token: TOKEN.into(),
+        bulk_max_bytes: bedrock_lib::node::DEFAULT_BULK_MAX_BYTES,
         retention: Retention {
             event_retention_ms: EVENT_RETENTION_MS,
             retry_retention_ms: RETRY_RETENTION_MS,

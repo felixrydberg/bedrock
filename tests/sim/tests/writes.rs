@@ -22,6 +22,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::StatusCode;
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
+use prost::Message;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
@@ -98,6 +99,25 @@ async fn send(
     body: String,
     authorization: &[&str],
 ) -> (StatusCode, String) {
+    send_bytes(
+        api,
+        method,
+        path,
+        idempotency_key,
+        body.into(),
+        authorization,
+    )
+    .await
+}
+
+async fn send_bytes(
+    api: SocketAddr,
+    method: &str,
+    path: &str,
+    idempotency_key: &str,
+    body: Bytes,
+    authorization: &[&str],
+) -> (StatusCode, String) {
     let stream = TcpStream::connect(api).await.unwrap();
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
@@ -111,7 +131,7 @@ async fn send(
     for value in authorization {
         request = request.header("authorization", *value);
     }
-    let request = request.body(Full::new(Bytes::from(body))).unwrap();
+    let request = request.body(Full::new(body)).unwrap();
     let response = sender.send_request(request).await.unwrap();
     let status = response.status();
     if status == StatusCode::UNAUTHORIZED {
@@ -287,6 +307,63 @@ async fn scenario(api: SocketAddr, replication: String) {
             );
         }
     }
+
+    // #76 / B-09c: a bulk commits its keys as one revision, which subscribers apply in one batch.
+    let head = acked["pages"].len() as u64;
+    let changes = (0..3)
+        .map(|i| pb::Change {
+            key: format!("bulk/{i}").into_bytes(),
+            value: (i != 1).then(|| vec![i]),
+        })
+        .collect();
+    let body = Bytes::from(pb::Bulk { changes }.encode_to_vec());
+    let bulk = |body| send_bytes(api, "POST", "/v1/cdn/pages", "bulk", body, &[AUTHORIZATION]);
+    let committed = bulk(body.clone()).await;
+    assert_eq!(committed, (StatusCode::OK, (head + 1).to_string()));
+    assert_eq!(bulk(body).await, committed, "a retried bulk applies once");
+    let oversized = Bytes::from(vec![0; bedrock_lib::node::DEFAULT_BULK_MAX_BYTES + 1]);
+    assert_eq!(bulk(oversized).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+    let (status, _) = send_bytes(
+        api,
+        "POST",
+        "/v1/cdn/pages",
+        "empty",
+        Bytes::new(),
+        &[AUTHORIZATION],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an empty bulk");
+    timeout(
+        Duration::from_secs(30),
+        subscription.wait_for("cdn", "pages", head + 1),
+    )
+    .await
+    .expect("the bulk reaches the subscriber");
+    let last = applied
+        .batches
+        .lock()
+        .unwrap()
+        .iter()
+        .rfind(|b| !b.ops.is_empty())
+        .expect("the bulk's batch")
+        .ops
+        .clone();
+    assert_eq!(
+        last,
+        [
+            WriteOp::Put {
+                key: b"pages\0bulk/0".to_vec(),
+                value: vec![0]
+            },
+            WriteOp::Delete {
+                key: b"pages\0bulk/1".to_vec()
+            },
+            WriteOp::Put {
+                key: b"pages\0bulk/2".to_vec(),
+                value: vec![2]
+            },
+        ]
+    );
     subscription.stop().await;
 }
 
@@ -316,7 +393,12 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
     let api = http.local_addr().unwrap();
     tokio::spawn(bedrock_lib::http::serve(
         http,
-        bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
+        bedrock_api::app(
+            writer.clone(),
+            WRITE_TOKEN.into(),
+            bedrock_lib::node::DEFAULT_BULK_MAX_BYTES,
+        )
+        .unwrap(),
         None,
     ));
     let grpc = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -376,7 +458,12 @@ async fn simulated() {
             let http = TcpListener::bind(api).await.unwrap();
             tokio::spawn(bedrock_lib::http::serve(
                 http,
-                bedrock_api::app(writer.clone(), WRITE_TOKEN.into()).unwrap(),
+                bedrock_api::app(
+                    writer.clone(),
+                    WRITE_TOKEN.into(),
+                    bedrock_lib::node::DEFAULT_BULK_MAX_BYTES,
+                )
+                .unwrap(),
                 None,
             ));
             tonic::transport::Server::builder()
