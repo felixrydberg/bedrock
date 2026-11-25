@@ -165,6 +165,12 @@ async fn commit(
     operation: Operation,
     headers: &HeaderMap,
 ) -> (StatusCode, String) {
+    if dataset == "kv" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "customer KV writes go through the KV actor API".into(),
+        );
+    }
     let idempotency_key = match headers.get("idempotency-key").map(|k| k.to_str()) {
         None => None,
         Some(Ok(key)) if !key.is_empty() => Some(key.to_owned()),

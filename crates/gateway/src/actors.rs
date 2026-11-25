@@ -353,6 +353,8 @@ impl Router {
                 let request = targeted(request.clone(), COMPUTE, &target.cell);
                 dispatch.send(async move {
                     pb::actors_client::ActorsClient::new(channel)
+                        .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
                         .invoke(request?)
                         .await
                 })
@@ -405,6 +407,8 @@ impl Router {
         self.client
             .call_member(&member, |channel| async move {
                 pb::actors_client::ActorsClient::new(channel)
+                    .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+                    .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
                     .invoke(request)
                     .await
             })

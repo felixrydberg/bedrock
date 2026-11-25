@@ -3,22 +3,23 @@
 //! and home region from the same replicated bytes.
 //!
 //! - **IDs** are random version 4 UUIDs as 32 lowercase hex characters (Cloudflare's namespace ID shape), never
-//!   reused. They are valid writer and storage identities, so a namespace's database lives at `kv/{id}/` (the writer's
-//!   `{dataset}/{namespace}` layout). Bindings reference the ID; `tenant` and `title` are descriptive only.
+//!   reused. `storage = kv/{id}` remains a logical directory identity; the built-in writer's bytes live in its volume
+//!   range database (#126 / S-18). Bindings reference the ID; `tenant` and `title` are descriptive only.
 //! - **Nothing locational** is recorded: no cell, origin or cache holder. Adding a cell changes no record.
-//! - **Create** writes only the record. The writer opens the namespace's database on its first data write, so an empty
-//!   namespace has no engine objects.
-//! - **Delete** marks the record `Deleting` and stamps `deleting_at`, which closes it to new opens and writes at once.
-//!   Its S3 objects stay until an explicit **purge** ([`Directory::purge`]) after [`PURGE_GRACE`]: purging is never
-//!   triggered by polling, and there is no undelete (#57 / B-39).
+//! - **Create** writes only the record, so an empty namespace creates no storage objects.
+//! - **Delete** marks the record `Deleting` and stamps `deleting_at`. Reads at its publication revision close admission;
+//!   callers without that floor learn deletion through ordinary directory propagation.
+//!   Explicit **purge** ([`Directory::purge`]) after [`PURGE_GRACE`] tombstones the actor before removing the record;
+//!   volume reclaims its range keys after its own deletion grace. There is no undelete.
 //! - Writes are planned from a read and committed with `If-Match` on the `infrastructure` head. The answering range may
 //!   lag the head; a 412 carries the head, and the operation re-reads at it and plans again.
 //! - **The management API** is Cloudflare's namespace API (`/client/v4/accounts/{tenant}/storage/kv/namespaces`): the
 //!   same paths, bodies, envelope and namespace object, so its clients work against a `bedrock-kv` host. Its additions
 //!   are each answer's directory `revision`, `?min_revision=` on reads and lists, and quota fields on create.
 
+pub(crate) use bedrock_lib::wall_ms;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
@@ -31,7 +32,6 @@ use bedrock_lib::admin::Admin;
 use bedrock_lib::client::Client;
 use bedrock_lib::transport::tls::Tls;
 
-use crate::storage::Readers;
 use http_body_util::Full;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
@@ -47,7 +47,7 @@ pub const NAMESPACE: &str = "infrastructure";
 pub const PREFIX: &str = "kv/namespaces/";
 /// Records this code writes; any other version is refused rather than misread.
 pub const FORMAT_VERSION: u32 = 1;
-/// Remote regions cache values returned by the home reader for this long (fixed, B-27).
+/// Per-cell caches keep holder answers for at most this long (fixed, S-18).
 pub const CACHE_TTL_SECONDS: u32 = 60;
 /// Reads, writes and conflicts one operation may go through before giving up.
 const ATTEMPTS: usize = 4;
@@ -57,52 +57,7 @@ const MAX_TENANT: usize = 32;
 const MAX_TITLE: usize = 512;
 const MAX_REGION: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
-#[repr(i32)]
-pub enum Lifecycle {
-    Active = 0,
-    /// Closed to new opens and writes; its storage stays until a purge after [`PURGE_GRACE`].
-    Deleting = 1,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct Record {
-    #[prost(uint32, tag = "1")]
-    pub format_version: u32,
-    #[prost(string, tag = "2")]
-    pub id: String,
-    #[prost(string, tag = "3")]
-    pub tenant: String,
-    #[prost(string, tag = "4")]
-    pub title: String,
-    /// The only region that opens the namespace's database; its writer is that region's API writer. Cloudflare's
-    /// `jurisdiction`.
-    #[prost(string, tag = "5")]
-    pub home_region: String,
-    /// The namespace's S3 database prefix, `kv/{id}`.
-    #[prost(string, tag = "6")]
-    pub storage: String,
-    /// The materialized-state format the database was created for.
-    #[prost(uint32, tag = "7")]
-    pub storage_format: u32,
-    /// Total persistent size limit; unset means none.
-    #[prost(uint64, optional, tag = "8")]
-    pub storage_bytes: Option<u64>,
-    // ponytail: opaque grants until Auth defines their shape (B-42).
-    #[prost(string, repeated, tag = "9")]
-    pub permissions: Vec<String>,
-    #[prost(uint32, tag = "10")]
-    pub cache_ttl_seconds: u32,
-    #[prost(enumeration = "Lifecycle", tag = "11")]
-    pub state: i32,
-    /// Wall-clock milliseconds since the Unix epoch.
-    #[prost(uint64, tag = "12")]
-    pub created_at: u64,
-    /// When the namespace became `Deleting`, in wall-clock milliseconds; 0 while active, and for namespaces deleted
-    /// before this was recorded.
-    #[prost(uint64, tag = "13")]
-    pub deleting_at: u64,
-}
+pub use bedrock_lib::kv::{Lifecycle, Record};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -110,8 +65,6 @@ pub enum Error {
     /// The tenant already has an active namespace with this title.
     Duplicate,
     Invalid(String),
-    /// Quota or deletion refused the operation.
-    Rejected(Rejected),
     /// The directory kept moving under this operation; retry later.
     Contended,
     Unavailable(String),
@@ -122,7 +75,6 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rejected {
     Deleted,
-    StorageQuota,
 }
 
 impl std::fmt::Display for Error {
@@ -131,10 +83,6 @@ impl std::fmt::Display for Error {
             Self::NotFound => f.write_str("namespace not found"),
             Self::Duplicate => f.write_str("a namespace with this title already exists"),
             Self::Invalid(detail) => write!(f, "invalid request: {detail}"),
-            Self::Rejected(Rejected::Deleted) => f.write_str("namespace is being deleted"),
-            Self::Rejected(Rejected::StorageQuota) => {
-                f.write_str("namespace storage quota exceeded")
-            }
             Self::Contended => f.write_str("the directory changed during the operation; retry"),
             Self::Unavailable(detail) => write!(f, "directory unavailable: {detail}"),
             Self::Corrupt(detail) => write!(f, "directory record is corrupt: {detail}"),
@@ -147,7 +95,7 @@ pub fn key(id: &str) -> Vec<u8> {
     [PREFIX.as_bytes(), id.as_bytes()].concat()
 }
 
-/// The S3 database prefix of namespace `id`: the writer stores dataset `kv`, namespace `id` under `kv/{id}/`.
+/// The stable logical storage identity; S-18 stores the actor's bytes in volume range databases.
 pub fn storage(id: &str) -> String {
     format!("kv/{id}")
 }
@@ -182,8 +130,7 @@ pub fn decode(id: &str, bytes: &[u8]) -> Result<Record, Error> {
     }
 }
 
-/// Whether a new reader or write may open the namespace. Callers check a fresh directory read, so a warm cache or
-/// reader never bypasses deletion.
+/// Whether a read or write may use the namespace. A warm value cache also checks a fresh directory read.
 pub fn admit_open(record: &Record) -> Result<(), Rejected> {
     match record.state() {
         Lifecycle::Active => Ok(()),
@@ -191,24 +138,9 @@ pub fn admit_open(record: &Record) -> Result<(), Rejected> {
     }
 }
 
-/// Whether a write adding `added` bytes to a namespace holding `current` fits its storage quota.
-pub fn admit_write(record: &Record, current: u64, added: u64) -> Result<(), Rejected> {
-    admit_open(record)?;
-    match record.storage_bytes {
-        Some(limit) if current.saturating_add(added) > limit => Err(Rejected::StorageQuota),
-        _ => Ok(()),
-    }
-}
-
-/// How long a `Deleting` namespace keeps its storage. It outlasts directory propagation and the writes and reads that
-/// were admitted before the deletion reached them, and the idle close of a reader another node still has open, so no
-/// such reader writes a checkpoint back after the purge. A reader still open fails once its objects are gone; it never
-/// serves a missing object as an absent key.
+/// Directory propagation grace before actor deletion. Volume's tombstone then fences every old holder before the
+/// directory record is removed; its separate grace governs physical reclamation of range-database keys.
 pub const PURGE_GRACE: Duration = Duration::from_secs(20 * 60);
-const _: () = assert!(
-    PURGE_GRACE.as_secs() > crate::storage::IDLE.as_secs() + crate::SWEEP.as_secs() + 60,
-    "a purge must wait out every reader's idle close"
-);
 
 /// Whether `record`'s storage may be purged at wall-clock `now_ms`. A deletion with no recorded time never is: deleting
 /// it again records one.
@@ -260,11 +192,6 @@ fn taken(records: &[Record], tenant: &str, title: &str, id: &str) -> bool {
 struct OperationLabels {
     operation: &'static str,
     outcome: &'static str,
-}
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct QuotaLabels {
-    quota: &'static str,
 }
 
 /// `bedrock-api`'s write endpoint.
@@ -337,20 +264,18 @@ impl Api {
 
 pub struct Directory {
     client: Arc<Client>,
+    directory: Arc<bedrock_lib::kv::DirectoryView>,
     api: Api,
-    readers: Arc<Readers>,
     /// Home region of namespaces created without a jurisdiction: this node's region.
     region: String,
     operations: Family<OperationLabels, Counter>,
-    quota_rejections: Family<QuotaLabels, Counter>,
 }
 
 impl Directory {
     pub fn new(
         admin: &Admin,
-        client: Arc<Client>,
+        directory: Arc<bedrock_lib::kv::DirectoryView>,
         api: Api,
-        readers: Arc<Readers>,
         region: String,
     ) -> Self {
         let operations = Family::default();
@@ -359,19 +284,12 @@ impl Directory {
             "Namespace directory operations by outcome",
             operations.clone(),
         );
-        let quota_rejections = Family::default();
-        admin.register(
-            "kv_quota_rejections",
-            "Writes refused by a namespace quota or deletion",
-            quota_rejections.clone(),
-        );
         Self {
-            client,
+            client: directory.client.clone(),
+            directory,
             api,
-            readers,
             region,
             operations,
-            quota_rejections,
         }
     }
 
@@ -381,7 +299,6 @@ impl Directory {
             Err(Error::NotFound) => "not_found",
             Err(Error::Duplicate) => "duplicate",
             Err(Error::Invalid(_)) => "invalid",
-            Err(Error::Rejected(_)) => "rejected",
             Err(Error::Contended) => "contended",
             Err(Error::Unavailable(_)) => "unavailable",
             Err(Error::Corrupt(_)) => "corrupt",
@@ -390,21 +307,6 @@ impl Directory {
             .get_or_create(&OperationLabels { operation, outcome })
             .inc();
         result
-    }
-
-    /// [`admit_write`], counted for the quota metrics. Only B-26's write path calls it.
-    pub fn admit_write(&self, record: &Record, current: u64, added: u64) -> Result<(), Rejected> {
-        let admitted = admit_write(record, current, added);
-        if let Err(rejected) = admitted {
-            let quota = match rejected {
-                Rejected::Deleted => "deleted",
-                Rejected::StorageQuota => "storage_bytes",
-            };
-            self.quota_rejections
-                .get_or_create(&QuotaLabels { quota })
-                .inc();
-        }
-        admitted
     }
 
     /// Namespace `id` in any state and the directory revision that proves it, from a holder at least at
@@ -423,9 +325,16 @@ impl Directory {
         }
         let found = self
             .client
-            .get(SERVICE, DATASET, NAMESPACE, &key(id), min_revision)
+            .get(
+                SERVICE,
+                DATASET,
+                NAMESPACE,
+                &key(id),
+                min_revision.max(self.directory.minimum()),
+            )
             .await
             .map_err(|status| Error::Unavailable(status.message().to_owned()))?;
+        self.directory.observe(found.revision);
         let record = found.value.map(|bytes| decode(id, &bytes)).transpose()?;
         Ok((record, found.revision))
     }
@@ -447,7 +356,7 @@ impl Directory {
                     PREFIX.as_bytes(),
                     &start_after,
                     0,
-                    min_revision,
+                    min_revision.max(self.directory.minimum()),
                 )
                 .await
                 .map_err(|status| Error::Unavailable(status.message().to_owned()))?;
@@ -459,6 +368,7 @@ impl Directory {
                 start_after = key;
             }
             if !page.more {
+                self.directory.observe(revision);
                 return Ok((records, revision));
             }
         }
@@ -480,7 +390,10 @@ impl Directory {
                 bedrock_lib::placement::hash_of(DATASET, NAMESPACE, &record.encode_to_vec());
             let idempotency = format!("{operation}:{}:{revision}:{payload:016x}", record.id);
             match self.api.put(&record, revision, &idempotency).await? {
-                Put::Committed { revision } => return Ok((record, revision)),
+                Put::Committed { revision } => {
+                    self.directory.observe(revision);
+                    return Ok((record, revision));
+                }
                 Put::Conflict { head } => floor = head,
             }
         }
@@ -513,6 +426,7 @@ impl Directory {
                         state: Lifecycle::Active as i32,
                         created_at: wall_ms(),
                         deleting_at: 0,
+                        purge_grant_hash: String::new(),
                     })
                 })
                 .await
@@ -578,14 +492,17 @@ impl Directory {
                 .await?
             {
                 // Storage stays until a purge after `PURGE_GRACE`.
-                Put::Committed { revision } => return Ok((record, revision)),
+                Put::Committed { revision } => {
+                    self.directory.observe(revision);
+                    return Ok((record, revision));
+                }
                 Put::Conflict { head } => floor = head,
             }
         }
         Err(Error::Contended)
     }
 
-    /// Deletes the tenant's `Deleting` namespace `id`'s storage under `kv/{id}/` once [`PURGE_GRACE`] has passed, then
+    /// Publishes an unguessable management grant, tombstones the tenant's `Deleting` actor after [`PURGE_GRACE`], then deletes
     /// its record, and returns the directory revision without it. Retrying after a failure repeats only what is left.
     pub async fn purge(&self, tenant: &str, id: &str) -> Result<u64, Error> {
         let purged = self.try_purge(tenant, id).await;
@@ -596,7 +513,7 @@ impl Directory {
         let mut floor = 0;
         for _ in 0..ATTEMPTS {
             let (record, revision) = self.read(id, floor).await?;
-            let record = record
+            let mut record = record
                 .filter(|r| r.tenant == tenant)
                 .ok_or(Error::NotFound)?;
             if !purgeable(&record, wall_ms()) {
@@ -604,16 +521,36 @@ impl Directory {
                     "only a namespace deleted at least PURGE_GRACE ago can be purged".into(),
                 ));
             }
-            self.readers
-                .destroy(id)
+            let grant = bedrock_lib::uuid();
+            record.purge_grant_hash = bedrock_lib::kv::purge_grant_hash(&grant);
+            let revision = match self
+                .api
+                .put(
+                    &record,
+                    revision,
+                    &format!("purge-grant:{id}:{revision}:{}", record.purge_grant_hash),
+                )
+                .await?
+            {
+                Put::Committed { revision } => revision,
+                Put::Conflict { head } => {
+                    floor = head;
+                    continue;
+                }
+            };
+            self.directory.observe(revision);
+            bedrock_lib::kv::purge(&self.directory, &record, &grant)
                 .await
-                .map_err(|error| Error::Unavailable(error.to_string()))?;
+                .map_err(|error| Error::Unavailable(format!("actor purge: {error}")))?;
             match self
                 .api
                 .delete(id, revision, &format!("purge:{id}"))
                 .await?
             {
-                Put::Committed { revision } => return Ok(revision),
+                Put::Committed { revision } => {
+                    self.directory.observe(revision);
+                    return Ok(revision);
+                }
                 Put::Conflict { head } => floor = head,
             }
         }
@@ -632,15 +569,6 @@ impl Directory {
             });
         self.count("list", listed)
     }
-}
-
-/// Wall time is the point here (`created_at`); madsim simulates it.
-#[allow(clippy::disallowed_methods)]
-fn wall_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// Cloudflare's KV namespace routes, at the same paths as under `api.cloudflare.com`. Callers authenticate in front of
@@ -852,7 +780,7 @@ fn reply(result: Result<Value, Error>, result_info: Option<Value>) -> Response {
             let status = match error {
                 Error::NotFound => StatusCode::NOT_FOUND,
                 Error::Invalid(_) | Error::Duplicate => StatusCode::BAD_REQUEST,
-                Error::Rejected(_) | Error::Contended => StatusCode::CONFLICT,
+                Error::Contended => StatusCode::CONFLICT,
                 Error::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
                 Error::Corrupt(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };

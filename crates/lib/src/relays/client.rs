@@ -199,8 +199,8 @@ impl Names {
     }
 }
 
-/// Rebuild generation requested per dataset ([`Rebuilder`]).
-type Rebuilds = Arc<Watched<BTreeMap<String, u64>>>;
+/// The latest rebuild requested per dataset ([`Rebuilder`]): its generation, and the ranges it covers (all when empty).
+type Rebuilds = Arc<Watched<BTreeMap<String, (u64, Vec<Range>)>>>;
 
 #[derive(Default)]
 struct Progress {
@@ -498,19 +498,37 @@ impl Session {
         self.stop().await;
     }
 
-    /// Announces the datasets whose local storage is quarantined or rebuilding (#13 / B-14). The relays publish them
-    /// with this member's entry. Datasets the member did not announce are dropped: the relays would refuse them.
-    pub fn set_unhealthy(&self, unhealthy: &BTreeSet<String>) {
+    /// Announces the datasets whose local storage is quarantined or rebuilding (#13 / B-14), and for those quarantined
+    /// only in part, the ranges that are (#103 / B-62). The relays publish them with this member's entry. Datasets the
+    /// member did not announce are dropped: the relays would refuse them.
+    pub fn set_unhealthy(
+        &self,
+        unhealthy: &BTreeSet<String>,
+        damaged: &BTreeMap<String, Vec<Range>>,
+    ) {
         let Some(member) = &self.member else { return };
-        let mut current = member.get();
-        let announced = current.datasets.clone();
-        current.unhealthy = unhealthy
+        let current = member.get();
+        let announced = |d: &String| current.datasets.contains(d) && unhealthy.contains(d);
+        let unhealthy: Vec<String> = unhealthy.iter().filter(|d| announced(d)).cloned().collect();
+        let damaged: Vec<pb::Damaged> = damaged
             .iter()
-            .filter(|d| announced.contains(d))
-            .cloned()
+            .filter(|(d, _)| announced(d))
+            .map(|(dataset, ranges)| pb::Damaged {
+                dataset: dataset.clone(),
+                spans: ranges
+                    .iter()
+                    .map(|r| pb::Span {
+                        start: r.0,
+                        end: r.1,
+                    })
+                    .collect(),
+            })
             .collect();
-        if current.unhealthy != member.get().unhealthy {
-            member.update(|m| m.unhealthy = current.unhealthy);
+        if (&unhealthy, &damaged) != (&current.unhealthy, &current.damaged) {
+            member.update(|m| {
+                m.unhealthy = unhealthy;
+                m.damaged = damaged;
+            });
         }
     }
 
@@ -560,7 +578,9 @@ impl Session {
     }
 }
 
-/// Makes one dataset's subscriptions install fresh verified bootstraps, as after a local storage failure.
+/// Makes one dataset's subscriptions, or those of some of its ranges, install fresh verified bootstraps, as after a local
+/// storage failure.
+#[derive(Clone)]
 pub struct Rebuilder {
     dataset: String,
     progress: Arc<Mutex<Progress>>,
@@ -569,14 +589,61 @@ pub struct Rebuilder {
 }
 
 impl Rebuilder {
+    /// `ranges` together with every L2 range this dataset's subscriptions hold in `engine` that overlaps them: a range
+    /// rebuilds through its whole subscription, so all of it must stay quarantined and be discarded (#103 / B-62).
+    pub fn widen(&self, engine: &dyn StorageEngine, ranges: &[Range]) -> StorageResult<Vec<Range>> {
+        let held = held(engine, &self.dataset).map_err(|status| {
+            crate::storage::StorageError::Unavailable(crate::storage::ErrorContext {
+                engine: "relay",
+                instance: self.dataset.clone(),
+                file: None,
+                partition: None,
+                detail: status.message().to_owned(),
+            })
+        })?;
+        let mut widened = ranges.to_vec();
+        widened.extend(
+            held.into_iter()
+                .filter(|h| ranges.iter().any(|r| ranges::overlaps(*r, *h))),
+        );
+        Ok(widened)
+    }
+
+    /// Removes every revision of the range subscriptions overlapping `ranges` from `engine`, whose records there were
+    /// discarded (#103 / B-62): a subscription started later, after a restart say, then bootstraps instead of resuming
+    /// from a position whose data is gone.
+    pub fn forget(&self, engine: &dyn StorageEngine, ranges: &[Range]) -> StorageResult<()> {
+        let prefix = format!("relay:range:{}:", self.dataset);
+        let markers = engine.snapshot()?.revisions_in(&[prefixed(&prefix)])?;
+        let mut batch = WriteBatch::default();
+        for name in markers.into_keys() {
+            let rest = &name[prefix.len()..];
+            let Some(range) = marker_range(rest) else {
+                continue;
+            };
+            if !ranges.iter().any(|r| ranges::overlaps(*r, range)) {
+                continue;
+            }
+            let names = Names::of(&self.dataset, &rest[34..], &[], Some(range));
+            for name in [names.active, names.revision, names.pending] {
+                batch.delete_revision(name);
+            }
+            batch.delete_revision(name);
+        }
+        engine.write(batch)
+    }
+
     /// Abandons each subscription's current coverage, recovers it from a new bootstrap, and returns once every one is
-    /// validated again: bootstrap checksum verified, then confirmed through the relay's head. The caller bounds the wait.
-    pub async fn rebuild(&self) {
+    /// validated again: bootstrap checksum verified, then confirmed through the relay's head. With `ranges`, only the
+    /// range subscriptions overlapping them. The caller bounds the wait. A range no subscription covers waits for
+    /// nothing: its data was discarded and [`Rebuilder::forget`] removed its markers, so this node no longer holds it
+    /// and a later subscription bootstraps it (#103 / B-62).
+    pub async fn rebuild(&self, ranges: &[Range]) {
         let mut generation = 0;
         self.rebuilds.update(|requested| {
             let entry = requested.entry(self.dataset.clone()).or_default();
-            *entry += 1;
-            generation = *entry;
+            *entry = (entry.0 + 1, ranges.to_vec());
+            generation = entry.0;
         });
         loop {
             let seen = self.changes.get();
@@ -585,7 +652,9 @@ impl Rebuilder {
                 let rebuilt = state
                     .scopes
                     .iter()
-                    .filter(|((dataset, _, _), _)| *dataset == self.dataset)
+                    .filter(|((dataset, _, span), _)| {
+                        *dataset == self.dataset && covers(ranges, *span)
+                    })
                     .all(|(scope, (_, _, validated))| {
                         *validated && state.rebuilt.get(scope) >= Some(&generation)
                     });
@@ -625,6 +694,11 @@ struct Consumer {
     bootstrap: Option<BootstrapState>,
     /// The rebuild generation this consumer has started recovering for.
     rebuild: u64,
+}
+
+/// Whether a rebuild of `ranges` (all when empty) covers a scope over `span` (a whole namespace when `None`).
+fn covers(ranges: &[Range], span: Option<Range>) -> bool {
+    ranges.is_empty() || span.is_some_and(|span| ranges.iter().any(|r| ranges::overlaps(*r, span)))
 }
 
 /// Whether `status` came from this process's own storage, as [`storage`] marks it.
@@ -816,19 +890,21 @@ impl Consumer {
         self.recover |= self.awaiting_confirmation;
     }
 
-    /// Whether a rebuild of this consumer's dataset was requested since it last started one.
-    fn rebuild_requested(&self, requested: &BTreeMap<String, u64>) -> bool {
+    /// Whether a rebuild covering this consumer was requested since it last started one.
+    fn rebuild_requested(&self, requested: &BTreeMap<String, (u64, Vec<Range>)>) -> bool {
         requested
             .get(&self.target.selection.dataset)
-            .is_some_and(|generation| *generation > self.rebuild)
+            .is_some_and(|(generation, ranges)| {
+                *generation > self.rebuild && covers(ranges, self.target.span)
+            })
     }
 
     /// Starts recovering for a requested rebuild: no coverage counts until a fresh bootstrap installs.
-    fn start_rebuild(&mut self, requested: &BTreeMap<String, u64>) -> bool {
+    fn start_rebuild(&mut self, requested: &BTreeMap<String, (u64, Vec<Range>)>) -> bool {
         if !self.rebuild_requested(requested) {
             return false;
         }
-        self.rebuild = requested[&self.target.selection.dataset];
+        self.rebuild = requested[&self.target.selection.dataset].0;
         self.recover = true;
         self.bootstrap = None;
         true
@@ -1688,8 +1764,10 @@ async fn settle(
             for change in &plan.changed {
                 let unhealthy = members
                     .values()
-                    .filter(|member| member.unhealthy.contains(&dataset))
-                    .map(|member| member.node_id.clone())
+                    .filter_map(|member| {
+                        let ranges = crate::membership::quarantined(member, &dataset)?;
+                        Some((member.node_id.clone(), ranges))
+                    })
                     .collect();
                 let confirmed =
                     ranges::confirm(directories.get(&dataset), &node, change, &unhealthy);
@@ -2134,11 +2212,18 @@ impl Intake {
 
     /// Takes the retries to send now. A quarantined engine refuses every install until its rebuild starts, and starting
     /// it requests again, so those wait: each request would hold one of the relay's few recovery slots for nothing,
-    /// starving other recoveries, including this node's rebuild of another dataset.
+    /// starving other recoveries, including this node's rebuild of another dataset. Once a quarantine is narrowed to some
+    /// ranges (#103 / B-62), only the scopes overlapping them wait, which a read at the range's first key tells.
     fn due(&mut self, consumers: &BTreeMap<Scope, Consumer>) -> BTreeSet<Scope> {
         let (due, held) = std::mem::take(&mut self.retries)
             .into_iter()
-            .partition(|scope| consumers[scope].target.engine.health().is_ok());
+            .partition(|scope| {
+                let target = &consumers[scope].target;
+                target.engine.health().is_ok()
+                    && target.span.is_none_or(|(start, end)| {
+                        target.engine.get(&l2_span(start, end).start).is_ok()
+                    })
+            });
         self.retries = held;
         due
     }

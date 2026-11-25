@@ -7,7 +7,7 @@
 //! Ranges also merge (#66 / B-61, `docs/spec/merge.tla`): a pushed range made of several kept parts joins their consumers
 //! once each namespace's are at the same revision, and one with gaps bootstraps whole over them.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use tonic::Status;
 
@@ -30,7 +30,7 @@ pub fn within(inner: Range, outer: Range) -> bool {
     inner.0 >= outer.0 && end(inner) <= end(outer)
 }
 
-pub(super) fn overlaps(a: Range, b: Range) -> bool {
+pub(crate) fn overlaps(a: Range, b: Range) -> bool {
     u128::from(a.0) < end(b) && u128::from(b.0) < end(a)
 }
 
@@ -167,14 +167,30 @@ fn intersection(a: Range, b: Range) -> Range {
     (start, stop)
 }
 
+/// Nodes whose copy of a dataset is quarantined, each with the quarantined ranges, or none for all of it
+/// ([`crate::membership::quarantined`]).
+pub type Unhealthy = BTreeMap<String, Vec<Range>>;
+
+/// Whether a copy whose `quarantined` ranges are these (all of it when empty) may not serve `range`.
+pub fn hits(quarantined: &[Range], range: Range) -> bool {
+    quarantined.is_empty() || quarantined.iter().any(|r| overlaps(*r, range))
+}
+
+/// Whether `node`'s copy of `range` is quarantined in `unhealthy`.
+pub fn sick(unhealthy: &Unhealthy, node: &str, range: Range) -> bool {
+    unhealthy
+        .get(node)
+        .is_some_and(|quarantined| hits(quarantined, range))
+}
+
 /// Whether `node`'s own directory view confirms dropping `range`: every directory range overlapping it no longer lists
-/// the node, in any state, and has another owner `ready`. Returns a reason to refuse if the directory is missing,
-/// no directory range overlaps, or an overlapping range fails those checks.
+/// the node, in any state, and has another owner `ready` whose copy of that part is not quarantined. Returns a reason to
+/// refuse if the directory is missing, no directory range overlaps, or an overlapping range fails those checks.
 fn confirms(
     directory: Option<&Directory>,
     node: &str,
     range: Range,
-    unhealthy: &BTreeSet<String>,
+    unhealthy: &Unhealthy,
 ) -> Result<(), String> {
     let directory = directory.ok_or("the directory view has no ranges for the dataset")?;
     let mut entries = directory.iter().peekable();
@@ -189,9 +205,10 @@ fn confirms(
             return Err(format!("still an owner of range {start:016x}"));
         }
         // An unhealthy owner's copy may be the damaged one, so it cannot be why this one goes.
+        let part = intersection(entry, range);
         if !owners
             .iter()
-            .any(|o| o.state == State::Ready && !unhealthy.contains(&o.node))
+            .any(|o| o.state == State::Ready && !sick(unhealthy, &o.node, part))
         {
             return Err(format!("range {start:016x} has no ready owner"));
         }
@@ -217,7 +234,7 @@ pub fn confirm<'a>(
     directory: Option<&Directory>,
     node: &str,
     change: &'a Change,
-    unhealthy: &BTreeSet<String>,
+    unhealthy: &Unhealthy,
 ) -> Result<Confirmed<'a>, String> {
     change
         .dropped

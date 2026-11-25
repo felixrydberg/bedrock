@@ -2,7 +2,10 @@
 # Checks the TLA+ models in docs/spec with TLC (#25 / B-23 Layer 1): every model's config must pass, and every
 # deliberate bug must break the invariant it names, checked alone so no other invariant fires first.
 #
-#   scripts/tlc.sh          Every model, then every bug: about 2 hours, mostly the volume configs (2 workers).
+#   scripts/tlc.sh          Every model, then every bug: many hours since per-point health (#103 / B-62); `handoff` alone
+#                           took 2 hours at 4 workers, and `handoff-volume-faulty` did not finish in 2.5 (membership.md).
+#                           It leaves out handoff-ranges, which did not finish (its bugs only run with it).
+#   scripts/tlc.sh handoff-ranges   That model and its bugs.
 #   scripts/tlc.sh bugs     Only the bugs: about 40 minutes, mostly volume-base's previous.
 #   scripts/tlc.sh relays   One model and its bugs.
 #
@@ -46,6 +49,76 @@ materialized crash OrderedPositions
 materialized cleanup YoungEventsSurvive
 materialized retry RetryProtection
 materialized event PendingRetained
+kv_actor bulk AtomicBuffered
+kv_actor torn AtomicCommitted
+kv_actor ack NoLostAck
+kv_actor claim AtomicCommitted
+kv_actor bytes ExactQuota
+kv_actor quota ExactQuota
+kv_actor retry-drop RetryProtection
+kv_actor retry-expiry AtomicCommitted
+kv_actor retry-result RetryOriginalResult
+kv_actor retry-time RetryOriginalResult
+kv_actor staged-retry AtomicBuffered
+kv_actor staged-event AtomicBuffered
+kv_actor events YoungEventsSurvive
+kv_actor cache-regress CacheMonotonic
+kv_actor cache-ttl CacheLifetime
+kv_actor minimum ReadMinimum
+kv_actor expired ReadVisibility
+kv_actor-local bulk AtomicBuffered
+kv_actor-local torn AtomicCommitted
+kv_actor-local ack NoLostAck
+kv_actor-local claim AtomicCommitted
+kv_actor-local bytes ExactQuota
+kv_actor-local quota ExactQuota
+kv_actor-local retry-drop RetryProtection
+kv_actor-local retry-expiry AtomicCommitted
+kv_actor-local retry-result RetryOriginalResult
+kv_actor-local retry-time RetryOriginalResult
+kv_actor-local staged-retry AtomicBuffered
+kv_actor-local staged-event AtomicBuffered
+kv_actor-local events YoungEventsSurvive
+kv_actor-local cache-regress CacheMonotonic
+kv_actor-local cache-ttl CacheLifetime
+kv_actor-local minimum ReadMinimum
+kv_actor-local expired ReadVisibility
+kv_actor-overwrite bulk AtomicBuffered
+kv_actor-overwrite torn AtomicCommitted
+kv_actor-overwrite ack NoLostAck
+kv_actor-overwrite claim AtomicCommitted
+kv_actor-overwrite bytes ExactQuota
+kv_actor-overwrite quota ExactQuota
+kv_actor-overwrite retry-drop RetryProtection
+kv_actor-overwrite retry-expiry AtomicCommitted
+kv_actor-overwrite retry-result RetryOriginalResult
+kv_actor-overwrite retry-time RetryOriginalResult
+kv_actor-overwrite staged-retry AtomicBuffered
+kv_actor-overwrite staged-event AtomicBuffered
+kv_actor-overwrite events YoungEventsSurvive
+kv_actor-overwrite cache-regress CacheMonotonic
+kv_actor-overwrite cache-ttl CacheLifetime
+kv_actor-overwrite minimum ReadMinimum
+kv_actor-overwrite expired ReadVisibility
+kv_actor-review bulk AtomicBuffered
+kv_actor-review torn AtomicCommitted
+kv_actor-review ack NoLostAck
+kv_actor-review claim AtomicCommitted
+kv_actor-review bytes ExactQuota
+kv_actor-review quota ExactQuota
+kv_actor-review retry-drop RetryProtection
+kv_actor-review retry-expiry AtomicCommitted
+kv_actor-review retry-result RetryOriginalResult
+kv_actor-review retry-time RetryOriginalResult
+kv_actor-review staged-retry AtomicBuffered
+kv_actor-review staged-event AtomicBuffered
+kv_actor-review events YoungEventsSurvive
+kv_actor-review cache-regress CacheMonotonic
+kv_actor-review cache-ttl CacheLifetime
+kv_actor-review minimum ReadMinimum
+kv_actor-review expired ReadVisibility
+kv_admission admin-bypass PurgeAuthorized
+kv_admission stale-floor KnownDeletionFences
 publisher unconditional NoLostUpdate
 publisher unconditional NoRegression
 publisher ahead ViewsLag
@@ -60,6 +133,7 @@ membership early-drop NoDropBeforeReady
 membership early-removal NoEarlyRemoval
 membership minority-write Freeze
 membership merge-unequal NoDropBeforeReady
+membership range-only NoUnhealthyRouting
 service_isolation global-freeze HealthyServiceEnabled
 service_isolation stale-clock ClockBound
 service_isolation stale-clock NoEarlyRemoval
@@ -73,6 +147,10 @@ handoff absent NewOwnersPublished
 handoff early-drop NoDropBeforeReady
 handoff any-ready KeepsHealthyHolder
 handoff minority-write Freeze
+handoff-ranges start-only KeepsHealthyHolder
+handoff-ranges unverified DamageRefused
+handoff-ranges-restart forget DamageRefused
+handoff-ranges-restart unverified DamageRefused
 handoff-volume early-report ReadyCopied
 handoff-volume no-gen ReadyCopied
 handoff-volume-split early-report ReadyCopied
@@ -103,7 +181,9 @@ volume-delete-handoff undelete DeletedNeverServes
 volume-delete-truncate undelete DeletedNeverServes
 volume_cold-split no-retire NoLostFlush
 volume_cold-split no-cas NoLostFlush
+volume_cold-split prefix-truncate NoLostFlush
 volume_cold-move no-adopt Consistent
+volume_cold-move prefix-truncate NoLostFlush
 cells unchecked ListedLive
 cells sticky ListedLive
 cells unscoped ServedInTarget
@@ -163,7 +243,7 @@ bug() {
     fi
 }
 
-models="alarms relays cells follows merge materialized publisher membership service_isolation handoff handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
+models="alarms relays cells follows merge materialized kv_actor kv_actor-local kv_actor-overwrite kv_actor-review kv_admission publisher membership service_isolation handoff handoff-ranges-restart handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

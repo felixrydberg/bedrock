@@ -241,6 +241,8 @@ impl Placement for Cells {
                         .map_err(|e| Status::unavailable(e.to_string()))?;
                     let call = async move {
                         pb::volume_client::VolumeClient::new(channel)
+                            .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+                            .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
                             .truncate(request)
                             .await
                     };
@@ -383,6 +385,8 @@ impl crate::repair::Peers for Cells {
             .map_err(|e| Status::unavailable(e.to_string()))?;
         let call = async move {
             pb::volume_client::VolumeClient::new(channel)
+                .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
                 .repair(request)
                 .await
         };

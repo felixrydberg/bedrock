@@ -422,7 +422,8 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
         &[AUTHORIZATION],
     )
     .await;
-    assert_eq!((status, sequence), (StatusCode::OK, "1".into()));
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(sequence.contains("KV actor API"));
     assert_eq!(
         writer
             .bootstrap("kv", "customer")
@@ -430,7 +431,7 @@ async fn http_writes_commit_once_and_reach_subscribers_in_order() {
             .unwrap()
             .values
             .get(b"key".as_slice()),
-        Some(&b"value".to_vec())
+        None
     );
     writer.close().await.unwrap();
 }

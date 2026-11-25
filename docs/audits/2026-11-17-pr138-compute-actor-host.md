@@ -9,7 +9,7 @@ base: f7aa02b4e017 (main; merge-base 011ebd7c with the PR head)
 head: 0fc59a37d0d4
 audited: 2026-11-17
 kind: technical-decision audit — read-only, independent; not a code review, no verdict
-open: 10
+open: 9
 principles: ARCHITECTURAL-PRINCIPLES.md, suggested defaults (unchanged); P-* ids cited below
 not-verified: madsim scenario never run by me (not buildable on this Windows host; CI sets no --cfg madsim), cargo fmt/clippy/test not run locally, no production wiring traced (no binary/relay/Gateway exists), S-05 flush/truncation behaviour for page loss
 
@@ -89,7 +89,8 @@ settled-by: a recorded owner plus a version or prefix decision, and a test openi
 question: who owns the actor storage format, and what is the migration path when S-10's KV API becomes a hidden SQLite table?
 
 F3 — One quorum round trip per transaction and a ~750-page ceiling
-status: open
+status: answered
+answer: 2026-11-24 — #126 / S-18 preserves one atomic entry per transaction and raises its cap to 224 MiB, with a 256 MiB byte-bounded append window. The user approved retaining 25 MiB values and 100 MiB bulks. Real HTTP/2 committed a 209,709,211-byte bulk-plus-event entry in 1,404 ms locally; an oversized SQLite transaction still rolls back in the host simulation. See [S-18 validation](../implementation-prototype/statefull/s18-validation.md); remote latency remains pending deployment checks.
 decision: C2
 defensible: simplest construction that satisfies "no response precedes its commit"; limits recorded as known limits in the issue amendment
 contestable: the ceiling lands before D1/Queues exist; TooLarge is a permanent error, not backpressure (P-CPLX-2, P-COMPAT-1)

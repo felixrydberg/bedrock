@@ -144,7 +144,7 @@ where
         .build()
 }
 
-/// Built-in `kv`: each event commits the counter plus one and answers "{host}#{instance} {counter}", where `instance`
+/// A test D1 handler: each event commits the counter plus one and answers "{host}#{instance} {counter}", where `instance`
 /// counts the instances this process started.
 struct Counter {
     instance: String,
@@ -196,7 +196,7 @@ fn compute(ip: &'static str) -> NodeHandle {
                 node: node(&compute_name(ip), ip),
                 relays: addresses(&RELAYS),
             },
-            Arc::new(RustExecutor::new([(Kind::Kv, counter)])),
+            Arc::new(RustExecutor::new([(Kind::D1, counter)])),
         )
     })
 }
@@ -373,7 +373,7 @@ async fn scenario() -> Vec<String> {
     let actor = pb::Actor {
         namespace: "ns".into(),
         id: id.to_string(),
-        kind: Kind::Kv as i32,
+        kind: Kind::D1 as i32,
     };
 
     handle

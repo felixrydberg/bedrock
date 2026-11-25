@@ -1,8 +1,10 @@
 //! `bedrock-kv`: customer KV. It hosts no relay-fed datasets; it only joins the cell membership as service `kv`.
 //! It reads the namespace directory from Quicksilver through the shared client and, with `manage_listen` set, serves
-//! namespace management ([`namespaces::routes`]). Home-region namespaces are read from S3 through [`storage::Readers`].
+//! namespace management and values. Cache misses route through the Gateway to the namespace actor; this service
+//! never reads a namespace database from S3 or subscribes to its data.
 
 pub mod namespaces;
+pub mod operations;
 pub mod storage;
 
 use std::fmt;
@@ -11,11 +13,7 @@ use std::sync::Arc;
 
 use bedrock_lib::membership;
 use bedrock_lib::node::{self, ConfigError, NodeConfig, ServiceConfig};
-use bedrock_lib::s3::S3Config;
 use serde::Deserialize;
-
-/// How often idle readers are closed and retired ones released.
-const SWEEP: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Clone, Deserialize)]
 pub struct KvConfig {
@@ -28,10 +26,6 @@ pub struct KvConfig {
     /// `bedrock-api`'s write credential, required with `manage_listen`.
     #[serde(default)]
     pub write_token: Option<String>,
-    /// The bucket `bedrock-api` writes namespace databases to; readers only read it, except for their managed
-    /// checkpoints and purges. Required outside simulation.
-    #[serde(default)]
-    pub s3: Option<S3Config>,
 }
 
 impl From<ServiceConfig> for KvConfig {
@@ -40,7 +34,6 @@ impl From<ServiceConfig> for KvConfig {
             service,
             manage_listen: None,
             write_token: None,
-            s3: None,
         }
     }
 }
@@ -60,7 +53,6 @@ impl fmt::Debug for KvConfig {
                 "write_token",
                 &self.write_token.as_ref().map(|_| "<redacted>"),
             )
-            .field("s3", &self.s3)
             .finish()
     }
 }
@@ -72,7 +64,6 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         service: config,
         manage_listen,
         write_token,
-        s3,
     } = config;
     config.validate()?;
     check_hosts_nothing_pushed(&config)?;
@@ -80,21 +71,14 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         return Err(ConfigError("manage_listen requires write_token".into()));
     }
     tracing::info!(node_id = %config.node.node_id, "starting bedrock-kv");
-    // ponytail: roles are only logged; the read path (B-27) decides what l1 and l2 serve.
+    // Every role uses the cell value cache; a process-local L1 is optional.
     for role in &config.roles {
         tracing::info!(?role, "role enabled");
     }
     let memory_mb = config.node.budget.memory_mb.unwrap_or(1024);
-    let factory = namespace_factory(s3.as_ref(), memory_mb)?;
     let admin = node::start_admin(&config.node).await?;
-    let readers = storage::Readers::new(
-        &admin,
-        factory,
-        config.node.location.region.clone(),
-        config.node.location.cell.clone(),
-        storage::max_open(memory_mb),
-    );
     let (members, target) = membership::View::new("kv", &config.node.location.cell);
+    let members = Arc::new(members);
     let tls = bedrock_lib::transport::tls::start(&config.node, "kv", &admin).await?;
     let peers = Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(tls.clone()));
     let session = bedrock_lib::relays::client::Session::join(
@@ -113,20 +97,38 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         config.relays.clone(),
         config.node.location.failure_domain.clone(),
     ));
+    let directory_view = Arc::new(bedrock_lib::kv::DirectoryView::new(client));
+    let values = Arc::new(operations::Values::new(
+        &admin,
+        directory_view.clone(),
+        members.clone(),
+        peers.clone(),
+        config.node.node_id.clone(),
+        config.node.location.cell.clone(),
+        memory_mb.saturating_mul(1024 * 1024) / 2,
+    ));
+    let router = bedrock_lib::transport::server(tls.as_ref()).add_service(
+        bedrock_lib::replication::pb::reads_server::ReadsServer::new((*values).clone())
+            .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES),
+    );
+    let mut serving = bedrock_lib::transport::serve(router, config.node.listen, tls.clone());
     let manage = match (manage_listen, write_token) {
         (Some(listen), Some(token)) => {
             let directory = Arc::new(namespaces::Directory::new(
                 &admin,
-                client,
+                directory_view,
                 namespaces::Api {
                     address: config.api.clone(),
                     token: token.clone(),
                     tls: tls.clone(),
                 },
-                readers.clone(),
                 config.node.location.region.clone(),
             ));
-            let app = bedrock_lib::http::bearer(namespaces::routes(directory), &token)?;
+            let app = bedrock_lib::http::bearer(
+                namespaces::routes(directory).merge(operations::routes(values)),
+                &token,
+            )?;
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .map_err(|e| ConfigError(format!("manage_listen {listen}: {e}")))?;
@@ -135,22 +137,14 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         _ => None,
     };
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
-    // Its own task, so a slow reader close never delays readiness or shutdown. Cancelled at shutdown: readers write no
-    // data, and an unclosed reader's checkpoint expires on its own.
-    let sweeping = tokio::spawn({
-        let readers = readers.clone();
-        async move {
-            let mut sweep = tokio::time::interval(SWEEP);
-            loop {
-                sweep.tick().await;
-                readers.sweep().await;
-            }
-        }
-    });
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
         tokio::select! {biased;
             ()=&mut shutdown=>break,
+            served=&mut serving=>{
+                served.map_err(|e| ConfigError(format!("listen {}: {e}", config.node.listen)))?;
+                break;
+            },
             _=readiness.tick()=>{
                 admin.set_ready(session.ready());
                 if let Err(error)=members.refresh(&session,&peers){
@@ -160,36 +154,13 @@ pub async fn run(config: KvConfig) -> Result<(), ConfigError> {
         }
     }
     admin.set_ready(false);
-    sweeping.abort();
     if let Some(manage) = manage {
         manage.abort();
     }
     session.drain().await;
+    serving.close().await;
     tracing::info!("shutting down");
     Ok(())
-}
-
-/// The namespace databases `bedrock-api` writes, read through one block cache of a quarter of the memory budget.
-#[cfg(not(madsim))]
-fn namespace_factory(
-    s3: Option<&S3Config>,
-    memory_mb: u64,
-) -> Result<Arc<dyn bedrock_lib::storage::namespace::NamespaceFactory>, ConfigError> {
-    let s3 = s3.ok_or_else(|| ConfigError("bedrock-kv needs [s3] to read namespaces".into()))?;
-    let store =
-        bedrock_lib::s3::object_store(s3).map_err(|error| ConfigError(error.to_string()))?;
-    Ok(Arc::new(
-        bedrock_lib::storage::slate::SlateFactory::new(store)
-            .with_reader_cache_bytes(memory_mb * 1024 * 1024 / 4),
-    ))
-}
-
-#[cfg(madsim)]
-fn namespace_factory(
-    _: Option<&S3Config>,
-    _: u64,
-) -> Result<Arc<dyn bedrock_lib::storage::namespace::NamespaceFactory>, ConfigError> {
-    Ok(bedrock_lib::sim::namespaces())
 }
 
 /// Customer KV has no pushed data; Quicksilver and CDN have separate binaries.

@@ -295,7 +295,7 @@ fn spawn_member(
                                 state.revision.store(revision, Ordering::Relaxed);
                             }
                             view.refresh(&session, &peers).unwrap();
-                            session.set_unhealthy(&storage.unhealthy());
+                            session.set_unhealthy(&storage.unhealthy(), &storage.damaged());
                         },
                     }
                 }

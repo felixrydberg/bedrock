@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bedrock_sim::history::{
     History, KEPT, OwnerState, Placement, Stream, Violation, check_coverage, check_handoff,
-    check_held, check_routing,
+    check_handoff_by, check_held, check_routing,
 };
 
 fn stream() -> Stream {
@@ -320,6 +320,35 @@ fn no_drop_before_ready_fires_when_only_populating_owners_remain() {
         invariant(check_handoff(&before, &after, &members(&["a", "b"]))),
         "NoDropBeforeReady"
     );
+}
+
+/// An owner quarantined on part of its range still holds the rest, which must keep a serving owner (#103 / B-62).
+#[test]
+fn no_drop_before_ready_checks_the_healthy_part_of_a_partly_quarantined_owner() {
+    let before = vec![((0, 0), owners(&[("a", Ready)]))];
+    let quarantined = |owner: &str| {
+        if owner == "a" {
+            vec![(10, 20)]
+        } else {
+            Vec::new()
+        }
+    };
+    let after = vec![
+        ((0, HALF), owners(&[("a", Ready)])),
+        ((HALF, 0), owners(&[("b", Populating)])),
+    ];
+    assert_eq!(
+        invariant(check_handoff_by(&before, &after, quarantined)),
+        "NoDropBeforeReady"
+    );
+
+    // Only the quarantined piece lost its serving owner.
+    let after = vec![
+        ((0, 10), owners(&[("a", Ready)])),
+        ((10, 20), owners(&[("b", Populating)])),
+        ((20, 0), owners(&[("a", Ready)])),
+    ];
+    check_handoff_by(&before, &after, quarantined).unwrap();
 }
 
 #[test]

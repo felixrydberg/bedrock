@@ -12,14 +12,16 @@ require verified data and readiness; local consensus cannot make an incomplete c
 ## Protocol
 
 - **Handshake.** A leaf `Hello` carries a `Member`: node ID, service, region, DC, cell, roles, datasets,
-  CPU/memory/disk budget, failure domain, advertised address, status (`ready`/`draining`) and unhealthy
-  datasets. Later `RelayRequest.member` messages may change only the status and unhealthy datasets of the same
-  `(service, node_id)`. Relay-to-relay and recovery sessions carry no member. Identities are ASCII letters,
+  CPU/memory/disk budget, failure domain, advertised address, status (`ready`/`draining`), unhealthy
+  datasets and their damaged ranges. Later `RelayRequest.member` messages may change only the status, unhealthy
+  datasets, damaged ranges and range sizes of the same `(service, node_id)`. Relay-to-relay and recovery sessions carry no member. Identities are ASCII letters,
   digits, `-`, `_` and `.`.
 - **Storage health.** `Member.unhealthy` lists, in order, the member's own datasets whose local storage its
   process has quarantined or is rebuilding (`health::storage`). The session sends a member update when the list
   changes and the current list on every `Hello`. It is published like any other change to the entry. It is not a
-  heartbeat: it is sent only on change, on the stream the node already holds.
+  heartbeat: it is sent only on change, on the stream the node already holds. When a rebuild has verified the
+  instance and narrowed its quarantine to the L2 ranges holding the damage (#103 / B-62), `Member.damaged` names those
+  hash ranges for the dataset, which stays in `unhealthy`; an unhealthy dataset without them is quarantined whole.
 - **Relay view.** Each relay lists the members on its leaf sessions, the newest session winning a duplicate
   identity, with each subscription's acknowledged revision for range readiness (#22 / B-21). When a
   draining member's stream closes, the relay keeps it as relay-local `LEFT` for 30 seconds.
@@ -78,8 +80,9 @@ all membership changes until it returns.
   view or superseded leadership cannot overwrite newer state. A failed write abandons
   the rest of its plan: only a prefix of a plan may land, since a later write alone can leave part of the hash space
   unowned. `bedrock-quicksilver` places `quicksilver`; `bedrock-cdn` places `cdn`, whose ref keys sit at their artifact's content hash (B-34, §4 decision 14). Auth is not hosted or placed until the Gateway work. A
-  member announcing a dataset as unhealthy (#13 / B-14) gets no new ranges of it. It keeps what it holds, for B-22
-  to rebuild, and source selection skips it for the unhealthy datasets only.
+  member announcing a dataset as unhealthy (#13 / B-14) gets no new ranges of it, even when only some of its ranges
+  are damaged (user decision 2026-11-22). It keeps what it holds, for B-22 to rebuild, and source selection skips it
+  for the unhealthy datasets only, and only for hashes in its damaged ranges when it names them.
 - **Owner checks.** Nodes read the directory from `membership::View::directory`. `placement::owners` lists the owners
   of a hash; a node serves a hash only if it holds it as `ready` or `leaving` in its own view. A caller routed by a
   stale view is rejected and retries the next owner. Revisions are ordinary dataset revisions, not a placement
@@ -106,7 +109,9 @@ all membership changes until it returns.
    pushed set. It shares that ready bit with its siblings, never the acknowledgements; the publisher writes the
    owner `ready`.
 4. A `leaving` owner keeps following and serving. Once every other owner of the entry is `ready`, the publisher
-   removes it. An owner reporting the dataset unhealthy does not count: its copy may be the damaged one.
+   removes it. An owner reporting the dataset unhealthy does not count: its copy may be the damaged one. A member
+   confirming a revoke (step 5) counts an owner quarantined in part for the parts of the range outside its damaged
+   ranges.
 5. The relay then pushes a set without the range: that is the revoke. The member waits until its own view has
    reached the pushed revision, then confirms that the view no longer lists it for the range and lists another
    `ready` owner. It stops serving and following the range, deletes it with one `delete_range` over the hash span
@@ -311,7 +316,25 @@ uncapped configs keep both unlimited at shallower depth.
 - `OwnedOrLeaving`: once a node has processed a revoke its relay pushed, it no longer holds that point's data. A
   confirmed revoke deletes it, and a refused one makes the relay push again.
 - `KeepsHealthyHolder`: a directory write never lets go of a range's last healthy holder, even when an unhealthy
-  owner is listed as ready.
+  owner is listed as ready. Health is per point (#103 / B-62): `sick` is the set of points a member's storage
+  refuses and reports, all of them while the whole instance is quarantined. `Sicken(n, D)` damages points `D` (none
+  for an I/O failure) and quarantines every point; `Narrow(n, D)` keeps only points `D`, which must cover every
+  damaged one (the ghost `bad`); `Heal(n, h)` rebuilds point `h` in one step, so the model never shows a `ready` owner
+  whose discarded range is empty and kept out of service only by its refusal (`relays.tla` checks the re-bootstrap). A `Connect` may follow a restart, which reads
+  `sick` back from the quarantine record, or all points when it cannot be read as points.
+- `DamageRefused`: every damaged point stays refused from its damage until its rebuild, across restarts.
+
+Two configs check these with two points, so a range can be damaged in part. A relay-fed handoff of two points is too
+deep for TLC to reach a ready owner damaged in part (one run passed 17 million states at depth 18 without finishing), so
+`handoff-ranges.cfg` uses node-reported readiness, whose first directory write makes owners ready at once, with no
+disconnects. It has not finished either (15.5 million distinct states at depth 14 without a violation, 2026-11-22), so,
+like `handoff-volume-split`, it is left out of the default run. `handoff-ranges-restart.cfg` is relay-fed with one node,
+faulty revokes and two disconnects: narrowing, restarts and the damage ghost need no second node. Their bugs:
+`start-only` judges a range's health by its start alone and breaks `KeepsHealthyHolder` in `handoff-ranges`;
+`unverified` narrows to the reported failure without verifying and `forget` comes back from a restart healthy, and both
+break `DamageRefused`. In `membership.tla`, `Sicken`
+toggles one point; a member with any unhealthy point still gets no new ranges, and bug `range-only`, which lets it take
+a range clear of its unhealthy points, breaks `NoUnhealthyRouting`.
 - `DirectoryCoverage`, `NewOwnersPublished`, `NoDropBeforeReady` and `Freeze` as above, against the abstract
   membership.
 
@@ -401,6 +424,15 @@ With the `Sicken` action, which lets a member turn unhealthy, TLC checked on 202
 `handoff.cfg`: 396,310,318 generated and 34,143,510 distinct states, depth 51, no violation (23 min 44 s). With
 `MaxRev = 4`: 143,956,394 generated and 12,408,194 distinct states, no violation (8 min 13 s). `Bug = "any-ready"`,
 the deliberate bug where any ready owner counts, violates `KeepsHealthyHolder`.
+
+With per-point health (#103 / B-62), TLC 1.8.0 checked on 2026-11-22 and 2026-11-23 (4 workers, 4 GB heap):
+`handoff.cfg` 1,680,184,660 generated and 124,264,914 distinct states, depth 54, no violation (1 h 56 min), with all
+seven bugs caught; `membership.cfg` 10,868,256 distinct states, depth 26 (14 min), all twelve bugs caught, `range-only`
+included; `handoff-volume.cfg` 15,643,221 distinct states, depth 37 (11 min), both bugs caught;
+`handoff-ranges-restart.cfg` 9,948,040 distinct states, depth 32 (11 min), `forget` and `unverified` caught.
+`handoff-ranges.cfg` catches `start-only` (41,877 distinct states) and `unverified`; its full run passed 15.5 million
+distinct states at depth 14 without finishing. `handoff-volume-faulty.cfg` was stopped after 2.5 hours at 141,835,871
+distinct states, depth 26, with no violation: the new state made it too large to finish locally.
 
 `publisher.tla` covers what these models cannot: `membership.tla` writes atomically, but a real directory write is
 planned from a view and lands later, and any relay may plan. `publisher.cfg` passes 436 states; `Bug = "unconditional"`, a writer

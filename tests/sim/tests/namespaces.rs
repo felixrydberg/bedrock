@@ -407,6 +407,7 @@ async fn scenario() -> Vec<String> {
                 state: Lifecycle::Deleting as i32,
                 created_at: 1,
                 deleting_at: 0,
+                ..Default::default()
             };
             let request = hyper::Request::put(format!(
                 "/v1/quicksilver/infrastructure/kv/namespaces/{legacy}"
@@ -426,17 +427,67 @@ async fn scenario() -> Vec<String> {
             .unwrap();
             assert_eq!(status.as_u16(), 200);
             let legacy_path = format!("{mine}/{legacy}");
-            until("legacy delete", Duration::from_secs(60), 200, || {
+            let stamped = until("legacy delete", Duration::from_secs(60), 200, || {
                 call(kv_a, "DELETE", &legacy_path, "")
             })
             .await;
             sleep(PURGE_GRACE + Duration::from_secs(60)).await;
             let purge = format!("{legacy_path}/purge");
-            until("legacy purge", Duration::from_secs(60), 200, || {
-                call(kv_a, "POST", &purge, "")
-            })
+            // This fixture has no Compute/volume/Gateway: purge must preserve the directory until the actor's
+            // durable deletion succeeds. The complete actor lifecycle is exercised in kv_actor.rs.
+            let failed = until(
+                "purge needs the actor Gateway",
+                Duration::from_secs(60),
+                503,
+                || call(kv_a, "POST", &purge, ""),
+            )
             .await;
-            trace.push("legacy deletion purged".into());
+            assert!(
+                failed.to_string().contains("actor purge:"),
+                "503 must come from durable actor purge: {failed}"
+            );
+            let admin = bedrock_lib::admin::Admin::new();
+            let directory = bedrock_lib::client::Client::new(
+                &admin,
+                Arc::new(bedrock_lib::transport::Peers::new(&admin)),
+                CELLS[0]
+                    .1
+                    .iter()
+                    .map(|relay| format!("{relay}:7000"))
+                    .collect(),
+                String::new(),
+            );
+            let found = directory
+                .get(
+                    "quicksilver",
+                    "quicksilver",
+                    "infrastructure",
+                    &bedrock_kv::namespaces::key(&legacy),
+                    stamped["result"]["revision"].as_u64().unwrap(),
+                )
+                .await
+                .unwrap();
+            let preserved = Record::decode(
+                found
+                    .value
+                    .as_deref()
+                    .expect("actor purge failure preserves the authoritative directory record"),
+            )
+            .unwrap();
+            assert_eq!(preserved.state, Lifecycle::Deleting as i32);
+            assert!(
+                preserved.deleting_at > 0,
+                "legacy deletion was durably stamped before actor purge"
+            );
+            assert!(
+                databases
+                    .namespaces()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|(dataset, _)| dataset != "kv")
+            );
+            trace.push("purge waits for actor deletion".into());
             let unknown = call(kv_a, "GET", &format!("{mine}/{}", "0".repeat(32)), "").await;
             assert_eq!(unknown.0, 404);
             // A wrong token never reaches the directory.

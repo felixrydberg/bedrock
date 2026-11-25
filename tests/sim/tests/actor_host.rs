@@ -31,6 +31,7 @@ use bedrock_volume::serve::Service;
 use bedrock_volume::store::Store;
 use madsim::net::NetSim;
 use madsim::runtime::{Handle, NodeHandle, Runtime};
+use tokio::sync::Notify;
 use tokio::time::sleep;
 
 const SLOT_IPS: [&str; 3] = ["10.0.1.1", "10.0.1.2", "10.0.1.3"];
@@ -125,6 +126,26 @@ impl Instance for Counter {
     }
 }
 
+/// Holds one real event at the input gate until the test releases it.
+struct LatchedCounter {
+    counter: Counter,
+    started: Arc<Notify>,
+    resume: Arc<Notify>,
+}
+
+#[async_trait]
+impl Instance for LatchedCounter {
+    async fn invoke(&mut self, request: Vec<u8>) -> Result<Vec<u8>, Error> {
+        if request == b"block" {
+            self.started.notify_one();
+            self.resume.notified().await;
+            self.counter.invoke(b"incr".to_vec()).await
+        } else {
+            self.counter.invoke(request).await
+        }
+    }
+}
+
 /// Built-in `d1`: each event inserts a row through the SQLite VFS and answers the row count. `big` tries a row too
 /// large for one entry, ignores the failure and answers the count, which must not include it.
 struct Rows(Storage);
@@ -149,10 +170,10 @@ impl Rows {
 impl Instance for Rows {
     async fn invoke(&mut self, request: Vec<u8>) -> Result<Vec<u8>, Error> {
         let count = if request == b"big" {
-            let big = vec![1; 4 << 20];
+            let big = vec![1; volume::MAX_ENTRY_BYTES + 1];
             match self.count(Some(&big)).await {
                 Err(volume::Error::TooLarge(_)) => {}
-                other => panic!("a 4 MiB transaction: {:?}", other.map(|r| r.ok())),
+                other => panic!("an oversized transaction: {:?}", other.map(|r| r.ok())),
             }
             self.count(None).await?
         } else {
@@ -429,6 +450,97 @@ async fn cancelled(fingerprint: &Fingerprint, next: &mut usize, sandbox: &Arc<At
     Handle::current().kill(node.id());
 }
 
+/// Cancelling administrative deletion keeps the stopped actor reachable for cleanup and recovers its committed state.
+async fn cancelled_delete(fingerprint: &Fingerprint, next: &mut usize, sandbox: &Arc<AtomicUsize>) {
+    let target = actor(*next, Kind::Kv);
+    *next += 1;
+    let node = compute(*next);
+    *next += 1;
+    let sandbox = sandbox.clone();
+    let trace = node
+        .spawn(async move {
+            let started = Arc::new(Notify::new());
+            let resume = Arc::new(Notify::new());
+            let (signal, latch) = (started.clone(), resume.clone());
+            let counter: Handler = Arc::new(move |_, storage| {
+                Box::new(LatchedCounter {
+                    counter: Counter {
+                        storage,
+                        value: None,
+                    },
+                    started: signal.clone(),
+                    resume: latch.clone(),
+                })
+            });
+            let admin = Admin::new();
+            let volume = Host::start(
+                Arc::new(Peers::new(&admin)),
+                pb::Holder {
+                    cell: CELLS[0].into(),
+                    host: "cancel-delete".into(),
+                },
+            );
+            let host = ActorHost::new(
+                &admin,
+                CELLS[0],
+                "dc1",
+                volume,
+                Arc::new(Fixed),
+                Arc::new(RustExecutor::new([(Kind::Kv, counter)])),
+                Arc::new(Stub(sandbox)),
+            );
+            let awake = host.acquire(&target).await.unwrap();
+            let event = {
+                let awake = awake.clone();
+                tokio::spawn(async move { awake.invoke(b"block".to_vec()).await })
+            };
+            started.notified().await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), host.delete(&target))
+                    .await
+                    .is_err(),
+                "deletion must wait for the active input gate"
+            );
+            assert_eq!(
+                host.awake().await,
+                1,
+                "cancelled deletion lost the actor before gate cleanup"
+            );
+            assert!(
+                !awake.serving(),
+                "deletion stops output before waiting for the gate"
+            );
+            resume.notify_one();
+            assert!(
+                event.await.unwrap().is_err(),
+                "the stopped event must not answer"
+            );
+            let recovered = host.acquire(&target).await.unwrap();
+            assert!(
+                !Arc::ptr_eq(&awake, &recovered),
+                "a stopped instance must be recovered"
+            );
+            assert_eq!(
+                number(&recovered.invoke(b"incr".to_vec()).await.unwrap()),
+                2,
+                "recovery reads the committed event from the slots"
+            );
+            sleep(Duration::from_secs(12)).await;
+            assert_eq!(
+                host.awake().await,
+                0,
+                "the retained actor remains eligible for normal idle cleanup"
+            );
+            let next = number(&call(&host, &target, b"incr").await);
+            assert_eq!(next, 3, "idle reacquisition recovers the next commit");
+            next
+        })
+        .await
+        .unwrap();
+    fingerprint.mix(("cancelled delete", trace));
+    Handle::current().kill(node.id());
+}
+
 /// A customer-code actor starts in the sandbox stub through the same seam; an unregistered built-in kind fails without
 /// reaching it.
 async fn seam(fingerprint: &Fingerprint, next: &mut usize, sandbox: &Arc<AtomicUsize>) {
@@ -473,6 +585,7 @@ async fn scenario() -> u64 {
     race(&fingerprint, &mut next, &sandbox).await;
     cut_off(&fingerprint, &mut next, &sandbox, &slots).await;
     cancelled(&fingerprint, &mut next, &sandbox).await;
+    cancelled_delete(&fingerprint, &mut next, &sandbox).await;
     seam(&fingerprint, &mut next, &sandbox).await;
     for node in &slots {
         Handle::current().kill(node.id());

@@ -212,6 +212,28 @@ async fn holders_with_unhealthy_storage_are_skipped_for_that_dataset_only() {
     assert_eq!(pick("quicksilver"), ["a", "b"]);
 }
 
+/// #103 / B-62: a holder quarantined in part is skipped only for hashes in its quarantined ranges.
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn holders_quarantined_in_part_are_skipped_only_there() {
+    let health = Health::new(&Admin::new());
+    let mut members = members(&[("a", ""), ("b", "")]);
+    let a = members.get_mut("a").unwrap();
+    a.unhealthy = vec!["auth".into()];
+    a.damaged = vec![pb::Damaged {
+        dataset: "auth".into(),
+        spans: vec![pb::Span {
+            start: H,
+            end: H + 1,
+        }],
+    }];
+    let dir = directory(vec![owner("a", State::Ready), owner("b", State::Ready)]);
+    let sources = Sources::default();
+    let pick = |hash| ids(&sources.select(&members, &dir, &health, "", "auth", "ns", hash, 0));
+    assert_eq!(pick(H), ["b"]);
+    assert_eq!(pick(H + 1), ["a", "b"]);
+}
+
 #[cfg_attr(not(madsim), tokio::test(start_paused = true))]
 #[cfg_attr(madsim, tokio::test)]
 async fn kv_readers_fail_over_to_the_next_ranked() {
