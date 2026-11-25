@@ -17,6 +17,8 @@ pub const SERVICES: [&str; 6] = [QUICKSILVER, KV, CDN, VOLUME, GATEWAY, COMPUTE]
 struct Capability {
     dataset: &'static str,
     pushed: bool,
+    /// Every cell must hold the complete dataset, and reports when it does not (#87 / B-40).
+    full_replica: bool,
     namespaces: &'static [&'static str],
     ranged_service: Option<&'static str>,
 }
@@ -26,24 +28,28 @@ const CAPABILITIES: &[Capability] = &[
     Capability {
         dataset: QUICKSILVER,
         pushed: true,
+        full_replica: true,
         namespaces: &["infrastructure"],
         ranged_service: Some(QUICKSILVER),
     },
     Capability {
         dataset: AUTH,
         pushed: true,
+        full_replica: true,
         namespaces: &["keys"],
         ranged_service: None,
     },
     Capability {
         dataset: CDN,
         pushed: true,
+        full_replica: false,
         namespaces: &["pages", "workers"],
         ranged_service: Some(CDN),
     },
     Capability {
         dataset: KV,
         pushed: false,
+        full_replica: false,
         namespaces: &[],
         ranged_service: None,
     },
@@ -52,12 +58,14 @@ const CAPABILITIES: &[Capability] = &[
     Capability {
         dataset: VOLUME,
         pushed: false,
+        full_replica: false,
         namespaces: &[],
         ranged_service: Some(VOLUME),
     },
     Capability {
         dataset: MEMBERSHIP,
         pushed: true,
+        full_replica: false,
         namespaces: &[],
         ranged_service: None,
     },
@@ -67,6 +75,13 @@ pub fn pushed(dataset: &str) -> bool {
     CAPABILITIES
         .iter()
         .any(|capability| capability.dataset == dataset && capability.pushed)
+}
+
+/// `full_replica` datasets: the Quicksilver binary's policy (`bedrock_quicksilver::DATASETS`), visible to relays.
+pub fn full_replica(dataset: &str) -> bool {
+    CAPABILITIES
+        .iter()
+        .any(|capability| capability.dataset == dataset && capability.full_replica)
 }
 
 pub fn namespaces(dataset: &str) -> &'static [&'static str] {

@@ -11,7 +11,7 @@
 
 ## Architecture boundaries
 
-- Put the shared distributed core in `crates/lib`. `quicksilver`, `kv`, `cdn`, `volume`, `compute` (planned, track O), `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
+- Put the shared distributed core in `crates/lib`. `quicksilver`, `kv`, `cdn`, `volume`, `compute` (track O), `relay` and `api` are separate binaries, depend on `lib`, and never depend on each other.
 - `bedrock-quicksilver` hosts `quicksilver`; `auth` serving awaits the future Gateway binary. `bedrock-kv` hosts customer `kv` only, with no virtual buckets and no dataset subscriptions; `bedrock-cdn` hosts `cdn` retention metadata and artifact bytes. Each subscribes only to its own datasets.
 - `bedrock-volume` stores actor slots (claims, quorum logs, overlays, alarm index) in relay-assigned `volume` hash ranges, which relays place but never stream. Its holders are Compute hosts; it subscribes to no dataset.
 - The write API and relays are generic over datasets. Retention is ordinary SET/DELETE replication interpreted only by CDN apply hooks.
@@ -85,9 +85,12 @@ The lead session plans, creates issues and starts issue sessions. Each issue is 
 - Preserve unrelated local work. Do not commit, publish or edit GitHub content when the user asked only for a draft.
 - Report the outcome, checks actually run and material limitations concisely.
 
-## Disk hygiene
+## Builds and disk hygiene
 
-- When you spawn a worker, worktree or test environment, or create a new `CARGO_TARGET_DIR`, clean up WSL space as part of the task. Delete only build caches and Docker artifacts that no running task uses, and list what you removed in the report.
+- Build in WSL (`wsl.exe -e bash -lc "..."`); Windows lacks libclang for RocksDB's bindings. The login shell's `~/.profile` sets `RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0` and `SCCACHE_CACHE_SIZE=40G`, so every build shares one content-addressed compiler cache in `~/.cache/sccache`. Never delete that cache; sccache evicts at its cap.
+- Give each checkout its own `CARGO_TARGET_DIR` under `~`, off the Windows drive: `~/bedrock-<issue>` for normal builds and `~/bedrock-<issue>-madsim` for `RUSTFLAGS="--cfg madsim"` builds, since a `RUSTFLAGS` change invalidates a target dir. Never point two checkouts, worktrees or temporary source copies at one target dir: cargo identifies workspace crates by their path relative to the workspace root and judges freshness by file times, so one checkout silently links another's code (verified 2026-11-20). sccache keys on source content and is safe to share.
+- With a warm cache a fresh target dir rebuilds quickly: RocksDB's C/C++ comes from sccache (a cold `bedrock-lib` build fell from 602 s to 142 s at `-j 2`). Rust crates do not hit across different target dirs, because their absolute paths are part of the key.
+- When you spawn a worker, worktree or test environment, or create a `CARGO_TARGET_DIR`, clean up WSL space as part of the task: delete the target dirs you created and Docker artifacts no running task uses, and list what you removed in the report.
 - Defer VHDX compaction to the user, or obtain explicit approval after affected work has stopped. To compact the distro's `ext4.vhdx` and Docker Desktop's `docker_data.vhdx`, quit Docker Desktop, run `wsl --shutdown`, then `Optimize-VHD -Mode Full` from an elevated PowerShell. Deleting alone does not return space to Windows.
 - Compaction needs an elevated shell. If you cannot run that step, say so in the report and leave it to the user.
 

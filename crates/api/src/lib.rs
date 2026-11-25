@@ -68,18 +68,19 @@ pub async fn run(config: ApiConfig) -> Result<(), ConfigError> {
             ),
         ),
     );
-    let replication = transport::serve(router, config.node.listen, tls);
+    let mut replication = transport::serve(router, config.node.listen, tls);
 
     admin.set_ready(true);
     tokio::select! {
         biased;
         () = node::shutdown_signal() => {}
-        served = replication => {
+        served = &mut replication => {
             served.map_err(|e| ConfigError(format!("listen {}: {e}", config.node.listen)))?;
         }
     }
     admin.set_ready(false);
     writes.abort();
+    replication.close().await;
     writer
         .close()
         .await

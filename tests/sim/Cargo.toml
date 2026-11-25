@@ -32,7 +32,7 @@ bedrock-api = { path = "../../crates/api" }
 bedrock-cdn = { path = "../../crates/cdn", features = ["test-support"] }
 bytes = "1"
 # Both builds: `tests/volume_client_limits.rs` needs real tonic's message limits.
-bedrock-compute = { path = "../../crates/compute" }
+bedrock-compute = { path = "../../crates/compute", features = ["test-support"] }
 bedrock-volume = { path = "../../crates/volume" }
 bedrock-lib = { workspace = true, features = ["test-support"] }
 http-body-util = "0.1"

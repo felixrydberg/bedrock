@@ -9,7 +9,7 @@ use crate::storage::{
 #[test]
 fn relay_capabilities_keep_delivery_placement_and_fixed_namespaces_distinct() {
     use capabilities::{
-        AUTH, CDN, KV, MEMBERSHIP, QUICKSILVER, namespaces, pushed, ranged_datasets,
+        AUTH, CDN, KV, MEMBERSHIP, QUICKSILVER, full_replica, namespaces, pushed, ranged_datasets,
     };
 
     assert!(pushed(QUICKSILVER) && pushed(AUTH) && pushed(CDN) && pushed(MEMBERSHIP));
@@ -21,6 +21,8 @@ fn relay_capabilities_keep_delivery_placement_and_fixed_namespaces_distinct() {
     );
     assert_eq!(ranged_datasets("cdn").collect::<Vec<_>>(), [CDN]);
     assert_eq!(ranged_datasets("kv").count(), 0);
+    assert!(full_replica(QUICKSILVER) && full_replica(AUTH));
+    assert!(!full_replica(CDN) && !full_replica(KV));
 }
 
 #[test]
@@ -92,6 +94,21 @@ fn namespace_overrides_replace_defaults() {
     assert!(!p.cache.l2_eviction);
     assert_eq!(p.replication, ReplicationPolicy::Global);
     assert_eq!(p.cache.pinned_prefixes, ["critical/"]);
+}
+
+#[test]
+fn full_replica_forbids_l2_eviction() {
+    let d = dataset("quicksilver");
+    let overrides = PolicyOverrides {
+        replication: Some(ReplicationPolicy::FullReplica),
+        l2_eviction: Some(true),
+        ..Default::default()
+    };
+    assert!(
+        !resolve(&d.defaults, &overrides, &Budget::default())
+            .cache
+            .l2_eviction
+    );
 }
 
 #[test]

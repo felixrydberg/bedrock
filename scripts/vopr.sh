@@ -15,12 +15,13 @@
 # memory figures are its, not glibc's: judge growth by its trend.
 # Each command builds what it runs. soak and watch use the `sim` profile, whose link-time optimisation runs seeds about 16%
 # faster but takes about a minute longer to build; the rest use `release`. VOPR_PROFILE overrides the choice. Builds go to
-# CARGO_TARGET_DIR, by default ~/bedrock-target-madsim-release: off the Windows drive, and apart from normal builds.
+# CARGO_TARGET_DIR, by default ~/bedrock-vopr-target-<checkout folder>: off the Windows drive, apart from normal builds,
+# and never shared between checkouts, which would link another checkout's crates (AGENTS.md "Builds and disk hygiene").
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 export RUSTFLAGS="--cfg madsim" RUSTDOCFLAGS="--cfg madsim"
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/bedrock-target-madsim-release}"
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/bedrock-vopr-target-$(basename "$PWD")}"
 export VOPR_REPORTS="${VOPR_REPORTS:-$HOME/bedrock-vopr/reports}"
 
 binary() {

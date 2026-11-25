@@ -218,15 +218,76 @@ pub fn server(tls: Option<&Arc<Tls>>) -> Server {
     }
 }
 
-/// Serves `router` on `addr`, over mutual TLS when `tls` is set.
-pub async fn serve(
+/// How long [`Listener::close`] lets accepted RPCs finish: below the 5 s slot lease, so a Compute host's events finish
+/// while it still holds their actors.
+pub const DRAIN: Duration = Duration::from_secs(4);
+
+/// Serves `router` on `addr`, over mutual TLS when `tls` is set. Await the listener for a listen failure, and
+/// [`Listener::close`] it at shutdown.
+pub fn serve(
     router: tonic::transport::server::Router,
     addr: std::net::SocketAddr,
     tls: Option<Arc<Tls>>,
-) -> Result<(), String> {
-    match tls {
-        Some(tls) => tls.serve(router, addr).await,
-        None => router.serve(addr).await.map_err(|e| e.to_string()),
+) -> Listener {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let stopped = async {
+        let _ = stopped.await;
+    };
+    let serving = Box::pin(async move {
+        match tls {
+            Some(tls) => tls.serve(router, addr, stopped).await,
+            None => router
+                .serve_with_shutdown(addr, stopped)
+                .await
+                .map_err(|e| e.to_string()),
+        }
+    });
+    Listener {
+        stop: Some(stop),
+        serving: Some(serving),
+    }
+}
+
+type Serving = std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+/// A gRPC listener from [`serve`]. As a future it ends only if serving fails.
+pub struct Listener {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    serving: Option<Serving>,
+}
+
+impl Future for Listener {
+    type Output = Result<(), String>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let Some(serving) = self.serving.as_mut() else {
+            return std::task::Poll::Pending;
+        };
+        let served = std::task::ready!(serving.as_mut().poll(cx));
+        self.serving = None;
+        std::task::Poll::Ready(served)
+    }
+}
+
+impl Listener {
+    /// Stops accepting connections and lets accepted RPCs finish for up to [`DRAIN`]; a streaming RPC holds it for all
+    /// of that. RPCs still running then are cut off when the process exits, as in a crash: their callers see the call
+    /// fail, and a write one made may have committed. Simulation builds stop at once and leave handlers running.
+    pub async fn close(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let Some(serving) = self.serving.take() else {
+            return;
+        };
+        match tokio::time::timeout(DRAIN, serving).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "listener failed while closing"),
+            Err(_) => tracing::warn!(drain = ?DRAIN, "RPCs still running at shutdown are cut off"),
+        }
     }
 }
 

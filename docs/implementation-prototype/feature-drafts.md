@@ -52,7 +52,7 @@ B-11 adds an asynchronous, SlateDB-based atomic S3 persistence contract in `lib/
 Track O reuses it for one S3 database per `volume` range, shared by many actors (amended 2026-11-14): the range's
 maintainer flushes to it and other slots read it through B-39's `Reader`.
 Quicksilver, Auth, relay replay and CDN retention continue using the local `StorageEngine` and pushed replication.
-`full_replica` completeness and CDN phase 3/4 items remain later work. Sequence compression is out of scope.
+Cell relays report `full_replica` completeness (B-40); CDN phase 3/4 items remain later work. Sequence compression is out of scope.
 
 ### Code structure followed
 
@@ -85,7 +85,7 @@ server runs every service, each service is its own process, and code is shared a
 | `bedrock-kv` | Customer `kv` read side: value caches, the REST API and namespace management; no hash ranges or buckets (§4 decisions 12, 16) | `l1`, `l2` (only logged until B-39) |
 | `bedrock-cdn` | Dataset `cdn` (path rows and ref keys) and artifact bytes: storage, transfer, regional L2 placement, serving | `l1`, `l2` (artifact cache roles) |
 | `bedrock-gateway` (planned, B-57) | Public entry point, internal routing between cells, API-key checks and the local `auth` copy (§4 decision 15); actor routing (S-08) | — (follows its relay's tier) |
-| `bedrock-compute` (planned, S-07) | One execution layer: sandboxed customer code (Workers, Durable Objects) and built-in `d1`, `kv`, `queue` and `cron` handlers in Rust; actor host; stateless Worker invocation (§4 decision 16) | — |
+| `bedrock-compute` (S-07, binary S-20) | One execution layer: sandboxed customer code (Workers, Durable Objects) and built-in `d1`, `kv`, `queue` and `cron` handlers in Rust; actor host; stateless Worker invocation (§4 decision 16) | — |
 | `bedrock-volume` (S-03; cold tier S-05) | Actor storage: claims, leases, quorum log, overlay, flushes to S3, alarm index; `volume` hash ranges per cell (§4 decision 16) | — |
 
 Rules this implies:
@@ -229,10 +229,12 @@ Rules this implies:
 | [S-13](https://github.com/felixrydberg/bedrock/issues/121) | Cron Triggers | Compute | `compute/builtin` | S-09, B-50 |
 | [S-14](https://github.com/felixrydberg/bedrock/issues/122) | Workflows | Compute | `compute` (runtime library) | S-10 |
 | [S-15](https://github.com/felixrydberg/bedrock/issues/123) | Hibernatable WebSockets held at the Gateway | Compute | `gateway/actors` | S-08 |
-| [S-16](https://github.com/felixrydberg/bedrock/issues/124) | Simulation and crash load: actor workload, kills mid-append, slot loss, cell loss | Actors | `tests/sim`, `tests/crash` | S-07, B-23 |
+| [S-16](https://github.com/felixrydberg/bedrock/issues/124) | Simulation and crash load: actor workload, kills mid-append, slot loss, cell loss | Actors | `tests/sim`, `tests/crash` | S-07, B-23, S-20 |
 | [S-17](https://github.com/felixrydberg/bedrock/issues/125) | Planned DC changes and manual DC-loss restore | Actors | `lib/actors`, operator tooling | S-05 |
 | [S-18](https://github.com/felixrydberg/bedrock/issues/126) | Customer-KV writers as `kv` actors, with reads through the value cache to the holder (replaces B-26, B-27) | KV | `compute/builtin`, `kv` | S-05, S-08, B-25 |
 | [S-19](https://github.com/felixrydberg/bedrock/issues/127) | Load- and flush-lag-based range splitting for `volume` ranges (later, gated on measurements; bytes balancing is in S-03) | Actors | `lib/placement`, `volume` | S-03, S-16 |
+| [S-20](https://github.com/felixrydberg/bedrock/issues/147) | `bedrock-compute` binary: `run`, internal listener and relay membership | Actors | `compute` | S-08 |
+| [S-20b](https://github.com/felixrydberg/bedrock/issues/148) | `Relay.Routes` for compute callers and sibling cells' `volume` tables | Actors | `lib/relays`, `compute`, `volume` | S-20, B-62 |
 
 ### Parallel work inside the shared core
 
@@ -984,6 +986,8 @@ issue, its body is written from those sections in the usual template. All are cr
 - S-17: [#125](https://github.com/felixrydberg/bedrock/issues/125) — Feature 🚀: Planned DC changes and manual DC-loss restore for actors
 - S-18: [#126](https://github.com/felixrydberg/bedrock/issues/126) — Feature 🚀: Customer-KV namespace writers as kv actors, with reads through the value cache
 - S-19: [#127](https://github.com/felixrydberg/bedrock/issues/127) — Feature 🚀: Load-based range splitting for volume ranges
+- S-20: [#147](https://github.com/felixrydberg/bedrock/issues/147) — Feature 🚀: bedrock-compute binary: run, internal listener and relay membership
+- S-20b: [#148](https://github.com/felixrydberg/bedrock/issues/148) — Feature 🚀: Relay.Routes for compute callers and sibling cells' volume tables
 
 - **Storage first.** S-01 … S-06 build actor storage. S-02 updates the specification before any protocol code, and
   S-03 waits for it.

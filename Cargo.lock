@@ -323,6 +323,7 @@ dependencies = [
  "prometheus-client",
  "prost",
  "rusqlite",
+ "serde",
  "sqlite-plugin",
  "tracing",
 ]

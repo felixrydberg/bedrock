@@ -7,6 +7,9 @@
 //! - [`rank`] orders customer-KV readers by rendezvous hash. Customer KV has no ranges.
 //! - [`hash_of`] places a key in the hash space; relay range streams select keys with [`in_span`] (#22 / B-21).
 //! - [`namespaces`] is the fixed namespace set of each ranged dataset, so relays know every namespace a range covers.
+//! - [`coverage`] measures `full_replica` completeness from the same [`holds`] rule as [`serves`] (#87 / B-40).
+
+pub mod coverage;
 
 use std::collections::BTreeMap;
 
@@ -80,12 +83,19 @@ pub fn end_of(directory: &Directory, start: u64) -> u64 {
         .map_or(0, |(next, _)| *next)
 }
 
-/// The owner check: a node serves only ranges it holds as `ready` or `leaving` in its own view; a `populating` owner
-/// may not have the data yet (#22 / B-21). A caller routed by a stale view is rejected and retries the next owner.
+/// Whether an owner holds its range: `ready` or `leaving`. A `populating` owner may not have the data yet (#22 / B-21).
+/// Serving ([`serves`]) and `full_replica` completeness ([`coverage`]) both count only holders; each adds the owner's
+/// storage health (a quarantined engine refuses reads; a member lists its unhealthy datasets).
+pub fn holds(owner: &Owner) -> bool {
+    owner.state != State::Populating
+}
+
+/// The owner check: a node serves only ranges it [`holds`] in its own view. A caller routed by a stale view is rejected
+/// and retries the next owner.
 pub fn serves(directory: &Directory, node: &str, hash: u64) -> bool {
     owners(directory, hash)
         .iter()
-        .any(|o| o.node == node && o.state != State::Populating)
+        .any(|o| o.node == node && holds(o))
 }
 
 /// Customer-KV readers for a key, most preferred first: rendezvous hashing of `hash`

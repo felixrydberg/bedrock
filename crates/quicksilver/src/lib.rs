@@ -114,11 +114,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     };
     let router = bedrock_lib::transport::server(tls.as_ref())
         .add_service(bedrock_lib::replication::pb::reads_server::ReadsServer::new(reads));
-    let mut serving = std::pin::pin!(bedrock_lib::transport::serve(
-        router,
-        config.node.listen,
-        tls
-    ));
+    let mut serving = bedrock_lib::transport::serve(router, config.node.listen, tls);
     let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
@@ -143,6 +139,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     rebuilding.abort();
     scrubbing.abort();
     session.drain().await;
+    serving.close().await;
     tracing::info!("shutting down");
     Ok(())
 }

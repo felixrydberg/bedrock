@@ -302,7 +302,10 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
         let actor = request
             .actor
             .ok_or_else(|| Status::invalid_argument("missing actor"))?;
-        let result = router.route(actor, request.payload).await;
+        let result = match request.alarm_ms {
+            Some(at_ms) => router.alarm(actor, at_ms).await.map(|()| Vec::new()),
+            None => router.route(actor, request.payload).await,
+        };
         self.count(COMPUTE, if result.is_ok() { "served" } else { "failed" });
         Ok(Response::new(bedrock_lib::volume::InvokeReply {
             payload: result?,
@@ -438,11 +441,7 @@ pub async fn run(config: GatewayConfig) -> Result<(), ConfigError> {
         .add_service(bedrock_lib::volume::actors_server::ActorsServer::from_arc(
             gateway,
         ));
-    let mut server = std::pin::pin!(bedrock_lib::transport::serve(
-        router,
-        config.node.listen,
-        tls
-    ));
+    let mut server = bedrock_lib::transport::serve(router, config.node.listen, tls);
     let mut readiness = tokio::time::interval(Duration::from_millis(100));
     let result = loop {
         tokio::select! {biased;
@@ -462,6 +461,7 @@ pub async fn run(config: GatewayConfig) -> Result<(), ConfigError> {
     if let Some(session) = session {
         session.drain().await;
     }
+    server.close().await;
     tracing::info!("shutting down");
     result
 }

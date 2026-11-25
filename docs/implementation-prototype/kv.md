@@ -780,6 +780,12 @@ If an L2 node fails (removed from membership after the grace period), joins or d
 For ordinary caches, ranges without a ready owner may temporarily fall through to L3.
 
 For `full_replica`, loss of required coverage must be reported as degraded until rebuilding restores the configured redundancy and completeness.
+Each cell relay reports it per dataset (`full_replica_complete_ratio`, `full_replica_redundant_ratio`,
+`full_replica_degraded`; B-40). An owner counts only when it holds the range as `ready` or `leaving`, the rule nodes
+serve by, is connected to a cell relay, still carries the dataset and its storage for it is healthy, so a lost node is
+degraded at once rather than after the grace period. `populating` owners never count. Redundancy expects as many holders
+as placement can give a range: R, or the number of `ready` `l2` members carrying the dataset when fewer.
+While a relay has no validated view of the directory, it reports the dataset degraded with nothing confirmed held.
 
 ### 15.6 Automatic Cache Rebuilding
 
