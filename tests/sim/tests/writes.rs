@@ -26,7 +26,11 @@ use prost::Message;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-const NAMESPACES: [&str; 2] = ["pages", "workers"];
+/// Two streams with distinct namespaces, so records stay keyed by namespace.
+const STREAMS: [(&str, &str); 2] = [("cdn", "deployments"), ("quicksilver", "infrastructure")];
+fn dataset(namespace: &str) -> &'static str {
+    STREAMS.iter().find(|(_, n)| *n == namespace).unwrap().0
+}
 const WRITES: usize = 200;
 const WRITE_TOKEN: &str = "test-writer-token";
 const AUTHORIZATION: &str = "Bearer test-writer-token";
@@ -148,11 +152,11 @@ async fn scenario(api: SocketAddr, replication: String) {
     let subscription = Session::start(
         peers,
         vec![replication],
-        NAMESPACES
+        STREAMS
             .into_iter()
-            .map(|namespace| Target {
+            .map(|(dataset, namespace)| Target {
                 selection: Selection {
-                    dataset: "cdn".into(),
+                    dataset: dataset.into(),
                     namespace: namespace.into(),
                 },
                 engine: applied.clone(),
@@ -177,7 +181,7 @@ async fn scenario(api: SocketAddr, replication: String) {
             let (status, _) = send(
                 api,
                 method,
-                "/v1/cdn/pages/key/0",
+                "/v1/cdn/deployments/key/0",
                 "w0",
                 "unauthorized".into(),
                 &authorization,
@@ -194,7 +198,7 @@ async fn scenario(api: SocketAddr, replication: String) {
     let (status, _) = send(
         api,
         "PUT",
-        "/v1/cdn/pages/key/0",
+        "/v1/cdn/deployments/key/0",
         "",
         String::new(),
         &[AUTHORIZATION],
@@ -205,13 +209,13 @@ async fn scenario(api: SocketAddr, replication: String) {
     let writes: Vec<_> = (0..WRITES)
         .map(|i| {
             tokio::spawn(async move {
-                let namespace = NAMESPACES[i % 2];
+                let (dataset, namespace) = STREAMS[i % 2];
                 let (method, body) = if i % 7 == 0 {
                     ("DELETE", String::new())
                 } else {
                     ("PUT", i.to_string())
                 };
-                let path = format!("/v1/cdn/{namespace}/key/{}", i % 5);
+                let path = format!("/v1/{dataset}/{namespace}/key/{}", i % 5);
                 let (status, sequence) = send(
                     api,
                     method,
@@ -252,7 +256,7 @@ async fn scenario(api: SocketAddr, replication: String) {
     let (status, _) = send(
         api,
         "DELETE",
-        "/v1/cdn/pages/key/0",
+        "/v1/cdn/deployments/key/0",
         "w0",
         String::new(),
         &[],
@@ -268,7 +272,7 @@ async fn scenario(api: SocketAddr, replication: String) {
         );
         timeout(
             Duration::from_secs(30),
-            subscription.wait_for("cdn", namespace, head),
+            subscription.wait_for(dataset(namespace), namespace, head),
         )
         .await
         .unwrap_or_else(|_| panic!("{namespace} did not reach {head}"));
@@ -309,7 +313,7 @@ async fn scenario(api: SocketAddr, replication: String) {
     }
 
     // #76 / B-09c: a bulk commits its keys as one revision, which subscribers apply in one batch.
-    let head = acked["pages"].len() as u64;
+    let head = acked["deployments"].len() as u64;
     let changes = (0..3)
         .map(|i| pb::Change {
             key: format!("bulk/{i}").into_bytes(),
@@ -317,7 +321,16 @@ async fn scenario(api: SocketAddr, replication: String) {
         })
         .collect();
     let body = Bytes::from(pb::Bulk { changes }.encode_to_vec());
-    let bulk = |body| send_bytes(api, "POST", "/v1/cdn/pages", "bulk", body, &[AUTHORIZATION]);
+    let bulk = |body| {
+        send_bytes(
+            api,
+            "POST",
+            "/v1/cdn/deployments",
+            "bulk",
+            body,
+            &[AUTHORIZATION],
+        )
+    };
     let committed = bulk(body.clone()).await;
     assert_eq!(committed, (StatusCode::OK, (head + 1).to_string()));
     assert_eq!(bulk(body).await, committed, "a retried bulk applies once");
@@ -326,7 +339,7 @@ async fn scenario(api: SocketAddr, replication: String) {
     let (status, _) = send_bytes(
         api,
         "POST",
-        "/v1/cdn/pages",
+        "/v1/cdn/deployments",
         "empty",
         Bytes::new(),
         &[AUTHORIZATION],
@@ -335,7 +348,7 @@ async fn scenario(api: SocketAddr, replication: String) {
     assert_eq!(status, StatusCode::BAD_REQUEST, "an empty bulk");
     timeout(
         Duration::from_secs(30),
-        subscription.wait_for("cdn", "pages", head + 1),
+        subscription.wait_for("cdn", "deployments", head + 1),
     )
     .await
     .expect("the bulk reaches the subscriber");
@@ -352,14 +365,14 @@ async fn scenario(api: SocketAddr, replication: String) {
         last,
         [
             WriteOp::Put {
-                key: b"pages\0bulk/0".to_vec(),
+                key: b"deployments\0bulk/0".to_vec(),
                 value: vec![0]
             },
             WriteOp::Delete {
-                key: b"pages\0bulk/1".to_vec()
+                key: b"deployments\0bulk/1".to_vec()
             },
             WriteOp::Put {
-                key: b"pages\0bulk/2".to_vec(),
+                key: b"deployments\0bulk/2".to_vec(),
                 value: vec![2]
             },
         ]

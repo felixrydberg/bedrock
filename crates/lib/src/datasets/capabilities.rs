@@ -43,7 +43,7 @@ const CAPABILITIES: &[Capability] = &[
         dataset: CDN,
         pushed: true,
         full_replica: false,
-        namespaces: &["pages", "workers"],
+        namespaces: &["deployments"],
         ranged_service: Some(CDN),
     },
     Capability {

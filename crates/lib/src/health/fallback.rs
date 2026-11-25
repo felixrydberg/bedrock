@@ -47,7 +47,7 @@ pub enum Read {
 }
 
 /// What a product's read key tells the protection layer. An artifact read might be
-/// `Get { cell: "cell-a", namespace: "workers", key: hash }`.
+/// `Get { cell: "cell-a", namespace: "deployments", key: hash }`.
 pub trait ReadKey: Sync {
     /// The caller's cell, which pays for the read in any [`Limited`] tier. Background work names its own lane; see
     /// [`Limiter::acquire`].

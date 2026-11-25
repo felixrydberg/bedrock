@@ -8,7 +8,7 @@ use bedrock_sim::history::{
 };
 
 fn stream() -> Stream {
-    ("cdn".into(), "pages".into())
+    ("cdn".into(), "deployments".into())
 }
 
 /// set a=1 at 1, set b=2 at 2, set a=3 at 3, delete b at 4.

@@ -73,6 +73,41 @@ fn hash_has_a_stable_cross_platform_vector() {
 }
 
 #[test]
+fn cdn_ref_keys_are_placed_by_their_content_hash_in_every_namespace() {
+    let mut sha = [0u8; 32];
+    sha[..8].copy_from_slice(&0x0123_4567_89ab_cdef_u64.to_be_bytes());
+    sha[31] = 0xff;
+    let hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
+    let key = format!("ref/{hex}/deployment-1");
+    assert_eq!(content(&sha), 0x0123_4567_89ab_cdef);
+    for namespace in ["deployments", "other"] {
+        assert_eq!(hash_of("cdn", namespace, key.as_bytes()), content(&sha));
+    }
+    // An empty deployment ID still names the artifact.
+    assert_eq!(
+        hash_of("cdn", "deployments", format!("ref/{hex}/").as_bytes()),
+        content(&sha)
+    );
+    // Malformed ref keys, path rows and other datasets keep the normal hash.
+    let upper = format!("ref/{}/d", hex.to_uppercase());
+    let short = format!("ref/{}/d", &hex[..62]);
+    let unslashed = format!("ref/{hex}");
+    let path = format!("path/{hex}/d");
+    for key in [&upper, &short, &unslashed, &path] {
+        assert_ne!(
+            hash_of("cdn", "deployments", key.as_bytes()),
+            content(&sha),
+            "{key}"
+        );
+    }
+    assert_ne!(hash_of("kv", "deployments", key.as_bytes()), content(&sha));
+    assert_ne!(
+        hash_of("quicksilver", "infrastructure", key.as_bytes()),
+        content(&sha)
+    );
+}
+
+#[test]
 fn spans_are_half_open_and_end_zero_is_the_top() {
     let span = |start, end| pb::Span { start, end };
     assert!(in_span(&span(10, 20), 10) && !in_span(&span(10, 20), 20));

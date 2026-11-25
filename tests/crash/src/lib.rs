@@ -56,13 +56,9 @@ use proxy::{Mode, Proxy};
 const TOKEN: &str = "crash-writer-token";
 const CELL: &str = "eu-1a";
 /// The workload's streams, as in the simulation: every pushed dataset's namespaces.
-const STREAMS: [(&str, &str); 3] = [
-    ("quicksilver", "infrastructure"),
-    ("cdn", "pages"),
-    ("cdn", "workers"),
-];
+const STREAMS: [(&str, &str); 2] = [("quicksilver", "infrastructure"), ("cdn", "deployments")];
 /// Streams the harness's own subscriber follows whole.
-const FOLLOWED: [(&str, &str); 2] = [("quicksilver", "infrastructure"), ("cdn", "pages")];
+const FOLLOWED: [(&str, &str); 2] = [("quicksilver", "infrastructure"), ("cdn", "deployments")];
 const WRITERS: usize = 4;
 /// Fault drivers at once, as in the simulation's busier profiles.
 const DRIVERS: u64 = 2;

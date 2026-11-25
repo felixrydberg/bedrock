@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bedrock_lib::admin::Admin;
+use bedrock_lib::health::storage::listed;
 use bedrock_lib::membership::{self, View};
 use bedrock_lib::node::{
     ApiConfig, Budget, ConfigError, Location, MembershipSettings, NodeConfig, RelayConfig,
@@ -32,6 +33,7 @@ use bedrock_lib::node::{
 };
 use bedrock_lib::placement::{Directory, Owner, State, hash_of};
 use bedrock_lib::relays::client::{Selection, Session, Target, applied_at, applied_ranges};
+use bedrock_lib::relays::ranges::overlaps;
 use bedrock_lib::replication::materialized::Retention;
 use bedrock_lib::replication::pb;
 use bedrock_lib::s3::S3Config;
@@ -186,13 +188,9 @@ const OBSERVER: &str = "10.0.5.51";
 const CLIENT: &str = "10.0.5.52";
 
 /// The workload's streams: every pushed dataset's namespaces.
-const STREAMS: [(&str, &str); 3] = [
-    ("quicksilver", "infrastructure"),
-    ("cdn", "pages"),
-    ("cdn", "workers"),
-];
+const STREAMS: [(&str, &str); 2] = [("quicksilver", "infrastructure"), ("cdn", "deployments")];
 /// Streams the external subscriber follows whole.
-const FOLLOWED: [(&str, &str); 2] = [("quicksilver", "infrastructure"), ("cdn", "pages")];
+const FOLLOWED: [(&str, &str); 2] = [("quicksilver", "infrastructure"), ("cdn", "deployments")];
 const GRACE: Duration = Duration::from_secs(5);
 /// How long the safety phase runs unless `BEDROCK_VOPR_SECONDS` says otherwise.
 const SAFETY: Duration = Duration::from_secs(60);
@@ -1115,14 +1113,21 @@ async fn writer(run: Arc<Run>, id: usize) {
 }
 
 /// Every validated copy `process` holds now. An engine with a damaged record is skipped: it cannot pass as healthy, since
-/// reads of the record fail.
+/// reads of the record fail. So is a range its quarantine record lists: a crash between discarding its data and
+/// forgetting its progress leaves both on disk, and the record keeps it quarantined until a rebuild releases it.
 fn copies(run: &Run, process: &Process) -> Vec<Sample> {
     let mut samples = Vec::new();
     for dataset in process.datasets {
         let Some(frozen) = readable(run, &process.dir, dataset) else {
             continue;
         };
+        let Ok(quarantined) = listed(&frozen) else {
+            continue;
+        };
         for (namespace, span, revision) in applied_ranges(&frozen, dataset).unwrap() {
+            if quarantined.iter().any(|listed| overlaps(*listed, span)) {
+                continue;
+            }
             let entries = frozen.scan(&l2_span(span.0, span.1)).unwrap();
             let held = entries
                 .map(Result::unwrap)

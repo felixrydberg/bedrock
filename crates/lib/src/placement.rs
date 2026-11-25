@@ -24,13 +24,42 @@ pub fn namespaces(dataset: &str) -> &'static [&'static str] {
 }
 
 /// A key's position in the 64-bit L2 hash space (#18 / B-15); customer KV ranks its readers by it.
+///
+/// A `cdn` ref key, `ref/{sha256 as 64 lowercase hex}/{deployment_id}`, is placed by its artifact's [`content`] hash,
+/// ignoring the namespace, so an artifact's holders receive exactly its ref keys (#80 / B-32, decision 14). Every other
+/// key, including a malformed `ref/` key, hashes `(dataset, namespace, key)`.
 pub fn hash_of(dataset: &str, namespace: &str, key: &[u8]) -> u64 {
+    if dataset == crate::datasets::capabilities::CDN
+        && let Some(hash) = ref_hash(key)
+    {
+        return hash;
+    }
     let mut hash = Sha256::new();
     for part in [dataset.as_bytes(), namespace.as_bytes(), key] {
         hash.update((part.len() as u64).to_be_bytes());
         hash.update(part);
     }
     u64::from_be_bytes(hash.finalize()[..8].try_into().unwrap())
+}
+
+/// An artifact's position in the hash space: the first 8 bytes of its SHA-256, big-endian. Its ref keys
+/// ([`hash_of`]) and its holders use the same position.
+pub fn content(sha256: &[u8; 32]) -> u64 {
+    u64::from_be_bytes(sha256[..8].try_into().unwrap())
+}
+
+/// The [`content`] hash of a well-formed `ref/{64 lowercase hex}/…` key.
+fn ref_hash(key: &[u8]) -> Option<u64> {
+    let hex = key.strip_prefix(b"ref/")?;
+    if hex.get(64) != Some(&b'/')
+        || !hex[..64]
+            .iter()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    // Checked lowercase hex digits, so the parse cannot fail.
+    u64::from_str_radix(std::str::from_utf8(&hex[..16]).ok()?, 16).ok()
 }
 
 /// Whether `hash` lies in `span`: `[start, end)`, where `end` 0 means 2⁶⁴.

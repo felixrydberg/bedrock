@@ -590,7 +590,7 @@ async fn placement() -> Vec<String> {
 }
 
 const WRITER: &str = "10.0.3.50";
-const NAMESPACES: [&str; 2] = ["pages", "workers"];
+const NAMESPACE: &str = "deployments";
 const KEYS: u64 = 24;
 
 /// `(namespace, key)` → value.
@@ -651,7 +651,7 @@ async fn write(
         .map_err(|_| "write timed out after 5 s".to_string())?
 }
 
-/// Writes throughout: every 100 ms one key of one namespace is set, or every fifth time deleted. A failed write is
+/// Writes throughout: every 100 ms one key is set, or every fifth time deleted. A failed write is
 /// retried with the same idempotency key, so the record matches what was committed.
 async fn writer(model: Arc<Model>) {
     loop {
@@ -662,8 +662,8 @@ async fn writer(model: Arc<Model>) {
         }
         model.paused.store(false, Ordering::SeqCst);
         let n = model.writes.load(Ordering::SeqCst);
-        let namespace = NAMESPACES[(n % 2) as usize];
-        let key = format!("k{:02}", (n / 2 * 7) % KEYS).into_bytes();
+        let namespace = NAMESPACE;
+        let key = format!("k{:02}", (n * 7) % KEYS).into_bytes();
         let value = (n % 5 != 4).then(|| format!("v{n}").into_bytes());
         while write("cdn", namespace, &key, value.as_deref(), &n.to_string())
             .await
@@ -849,10 +849,15 @@ fn merged_range_progress_requires_gap_free_parts() {
     ] {
         let revisions = parts
             .iter()
-            .map(|(start, end)| (format!("relay:range:cdn:{start:016x}-{end:016x}:pages"), 1))
+            .map(|(start, end)| {
+                (
+                    format!("relay:range:cdn:{start:016x}-{end:016x}:deployments"),
+                    1,
+                )
+            })
             .collect();
         assert_eq!(
-            has_progress(&revisions, "pages", range),
+            has_progress(&revisions, "deployments", range),
             expected,
             "{parts:?}"
         );

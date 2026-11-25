@@ -19,7 +19,11 @@ use bedrock_lib::storage::sim::MemoryFactory;
 use bedrock_lib::transport::Peers;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, timeout};
-const NAMESPACES: [&str; 2] = ["pages", "workers"];
+/// Two streams with distinct namespaces, so records stay keyed by namespace.
+const STREAMS: [(&str, &str); 2] = [("cdn", "deployments"), ("quicksilver", "infrastructure")];
+fn dataset(namespace: &str) -> &'static str {
+    STREAMS.iter().find(|(_, n)| *n == namespace).unwrap().0
+}
 const WRITES: u64 = 3000;
 /// Records successful commits together with their selector-scoped revisions.
 struct Recorded {
@@ -111,11 +115,11 @@ fn start(server: &str, engine: Arc<Recorded>) -> Session {
     Session::start(
         peers(),
         vec![server.into()],
-        NAMESPACES
+        STREAMS
             .into_iter()
-            .map(|namespace| Target {
+            .map(|(dataset, namespace)| Target {
                 selection: Selection {
-                    dataset: "cdn".into(),
+                    dataset: dataset.into(),
                     namespace: namespace.into(),
                 },
                 engine: engine.clone(),
@@ -129,7 +133,7 @@ fn start(server: &str, engine: Arc<Recorded>) -> Session {
 async fn caught_up(session: &Session, namespace: &str, revision: u64) {
     timeout(
         Duration::from_secs(30),
-        session.wait_for("cdn", namespace, revision),
+        session.wait_for(dataset(namespace), namespace, revision),
     )
     .await
     .unwrap_or_else(|_| panic!("{namespace} stalled at {revision}: {:?}", session.error()));
@@ -145,7 +149,7 @@ async fn write(
         if i == WRITES / 2 {
             resume.take().unwrap().await.unwrap();
         }
-        let namespace = NAMESPACES[rng.below(2) as usize];
+        let (dataset, namespace) = STREAMS[rng.below(2) as usize];
         let key = vec![b'x' + rng.below(4) as u8];
         let physical = [namespace.as_bytes(), b"\0", &key].concat();
         let operation = if rng.below(5) == 0 {
@@ -163,7 +167,7 @@ async fn write(
         };
         let sequence = writer
             .commit(Write {
-                dataset: "cdn".into(),
+                dataset: dataset.into(),
                 namespace: namespace.into(),
                 key,
                 operation,
@@ -318,7 +322,7 @@ async fn scenario(server: String, writer: Arc<Writer>, restart: mpsc::Sender<one
     let writing = tokio::spawn(write(writer.clone(), paused));
     let first = Arc::new(Recorded::new());
     let session = start(&server, first.clone());
-    caught_up(&session, "pages", 100).await;
+    caught_up(&session, "deployments", 100).await;
     let second = Arc::new(Recorded::new());
     // Extract per-namespace boundaries from the same atomic snapshot copied to the second replica.
     let snapshot = first.snapshot().unwrap();
@@ -388,21 +392,24 @@ async fn scenario(server: String, writer: Arc<Writer>, restart: mpsc::Sender<one
 async fn materialized_recovery_scenario(server: String, writer: Arc<Writer>) {
     let write = Write {
         dataset: "cdn".into(),
-        namespace: "pages".into(),
+        namespace: "deployments".into(),
         key: b"k".to_vec(),
         operation: Operation::Set(b"one".to_vec()),
         idempotency_key: None,
         expected: None,
     };
     assert_eq!(writer.commit(write.clone()).await.unwrap(), 1);
-    writer.log().prune("cdn", "pages", 1).unwrap();
+    writer.log().prune("cdn", "deployments", 1).unwrap();
     let engine = Arc::new(Recorded::new());
     let session = start(&server, engine.clone());
-    caught_up(&session, "pages", 1).await;
-    assert_eq!(engine.get(b"pages\0k").unwrap(), Some(b"one".to_vec()));
+    caught_up(&session, "deployments", 1).await;
+    assert_eq!(
+        engine.get(b"deployments\0k").unwrap(),
+        Some(b"one".to_vec())
+    );
     assert!(engine.batches.lock().unwrap().iter().any(|b| {
         b.ops
-            .contains(&WriteOp::DeleteRange(KeyRange::prefix(b"pages\0")))
+            .contains(&WriteOp::DeleteRange(KeyRange::prefix(b"deployments\0")))
     }));
     let installed = engine.snapshot().unwrap().revisions().unwrap();
     session.stop().await;
@@ -417,20 +424,20 @@ async fn materialized_recovery_scenario(server: String, writer: Arc<Writer>) {
             .unwrap(),
         2
     );
-    caught_up(&resumed, "pages", 2).await;
+    caught_up(&resumed, "deployments", 2).await;
     assert_eq!(
-        engine.operations("pages"),
+        engine.operations("deployments"),
         vec![
             WriteOp::Put {
-                key: b"pages\0k".to_vec(),
+                key: b"deployments\0k".to_vec(),
                 value: b"one".to_vec()
             },
             WriteOp::Delete {
-                key: b"pages\0k".to_vec()
+                key: b"deployments\0k".to_vec()
             }
         ]
     );
-    assert_eq!(engine.get(b"pages\0k").unwrap(), None);
+    assert_eq!(engine.get(b"deployments\0k").unwrap(), None);
     let revisions = engine.snapshot().unwrap().revisions().unwrap();
     let cursor = installed
         .iter()

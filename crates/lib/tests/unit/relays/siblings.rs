@@ -99,8 +99,7 @@ fn every_range_of_a_dataset_shares_as_one_whole_dataset_interest() {
         &hub,
         1,
         &[
-            ("cdn", "pages", Some(low), 7),
-            ("cdn", "workers", Some(low), 3),
+            ("cdn", "deployments", Some(low), 3),
             ("membership", "kv.c1", None, 5),
         ],
         &[("cdn", low)],
@@ -108,16 +107,13 @@ fn every_range_of_a_dataset_shares_as_one_whole_dataset_interest() {
     let _b = subscribe(
         &hub,
         2,
-        &[
-            ("cdn", "pages", Some(high), 4),
-            ("cdn", "workers", Some(high), 9),
-        ],
+        &[("cdn", "deployments", Some(high), 9)],
         &[("cdn", high)],
     );
     assert_eq!(
         hub.interests(),
         interests([
-            dataset("cdn", &[("pages", 4), ("workers", 3)]),
+            dataset("cdn", &[("deployments", 3)]),
             namespace("membership", "kv.c1", 5),
         ])
     );
@@ -129,15 +125,23 @@ fn what_a_sibling_shares_is_followed_but_never_shared_onward() {
     hub.shared(
         "b",
         Some(interests([
-            dataset("cdn", &[("pages", 4)]),
+            dataset("cdn", &[("deployments", 4)]),
+            dataset("quicksilver", &[]),
             namespace("membership", "kv.c1", 5),
         ])),
         LONG,
     );
     let (namespaces, datasets) = hub.desired();
-    assert_eq!(datasets, BTreeSet::from(["cdn".to_string()]));
-    assert_eq!(namespaces[&key("cdn", "pages")], 4);
-    assert_eq!(namespaces[&key("cdn", "workers")], 1, "a cursor is missing");
+    assert_eq!(
+        datasets,
+        BTreeSet::from(["cdn".to_string(), "quicksilver".to_string()])
+    );
+    assert_eq!(namespaces[&key("cdn", "deployments")], 4);
+    assert_eq!(
+        namespaces[&key("quicksilver", "infrastructure")],
+        1,
+        "a cursor is missing"
+    );
     assert_eq!(namespaces[&key("membership", "kv.c1")], 5);
     assert!(hub.interests().is_empty());
 
@@ -177,7 +181,7 @@ fn siblings_sharing_a_selector_keep_the_lowest_cursor() {
         "a",
         Some(interests([
             namespace("membership", "kv.c1", 9),
-            dataset("cdn", &[("pages", 8), ("workers", 3)]),
+            dataset("cdn", &[("deployments", 8)]),
             partial(7),
         ])),
         LONG,
@@ -186,7 +190,7 @@ fn siblings_sharing_a_selector_keep_the_lowest_cursor() {
         "b",
         Some(interests([
             namespace("membership", "kv.c1", 5),
-            dataset("cdn", &[("pages", 4)]),
+            dataset("cdn", &[]),
             partial(2),
         ])),
         LONG,
@@ -214,7 +218,7 @@ fn siblings_sharing_a_selector_keep_the_lowest_cursor() {
     };
     assert_eq!(
         cursors("cdn"),
-        BTreeMap::from([("pages".into(), 4), ("workers".into(), 1)]),
+        BTreeMap::from([("deployments".into(), 1)]),
         "a sibling without a namespace's cursor needs it from the start"
     );
     assert_eq!(
@@ -356,7 +360,7 @@ async fn a_recovery_waits_for_a_slot_to_free() {
 #[cfg_attr(madsim, tokio::test)]
 async fn only_the_relay_a_recovery_entered_needs_a_slot() {
     let hub = hub();
-    let stream = (key("cdn", "pages"), None);
+    let stream = (key("cdn", "deployments"), None);
     let _held = hub.0.recoveries.clone().acquire_many_owned(4).await;
     let entered = hub.proxy(1, &stream, 1, &[], false).await.unwrap_err();
     assert_eq!(entered.code(), tonic::Code::ResourceExhausted);

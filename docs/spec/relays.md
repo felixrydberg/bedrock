@@ -40,8 +40,8 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
   dataset. Events keep their namespace and per-namespace revision. Coverage is per namespace: a delivery notes how
   far each namespace it touches is covered, so namespaces without writes add nothing. The subscriber keeps one
   covered revision per namespace and resumes with that table. Each ranged dataset has a fixed namespace set in code
-  (`placement::namespaces`): `quicksilver` has `infrastructure`, `auth` has `keys` and `cdn` has `pages` and
-  `workers`. Auth is not currently placed by Quicksilver; its namespace remains available to the generic writer and
+  (`placement::namespaces`): `quicksilver` has `infrastructure`, `auth` has `keys` and `cdn` has `deployments`
+  (decision 17). Auth is not currently placed by Quicksilver; its namespace remains available to the generic writer and
   relay contracts for future Gateway work. The writer rejects any other namespace of these datasets. This is the
   model's constant `Namespaces`.
 - **Pushed ranges.** A relay pushes each leaf subscriber its full owned range set per dataset, tagged with the
