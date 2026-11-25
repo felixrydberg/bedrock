@@ -439,15 +439,24 @@ fn an_uncommitted_delete_leaves_the_committed_alarm_wakeable() {
 }
 
 #[test]
-fn due_alarm_scan_reports_corrupt_keys() {
-    let store = store();
-    let mut batch = WriteBatch::default();
-    batch.put(b"alarm/bad".to_vec(), Vec::new());
-    store.commit(batch).unwrap();
-    assert!(matches!(
-        store.due_alarms(u64::MAX),
-        Err(Error::Storage(StorageError::Corruption(_)))
-    ));
+fn alarm_scans_and_recovery_report_corrupt_keys() {
+    for key in [
+        b"alarm/bad".to_vec(),
+        [b"alarm/".as_slice(), &42u64.to_be_bytes(), b"bad"].concat(),
+    ] {
+        let store = store();
+        let mut batch = WriteBatch::default();
+        batch.put(key, Vec::new());
+        store.commit(batch).unwrap();
+        assert!(matches!(
+            store.due_alarms(u64::MAX),
+            Err(Error::Storage(StorageError::Corruption(_)))
+        ));
+        assert!(matches!(
+            store.recover(),
+            Err(Error::Storage(StorageError::Corruption(_)))
+        ));
+    }
 }
 
 #[test]
@@ -524,18 +533,7 @@ fn a_pending_alarm_change_keeps_a_released_alarm_indexed_until_commit_or_truncat
 }
 
 #[test]
-fn recovery_keeps_released_pending_hints_when_an_older_index_used_the_tail_alarm() {
-    let original = store();
-    let holder = host("a");
-    claimed(&original, &holder, 1);
-    let mut set = entry(1, 1, &[]);
-    set.alarm = Some(pb::Alarm { at_ms: Some(42) });
-    let mut later = entry(2, 1, &[]);
-    later.alarm = Some(pb::Alarm { at_ms: Some(100) });
-    let mut release = entry(3, 1, &[]);
-    release.kind = EntryKind::Release as i32;
-    append(&original, &holder, 1, 0, vec![set, later, release], 1);
-    // This is the durable index written by the previous implementation for this pending reschedule.
+fn released_alarm_index_repairs_missing_and_legacy_keys_across_save_and_recovery() {
     let at = |time: u64| {
         [
             b"alarm/".as_slice(),
@@ -544,17 +542,69 @@ fn recovery_keeps_released_pending_hints_when_an_older_index_used_the_tail_alarm
         ]
         .concat()
     };
-    let mut legacy = WriteBatch::default();
-    legacy.delete(at(42));
-    legacy.put(at(100), Vec::new());
-    original.engine.write(legacy).unwrap();
-    let reopened = Store::new(original.engine.clone());
-    reopened.recover().unwrap();
-    for now in [42, 100] {
-        let due = reopened.due_alarms(now).unwrap();
-        assert_eq!(due.len(), 1);
-        assert_eq!((due[0].at_ms, due[0].released), (42, true));
-        assert!(!reopened.alarms.lock().unwrap().is_empty());
+    let indexed = |store: &Store| {
+        store
+            .engine
+            .scan(&KeyRange::prefix(*b"alarm/"))
+            .unwrap()
+            .map(|row| row.unwrap().0)
+            .collect::<Vec<_>>()
+    };
+    for legacy_at in [None, Some(100)] {
+        for recover in [false, true] {
+            let original = store();
+            let holder = host("a");
+            claimed(&original, &holder, 1);
+            let mut set = entry(1, 1, &[]);
+            set.alarm = Some(pb::Alarm { at_ms: Some(42) });
+            let mut later = entry(2, 1, &[]);
+            later.alarm = Some(pb::Alarm { at_ms: Some(100) });
+            let mut release = entry(3, 1, &[]);
+            release.kind = EntryKind::Release as i32;
+            append(&original, &holder, 1, 0, vec![set, later, release], 1);
+            // Older stores could omit this key or index the uncommitted tail's alarm instead.
+            let mut legacy = WriteBatch::default();
+            legacy.delete(at(42));
+            if let Some(time) = legacy_at {
+                legacy.put(at(time), Vec::new());
+            }
+            original.engine.write(legacy).unwrap();
+            let active = if recover {
+                let reopened = Store::new(original.engine.clone());
+                reopened.recover().unwrap();
+                assert_eq!(indexed(&reopened), vec![at(42)]);
+                reopened
+            } else {
+                original
+            };
+            for now in [42, 100] {
+                let due = active.due_alarms(now).unwrap();
+                assert_eq!(due.len(), 1);
+                assert_eq!((due[0].at_ms, due[0].released), (42, true));
+            }
+
+            // The committed index key is unchanged, but saving must repair its durable representation.
+            let mut later = entry(4, 1, &[]);
+            later.alarm = Some(pb::Alarm { at_ms: Some(200) });
+            assert_eq!(
+                refused(&append(&active, &holder, 1, 1, vec![later.clone()], 1)),
+                Refusal::None
+            );
+            assert_eq!(indexed(&active), vec![at(42)]);
+            append(&active, &holder, 1, 1, vec![later], 4);
+            assert!(active.due_alarms(100).unwrap().is_empty());
+            let due = active.due_alarms(200).unwrap();
+            assert_eq!(due.len(), 1);
+            assert_eq!((due[0].at_ms, due[0].released), (200, true));
+            assert_eq!(indexed(&active), vec![at(200)]);
+
+            let reopened = Store::new(active.engine.clone());
+            reopened.recover().unwrap();
+            let due = reopened.due_alarms(200).unwrap();
+            assert_eq!(due.len(), 1);
+            assert_eq!((due[0].at_ms, due[0].released), (200, true));
+            assert_eq!(indexed(&reopened), vec![at(200)]);
+        }
     }
 }
 
@@ -612,6 +662,10 @@ fn recovery_restores_a_pending_alarm_hint_before_any_alarm_has_committed() {
     let cleared = Store::new(original.engine.clone());
     cleared.recover().unwrap();
     assert!(cleared.alarms.lock().unwrap().is_empty());
+    assert!(
+        cleared.alarm_summaries.lock().unwrap().is_empty(),
+        "fully committed alarm-free claims need no reconstructed summaries"
+    );
 }
 
 #[test]

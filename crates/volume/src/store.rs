@@ -86,6 +86,16 @@ fn missing(seq: u64) -> Error {
     }))
 }
 
+fn bad_alarm_key() -> Error {
+    Error::Storage(StorageError::Corruption(ErrorContext {
+        engine: "volume",
+        instance: "volume".into(),
+        file: None,
+        partition: None,
+        detail: "an alarm candidate has an invalid actor key".into(),
+    }))
+}
+
 /// An actor's key prefix, hash and metrics kind.
 pub struct Actor {
     hash: u64,
@@ -156,6 +166,15 @@ impl Actor {
 
 pub fn claim_key(actor: &Actor) -> Vec<u8> {
     actor.key(b"claim")
+}
+
+fn alarm_actor(prefix: &[u8]) -> Result<pb::Actor, Error> {
+    let wire = Actor::parse(prefix, 0).ok_or_else(bad_alarm_key)?;
+    let actor = Actor::new(&wire).map_err(|_| bad_alarm_key())?;
+    if actor.prefix != prefix {
+        return Err(bad_alarm_key());
+    }
+    Ok(wire)
 }
 
 fn log_key(actor: &Actor, seq: u64) -> Vec<u8> {
@@ -1169,23 +1188,6 @@ impl Store {
     /// old epoch's tail: a wake may make the next claim truncate it, exactly as any other request would, so the actor
     /// still serves and its committed alarm still fires.
     pub fn due_alarms(&self, now_ms: u64) -> Result<Vec<AlarmCandidate>, Error> {
-        let bad_key = || {
-            Error::Storage(StorageError::Corruption(ErrorContext {
-                engine: "volume",
-                instance: "volume".into(),
-                file: None,
-                partition: None,
-                detail: "an alarm candidate has an invalid actor key".into(),
-            }))
-        };
-        let parse = |prefix: &[u8], kind| -> Result<pb::Actor, Error> {
-            let wire = Actor::parse(prefix, kind).ok_or_else(bad_key)?;
-            let actor = Actor::new(&wire).map_err(|_| bad_key())?;
-            if actor.prefix != prefix {
-                return Err(bad_key());
-            }
-            Ok(wire)
-        };
         let mut due = Vec::new();
         let mut indexed = BTreeSet::new();
         for item in self.engine.scan(&KeyRange::prefix(*b"alarm/"))? {
@@ -1193,13 +1195,13 @@ impl Store {
             let at = key
                 .get(6..14)
                 .and_then(|v| <[u8; 8]>::try_from(v).ok())
-                .ok_or_else(bad_key)?;
+                .ok_or_else(bad_alarm_key)?;
             let at_ms = u64::from_be_bytes(at);
             if at_ms > now_ms {
                 break;
             }
             let prefix = [b"s/".as_slice(), &key[14..]].concat();
-            let wire = parse(&prefix, 0)?;
+            let wire = alarm_actor(&prefix)?;
             let actor = Actor::new(&wire)?;
             let _stripe = self.lock(&actor);
             let claim = self.load(&actor)?;
@@ -1229,7 +1231,7 @@ impl Store {
             .cloned()
             .collect();
         for prefix in prefixes {
-            let wire = parse(&prefix, 0)?;
+            let wire = alarm_actor(&prefix)?;
             let actor = Actor::new(&wire)?;
             let _stripe = self.lock(&actor);
             let claim = self.load(&actor)?;
@@ -1398,7 +1400,7 @@ impl Store {
         Ok(started.elapsed())
     }
 
-    /// Adds the claim, and its alarm and tombstone index entries if they changed, to `batch`.
+    /// Adds the claim and its alarm and tombstone index entries to `batch`.
     fn save(
         &self,
         batch: &mut WriteBatch,
@@ -1408,7 +1410,23 @@ impl Store {
     ) -> Result<(), Error> {
         let was = self.alarm_key(actor, old, None)?;
         let is = self.alarm_key(actor, new, Some(&batch.ops))?;
-        Self::index(batch, was, is);
+        if was != is
+            && let Some(was) = was
+        {
+            batch.delete(was);
+        }
+        // Older stores indexed the pending tail's alarm instead of the committed alarm.
+        if old.released
+            && let Some(at) = old.alarm_ms
+        {
+            let legacy = [b"alarm/".as_slice(), &at.to_be_bytes(), &actor.prefix[2..]].concat();
+            if Some(&legacy) != is.as_ref() {
+                batch.delete(legacy);
+            }
+        }
+        if let Some(is) = is {
+            batch.put(is, Vec::new());
+        }
         Self::index(batch, gone_key(actor, old), gone_key(actor, new));
         batch.put(claim_key(actor), new.encode_to_vec());
         Ok(())
@@ -2270,9 +2288,8 @@ impl Store {
         })
     }
 
-    /// Rebuilds the in-memory flush state (unflushed actors, log bytes, owed truncations) and returns overlay bytes per
-    /// actor kind, for
-    /// the gauge: one pass over every slot record at startup.
+    /// Rebuilds the in-memory flush state and alarm hints, repairs the released-alarm index, and returns overlay bytes
+    /// per actor kind for the gauge: one pass over every slot record at startup.
     // ponytail: a full scan at startup; keep running totals in a record if startup time matters.
     pub fn recover(&self) -> Result<BTreeMap<i32, i64>, Error> {
         self.alarm_summaries
@@ -2299,6 +2316,14 @@ impl Store {
         let mut bytes = BTreeMap::new();
         let mut kind = 0;
         let mut logged = 0;
+        let mut alarm_keys = BTreeSet::new();
+        for item in self.engine.scan(&KeyRange::prefix(*b"alarm/"))? {
+            let (key, _) = item?;
+            let suffix = key.get(14..).ok_or_else(bad_alarm_key)?;
+            alarm_actor(&[b"s/".as_slice(), suffix].concat())?;
+            alarm_keys.insert(key);
+        }
+        let mut alarm_repairs = WriteBatch::default();
         for item in self.engine.scan(&KeyRange::prefix(*b"s/"))? {
             let (key, value) = item?;
             // `s/`, the hash, then `{namespace}\0{id}\0` and the record's name.
@@ -2310,18 +2335,22 @@ impl Store {
                 let claim =
                     pb::ClaimRecord::decode(value.as_slice()).map_err(|e| corrupt("a claim", e))?;
                 kind = claim.kind;
-                // A pending tail may have hidden the committed alarm from the claim's own `alarm_ms`.
-                if (!claim.released || end(&claim).seq > claim.committed)
+                let pending = end(&claim).seq > claim.committed;
+                if (pending || claim.alarm_ms.is_some())
                     && let Some(parsed) = Actor::parse(&key[..at], kind)
                 {
                     let actor = Actor::new(&parsed)?;
-                    if self.committed_alarm(&actor, &claim)?.is_some()
-                        || end(&claim).seq > claim.committed
-                    {
+                    // Pending tails may commit an alarm even when the current claim field is clear.
+                    if pending || !claim.released {
                         self.alarms
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .insert(key[..at].to_vec());
+                    }
+                    if let Some(key) = self.alarm_key(&actor, &claim, None)?
+                        && !alarm_keys.remove(&key)
+                    {
+                        alarm_repairs.put(key, Vec::new());
                     }
                 }
                 self.mark(&key[..at], &claim);
@@ -2341,6 +2370,12 @@ impl Store {
                 })?;
                 self.owe(&key[..at], kind, u64::from_be_bytes(through));
             }
+        }
+        for key in alarm_keys {
+            alarm_repairs.delete(key);
+        }
+        if !alarm_repairs.ops.is_empty() {
+            self.commit(alarm_repairs)?;
         }
         self.unflushed.store(logged, Ordering::Relaxed);
         Ok(bytes)

@@ -484,6 +484,13 @@ impl Instance for HungAlarm {
             self.storage
                 .commit_with_alarm(Vec::new(), Some(now_ms()))
                 .await?;
+        } else if request.len() == 8 {
+            self.storage
+                .commit_with_alarm(
+                    Vec::new(),
+                    Some(u64::from_be_bytes(request.as_slice().try_into().unwrap())),
+                )
+                .await?;
         }
         Ok(request)
     }
@@ -507,7 +514,7 @@ impl Instance for HungAlarm {
     }
 }
 
-async fn expired_acquire_scenario() {
+async fn expired_acquire_scenario(external_wake: bool) {
     let (a, _, _, _) = volume(0).await;
     let (b, _, _, _) = volume(1).await;
     let (c, _, _, _) = volume(2).await;
@@ -544,31 +551,61 @@ async fn expired_acquire_scenario() {
     );
     let target = actor('h');
     let awake = host.acquire(&target).await.unwrap();
-    awake.invoke(b"schedule".to_vec()).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), started.notified())
-        .await
-        .expect("the holder timer did not start its alarm");
-    assert!(
-        !awake.serving(),
-        "the cancelled commit did not fence storage"
-    );
-    // Acquire holds the wake lock while stopping: the watcher cannot acquire it to abort the hung timer.
-    let recovered = tokio::time::timeout(Duration::from_secs(3), host.acquire(&target))
-        .await
-        .expect("expired Acquire waited forever for the hung alarm's input gate")
-        .unwrap();
-    assert!(dropped.load(Ordering::SeqCst));
-    assert_eq!(starts.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        recovered.invoke(b"recovered".to_vec()).await.unwrap(),
-        b"recovered"
-    );
+    let _watch = awake.pause_watcher().await;
+    let mut external = None;
+    if external_wake {
+        let at = now_ms();
+        let schedule = awake.invoke(at.to_be_bytes().to_vec());
+        tokio::pin!(schedule);
+        // Queue the Wake at the input gate during the commit, ahead of the holder timer.
+        tokio::select! {
+            biased;
+            result = &mut schedule => panic!("schedule did not yield to its volume RPCs: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        let mut alarm = Box::pin(awake.alarm(at));
+        tokio::select! {
+            biased;
+            result = &mut alarm => panic!("Wake bypassed the request input gate: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        schedule.await.unwrap();
+        external = Some(alarm);
+    } else {
+        awake.invoke(b"schedule".to_vec()).await.unwrap();
+    }
+    let acquire = async {
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .expect("the alarm handler did not start");
+        assert!(
+            !awake.serving(),
+            "the cancelled commit did not fence storage"
+        );
+        // The watcher remains blocked before the wake lock for this entire Acquire.
+        let recovered = tokio::time::timeout(Duration::from_secs(3), host.acquire(&target))
+            .await
+            .expect("expired Acquire waited forever for the hung alarm's input gate")
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            recovered.invoke(b"recovered".to_vec()).await.unwrap(),
+            b"recovered"
+        );
+    };
+    if let Some(alarm) = external {
+        let (result, ()) = tokio::join!(alarm, acquire);
+        assert!(matches!(result, Err(Error::Volume(_))));
+    } else {
+        acquire.await;
+    }
 }
 
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn expired_acquire_cancels_a_hung_holder_alarm() {
-    expired_acquire_scenario().await;
+    expired_acquire_scenario(false).await;
 }
 
 #[cfg(madsim)]
@@ -578,7 +615,25 @@ async fn expired_acquire_cancels_a_hung_holder_alarm() {
         .create_node()
         .ip("10.9.0.1".parse().unwrap())
         .build()
-        .spawn(expired_acquire_scenario())
+        .spawn(expired_acquire_scenario(false))
+        .await
+        .unwrap();
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn expired_acquire_cancels_a_hung_wake_alarm() {
+    expired_acquire_scenario(true).await;
+}
+
+#[cfg(madsim)]
+#[madsim::test]
+async fn expired_acquire_cancels_a_hung_wake_alarm() {
+    madsim::runtime::Handle::current()
+        .create_node()
+        .ip("10.9.0.1".parse().unwrap())
+        .build()
+        .spawn(expired_acquire_scenario(true))
         .await
         .unwrap();
 }

@@ -256,6 +256,9 @@ impl Inner {
             last: Mutex::new(bedrock_lib::monotonic_now()),
             busy: AtomicUsize::new(0),
             timer: OnceLock::new(),
+            stopped: tokio::sync::Notify::new(),
+            #[cfg(feature = "test-support")]
+            watch_gate: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -288,6 +291,8 @@ async fn watch(
     // Keep cleanup ownership even if a cancelled or panicked event removes Awake's storage.
     loop {
         sleep(HEARTBEAT).await;
+        #[cfg(feature = "test-support")]
+        let _watch = awake.watch_gate.lock().await;
         let Some(host) = host.upgrade() else {
             cleanup(&awake, storage, timer).await;
             return;
@@ -353,7 +358,7 @@ async fn alarms(host: Weak<Inner>, awake: Arc<Awake>) {
         if host.upgrade().is_none() || !awake.serving() {
             return;
         }
-        let at = awake.storage().and_then(|storage| storage.alarm_ms());
+        let at = awake.alarm_ms();
         if at != previous {
             previous = at;
             backoff = POLL;
@@ -383,9 +388,26 @@ pub struct Awake {
     last: Mutex<Instant>,
     busy: AtomicUsize,
     timer: OnceLock<tokio::task::AbortHandle>,
+    stopped: tokio::sync::Notify,
+    #[cfg(feature = "test-support")]
+    watch_gate: tokio::sync::Mutex<()>,
 }
 
 impl Awake {
+    /// Holds the lifecycle watcher before it can take the wake lock.
+    #[cfg(feature = "test-support")]
+    pub async fn pause_watcher(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.watch_gate.lock().await
+    }
+
+    fn alarm_ms(&self) -> Option<u64> {
+        self.storage
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(Storage::alarm_ms)
+    }
+
     fn storage(&self) -> Option<Storage> {
         self.storage
             .lock()
@@ -435,13 +457,16 @@ impl Awake {
         };
         let result = {
             let mut instance = self.instance.lock().await;
+            // Register before checking serving, so stop cannot miss an alarm entering its handler.
+            let stopped = self.stopped.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
             let result = match instance.as_mut() {
                 Some(instance) if self.serving() => {
                     // Only once the event runs: a caller cancelled while queued at the gate leaves the actor alone.
                     match event {
                         Event::Alarm(at)
-                            if at > super::storage::now_ms()
-                                || self.storage().and_then(|s| s.alarm_ms()) != Some(at) =>
+                            if at > super::storage::now_ms() || self.alarm_ms() != Some(at) =>
                         {
                             Ok(Vec::new())
                         }
@@ -450,7 +475,11 @@ impl Awake {
                             self.lateness.observe(
                                 super::storage::now_ms().saturating_sub(at) as f64 / 1000.0,
                             );
-                            instance.alarm(at).await.map(|()| Vec::new())
+                            tokio::select! {
+                                biased;
+                                () = &mut stopped => Err(Error::Volume(volume::Error::Fenced)),
+                                result = instance.alarm(at) => result.map(|()| Vec::new()),
+                            }
                         }
                         Event::Request(request) => {
                             busy.armed = true;
@@ -481,6 +510,8 @@ impl Awake {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        // Wake hints can run outside the holder timer; cancel their handler before waiting for the gate.
+        self.stopped.notify_waiters();
         if let Some(timer) = self.timer.get() {
             timer.abort();
         }
