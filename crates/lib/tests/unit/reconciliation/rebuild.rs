@@ -252,6 +252,122 @@ impl StorageEngine for Unrestorable {
     }
 }
 
+/// Verification blocks until released; records whether any call ran while a verification was in progress.
+#[cfg(not(madsim))]
+struct Gated {
+    inner: MemoryEngine,
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    verifying: AtomicBool,
+    overlapped: AtomicBool,
+    restored: AtomicBool,
+}
+
+#[cfg(not(madsim))]
+impl Gated {
+    fn check(&self) {
+        if self.verifying.load(Ordering::SeqCst) {
+            self.overlapped.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(not(madsim))]
+impl StorageEngine for Gated {
+    fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        self.inner.get(key)
+    }
+    fn scan(&self, range: &KeyRange) -> StorageResult<crate::storage::Scan<'_>> {
+        self.inner.scan(range)
+    }
+    fn write(&self, batch: WriteBatch) -> StorageResult<()> {
+        self.check();
+        self.inner.write(batch)
+    }
+    fn revision(&self, name: &str) -> StorageResult<Option<u64>> {
+        self.inner.revision(name)
+    }
+    fn snapshot(&self) -> StorageResult<Box<dyn crate::storage::Snapshot + '_>> {
+        self.inner.snapshot()
+    }
+    fn restore(&self, snapshot: &dyn crate::storage::Snapshot) -> StorageResult<()> {
+        self.check();
+        self.restored.store(true, Ordering::SeqCst);
+        self.inner.restore(snapshot)
+    }
+    fn stats(&self) -> StorageResult<crate::storage::StorageStats> {
+        self.inner.stats()
+    }
+    fn disk_usage(&self) -> StorageResult<u64> {
+        self.inner.disk_usage()
+    }
+    fn health(&self) -> StorageResult<()> {
+        self.inner.health()
+    }
+    fn verify(&self) -> StorageResult<()> {
+        self.check();
+        self.verifying.store(true, Ordering::SeqCst);
+        self.entered.send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+        self.verifying.store(false, Ordering::SeqCst);
+        self.inner.verify()
+    }
+}
+
+/// Review of #103 / B-62: a timed-out repair stops waiting for its verification pass, which runs on; a retry must not
+/// verify, discard or restore the engine until that pass ends.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_waits_for_an_abandoned_verification_pass() {
+    let (entered, on_enter) = std::sync::mpsc::channel();
+    let (release, on_release) = std::sync::mpsc::channel();
+    let engine = Arc::new(Gated {
+        inner: MemoryEngine::new("auth"),
+        entered,
+        release: Mutex::new(on_release),
+        verifying: AtomicBool::new(false),
+        overlapped: AtomicBool::new(false),
+        restored: AtomicBool::new(false),
+    });
+    let restore = Arc::new(Reinitialise::new(engine.clone(), None));
+    let on_enter = Arc::new(Mutex::new(on_enter));
+    let wait_entered = || {
+        let on_enter = on_enter.clone();
+        tokio::task::spawn_blocking(move || on_enter.lock().unwrap().recv().unwrap())
+    };
+
+    let first = tokio::spawn({
+        let restore = restore.clone();
+        async move { restore.narrow().await }
+    });
+    wait_entered().await.unwrap();
+    // The repair's timeout drops its waiter; the blocking pass keeps going.
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    let retry = tokio::spawn({
+        let restore = restore.clone();
+        async move {
+            let ranges = restore.narrow().await?;
+            restore.restore(&[]).await.map(|()| ranges)
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!retry.is_finished(), "the retry waits for the first pass");
+    assert!(
+        on_enter.lock().unwrap().try_recv().is_err(),
+        "no second verification"
+    );
+    assert!(!engine.restored.load(Ordering::SeqCst), "no restore");
+
+    release.send(()).unwrap();
+    wait_entered().await.unwrap();
+    release.send(()).unwrap();
+    assert_eq!(retry.await.unwrap(), Ok(None));
+    assert!(engine.restored.load(Ordering::SeqCst));
+    assert!(!engine.overlapped.load(Ordering::SeqCst));
+}
+
 mod ranges {
     //! #103 / B-62: verify, then narrow the quarantine to the damaged ranges.
     use super::*;
