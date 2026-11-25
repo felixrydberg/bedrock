@@ -8,11 +8,14 @@ description = "Real-binary crash and fault checks for the shared core (#25 / B-2
 
 # The harness drives real processes, sockets and RocksDB, so simulation builds leave it out.
 [target.'cfg(not(madsim))'.dependencies]
+# The holder of `src/volume.rs`'s actor: the volume client of Compute (#124 / S-16).
+bedrock-compute = { path = "../../crates/compute" }
 bedrock-lib.workspace = true
 bedrock-sim = { path = "../sim" }
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client", "http1"] }
 hyper-util.workspace = true
+prost.workspace = true
 rand = "0.8"
 rcgen = "0.14"
 tokio = { workspace = true, features = ["io-util"] }

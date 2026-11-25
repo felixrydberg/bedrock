@@ -17,6 +17,7 @@
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod proxy;
+pub mod volume;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -167,6 +168,7 @@ enum Kind {
     Quicksilver,
     Cdn,
     Kv,
+    Volume,
 }
 
 impl Kind {
@@ -177,6 +179,7 @@ impl Kind {
             Kind::Quicksilver => "bedrock-quicksilver",
             Kind::Cdn => "bedrock-cdn",
             Kind::Kv => "bedrock-kv",
+            Kind::Volume => "bedrock-volume",
         }
     }
 
@@ -255,7 +258,7 @@ fn certificates(dir: &Path, nodes: &[Arc<Node>]) -> TlsConfig {
                 node.kind.binary().trim_start_matches("bedrock-"),
             )
         })
-        .chain(std::iter::once(("harness", "relay")));
+        .chain([("harness", "relay"), (volume::HOLDER, "compute")]);
     for (name, service) in identities {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -292,16 +295,26 @@ pub struct Cluster {
 
 impl Cluster {
     async fn new(options: Options) -> Self {
+        Self::with(
+            options,
+            &[
+                (Kind::Region, "region", 2),
+                (Kind::Relay, "relay", 3),
+                (Kind::Quicksilver, "quicksilver", 4),
+                (Kind::Cdn, "cdn", 4),
+                (Kind::Kv, "kv", 2),
+            ],
+        )
+        .await
+    }
+
+    /// An API and `layout`'s processes. Cell relays take their stream from the region relays, or from the API when there
+    /// are none.
+    async fn with(options: Options, layout: &[(Kind, &str, usize)]) -> Self {
         let _ = fs::remove_dir_all(&options.dir);
         fs::create_dir_all(options.dir.join("logs")).unwrap();
         let mut names = vec![("api".to_owned(), Kind::Api)];
-        let counts = [
-            (Kind::Region, "region", 2),
-            (Kind::Relay, "relay", 3),
-            (Kind::Quicksilver, "quicksilver", 4),
-        ];
-        let more = [(Kind::Cdn, "cdn", 4), (Kind::Kv, "kv", 2)];
-        for (kind, prefix, count) in counts.into_iter().chain(more) {
+        for &(kind, prefix, count) in layout {
             names.extend((1..=count).map(|i| (format!("{prefix}-{i}"), kind)));
         }
         let (mut nodes, mut reserved) = (Vec::new(), Vec::new());
@@ -437,9 +450,13 @@ impl Cluster {
                 tables += &replay;
             }
             Kind::Relay => {
+                let mut upstreams = self.addresses(Kind::Region);
+                if upstreams.is_empty() {
+                    upstreams.push(self.api().address());
+                }
                 top += &format!(
                     "tier = \"cell\"\nupstreams = {}\nreplay_peers = {}\nwrite_token = {TOKEN:?}\n",
-                    list(self.addresses(Kind::Region)),
+                    list(upstreams),
                     others(Kind::Relay),
                 );
                 tables += &replay;
@@ -449,7 +466,7 @@ impl Cluster {
                     tables += &format!("{:?} = {:?}\n", voter.address(), voter.name);
                 }
             }
-            Kind::Quicksilver | Kind::Cdn | Kind::Kv => {
+            Kind::Quicksilver | Kind::Cdn | Kind::Kv | Kind::Volume => {
                 let datasets: Vec<String> = node
                     .kind
                     .datasets()
@@ -463,7 +480,10 @@ impl Cluster {
                     self.write_address(),
                     self.options.s3,
                 );
-                if node.kind == Kind::Kv {
+                if node.kind == Kind::Volume {
+                    top += "cache_mb = 16\n";
+                }
+                if matches!(node.kind, Kind::Kv | Kind::Volume) {
                     tables += &format!(
                         "[s3]\nendpoint = {:?}\nbucket = {:?}\naccess_key_id = \"local\"\nsecret_access_key = \"local\"\n",
                         format!("http://127.0.0.1:{}", self.s3.port),

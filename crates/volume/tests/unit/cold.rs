@@ -2166,3 +2166,82 @@ async fn a_deleted_actor_keeps_its_keys_during_the_grace_period() {
         "still waiting"
     );
 }
+
+/// #124 / S-16 seed 2: an append past a slot's log end that S3 does not hold either is answered with its gap well
+/// within the holder's call timeout, so the holder resends from the slot's end. Waiting out [`BEHIND_WAIT`] instead
+/// timed the call out every time, and a slot behind the other voter never caught up.
+#[tokio::test(start_paused = true)]
+async fn an_append_past_what_s3_holds_answers_its_gap_at_once() {
+    use bedrock_lib::volume::volume_server::Volume;
+    use tonic::Request;
+
+    let bucket = Memory::default();
+    let n = node(&bucket, "n1", u64::MAX);
+    claim(&n.store, 0);
+    append(&n.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    n.cold.tick(&n.directory).await;
+    let service = crate::serve::Service::new(&Admin::new(), n.store, "n1", "cell-1", "dc1")
+        .unwrap()
+        .with_cold(Arc::new(n.cold));
+    *service.directory.write().unwrap() = n.directory;
+    let started = bedrock_lib::monotonic_now();
+    let answer = service
+        .append(Request::new(pb::AppendRequest {
+            actor: Some(actor(0)),
+            holder: Some(holder()),
+            epoch: 1,
+            prev_epoch: 1,
+            entries: vec![entry(3, &[])],
+            commit: 2,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(answer.refused, Refusal::LogGap as i32);
+    assert_eq!(answer.slot.unwrap().end.unwrap().seq, 1);
+    assert!(
+        started.elapsed() <= crate::serve::GAP_WAIT,
+        "the gap was answered after {:?}",
+        started.elapsed()
+    );
+}
+
+/// The other half of [`an_append_past_what_s3_holds_answers_its_gap_at_once`]: when the flush that holds what the slot
+/// lacks lands while the append waits, the slot skips to it and takes the append, as before the bound.
+#[tokio::test(start_paused = true)]
+async fn an_append_past_a_flush_still_landing_is_taken() {
+    use bedrock_lib::volume::volume_server::Volume;
+    use tonic::Request;
+
+    let bucket = Memory::default();
+    let behind = node(&bucket, "n1", u64::MAX);
+    let ahead = node(&bucket, "n2", u64::MAX);
+    claim(&behind.store, 0);
+    claim(&ahead.store, 0);
+    append(&behind.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    behind.cold.tick(&behind.directory).await;
+    append(&ahead.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    append(&ahead.store, 0, 1, vec![entry(2, &[("k", Some("2"))])], 2).unwrap();
+    let service = crate::serve::Service::new(&Admin::new(), behind.store, "n1", "cell-1", "dc1")
+        .unwrap()
+        .with_cold(Arc::new(behind.cold));
+    *service.directory.write().unwrap() = behind.directory;
+    let request = Request::new(pb::AppendRequest {
+        actor: Some(actor(0)),
+        holder: Some(holder()),
+        epoch: 1,
+        prev_epoch: 1,
+        entries: vec![entry(3, &[])],
+        commit: 2,
+        ..Default::default()
+    });
+    let flush = async {
+        tokio::time::sleep(crate::serve::GAP_WAIT / 2).await;
+        ahead.cold.tick(&ahead.directory).await;
+    };
+    let (answer, ()) = tokio::join!(service.append(request), flush);
+    let answer = answer.unwrap().into_inner();
+    assert_eq!(answer.refused, Refusal::None as i32, "{answer:?}");
+    assert_eq!(answer.slot.unwrap().end.unwrap().seq, 3);
+}

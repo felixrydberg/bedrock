@@ -54,7 +54,7 @@ use crate::{
     plugin,
     rand::{GlobalRng, Rng},
     task::{NodeId, NodeInfo, Spawner},
-    time::{sleep, sleep_until, Duration, TimeHandle},
+    time::{Duration, TimeHandle},
 };
 
 mod addr;
@@ -289,7 +289,8 @@ impl NetSim {
         if buggify_with_prob(0.1) {
             delay = Duration::from_secs(self.rand.with(|rng| rng.gen_range(1..5)));
         }
-        self.time.sleep(delay).await;
+        // bedrock: simulated time, whatever the node's clock rate.
+        self.time.sleep_global(delay).await;
         // TODO: inject failure
         Ok(())
     }
@@ -372,11 +373,12 @@ impl NetSim {
     ) -> (PayloadSender, PayloadReceiver) {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let net = self.clone();
+        let net_time = self.time.clone();
         let test_link = Arc::new(move || {
             net.network
                 .lock()
                 .try_send(node, dst, protocol)
-                .map(|(_, _, _, latency)| net.time.now_instant() + latency)
+                .map(|(_, _, _, latency)| net.time.now_global() + latency)
         });
         let sender = PayloadSender {
             test_link: test_link.clone(),
@@ -391,12 +393,12 @@ impl NetSim {
                         break arrive_time;
                     }
                     // backoff
-                    sleep(backoff).await;
+                    net_time.sleep_global(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));
                     // retry
                     state = test_link();
                 };
-                sleep_until(arrive_time).await;
+                net_time.sleep_until_global(arrive_time).await;
                 yield value;
             }
         }

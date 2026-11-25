@@ -61,3 +61,18 @@ async fn real_binaries_hold_every_invariant() {
         ),
     }
 }
+
+/// #124 / S-16: real volume processes killed at every append delivery boundary keep every acknowledged commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the release binaries and an S3 service: scripts/crash.sh volume"]
+async fn volume_slots_keep_every_acknowledged_commit_across_kills() {
+    let options = bedrock_crash::Options::from_env();
+    let (seed, dir) = (options.seed, options.dir.clone());
+    match bedrock_crash::volume::run(options).await {
+        Ok(outcome) => println!("CRASH volume seed={seed} {outcome:?}"),
+        Err(violation) => panic!(
+            "seed {seed} broke {violation}\nLogs: {}\nRerun: BEDROCK_CRASH_SEED={seed} scripts/crash.sh volume",
+            dir.display()
+        ),
+    }
+}

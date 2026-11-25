@@ -34,6 +34,10 @@ use crate::store::{self, Actor, Store};
 
 /// How long a holder's host stays live after its last heartbeat (§5 Lease).
 pub const LEASE: Duration = Duration::from_secs(5);
+/// How long an append past this slot's log end waits for S3 to hold what the slot lacks (#124 / S-16): longer than a
+/// range database reader takes to see a flush (its manifest poll is 1 s), and shorter than the holder's 2 s call, so a
+/// holder that still has the entries hears the gap and sends them rather than timing out and sending the same append.
+pub const GAP_WAIT: Duration = Duration::from_millis(1500);
 const COMPUTE: &str = "compute";
 const VOLUME: &str = bedrock_lib::datasets::capabilities::VOLUME;
 
@@ -55,6 +59,8 @@ struct Metrics {
     fsync: Latency,
     overlay: Family<KindLabel, Gauge>,
     expiries: Family<KindLabel, Counter>,
+    /// Holder heartbeats taken: one per second per Compute host with actors here (`statefull/v2.md` §12 question 7).
+    heartbeats: Counter,
 }
 
 impl Metrics {
@@ -65,6 +71,7 @@ impl Metrics {
             }),
             overlay: Family::default(),
             expiries: Family::default(),
+            heartbeats: Counter::default(),
         };
         admin.register_labelled(
             vec![("cell", cell.to_owned()), ("dc", dc.to_owned())],
@@ -83,6 +90,11 @@ impl Metrics {
                     "volume_lease_expiries",
                     "Claims that took an actor over from a holder whose lease had expired",
                     metrics.expiries.clone(),
+                );
+                registry.register(
+                    "volume_heartbeats",
+                    "Holder heartbeats this node took",
+                    metrics.heartbeats.clone(),
                 );
             },
         );
@@ -389,7 +401,10 @@ impl pb::volume_server::Volume for Service {
             else {
                 return Ok(Response::new(outcome.answer));
             };
-            match cold.meta(&self.cell, pb_actor, end + 1).await {
+            let meta = tokio::time::timeout(GAP_WAIT, cold.meta(&self.cell, pb_actor, end + 1))
+                .await
+                .unwrap_or_else(|_| Err(Status::unavailable("S3 did not answer in time")));
+            match meta {
                 Ok(meta) => {
                     let actor = self.actor(Some(pb_actor))?;
                     let kind = actor.kind();
@@ -443,6 +458,7 @@ impl pb::volume_server::Volume for Service {
     ) -> Result<Response<pb::HeartbeatReply>, Status> {
         let host = holder(request.get_ref().holder.as_ref())?.clone();
         check(&request, COMPUTE, Some(&host))?;
+        self.metrics.heartbeats.inc();
         let now = bedrock_lib::monotonic_now();
         let mut leases = self.leases.lock().unwrap_or_else(PoisonError::into_inner);
         // Hosts seen long ago no longer hold a lease here.

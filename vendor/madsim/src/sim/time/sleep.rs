@@ -20,6 +20,8 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
 pub struct Sleep {
     pub(super) handle: TimeHandle,
     pub(super) deadline: Instant,
+    /// bedrock: the rate of the clock `deadline` is on: its creating node's.
+    pub(super) rate: u64,
     /// bedrock: the deadline and waker a timer is already set for.
     pub(super) armed: Option<(Instant, std::task::Waker)>,
 }
@@ -34,7 +36,7 @@ impl Sleep {
     ///
     /// A `Sleep` instance is elapsed when the requested duration has elapsed.
     pub fn is_elapsed(&self) -> bool {
-        self.handle.clock.now_instant() >= self.deadline
+        self.handle.local_instant(self.rate) >= self.deadline
     }
 
     /// Resets the `Sleep` instance to a new deadline.
@@ -60,7 +62,8 @@ impl Future for Sleep {
         }
         let waker = cx.waker().clone();
         this.armed = Some((this.deadline, waker.clone()));
-        this.handle.add_timer_at(this.deadline, || waker.wake());
+        this.handle
+            .add_local_timer_at(this.deadline, this.rate, || waker.wake());
         Poll::Pending
     }
 }

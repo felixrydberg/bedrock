@@ -335,12 +335,14 @@ dependencies = [
 name = "bedrock-crash"
 version = "0.1.0"
 dependencies = [
+ "bedrock-compute",
  "bedrock-lib",
  "bedrock-sim",
  "http-body-util",
  "hyper",
  "hyper-util",
  "madsim-tokio",
+ "prost",
  "rand 0.8.8",
  "rcgen",
 ]
