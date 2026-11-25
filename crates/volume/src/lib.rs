@@ -3,6 +3,7 @@
 //! It joins its cell as service `volume` and announces the `volume` dataset, which relays place in ranges but never
 //! stream.
 
+pub mod alarms;
 pub mod cold;
 pub mod repair;
 pub mod serve;
@@ -132,7 +133,7 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
         }
     }
     let placement = Arc::new(cold::placement::Cells::new(
-        client,
+        client.clone(),
         peers.clone(),
         &node.location,
         &node.node_id,
@@ -153,6 +154,13 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
         &node.node_id,
     ));
     let service = service.with_cold(cold.clone()).with_repair();
+    let alarms = alarms::Scanner::new(
+        store.clone(),
+        placement.clone(),
+        Arc::new(alarms::Gateway(client)),
+        &node.node_id,
+        service.lease_live(),
+    );
     let repair = repair::Repair::new(store.clone(), placement, &node.node_id, &node.location.cell);
     let mut member = membership::member(&config, VOLUME);
     member.datasets = vec![VOLUME.into()];
@@ -176,6 +184,7 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
     // The repair loop copies only from a validated directory view, with its generations; it says when a range became
     // held.
     let assignments = Arc::new(std::sync::RwLock::new(None));
+    let mut alarming = std::pin::pin!(alarm_loop(alarms, assignments.clone()));
     let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut repairing = std::pin::pin!(repairs(repair, assignments.clone(), held_tx));
     let mut published = Vec::new();
@@ -185,6 +194,7 @@ pub async fn run(config: impl Into<VolumeConfig>) -> Result<(), ConfigError> {
             ()=&mut shutdown=>break,
             ()=&mut flushing=>unreachable!("the flush loop runs until shutdown"),
             ()=&mut repairing=>unreachable!("the repair loop runs until shutdown"),
+            ()=&mut alarming=>unreachable!("the alarm loop runs until shutdown"),
             Some(())=held_rx.recv()=>session.report(),
             served=&mut serving=>{
                 served.map_err(|e| ConfigError(format!("listen {}: {e}", node.listen)))?;
@@ -279,6 +289,25 @@ async fn flush(cold: Arc<cold::Cold>, directory: Arc<std::sync::RwLock<Directory
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         cold.tick(&current).await;
+    }
+}
+
+/// Scans alarms independently of listener/readiness polling, using only validated assignments from a ready session.
+async fn alarm_loop(
+    mut scanner: alarms::Scanner,
+    assignments: Arc<std::sync::RwLock<Option<membership::Assignments>>>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        interval.tick().await;
+        let current = assignments
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        match current {
+            Some((directory, _)) => scanner.tick(&directory).await,
+            None => scanner.pause(),
+        }
     }
 }
 

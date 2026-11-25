@@ -160,6 +160,12 @@ fn holder(holder: Option<&pb::Holder>) -> Result<&pb::Holder, Status> {
 }
 
 impl Service {
+    /// Shares the same host leases and startup grace with the alarm scanner.
+    pub fn lease_live(&self) -> crate::alarms::LeaseLive {
+        let (leases, started) = (self.leases.clone(), self.started);
+        Arc::new(move |holder| live(&leases, started, holder))
+    }
+
     /// Opens the service over `store`, as node `node`, with metrics labelled by `cell` and `dc`.
     pub fn new(
         admin: &Admin,

@@ -229,16 +229,30 @@ impl Router {
 
     /// Routes an entering request to the actor's holder and returns its answer.
     pub async fn route(&self, actor: pb::Actor, payload: Vec<u8>) -> Result<Vec<u8>, Status> {
+        self.event(actor, payload, None).await
+    }
+
+    /// Routes an alarm Wake through the same location cache, redirects and Gateway tiers.
+    pub async fn alarm(&self, actor: pb::Actor, at_ms: u64) -> Result<(), Status> {
+        self.event(actor, Vec::new(), Some(at_ms)).await.map(|_| ())
+    }
+
+    async fn event(
+        &self,
+        actor: pb::Actor,
+        payload: Vec<u8>,
+        alarm_ms: Option<u64>,
+    ) -> Result<Vec<u8>, Status> {
         let key = (actor.namespace.clone(), actor.id.clone());
         let mut place = self.cache().get(&key);
         let mut redirects = 0;
         loop {
             let result = match &place {
                 Some(place) => self
-                    .send(&actor, &payload, place)
+                    .send(&actor, &payload, alarm_ms, place)
                     .await
                     .map(|reply| (place.dc.clone(), reply)),
-                None => self.wake(&actor, &payload).await,
+                None => self.wake(&actor, &payload, alarm_ms).await,
             };
             let (dc, reply) = match result {
                 Ok(answer) => answer,
@@ -278,6 +292,7 @@ impl Router {
         &self,
         actor: &pb::Actor,
         payload: &[u8],
+        alarm_ms: Option<u64>,
     ) -> Result<(String, pb::InvokeReply), Status> {
         // ponytail: one Quicksilver read in this cell per miss; cache the topology by revision if misses get hot.
         let code = region(&actor.id)?;
@@ -300,7 +315,7 @@ impl Router {
                     host: String::new(),
                 },
             };
-            match self.send(actor, payload, &place).await {
+            match self.send(actor, payload, alarm_ms, &place).await {
                 Ok(reply) => return Ok((dc, reply)),
                 Err(status) if status.code() == Code::FailedPrecondition => last = status,
                 Err(status) => return Err(status),
@@ -314,6 +329,7 @@ impl Router {
         &self,
         actor: &pb::Actor,
         payload: &[u8],
+        alarm_ms: Option<u64>,
         place: &Place,
     ) -> Result<pb::InvokeReply, Status> {
         let target = Location {
@@ -325,6 +341,7 @@ impl Router {
             actor: Some(actor.clone()),
             payload: payload.to_vec(),
             host: place.holder.host.clone(),
+            alarm_ms,
         };
         if target == self.home {
             return self.deliver(request).await;

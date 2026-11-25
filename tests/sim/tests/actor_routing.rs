@@ -13,7 +13,8 @@
 #![cfg(madsim)]
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -186,15 +187,39 @@ fn slot_node(i: usize, engine: Arc<dyn StorageEngine>) -> NodeHandle {
             let (engine, name) = (engine.clone(), name.clone());
             async move {
                 let store = Arc::new(Store::new(engine));
+                store.hold(0, 0, 0).unwrap();
                 let service =
-                    Service::new(&Admin::new(), store, &name, CELLS[i % 2].0, "arn1").unwrap();
+                    Service::new(&Admin::new(), store.clone(), &name, CELLS[i % 2].0, "arn1")
+                        .unwrap();
                 *service.directory.write().unwrap() = BTreeMap::from([(
                     0,
                     vec![Owner {
-                        node: name,
+                        node: name.clone(),
                         state: State::Ready,
                     }],
                 )]);
+                let admin = Admin::new();
+                let client = Arc::new(Client::new(
+                    &admin,
+                    Arc::new(Peers::new(&admin)),
+                    addresses(&CELLS[i % 2].1),
+                    String::new(),
+                ));
+                let mut scanner = bedrock_volume::alarms::Scanner::new(
+                    store,
+                    Arc::new(AlarmPrimary(i == 0)),
+                    Arc::new(bedrock_volume::alarms::Gateway(client)),
+                    &name,
+                    service.lease_live(),
+                );
+                let directory = service.directory.clone();
+                tokio::spawn(async move {
+                    loop {
+                        sleep(Duration::from_millis(100)).await;
+                        let current = directory.read().unwrap().clone();
+                        scanner.tick(&current).await;
+                    }
+                });
                 tonic::transport::Server::builder()
                     .add_service(VolumeServer::new(service))
                     .serve(format!("{}:7000", SLOTS[i]).parse().unwrap())
@@ -207,6 +232,20 @@ fn slot_node(i: usize, engine: Arc<dyn StorageEngine>) -> NodeHandle {
 
 /// Every actor's slots are the three standalone slot nodes.
 struct Fixed;
+
+struct AlarmPrimary(bool);
+#[async_trait]
+impl bedrock_volume::cold::Placement for AlarmPrimary {
+    async fn first_here(&self, _: &pb::Actor) -> Result<bool, tonic::Status> {
+        Ok(self.0)
+    }
+    async fn first_cell(&self, _: &pb::Actor) -> Result<String, tonic::Status> {
+        Ok(CELLS[0].0.into())
+    }
+    async fn truncate_others(&self, _: &pb::Actor, _: u64) -> Result<bool, tonic::Status> {
+        unreachable!()
+    }
+}
 
 #[async_trait]
 impl Placement for Fixed {
@@ -231,11 +270,22 @@ struct Counter {
     host: String,
     storage: Storage,
     value: Option<u64>,
+    alarm_starts: Arc<Mutex<Vec<String>>>,
+    crash_alarm: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl Instance for Counter {
     async fn invoke(&mut self, request: Vec<u8>) -> Result<Vec<u8>, Error> {
+        if let Some(at) = request.strip_prefix(b"alarm:") {
+            let at = u64::from_be_bytes(at.try_into().unwrap());
+            self.storage.commit_with_alarm(Vec::new(), Some(at)).await?;
+            return Ok(self.host.clone().into_bytes());
+        }
+        if request == b"alarm-count" {
+            let values = self.storage.get(vec![b"alarm-count".to_vec()]).await?;
+            return Ok(values[0].value.clone().unwrap_or_default());
+        }
         let current = match self.value {
             Some(value) => value,
             None => {
@@ -259,6 +309,28 @@ impl Instance for Counter {
         }
         Ok(format!("{} {next}", self.host).into_bytes())
     }
+
+    async fn alarm(&mut self, _: u64) -> Result<(), Error> {
+        self.alarm_starts.lock().unwrap().push(self.host.clone());
+        if self.crash_alarm.swap(false, Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        let values = self.storage.get(vec![b"alarm-count".to_vec()]).await?;
+        let previous = values[0]
+            .value
+            .as_deref()
+            .map_or(0, |v| u64::from_be_bytes(v.try_into().unwrap()));
+        self.storage
+            .commit_with_alarm(
+                vec![pb::Change {
+                    key: b"alarm-count".to_vec(),
+                    value: Some((previous + 1).to_be_bytes().to_vec()),
+                }],
+                None,
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 fn compute_name(ip: &str) -> String {
@@ -266,7 +338,13 @@ fn compute_name(ip: &str) -> String {
 }
 
 /// A Compute host: an actor host serving `Actors` and joined to its cell relays as a `compute` member.
-fn compute_node(ip: &'static str, cell: &'static str, relays: [&'static str; 3]) -> NodeHandle {
+fn compute_node(
+    ip: &'static str,
+    cell: &'static str,
+    relays: [&'static str; 3],
+    alarm_starts: Arc<Mutex<Vec<String>>>,
+    crash_alarm: Arc<AtomicBool>,
+) -> NodeHandle {
     let name = compute_name(ip);
     Handle::current()
         .create_node()
@@ -274,6 +352,7 @@ fn compute_node(ip: &'static str, cell: &'static str, relays: [&'static str; 3])
         .ip(ip.parse().unwrap())
         .init(move || {
             let name = name.clone();
+            let (alarm_starts, crash_alarm) = (alarm_starts.clone(), crash_alarm.clone());
             async move {
                 let admin = Admin::new();
                 let peers = Arc::new(Peers::new(&admin));
@@ -288,6 +367,8 @@ fn compute_node(ip: &'static str, cell: &'static str, relays: [&'static str; 3])
                             host: name.clone(),
                             storage,
                             value: None,
+                            alarm_starts: alarm_starts.clone(),
+                            crash_alarm: crash_alarm.clone(),
                         })
                     })
                 };
@@ -436,6 +517,8 @@ async fn scenario() -> Vec<String> {
         });
     }
     let mut hosts = BTreeMap::new();
+    let alarm_starts = Arc::new(Mutex::new(Vec::new()));
+    let crash_alarm = Arc::new(AtomicBool::new(false));
     for (cell, relays, quicksilvers, gateway_ip, computes) in CELLS {
         for ip in relays {
             let config = relay(ip, Tier::Cell, &DC_RELAYS, &relays, cell);
@@ -454,7 +537,10 @@ async fn scenario() -> Vec<String> {
             bedrock_gateway::run(config.clone())
         });
         for ip in computes {
-            hosts.insert(compute_name(ip), compute_node(ip, cell, relays));
+            hosts.insert(
+                compute_name(ip),
+                compute_node(ip, cell, relays, alarm_starts.clone(), crash_alarm.clone()),
+            );
         }
     }
     let config = gateway("gw-arn1", DC_GATEWAY, "arn1", &DC_RELAYS);
@@ -595,6 +681,7 @@ async fn scenario() -> Vec<String> {
                             actor: Some(actor),
                             payload: b"incr".to_vec(),
                             host: String::new(),
+                            alarm_ms: None,
                         })
                         .await
                         .ok()?
@@ -623,6 +710,73 @@ async fn scenario() -> Vec<String> {
                 "one writer: no gap and no repeat"
             );
             trace.push(recovered);
+
+            // S-09: a released alarm is scanned and reaches the holder through the real Gateway tiers.
+            #[allow(clippy::disallowed_methods)]
+            let wall = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+            };
+            let at = wall() + 13_000;
+            let scheduled = [b"alarm:".as_slice(), &at.to_be_bytes()].concat();
+            bedrock_compute::bindings::call(&client, actor.clone(), scheduled)
+                .await
+                .unwrap();
+            sleep(Duration::from_secs(12)).await;
+            assert!(alarm_starts.lock().unwrap().is_empty());
+            until("sleeping alarm", Duration::from_secs(3), || async {
+                (!alarm_starts.lock().unwrap().is_empty()).then_some(())
+            })
+            .await;
+            let count =
+                bedrock_compute::bindings::call(&client, actor.clone(), b"alarm-count".to_vec())
+                    .await
+                    .unwrap();
+            assert_eq!(u64::from_be_bytes(count.try_into().unwrap()), 1);
+            assert!(
+                wall() <= at + 1_500,
+                "alarm exceeded one second plus routed wake time"
+            );
+            trace.push("sleeping alarm committed".into());
+
+            // Crash the entire Compute node after the next alarm starts, before its clear/state commit.
+            crash_alarm.store(true, Ordering::SeqCst);
+            let at = wall() + 200;
+            bedrock_compute::bindings::call(
+                &client,
+                actor.clone(),
+                [b"alarm:".as_slice(), &at.to_be_bytes()].concat(),
+            )
+            .await
+            .unwrap();
+            let crashed = until("alarm handler started", Duration::from_secs(3), || async {
+                let starts = alarm_starts.lock().unwrap();
+                (starts.len() == 2).then(|| starts[1].clone())
+            })
+            .await;
+            Handle::current().kill(hosts[&crashed].id());
+            // No request wakes the actor: the slots must recover the expired held alarm themselves.
+            until(
+                "alarm redelivery after holder crash",
+                Duration::from_secs(20),
+                || async { (alarm_starts.lock().unwrap().len() >= 3).then_some(()) },
+            )
+            .await;
+            let count = until(
+                "retried alarm committed",
+                Duration::from_secs(10),
+                || async {
+                    bedrock_compute::bindings::call(&client, actor.clone(), b"alarm-count".to_vec())
+                        .await
+                        .ok()
+                },
+            )
+            .await;
+            assert_eq!(u64::from_be_bytes(count.try_into().unwrap()), 2);
+            assert_eq!(alarm_starts.lock().unwrap().len(), 3);
+            trace.push("crashed alarm redelivered".into());
             trace
         })
         .await
