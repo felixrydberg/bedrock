@@ -5,6 +5,7 @@
 //! `--cfg madsim`. Bootstrap validation (corruption, interruption, lease expiry) is dataset-generic and covered by the
 //! relay client and server tests in `bedrock-lib`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -88,6 +89,10 @@ async fn relay(id: &str, tier: u32, upstream: &str, port: u16) -> (String, Serve
 
 /// `(hash, namespace, key, value)` of one stored record.
 type Row = (u64, Vec<u8>, Vec<u8>, Vec<u8>);
+/// One bulk's changes; `None` deletes.
+type Changes = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+/// The live rows every cell must converge to.
+type Model = BTreeMap<Vec<u8>, Vec<u8>>;
 
 /// A `bedrock-cdn` range holder: a local engine following one hash range of `cdn` through its cell relay.
 struct Holder {
@@ -116,6 +121,24 @@ impl Holder {
         }
     }
 
+    /// The rows of `model` in this holder's range, in stored order.
+    fn expected(&self, model: &Model) -> Vec<Row> {
+        let span = pb::Span {
+            start: self.span.0,
+            end: self.span.1,
+        };
+        let mut rows: Vec<Row> = model
+            .iter()
+            .map(|(key, value)| {
+                let hash = hash_of("cdn", NAMESPACE, key);
+                (hash, NAMESPACE.into(), key.clone(), value.clone())
+            })
+            .filter(|(hash, ..)| in_span(&span, *hash))
+            .collect();
+        rows.sort();
+        rows
+    }
+
     /// Every stored `(hash, namespace, key, value)` in the hash-first layout.
     fn rows(&self) -> Vec<Row> {
         self.engine
@@ -141,9 +164,9 @@ async fn until(what: &str, done: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
-/// Every path row and ref key of a deployment, or their deletions, in one bulk.
-async fn publish(writer: &Arc<Writer>, deployment: &str, files: &[(&str, Hash)], release: bool) {
-    let changes = files
+/// Every path row and ref key of a deployment, or their deletions, as one bulk.
+fn changes(deployment: &str, files: &[(&str, Hash)], release: bool) -> Changes {
+    files
         .iter()
         .flat_map(|(path, sha256)| {
             let row = PathRow {
@@ -157,7 +180,17 @@ async fn publish(writer: &Arc<Writer>, deployment: &str, files: &[(&str, Hash)],
             ]
         })
         .map(|(key, value)| (key, (!release).then_some(value)))
-        .collect();
+        .collect()
+}
+
+/// Commits `changes` and records them in `model`.
+async fn publish(writer: &Arc<Writer>, model: &mut Model, changes: Changes) {
+    for (key, value) in &changes {
+        match value {
+            Some(value) => model.insert(key.clone(), value.clone()),
+            None => model.remove(key),
+        };
+    }
     writer
         .commit(Write {
             dataset: "cdn".into(),
@@ -196,14 +229,15 @@ async fn scenario() {
     let shared = Hash([0xf0; 32]);
     let own = Hash([0x10; 32]);
     assert!(content(&shared.0) >= HALF && content(&own.0) < HALF);
+    let mut model = Model::new();
+    let d1 = [("/index.html", shared), ("/a.css", own)];
+    publish(&writer, &mut model, changes("d1", &d1, false)).await;
     publish(
         &writer,
-        "d1",
-        &[("/index.html", shared), ("/a.css", own)],
-        false,
+        &mut model,
+        changes("d2", &[("/index.html", shared)], false),
     )
     .await;
-    publish(&writer, "d2", &[("/index.html", shared)], false).await;
     let all = || cells.iter().flat_map(|(_, holders, ..)| holders.iter());
     let holding = |sha: Hash| {
         let holders: Vec<_> = all()
@@ -211,43 +245,22 @@ async fn scenario() {
             .collect();
         holders
     };
-    until("both deployments", || {
-        holding(shared) == [false, true, false, true] && holding(own) == [true, false, true, false]
-    })
-    .await;
-    // Each holder keeps exactly the keys of its range; ref keys sit at their artifact's position.
-    for holder in all() {
-        for (hash, namespace, key, _) in holder.rows() {
-            assert_eq!(namespace, NAMESPACE.as_bytes());
-            assert_eq!(hash, hash_of("cdn", NAMESPACE, &key));
-            let span = pb::Span {
-                start: holder.span.0,
-                end: holder.span.1,
-            };
-            assert!(in_span(&span, hash), "{key:?} outside {:?}", holder.span);
-            if key.starts_with(b"ref/") {
-                let sha = if key.starts_with(format!("ref/{shared}/").as_bytes()) {
-                    shared
-                } else {
-                    own
-                };
-                assert_eq!(hash, content(&sha.0));
-            }
-        }
+    // Each holder converges to exactly the rows of its range.
+    let converged = |model: &Model| all().all(|h| h.rows() == h.expected(model));
+    until("both deployments", || converged(&model)).await;
+    assert_eq!(holding(shared), [false, true, false, true]);
+    assert_eq!(holding(own), [true, false, true, false]);
+    // Ref keys sit at their artifact's position.
+    for sha in [shared, own] {
+        let key = ref_key(&sha, "d1").unwrap();
+        assert_eq!(hash_of("cdn", NAMESPACE, &key), content(&sha.0));
     }
 
-    // Releasing d1 keeps the artifact d2 shares and drops the one only d1 used.
-    publish(
-        &writer,
-        "d1",
-        &[("/index.html", shared), ("/a.css", own)],
-        true,
-    )
-    .await;
-    until("d1 released", || {
-        holding(shared) == [false, true, false, true] && holding(own) == [false; 4]
-    })
-    .await;
+    // Releasing d1 deletes its rows, keeps the artifact d2 shares and drops the one only d1 used.
+    publish(&writer, &mut model, changes("d1", &d1, true)).await;
+    until("d1 released", || converged(&model)).await;
+    assert_eq!(holding(shared), [false, true, false, true]);
+    assert_eq!(holding(own), [false; 4]);
 
     // Wipe cell-a's upper holder while deployments keep being published, then let it rebuild.
     let (address, holders, ..) = &mut cells[0];
@@ -256,35 +269,30 @@ async fn scenario() {
     old.session.stop().await;
     let publishing = {
         let writer = writer.clone();
+        let mut model = model.clone();
         tokio::spawn(async move {
             for i in 0..20u8 {
-                let sha = Hash([0x80 | i; 32]);
+                let files = [("/", Hash([0x80 | i; 32])), ("/shared", shared)];
                 publish(
                     &writer,
-                    &format!("w{i}"),
-                    &[("/", sha), ("/shared", shared)],
-                    false,
+                    &mut model,
+                    changes(&format!("w{i}"), &files, false),
                 )
                 .await;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
+            model
         })
     };
-    publishing.await.unwrap();
-    let [(_, a, ..), (_, b, ..)] = &cells[..] else {
-        unreachable!()
-    };
-    // The last deployment's ref key proves both holders caught up, not only that they agree on an earlier state.
-    let last = Hash([0x80 | 19; 32]);
+    let model = publishing.await.unwrap();
+    let all = || cells.iter().flat_map(|(_, holders, ..)| holders.iter());
+    let converged = |model: &Model| all().all(|h| h.rows() == h.expected(model));
+    // Every holder, the wiped one included, converges to the final rows of its range.
     until("the wiped holder rebuilt", || {
-        a[1].session.ready()
-            && b[1].session.ready()
-            && retained(a[1].engine.as_ref(), &last).unwrap()
-            && a[1].rows() == b[1].rows()
+        all().all(|h| h.session.ready()) && converged(&model)
     })
     .await;
-    assert!(!a[1].rows().is_empty());
-    assert!(retained(a[1].engine.as_ref(), &shared).unwrap());
+    assert!(retained(cells[0].1[1].engine.as_ref(), &shared).unwrap());
     for (_, holders, ..) in cells {
         for holder in holders {
             holder.session.stop().await;
