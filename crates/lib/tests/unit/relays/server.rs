@@ -1472,6 +1472,7 @@ fn a_range_stream_carries_exactly_its_own_changes_of_a_bulk() {
             .map(|bytes| Event::from(pb::Event::decode(bytes).unwrap()))
     };
     assert_eq!(carried((key.clone(), None)), Some(bulk.clone()));
+    assert_eq!(carried((key.clone(), Some((0, 0)))), Some(bulk.clone()));
     for (k, value) in [(b"a", Some(b"1".to_vec())), (b"b", None)] {
         let part = carried(only(k)).expect("the range's own change");
         assert_eq!(

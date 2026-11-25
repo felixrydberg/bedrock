@@ -934,6 +934,104 @@ async fn range_follow_streams_every_namespace_and_only_its_hashes_through_two_ti
     writer.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn a_bulk_across_two_ranges_reaches_each_range_with_exactly_its_own_keys() {
+    use bedrock_lib::placement::hash_of;
+    use bedrock_lib::storage::{KeyRange, l2_key};
+    const HALF: u64 = 1 << 63;
+    let writer = writer().await;
+    let source = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17511).await;
+    let top = relay("top", 3, &source.address);
+    let top_task = top.start();
+    let top = serve(top, 17512).await;
+    let cell = relay("cell", 1, &top.address);
+    let cell_task = cell.start();
+    let cell = serve(cell, 17513).await;
+    let halves = [(0, HALF), (HALF, 0)];
+    let engines = halves.map(|_| Arc::new(MemoryEngine::new("local")));
+    let inside = |half: usize, key: &[u8]| (hash_of("cdn", "pages", key) < HALF) == (half == 0);
+    let sessions: Vec<_> = (0..2)
+        .map(|half| {
+            let target = Target {
+                selection: Selection {
+                    dataset: "cdn".into(),
+                    namespace: String::new(),
+                },
+                engine: engines[half].clone(),
+                prefix: Vec::new(),
+                span: Some(halves[half]),
+            };
+            Session::start(peers(), vec![cell.address.clone()], vec![target]).unwrap()
+        })
+        .collect();
+    let stored = |half: usize, key: &[u8]| {
+        engines[half]
+            .get(&l2_key(hash_of("cdn", "pages", key), "pages", key))
+            .unwrap()
+    };
+    let keys: Vec<Vec<u8>> = (0u8..16).map(|i| vec![b'k', i]).collect();
+    assert!((0..2).all(|half| keys.iter().any(|key| inside(half, key))));
+    let bulk = |changes| async {
+        put(&writer, "pages", b"", Operation::Bulk(changes)).await;
+    };
+    // One bulk spanning both ranges, then one that deletes half its keys and changes the rest.
+    bulk(
+        keys.iter()
+            .map(|key| (key.clone(), Some(b"one".to_vec())))
+            .collect(),
+    )
+    .await;
+    bulk(
+        keys.iter()
+            .enumerate()
+            .map(|(i, key)| (key.clone(), i.is_multiple_of(2).then(|| b"two".to_vec())))
+            .collect(),
+    )
+    .await;
+    // A bulk entirely in the lower range is coverage alone for the upper one, which a later write there follows.
+    let lower: Vec<_> = keys.iter().filter(|key| inside(0, key)).cloned().collect();
+    bulk(
+        lower
+            .iter()
+            .map(|key| (key.clone(), Some(b"three".to_vec())))
+            .collect(),
+    )
+    .await;
+    let last = keys.iter().find(|key| inside(1, key)).unwrap().clone();
+    put(&writer, "pages", &last, Operation::Set(b"four".to_vec())).await;
+    let expected = |half: usize, i: usize, key: &[u8]| -> Option<&'static [u8]> {
+        if !inside(half, key) {
+            None
+        } else if half == 0 {
+            Some(b"three")
+        } else if *key == *last {
+            Some(b"four")
+        } else {
+            i.is_multiple_of(2).then_some(b"two")
+        }
+    };
+    // The upper range's last write follows a revision it got only coverage for, so reaching it shows the gap closed.
+    until("both ranges", || {
+        (0..2).all(|half| {
+            let mut keys = keys.iter().enumerate();
+            keys.all(|(i, key)| stored(half, key).as_deref() == expected(half, i, key))
+        })
+    })
+    .await;
+    // Nothing of the other range arrives.
+    for (half, engine) in engines.iter().enumerate() {
+        for entry in engine.scan(&KeyRange::prefix(*b"l2/")).unwrap() {
+            let (key, _) = entry.unwrap();
+            let hash = u64::from_be_bytes(key[3..11].try_into().unwrap());
+            assert_eq!(hash < HALF, half == 0, "key outside the followed range");
+        }
+    }
+    drop(sessions);
+    top_task.abort();
+    cell_task.abort();
+    writer.close().await.unwrap();
+}
+
 async fn admin_get(admin: &Arc<Admin>, path: &str) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

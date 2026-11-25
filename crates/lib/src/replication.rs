@@ -77,26 +77,6 @@ impl Event {
             _ => !self.key.is_empty(),
         }
     }
-
-    /// The part of the event a stream selecting `keep` carries: the event itself, a bulk cut to the changes `keep`
-    /// selects, or `None` when it selects none and the stream carries only coverage for this revision.
-    pub fn selected(&self, keep: impl Fn(&[u8]) -> bool) -> Option<Event> {
-        let Operation::Bulk(changes) = &self.operation else {
-            return keep(&self.key).then(|| self.clone());
-        };
-        let kept: Vec<_> = changes
-            .iter()
-            .filter(|(key, _)| keep(key))
-            .cloned()
-            .collect();
-        if kept.is_empty() {
-            return None;
-        }
-        Some(Event {
-            operation: Operation::Bulk(kept),
-            ..self.clone()
-        })
-    }
 }
 
 /// Road `partition` of `dataset`'s stream pool, e.g. `kv-0`. Datasets never share a stream.

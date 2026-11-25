@@ -46,36 +46,72 @@ type ReplayItem = (Event, u64, usize);
 #[derive(Clone)]
 struct EncodedEvent {
     bytes: Bytes,
-    /// The key's placement hash; `None` for a bulk, whose changes a range stream selects one by one (#76 / B-09c).
-    hash: Option<u64>,
+    placement: Placement,
+}
+
+#[derive(Clone)]
+enum Placement {
+    /// The key's placement hash.
+    Key(u64),
+    /// A bulk is encoded as the event without changes, `header` bytes long, followed by one `changes` field per
+    /// change. Each change keeps its hash and where its field ends, so a range stream copies the fields it selects
+    /// instead of decoding the bulk (#76 / B-09c).
+    Bulk {
+        header: usize,
+        changes: Arc<[(u64, usize)]>,
+    },
 }
 
 impl EncodedEvent {
     fn new(event: Event) -> Self {
-        let hash = match event.operation {
-            Operation::Bulk(_) => None,
-            _ => Some(hash_of(&event.dataset, &event.namespace, &event.key)),
-        };
+        let (dataset, namespace) = (event.dataset.clone(), event.namespace.clone());
+        let mut event = pb::Event::from(event);
+        if event.changes.is_empty() {
+            return EncodedEvent {
+                placement: Placement::Key(hash_of(&dataset, &namespace, &event.key)),
+                bytes: Bytes::from(event.encode_to_vec()),
+            };
+        }
+        let changes = std::mem::take(&mut event.changes);
+        let mut bytes = event.encode_to_vec();
+        let header = bytes.len();
+        let ends = changes
+            .iter()
+            .map(|change| {
+                prost::encoding::message::encode(9, change, &mut bytes);
+                (hash_of(&dataset, &namespace, &change.key), bytes.len())
+            })
+            .collect();
         EncodedEvent {
-            bytes: Bytes::from(pb::Event::from(event).encode_to_vec()),
-            hash,
+            bytes: Bytes::from(bytes),
+            placement: Placement::Bulk {
+                header,
+                changes: ends,
+            },
         }
     }
 
     /// What `stream` carries of the event: all of it, a bulk cut to the changes in its range, or nothing, which
     /// leaves only coverage of this revision.
     fn selected(self, stream: &StreamKey) -> Option<Bytes> {
-        match self.hash {
-            Some(hash) => selects(stream, hash).then_some(self.bytes),
-            None if stream.1.is_none() => Some(self.bytes),
-            None => {
-                let event =
-                    Event::from(pb::Event::decode(self.bytes).expect("encoded by this relay"));
-                let part = event.selected(|key| {
-                    selects(stream, hash_of(&event.dataset, &event.namespace, key))
-                })?;
-                Some(Bytes::from(pb::Event::from(part).encode_to_vec()))
+        let (header, changes) = match self.placement {
+            Placement::Key(hash) => return selects(stream, hash).then_some(self.bytes),
+            Placement::Bulk { header, changes } => (header, changes),
+        };
+        let mut part = self.bytes[..header].to_vec();
+        let mut start = header;
+        let mut kept = 0;
+        for &(hash, end) in changes.iter() {
+            if selects(stream, hash) {
+                part.extend_from_slice(&self.bytes[start..end]);
+                kept += 1;
             }
+            start = end;
+        }
+        match kept {
+            0 => None,
+            n if n == changes.len() => Some(self.bytes),
+            _ => Some(Bytes::from(part)),
         }
     }
 }

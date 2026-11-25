@@ -57,6 +57,21 @@ fn a_faithful_copy_passes_at_every_revision() {
 }
 
 #[test]
+fn a_bulk_changes_every_key_at_one_revision_and_half_of_it_is_caught() {
+    let mut history = history();
+    let s = stream();
+    let changes = [(b"a".to_vec(), None), (b"c".to_vec(), Some(b"5".to_vec()))];
+    history.acknowledged_changes(&s, 5, "w5", &changes).unwrap();
+    history
+        .check_copy(&s, 5, all, &copy(&[("c", "5")]))
+        .unwrap();
+    let half = history.check_copy(&s, 5, all, &copy(&[("a", "3"), ("c", "5")]));
+    assert_eq!(invariant(half), "NoResurrection");
+    let early = history.check_copy(&s, 4, all, &copy(&[("a", "3"), ("c", "5")]));
+    assert_eq!(invariant(early), "GapFreeApply");
+}
+
+#[test]
 fn selection_restricts_the_copy() {
     history()
         .check_copy(&stream(), 4, |key| key != b"a", &copy(&[]))
