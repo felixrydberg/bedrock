@@ -78,6 +78,44 @@ async fn only_ready_or_leaving_owners_serve_slot_requests() {
     }
 }
 
+/// #124 / S-16: a heartbeat acknowledges the endings it recorded or has no use for, and leaves one it could not write
+/// with the host, which resends it.
+#[tokio::test]
+async fn a_heartbeat_acknowledges_only_the_endings_it_recorded() {
+    let holder = pb::Holder {
+        cell: "cell-1".into(),
+        host: "h".into(),
+    };
+    let ended = pb::Ended {
+        actor: Some(actor()),
+        epoch: 1,
+    };
+    let beat = || {
+        Request::new(pb::HeartbeatRequest {
+            holder: Some(holder.clone()),
+            ended: vec![ended.clone()],
+        })
+    };
+    let acked = |service: Service| async move {
+        service.heartbeat(beat()).await.unwrap().into_inner().ended
+    };
+    assert_eq!(
+        acked(service(State::Ready)).await,
+        std::slice::from_ref(&ended)
+    );
+    // Another node's range: nothing to record here.
+    assert_eq!(
+        acked(service(State::Populating)).await,
+        std::slice::from_ref(&ended)
+    );
+    let sealed = service(State::Ready);
+    sealed.store.seal(0, u64::MAX).unwrap();
+    assert!(
+        acked(sealed).await.is_empty(),
+        "a sealed range records nothing now"
+    );
+}
+
 /// Over mutual TLS the caller is checked: only the claimant's own Compute host reads its log, and only a volume node
 /// copies a range's raw records.
 #[tokio::test]

@@ -91,7 +91,12 @@ impl Holder {
     /// Opens the actor once its three slots are placed and one quorum takes the claim; returns the writer and its
     /// recovered counter, recorded as a `Get`.
     async fn open(&mut self) -> Writer {
-        let deadline = Instant::now() + Duration::from_secs(120);
+        self.open_by(Instant::now() + Duration::from_secs(120))
+            .await
+    }
+
+    /// [`Holder::open`], failing the run at `deadline`.
+    async fn open_by(&mut self, deadline: Instant) -> Writer {
         loop {
             let start = self.now();
             match self.try_open().await {
@@ -139,8 +144,8 @@ impl Holder {
         });
     }
 
-    /// Commits the counter plus one; `false` when the outcome is unknown.
-    async fn commit(&mut self, writer: &Writer, value: &mut u64) -> bool {
+    /// Commits the counter plus one, waiting at most `within` (and 10 s); `false` when the outcome is unknown.
+    async fn commit(&mut self, writer: &Writer, value: &mut u64, within: Duration) -> bool {
         let start = self.now();
         let next = *value + 1;
         let change = pb::Change {
@@ -148,7 +153,7 @@ impl Holder {
             value: Some(next.to_be_bytes().to_vec()),
         };
         let committed = tokio::time::timeout(
-            Duration::from_secs(10),
+            within.min(Duration::from_secs(10)),
             writer.commit(vec![change], None, 0),
         )
         .await;
@@ -165,7 +170,8 @@ impl Holder {
     }
 
     /// Commits until `count` are acknowledged, reopening the actor when its writer stops serving; fails the run when
-    /// that takes longer than a minute. Unknown outcomes on the way stay in the history as such.
+    /// all of it, reopening included, takes longer than a minute. Unknown outcomes on the way stay in the history as
+    /// such.
     async fn progress(&mut self, writer: &mut Writer, value: &mut u64, count: usize) -> usize {
         let deadline = Instant::now() + Duration::from_secs(60);
         let (mut acked, mut reopened) = (0, 0);
@@ -175,11 +181,12 @@ impl Holder {
                 "{acked} of {count} commits acknowledged within a minute of a restart"
             );
             if !writer.serving() {
-                *writer = self.open().await;
+                *writer = self.open_by(deadline).await;
                 *value = self.history.calls.last().unwrap().answer.unwrap().value;
                 reopened += 1;
             }
-            if self.commit(writer, value).await {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if self.commit(writer, value, left).await {
                 acked += 1;
             }
         }
@@ -235,7 +242,7 @@ async fn kill_at(
     let acknowledged = match boundary {
         Boundary::BeforeDelivery => {
             node.proxy.set(Mode::Stall);
-            let acked = holder.commit(writer, value).await;
+            let acked = holder.commit(writer, value, Duration::from_secs(10)).await;
             cluster.kill(node);
             acked
         }
@@ -249,11 +256,14 @@ async fn kill_at(
                 sleep(delay).await;
                 cluster.kill(node);
             };
-            let (acked, ()) = tokio::join!(holder.commit(writer, value), killing);
+            let (acked, ()) = tokio::join!(
+                holder.commit(writer, value, Duration::from_secs(10)),
+                killing
+            );
             acked
         }
         Boundary::Between => {
-            let acked = holder.commit(writer, value).await;
+            let acked = holder.commit(writer, value, Duration::from_secs(10)).await;
             cluster.kill(node);
             acked
         }

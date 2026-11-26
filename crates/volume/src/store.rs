@@ -107,6 +107,11 @@ pub struct Actor {
     kind: i32,
 }
 
+/// Whether the promised holder said it stopped running the actor at this promise.
+fn lease_ended(claim: &pb::ClaimRecord) -> bool {
+    claim.holder.is_some() && claim.ended_epoch == claim.epoch && claim.ended_by == claim.holder
+}
+
 /// A due alarm hint. The receiving holder validates it against its recovered, committed alarm before invoking.
 #[derive(Clone, Debug)]
 pub struct AlarmCandidate {
@@ -902,7 +907,13 @@ impl Store {
             new.epoch = promise.epoch;
             new.holder = promise.holder.clone();
             new.released = promise.released && new.end == promise.end;
-            new.ended = promise.ended;
+            let ended = if copied.ended_epoch > here.ended_epoch {
+                &copied
+            } else {
+                here
+            };
+            new.ended_epoch = ended.ended_epoch;
+            new.ended_by = ended.ended_by.clone();
             new.reserved = here.reserved.max(copied.reserved);
             new.version = here.version.max(copied.version);
         }
@@ -1298,7 +1309,7 @@ impl Store {
                     },
                     at_ms,
                     // An ended lease no longer holds up the alarm: no one runs the actor.
-                    released: claim.released || claim.ended,
+                    released: claim.released || lease_ended(&claim),
                     holder: claim.holder,
                 });
             }
@@ -1653,7 +1664,7 @@ impl Store {
         let other = old
             .holder
             .as_ref()
-            .filter(|h| *h != holder && !old.released && !old.ended);
+            .filter(|h| *h != holder && !old.released && !lease_ended(&old));
         let refused = if version < old.version {
             Refusal::StaleVersion
         } else if epoch <= old.epoch {
@@ -1670,7 +1681,6 @@ impl Store {
             epoch,
             holder: Some(holder.clone()),
             released: false,
-            ended: false,
             version,
             kind: actor.kind,
             ..old.clone()
@@ -1681,21 +1691,21 @@ impl Store {
         Ok((answer(refused, &new, voting), other.is_some()))
     }
 
-    /// Ends the lease of the claim `holder` took at `epoch`, if it is still the slot's promise: the holder no longer runs
-    /// the actor there, so another may claim it while the holder's host heartbeats for other actors.
+    /// Ends the lease of the claim `holder` took at `epoch`: the holder no longer runs the actor there, so another may
+    /// claim it while the holder's host heartbeats for other actors. The ending is kept for a claim that has not arrived
+    /// yet, as a claim call can land after its writer gave up. `Ok` means it took effect or has none: a newer promise
+    /// or a tombstone stands.
     pub fn end_lease(&self, actor: &Actor, holder: &pb::Holder, epoch: u64) -> Result<(), Error> {
         let _lock = self.lock(actor);
         self.check_sealed(actor)?;
         let old = self.load(actor)?;
-        if old.ended
-            || old.epoch != epoch
-            || old.holder.as_ref() != Some(holder)
-            || buried(&old).is_some()
-        {
+        let other_holder = epoch == old.epoch && old.holder.as_ref() != Some(holder);
+        if epoch < old.epoch || other_holder || old.ended_epoch >= epoch || buried(&old).is_some() {
             return Ok(());
         }
         let new = pb::ClaimRecord {
-            ended: true,
+            ended_epoch: epoch,
+            ended_by: Some(holder.clone()),
             ..old.clone()
         };
         let mut batch = WriteBatch::default();

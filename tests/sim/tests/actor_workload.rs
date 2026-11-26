@@ -252,6 +252,8 @@ struct Shared {
     /// The host of the increment that reached it.
     appending: Mutex<Option<String>>,
     reached: tokio::sync::Notify,
+    /// Set once that increment's commit returned, however it ended.
+    returned: std::sync::atomic::AtomicBool,
 }
 
 /// The counter actor: `incr` commits the counter plus one, `alarm` also sets an alarm [`ALARM_IN`] ahead, `get` reads the
@@ -327,7 +329,11 @@ impl Instance for Counter {
                     self.shared.reached.notify_one();
                 }
                 if !(self.bug == Some(Bug::Uncommitted) && self.increments.is_multiple_of(3)) {
-                    self.storage.commit(Self::change(next)).await?;
+                    let committed = self.storage.commit(Self::change(next)).await;
+                    if armed {
+                        self.shared.returned.store(true, Ordering::SeqCst);
+                    }
+                    committed?;
                 }
                 self.value = Some(next);
                 Ok(self.answer(next))
@@ -732,7 +738,12 @@ async fn faults(cluster: &mut Cluster, recorder: &Recorder, busy: &pb::Actor) ->
             .await
             .expect("no increment of the busy actor reached its append");
         let holder = cluster.shared.appending.lock().unwrap().take().unwrap();
-        sleep(Duration::from_micros(thread_rng().gen_range(0..3_000))).await;
+        // Under one network hop (madsim sends take 1 ms or more), so no slot has answered the append yet.
+        sleep(Duration::from_micros(thread_rng().gen_range(0..1_000))).await;
+        assert!(
+            !cluster.shared.returned.load(Ordering::SeqCst),
+            "the append returned before its holder was killed"
+        );
         handle.kill(cluster.computes[&holder].id());
         trace.push(format!("{:?} killed {holder} mid-append", recorder.now()));
         holder

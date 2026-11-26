@@ -170,6 +170,18 @@ fn an_ended_claim_holds_no_lease() {
         Refusal::LeaseLive,
         "b's new claim holds a lease"
     );
+
+    // An ending can land before its claim: a's claim at 5 ends when it arrives, and an older ending changes nothing.
+    store.end_lease(&actor, &a, 5).unwrap();
+    store.end_lease(&actor, &a, 4).unwrap();
+    let (answer, _) = store.claim(&actor, &a, 5, 0, |_| false).unwrap();
+    assert_eq!(refused(&answer), Refusal::None);
+    let (answer, _) = store.claim(&actor, &b, 6, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::None,
+        "a's claim at 5 ended before it arrived"
+    );
 }
 
 /// What the slot answers now, for comparing whole answers.

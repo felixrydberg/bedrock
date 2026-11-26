@@ -133,7 +133,9 @@ message Answer { Refusal refused = 1; Slot slot = 2; }
 message HeartbeatRequest { Holder holder = 1; repeated Ended ended = 2; }
 // A claim at `epoch` whose holder no longer runs the actor: its lease is over (`Live` in `docs/spec/volume.tla`).
 message Ended { Actor actor = 1; uint64 epoch = 2; }
-message HeartbeatReply {}
+// `ended`: the endings this slot recorded, or has no use for (not its range, buried, or an older epoch); the host
+// resends the others.
+message HeartbeatReply { repeated Ended ended = 1; }
 
 message ReadRequest { Actor actor = 1; repeated bytes keys = 2; uint64 min_seq = 3; }
 // `value` is absent when the key is deleted or was never written.
@@ -189,8 +191,10 @@ message ClaimRecord {
   LogEnd deleted = 17;
   // The `DELETE`'s `committed_at`, where the grace period starts.
   uint64 deleted_at_ms = 18;
-  // The promised holder said it stopped running the actor at this promise: its lease is over. A new claim clears it.
-  bool ended = 19;
+  // The newest claim a holder said it stopped running the actor at, possibly before that claim arrived here: while the
+  // promise is that claim, its lease is over.
+  uint64 ended_epoch = 19;
+  Holder ended_by = 20;
 }
 message OverlayRecord { uint64 seq = 1; optional bytes value = 2; }
 

@@ -43,6 +43,8 @@ pub const GAP_WAIT: Duration = Duration::from_millis(1200);
 /// The whole S3 lookup of an append gap, under the holder's 2 s call. Past it the append answers `UNAVAILABLE`, which
 /// the holder retries: S3 confirmed nothing, so the holder must not take it for a gap and drop the slot.
 pub const GAP_LOOKUP: Duration = Duration::from_millis(1800);
+/// How long one heartbeat spends recording ended claims, well under the host's 2 s call; the rest wait for the next.
+pub const ENDING_BUDGET: Duration = Duration::from_millis(500);
 const COMPUTE: &str = "compute";
 const VOLUME: &str = bedrock_lib::datasets::capabilities::VOLUME;
 
@@ -467,27 +469,35 @@ impl pb::volume_server::Volume for Service {
         let host = holder(request.get_ref().holder.as_ref())?.clone();
         check(&request, COMPUTE, Some(&host))?;
         self.metrics.heartbeats.inc();
-        // Claims the host no longer runs. One this node does not serve, or cannot write now, is passed over: the host
-        // does not resend it.
-        // ponytail: a claim ended while its range is sealed for a handoff stays leased on the new owner; carry it in
-        // the copy if that shows up.
+        let now = bedrock_lib::monotonic_now();
+        {
+            let mut leases = self.leases.lock().unwrap_or_else(PoisonError::into_inner);
+            // Hosts seen long ago no longer hold a lease here.
+            leases.retain(|_, seen| now.duration_since(*seen) < LEASE);
+            leases.insert((host.cell.clone(), host.host.clone()), now);
+        }
+        // Claims the host no longer runs, recorded within ENDING_BUDGET so the heartbeat answers well inside the host's
+        // call. The reply names those recorded or of no use here (another node's range); the host resends the rest, so
+        // one that could not be written now (a sealed range, a storage error) is not lost.
+        // ponytail: an ending recorded while its range is sealed for a handoff stays on the old owner; carry it in the
+        // copy if that shows up.
+        let deadline = now + ENDING_BUDGET;
+        let mut recorded = Vec::new();
         for ended in request.into_inner().ended {
+            if bedrock_lib::monotonic_now() >= deadline {
+                break;
+            }
             let Ok(actor) = self.actor(ended.actor.as_ref()) else {
+                recorded.push(ended);
                 continue;
             };
-            let (store, holder) = (self.store.clone(), host.clone());
-            if let Err(error) =
-                blocking(move || store.end_lease(&actor, &holder, ended.epoch)).await?
-            {
-                tracing::debug!(error = %status(error), "ending a lease failed");
+            let (store, holder, epoch) = (self.store.clone(), host.clone(), ended.epoch);
+            match blocking(move || store.end_lease(&actor, &holder, epoch)).await? {
+                Ok(()) => recorded.push(ended),
+                Err(error) => tracing::debug!(error = %status(error), "ending a lease failed"),
             }
         }
-        let now = bedrock_lib::monotonic_now();
-        let mut leases = self.leases.lock().unwrap_or_else(PoisonError::into_inner);
-        // Hosts seen long ago no longer hold a lease here.
-        leases.retain(|_, seen| now.duration_since(*seen) < LEASE);
-        leases.insert((host.cell, host.host), now);
-        Ok(Response::new(pb::HeartbeatReply {}))
+        Ok(Response::new(pb::HeartbeatReply { ended: recorded }))
     }
 
     async fn read(

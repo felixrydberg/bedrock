@@ -57,6 +57,8 @@ pub const MAX_ENTRY_BYTES: usize = bedrock_lib::kv::MAX_ENTRY_BYTES;
 /// Pages one SQLite read miss fetches, aligned (user decision 2026-11-15).
 pub const CHUNK_PAGES: u32 = 64;
 const CALL: Duration = Duration::from_secs(2);
+/// Ended claims one heartbeat carries, so it stays far below the message limit; the rest follow with later heartbeats.
+const ENDED_PER_BEAT: usize = 256;
 const RETRY: Duration = Duration::from_millis(100);
 /// Committed entries, and their encoded bytes, kept for a lagging slot. A slot further behind waits for S-06's repair.
 // The latest committed entry stays even when larger, so an idle slot can learn its commit point.
@@ -298,20 +300,21 @@ impl Host {
         let ended = self
             .lock()
             .get(&slot.address)
-            .map(|n| n.ended.clone())
+            .map(|n| n.ended.iter().take(ENDED_PER_BEAT).cloned().collect())
             .unwrap_or_default();
         let request = pb::HeartbeatRequest {
             holder: Some(self.holder.clone()),
-            ended: ended.clone(),
+            ended,
         };
         let beat = call(&self.peers, &slot, |mut c| async move {
             c.heartbeat(request).await
         });
-        if beat.await.is_ok() {
+        if let Ok(reply) = beat.await {
             let mut nodes = self.lock();
             if let Some(node) = nodes.get_mut(&slot.address) {
                 node.acked = node.acked.max(Some(sent));
-                node.ended.retain(|e| !ended.contains(e));
+                // Only what the slot recorded; it resends the rest with the next heartbeat.
+                node.ended.retain(|e| !reply.ended.contains(e));
                 if node.users == 0 && node.ended.is_empty() {
                     nodes.remove(&slot.address);
                 }
