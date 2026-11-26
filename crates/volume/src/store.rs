@@ -52,7 +52,8 @@ pub const MAX_UNFLUSHED_BYTES: u64 = 16 << 30;
 pub enum Error {
     Storage(StorageError),
     Invalid(String),
-    /// Too much is not yet flushed to S3; the holder retries later. Nothing was written.
+    /// Too much is not yet flushed to S3, or too many lease endings wait for their claims; the caller retries later.
+    /// Nothing was written.
     Backpressure,
     /// A multi-key read must be split before it can fit in one response.
     ReplyTooLarge,
@@ -116,8 +117,10 @@ fn lease_ended(claim: &pb::ClaimRecord) -> bool {
             .any(|e| e.epoch == claim.epoch && e.holder == claim.holder)
 }
 
+/// Endings of claims above the promise a slot stores; `end_lease` refuses more, and the host resends them.
+const PENDING_ENDINGS: usize = 8;
+
 /// Endings worth keeping under a promise at `epoch`: none below it, each once, lowest first.
-// ponytail: capped at 8 pending endings, the lowest kept; only claim calls still in flight add more.
 fn endings(ended: impl IntoIterator<Item = pb::Ending>, epoch: u64) -> Vec<pb::Ending> {
     let mut kept: Vec<pb::Ending> = Vec::new();
     for e in ended {
@@ -126,7 +129,6 @@ fn endings(ended: impl IntoIterator<Item = pb::Ending>, epoch: u64) -> Vec<pb::E
         }
     }
     kept.sort_by_key(|e| e.epoch);
-    kept.truncate(8);
     kept
 }
 
@@ -1725,8 +1727,15 @@ impl Store {
         {
             return Ok(());
         }
+        let ended = endings(old.ended.iter().cloned().chain([ending]), old.epoch);
+        // The current promise's ending always fits; a full list refuses another future one rather than drop a stored one.
+        if epoch > old.epoch
+            && ended.iter().filter(|e| e.epoch > old.epoch).count() > PENDING_ENDINGS
+        {
+            return Err(Error::Backpressure);
+        }
         let new = pb::ClaimRecord {
-            ended: endings(old.ended.iter().cloned().chain([ending]), old.epoch),
+            ended,
             ..old.clone()
         };
         let mut batch = WriteBatch::default();

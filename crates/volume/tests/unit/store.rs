@@ -206,6 +206,32 @@ fn an_ended_claim_holds_no_lease() {
     );
 }
 
+/// #124 / S-16: a slot never drops an ending it stored; a full list refuses another future one, so the heartbeat does
+/// not acknowledge it, while the current promise's ending still fits.
+#[test]
+fn a_full_list_of_pending_endings_refuses_more_but_keeps_the_stored_ones() {
+    let store = store();
+    let actor = actor();
+    let a = host("a");
+    claimed(&store, &a, 1);
+    for epoch in 2..10 {
+        store.end_lease(&actor, &host("b"), epoch).unwrap();
+    }
+    assert!(matches!(
+        store.end_lease(&actor, &host("b"), 10),
+        Err(Error::Backpressure)
+    ));
+    store.end_lease(&actor, &a, 1).unwrap();
+    let (answer, _) = store.claim(&actor, &host("b"), 9, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None, "a's claim at 1 ended");
+    let (answer, _) = store.claim(&actor, &a, 10, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::None,
+        "b's stored ending at 9 holds"
+    );
+}
+
 /// What the slot answers now, for comparing whole answers.
 fn answer_of(store: &Store, holder: &pb::Holder, epoch: u64, version: u64) -> pb::Answer {
     let claim = store.load(&actor()).unwrap();
