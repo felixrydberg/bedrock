@@ -484,15 +484,18 @@ impl pb::volume_server::Volume for Service {
         let deadline = now + ENDING_BUDGET;
         let mut recorded = Vec::new();
         for ended in request.into_inner().ended {
-            if bedrock_lib::monotonic_now() >= deadline {
-                break;
-            }
             let Ok(actor) = self.actor(ended.actor.as_ref()) else {
                 recorded.push(ended);
                 continue;
             };
             let (store, holder, epoch) = (self.store.clone(), host.clone(), ended.epoch);
-            match blocking(move || store.end_lease(&actor, &holder, epoch)).await? {
+            let ending = blocking(move || store.end_lease(&actor, &holder, epoch));
+            // A write that misses the deadline goes unnamed; it may still land, and the host's resend is then a no-op.
+            let left = deadline.saturating_duration_since(bedrock_lib::monotonic_now());
+            let Ok(ended_lease) = tokio::time::timeout(left, ending).await else {
+                break;
+            };
+            match ended_lease? {
                 Ok(()) => recorded.push(ended),
                 Err(error) => tracing::debug!(error = %status(error), "ending a lease failed"),
             }
