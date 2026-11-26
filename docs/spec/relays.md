@@ -388,9 +388,8 @@ java -XX:+UseParallelGC -cp ../../scripts/tla2tools.jar tlc2.TLC -workers 1 -met
 The focused suites cover selector changes, filtered coverage, corruption, restart,
 eviction, storage failure/rebuild, subscription cancellation, two-tier forwarding,
 pruned-cursor bootstrap, and GC protection. A range follow through a writer, a top
-relay and a cell relay receives only its hashes in every namespace, picks up a
-namespace created after it followed, and resumes after a restart
-(`range_follow_streams_every_namespace_and_only_its_hashes_through_two_tiers`).
+relay and a cell relay receives only its hashes and resumes after a restart
+(`range_follow_streams_only_its_hashes_through_two_tiers_and_resumes`).
 `tests/sim/tests/relays.rs` runs seeds
 1, 2 and 42 twice and compares committed application traces through idle partitions,
 node kills, all-open routing and a KV-only process-task abort on a relay machine.
