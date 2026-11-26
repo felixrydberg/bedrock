@@ -227,6 +227,20 @@ fn due_alarms_include_held_claim_hints_without_changing_the_release_index() {
 }
 
 #[test]
+fn an_alarm_in_an_uncommitted_tail_is_a_held_hint() {
+    // The holder may have committed it by quorum and crashed before this slot learned the commit.
+    let store = store();
+    let holder = host("a");
+    claimed(&store, &holder, 1);
+    let mut event = entry(1, 1, &[]);
+    event.alarm = Some(pb::Alarm { at_ms: Some(42) });
+    assert_eq!(slot_end(&append(&store, &holder, 1, 0, vec![event], 0)), 1);
+    assert!(store.due_alarms(41).unwrap().is_empty());
+    let due = store.due_alarms(42).unwrap();
+    assert_eq!((due.len(), due[0].at_ms, due[0].released), (1, 42, false));
+}
+
+#[test]
 fn a_pending_alarm_change_does_not_suppress_the_committed_alarm() {
     let store = store();
     let holder = host("a");
