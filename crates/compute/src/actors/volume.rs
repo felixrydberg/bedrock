@@ -268,6 +268,17 @@ struct Node {
     ended: Vec<pb::Ended>,
 }
 
+/// Drops the endings a slot `recorded`. The others it was `sent` go to the back, so endings the slot keeps refusing
+/// do not hold the front of every heartbeat; they are resent after the rest.
+fn requeue(queue: &mut Vec<pb::Ended>, sent: &[pb::Ended], recorded: &[pb::Ended]) {
+    let (refused, rest): (Vec<_>, Vec<_>) = std::mem::take(queue)
+        .into_iter()
+        .filter(|e| !recorded.contains(e))
+        .partition(|e| sent.contains(e));
+    *queue = rest;
+    queue.extend(refused);
+}
+
 impl Host {
     /// Starts heartbeating as `holder` (this host's cell and node ID); stops once the host is dropped.
     pub fn start(peers: Arc<Peers>, holder: pb::Holder) -> Arc<Self> {
@@ -297,14 +308,14 @@ impl Host {
 
     async fn beat(&self, slot: Slot) {
         let sent = bedrock_lib::monotonic_now();
-        let ended = self
+        let ended: Vec<pb::Ended> = self
             .lock()
             .get(&slot.address)
             .map(|n| n.ended.iter().take(ENDED_PER_BEAT).cloned().collect())
             .unwrap_or_default();
         let request = pb::HeartbeatRequest {
             holder: Some(self.holder.clone()),
-            ended,
+            ended: ended.clone(),
         };
         let beat = call(&self.peers, &slot, |mut c| async move {
             c.heartbeat(request).await
@@ -313,8 +324,7 @@ impl Host {
             let mut nodes = self.lock();
             if let Some(node) = nodes.get_mut(&slot.address) {
                 node.acked = node.acked.max(Some(sent));
-                // Only what the slot recorded; it resends the rest with the next heartbeat.
-                node.ended.retain(|e| !reply.ended.contains(e));
+                requeue(&mut node.ended, &ended, &reply.ended);
                 if node.users == 0 && node.ended.is_empty() {
                     nodes.remove(&slot.address);
                 }

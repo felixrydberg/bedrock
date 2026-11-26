@@ -241,6 +241,17 @@ fn a_join_guard_leaves_the_heartbeat_set_when_dropped() {
     });
 }
 
+/// #124 / S-16: a heartbeat drops the endings the slot recorded and moves the refused ones behind those not yet sent.
+#[test]
+fn refused_endings_wait_behind_the_unsent_ones() {
+    let ended = |epoch| pb::Ended { actor: None, epoch };
+    let mut queue: Vec<pb::Ended> = (1..=5).map(ended).collect();
+    let sent: Vec<pb::Ended> = (1..=3).map(ended).collect();
+    requeue(&mut queue, &sent, &[ended(2)]);
+    let epochs: Vec<u64> = queue.iter().map(|e| e.epoch).collect();
+    assert_eq!(epochs, [4, 5, 1, 3]);
+}
+
 #[test]
 fn the_lease_deadline_follows_the_second_newest_acknowledged_heartbeat() {
     let runtime = tokio::runtime::Builder::new_current_thread()
