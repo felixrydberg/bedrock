@@ -75,7 +75,9 @@ impl Storage {
 
     fn check(&self) -> Result<(), Error> {
         if self.0.fenced.load(Ordering::Relaxed) {
-            return Err(Error::Fenced);
+            return Err(Error::Fenced(
+                "a commit's caller was cancelled before its quorum answered".into(),
+            ));
         }
         Ok(())
     }

@@ -328,7 +328,7 @@ fn a_waiter_woken_by_a_late_acknowledgement_after_the_fence_fails() {
         let fence_then_ack = async {
             tokio::task::yield_now().await;
             let mut state = writer.shared.lock();
-            writer.shared.fence(&mut state);
+            writer.shared.fence(&mut state, "test");
             for i in 0..2 {
                 state.ack(i, 3, true, 0);
             }
@@ -336,7 +336,7 @@ fn a_waiter_woken_by_a_late_acknowledgement_after_the_fence_fails() {
             writer.shared.changed.notify_waiters();
         };
         let (result, ()) = tokio::join!(waiter, fence_then_ack);
-        assert!(matches!(result, Err(Error::Fenced)), "{result:?}");
+        assert!(matches!(result, Err(Error::Fenced(_))), "{result:?}");
         assert_eq!(writer.committed(), 3, "the late acknowledgement did commit");
     });
 }
@@ -346,12 +346,20 @@ fn a_writer_with_fewer_than_two_slots_taking_appends_stops_serving() {
     runtime().block_on(async {
         let writer = writer(state(1, 0));
         assert!(writer.serving());
-        writer.shared.lose(0);
+        writer.shared.lose(0, "test");
         assert!(writer.serving(), "two slots still take appends");
-        writer.shared.lose(2);
+        writer.shared.lose(2, "corrupt");
         assert!(!writer.serving());
         let pending = writer.wait(|s| (s.commit >= 1).then_some(()));
-        assert!(matches!(pending.await, Err(Error::Fenced)));
+        // The error says why: the first reason, which a later fence does not replace.
+        writer.shared.fence(&mut writer.shared.lock(), "later");
+        let error = pending.await.unwrap_err().to_string();
+        assert!(
+            error.starts_with(
+                "the writer stopped serving: slot 2 dropped: corrupt; fewer than two voting slots"
+            ),
+            "{error}"
+        );
     });
 }
 
@@ -364,10 +372,10 @@ fn a_writer_left_with_one_voting_slot_stops_serving() {
         {
             let mut state = writer.shared.lock();
             state.ack(1, 1, false, 0);
-            assert!(!writer.shared.fence_without_quorum(&mut state));
+            assert!(!writer.shared.fence_without_quorum(&mut state, "test"));
         }
         assert!(writer.serving(), "slots 0 and 2 still vote");
-        writer.shared.lose(0);
+        writer.shared.lose(0, "test");
         assert!(!writer.serving(), "only slot 2 votes");
     });
 }

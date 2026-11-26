@@ -23,7 +23,7 @@ fn held_errors_redirect_to_the_exact_holder() {
 #[test]
 fn storage_failures_preserve_their_retry_and_diagnostic_information() {
     for original in [
-        volume::Error::Fenced,
+        volume::Error::Fenced("lease".into()),
         volume::Error::StaleVersion,
         volume::Error::Unavailable("no quorum".into()),
         volume::Error::TooLarge(3_145_729),
