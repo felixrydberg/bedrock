@@ -65,6 +65,26 @@ fn an_older_instance_answering_after_a_newer_one_is_two_serving() {
     );
 }
 
+/// The order is the claim order, not which instance answered first: here the newer one answered first.
+#[test]
+fn an_older_instance_answering_after_a_newer_one_first_did_is_two_serving() {
+    let history = History {
+        calls: vec![
+            call(Op::Get, 0, 1, Some((2, 0))),
+            call(Op::Peek, 2, 3, Some((1, 0))),
+        ],
+        ..History::default()
+    };
+    assert!(matches!(
+        history.check(),
+        Err(Violation::TwoServing {
+            older: 1,
+            newer: 2,
+            ..
+        })
+    ));
+}
+
 #[test]
 fn a_read_below_an_acknowledged_increment_is_stale() {
     let mut history = clean();
@@ -84,7 +104,8 @@ fn an_answer_after_an_acknowledged_deletion_is_served_deleted() {
     let mut history = clean();
     history.deleted.insert("a".into(), Duration::from_secs(12));
     assert_eq!(history.check(), Ok(()));
-    history.calls.push(call(Op::Get, 13, 14, Some((3, 4))));
+    // A call that starts at the instant the deletion was acknowledged comes after it.
+    history.calls.push(call(Op::Get, 12, 14, Some((3, 4))));
     assert_eq!(
         history.check(),
         Err(Violation::DeletedServed {

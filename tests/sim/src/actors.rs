@@ -1,14 +1,15 @@
 //! The actor workload's history checker (#124 / S-16). Each actor is a counter: `Incr` commits it plus one, `Get` reads it
-//! from the actor's slots and `Peek` answers from the instance's memory. Every answer names the instance that gave it,
-//! unique across hosts and restarts. Only answered calls constrain: a call that failed or timed out may or may not have
-//! run.
+//! from the actor's slots and `Peek` answers from the instance's memory. Every answer names the instance that gave it
+//! by its claim epoch, which a later claim of the actor has higher. Only answered calls constrain: a call that failed or
+//! timed out may or may not have run.
 //!
 //! - **No lost acknowledged commit.** Acknowledged increments are distinct, and one acknowledged before another started
 //!   has the lower value.
 //! - **One serving instance per actor.** Once an instance answered, an older one never answers a call that started after
 //!   that.
 //! - **No stale read below `min_seq`.** A `Get` returns at least every increment acknowledged before it started.
-//! - **A deleted actor stays deleted.** No call that started after its deletion was acknowledged gets an answer.
+//! - **A deleted actor stays deleted.** No call that started once its deletion was acknowledged gets an answer; the
+//!   caller makes no call to a deleted actor until then, so one that starts at the same instant came after it.
 //! - **Alarms fire.** Every acknowledged alarm fires at least once.
 //!
 //! Plain data, so it compiles in every build and `tests/crash` can reuse it.
@@ -151,14 +152,9 @@ impl History {
             }
         }
         for (actor, answered) in &by_actor {
-            let mut first: BTreeMap<u64, Duration> = BTreeMap::new();
-            for (call, answer) in answered {
-                let end = first.entry(answer.instance).or_insert(call.end);
-                *end = (*end).min(call.end);
-            }
             for (call, answer) in answered {
                 for (other, newer) in answered {
-                    if first[&newer.instance] > first[&answer.instance] && other.end < call.start {
+                    if newer.instance > answer.instance && other.end < call.start {
                         return Err(Violation::TwoServing {
                             actor: actor.to_string(),
                             older: answer.instance,
@@ -189,7 +185,7 @@ impl History {
                 .get(actor.as_str())
                 .into_iter()
                 .flatten()
-                .find(|(c, _)| c.start > *deleted);
+                .find(|(c, _)| c.start >= *deleted);
             if let Some((_, answer)) = served {
                 return Err(Violation::DeletedServed {
                     actor: actor.clone(),

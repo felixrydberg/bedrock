@@ -2201,10 +2201,42 @@ async fn an_append_past_what_s3_holds_answers_its_gap_at_once() {
     assert_eq!(answer.refused, Refusal::LogGap as i32);
     assert_eq!(answer.slot.unwrap().end.unwrap().seq, 1);
     assert!(
-        started.elapsed() <= crate::serve::GAP_WAIT,
+        started.elapsed() <= crate::serve::GAP_LOOKUP,
         "the gap was answered after {:?}",
         started.elapsed()
     );
+}
+
+/// When S3 is too slow to say whether it holds what the slot lacks, the append is retryable, not a gap: a holder sending
+/// the first entry it still keeps would take a gap for one it cannot fill and drop the slot.
+#[tokio::test(start_paused = true)]
+async fn an_append_gap_s3_is_too_slow_to_answer_is_retryable() {
+    use bedrock_lib::volume::volume_server::Volume;
+    use tonic::{Code, Request};
+
+    let bucket = Memory::default();
+    let n = node(&bucket, "n1", u64::MAX);
+    claim(&n.store, 0);
+    append(&n.store, 0, 0, vec![entry(1, &[("k", Some("1"))])], 1).unwrap();
+    n.cold.tick(&n.directory).await;
+    let service = crate::serve::Service::new(&Admin::new(), n.store, "n1", "cell-1", "dc1")
+        .unwrap()
+        .with_cold(Arc::new(n.cold));
+    *service.directory.write().unwrap() = n.directory;
+    bucket.slow(crate::serve::GAP_LOOKUP);
+    let refused = service
+        .append(Request::new(pb::AppendRequest {
+            actor: Some(actor(0)),
+            holder: Some(holder()),
+            epoch: 1,
+            prev_epoch: 1,
+            entries: vec![entry(3, &[])],
+            commit: 2,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::Unavailable, "{refused}");
 }
 
 /// The other half of [`an_append_past_what_s3_holds_answers_its_gap_at_once`]: when the flush that holds what the slot

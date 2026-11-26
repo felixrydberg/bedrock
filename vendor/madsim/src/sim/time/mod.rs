@@ -133,8 +133,9 @@ impl TimeHandle {
     /// time limit keep simulated time. Set it before the node runs, since a change moves the node's clock at once. A
     /// sleep follows the clock of the node that created it.
     pub fn set_clock_rate(&self, node: NodeId, rate: f64) {
-        assert!(rate > 0.0, "a clock rate must be positive");
-        self.rates.lock().insert(node, (rate * EXACT as f64).round() as u64);
+        let ppm = (rate * EXACT as f64).round() as u64;
+        assert!(ppm > 0, "a clock rate must be at least one part per million");
+        self.rates.lock().insert(node, ppm);
     }
 
     /// bedrock: the current node's clock rate.

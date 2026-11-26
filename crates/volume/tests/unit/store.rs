@@ -144,6 +144,34 @@ fn claims_need_a_higher_epoch_a_current_version_and_no_other_live_lease() {
     assert!(expired);
 }
 
+/// #124 / S-16: a holder that stopped running the actor ends its lease, although its host still heartbeats; only its
+/// current claim's lease ends, and a new claim starts a lease again.
+#[test]
+fn an_ended_claim_holds_no_lease() {
+    let store = store();
+    let actor = actor();
+    let (a, b) = (host("a"), host("b"));
+    claimed(&store, &a, 2);
+    store.end_lease(&actor, &a, 1).unwrap();
+    store.end_lease(&actor, &b, 2).unwrap();
+    let (answer, _) = store.claim(&actor, &b, 3, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::LeaseLive,
+        "another epoch or holder ends nothing"
+    );
+    store.end_lease(&actor, &a, 2).unwrap();
+    let (answer, expired) = store.claim(&actor, &b, 3, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None);
+    assert!(!expired, "an ended lease did not expire");
+    let (answer, _) = store.claim(&actor, &a, 4, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::LeaseLive,
+        "b's new claim holds a lease"
+    );
+}
+
 /// What the slot answers now, for comparing whole answers.
 fn answer_of(store: &Store, holder: &pb::Holder, epoch: u64, version: u64) -> pb::Answer {
     let claim = store.load(&actor()).unwrap();

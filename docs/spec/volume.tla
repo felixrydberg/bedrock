@@ -59,7 +59,8 @@ TakesClaim(n) == IF Bug = "undelete" THEN Voting(n) \/ st[n] = "repaired" ELSE T
 LastE(L) == IF L = <<>> THEN 0 ELSE L[Len(L)].e
 Adv(L, M) == LastE(L) > LastE(M) \/ (LastE(L) = LastE(M) /\ Len(L) > Len(M))
 \* The lease, under bounded clock drift: a holder self-fences before any slot sees its lease
-\* expire, so a slot sees a live lease exactly while its promised holder still runs the actor.
+\* expire, so a slot sees a live lease exactly while its promised holder still runs the actor. The
+\* code tracks it from above: host heartbeats, until the host reports the claim ended (volume.md).
 Live(h) == h # NoHost /\ phase[h] \in {"recover", "claimed", "open", "deleting"}
 \* What a populating node copies from before it is ready.
 Sources == IF Change = "handoff" THEN {"c"} ELSE {"a", "b"}
@@ -141,7 +142,8 @@ Release(h) == /\ phase[h] = "open" /\ Len(hlog[h]) < MaxLen
               /\ hlog' = [hlog EXCEPT ![h] = Append(@, Entry(h, FALSE))]
               /\ phase' = [phase EXCEPT ![h] = "released"]
               /\ UNCHANGED <<slots, epoch, hv, granted, ackd, acked, cp, s3, maint, tv, jointDone>>
-\* Self-fence (fewer than two heartbeats acknowledged within 4 s) or a crash.
+\* Self-fence (fewer than two heartbeats acknowledged within 4 s, or fewer than two slots that can still
+\* count towards a quorum of its epoch) or a crash.
 Fence(h) == /\ phase[h] \in {"reserving", "claiming", "recover", "claimed", "open", "deleting"}
             /\ phase' = [phase EXCEPT ![h] = "fenced"]
             /\ UNCHANGED <<slots, epoch, hv, granted, hlog, ackd, acked, cp, s3, maint, tv, jointDone>>

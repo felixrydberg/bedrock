@@ -902,6 +902,7 @@ impl Store {
             new.epoch = promise.epoch;
             new.holder = promise.holder.clone();
             new.released = promise.released && new.end == promise.end;
+            new.ended = promise.ended;
             new.reserved = here.reserved.max(copied.reserved);
             new.version = here.version.max(copied.version);
         }
@@ -1296,7 +1297,8 @@ impl Store {
                         ..wire
                     },
                     at_ms,
-                    released: claim.released,
+                    // An ended lease no longer holds up the alarm: no one runs the actor.
+                    released: claim.released || claim.ended,
                     holder: claim.holder,
                 });
             }
@@ -1651,7 +1653,7 @@ impl Store {
         let other = old
             .holder
             .as_ref()
-            .filter(|h| *h != holder && !old.released);
+            .filter(|h| *h != holder && !old.released && !old.ended);
         let refused = if version < old.version {
             Refusal::StaleVersion
         } else if epoch <= old.epoch {
@@ -1668,6 +1670,7 @@ impl Store {
             epoch,
             holder: Some(holder.clone()),
             released: false,
+            ended: false,
             version,
             kind: actor.kind,
             ..old.clone()
@@ -1676,6 +1679,29 @@ impl Store {
         self.save(&mut batch, actor, &old, &new)?;
         self.commit(batch)?;
         Ok((answer(refused, &new, voting), other.is_some()))
+    }
+
+    /// Ends the lease of the claim `holder` took at `epoch`, if it is still the slot's promise: the holder no longer runs
+    /// the actor there, so another may claim it while the holder's host heartbeats for other actors.
+    pub fn end_lease(&self, actor: &Actor, holder: &pb::Holder, epoch: u64) -> Result<(), Error> {
+        let _lock = self.lock(actor);
+        self.check_sealed(actor)?;
+        let old = self.load(actor)?;
+        if old.ended
+            || old.epoch != epoch
+            || old.holder.as_ref() != Some(holder)
+            || buried(&old).is_some()
+        {
+            return Ok(());
+        }
+        let new = pb::ClaimRecord {
+            ended: true,
+            ..old.clone()
+        };
+        let mut batch = WriteBatch::default();
+        self.save(&mut batch, actor, &old, &new)?;
+        self.commit(batch)?;
+        Ok(())
     }
 
     /// Writes entries at the slot's promise (epoch and holder), once its log holds the holder's entry before them. An

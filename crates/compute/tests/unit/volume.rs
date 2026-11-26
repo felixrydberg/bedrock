@@ -219,13 +219,25 @@ fn a_join_guard_leaves_the_heartbeat_set_when_dropped() {
         };
         let slots = [slot(0), slot(1), slot(2)];
         // Registration is owned by the guard before any heartbeat await, so a cancelled open cannot leak it.
-        let first = host.join(&slots);
-        let second = host.join(&slots);
+        let first = host.join(&slots, &pb::Actor::default());
+        let second = host.join(&slots, &pb::Actor::default());
         assert_eq!(host.lock().len(), 3);
         drop(first);
         assert_eq!(host.lock().len(), 3, "another writer still uses the nodes");
         drop(second);
         assert!(host.lock().is_empty());
+
+        // A guard that claimed ends those claims' leases: the nodes stay until a heartbeat carries them.
+        let mut third = host.join(&slots, &pb::Actor::default());
+        third.claimed.extend([4, 7]);
+        drop(third);
+        let nodes = host.lock();
+        assert_eq!(nodes.len(), 3);
+        for node in nodes.values() {
+            assert_eq!(node.users, 0);
+            let epochs: Vec<u64> = node.ended.iter().map(|e| e.epoch).collect();
+            assert_eq!(epochs, [4, 7]);
+        }
     });
 }
 
@@ -251,7 +263,7 @@ fn the_lease_deadline_follows_the_second_newest_acknowledged_heartbeat() {
             },
         };
         let slots = [slot(0), slot(1), slot(2)];
-        let _joined = host.join(&slots);
+        let _joined = host.join(&slots, &pb::Actor::default());
         assert_eq!(host.deadline(&slots), None, "no acknowledgement yet");
         let now = bedrock_lib::monotonic_now();
         let sent = [
@@ -283,7 +295,7 @@ fn writer(state: State) -> Writer {
             host: format!("10.0.0.{i}"),
         },
     });
-    let joined = host.join(&slots);
+    let joined = host.join(&slots, &pb::Actor::default());
     for node in host.lock().values_mut() {
         node.acked = Some(bedrock_lib::monotonic_now());
     }
@@ -340,6 +352,23 @@ fn a_writer_with_fewer_than_two_slots_taking_appends_stops_serving() {
         assert!(!writer.serving());
         let pending = writer.wait(|s| (s.commit >= 1).then_some(()));
         assert!(matches!(pending.await, Err(Error::Fenced)));
+    });
+}
+
+/// #124 / S-16 seeds 1–3: one slot lost and another repaired leave one voter, so nothing commits again; the writer
+/// fences, so a new claim can take the actor, rather than holding it unavailable while its lease lives.
+#[test]
+fn a_writer_left_with_one_voting_slot_stops_serving() {
+    runtime().block_on(async {
+        let writer = writer(state(1, 0));
+        {
+            let mut state = writer.shared.lock();
+            state.ack(1, 1, false, 0);
+            assert!(!writer.shared.fence_without_quorum(&mut state));
+        }
+        assert!(writer.serving(), "slots 0 and 2 still vote");
+        writer.shared.lose(0);
+        assert!(!writer.serving(), "only slot 2 votes");
     });
 }
 

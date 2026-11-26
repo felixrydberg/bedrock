@@ -7,6 +7,7 @@
 //!   owner, and it seals the span before the first record goes out.
 //! - **Leases.** Each Compute host heartbeats once per second; an actor's lease is live while its holder's host was seen
 //!   within [`LEASE`]. A restarted node has seen no one yet, so for its first [`LEASE`] it treats every holder as live.
+//!   A heartbeat also names claims its host stopped running without a `RELEASE`; their leases end at once (#124 / S-16).
 //! - **Callers.** Over mutual TLS, holder calls must come from that holder's Compute host, and `Truncate` and `Repair`
 //!   from a volume node. A claimant recovers its log through `Log`, which only the holder the slot promised may read.
 //! - **Blocking.** Store calls wait on fsyncs and actor locks, so they run off the async workers.
@@ -34,10 +35,14 @@ use crate::store::{self, Actor, Store};
 
 /// How long a holder's host stays live after its last heartbeat (§5 Lease).
 pub const LEASE: Duration = Duration::from_secs(5);
-/// How long an append past this slot's log end waits for S3 to hold what the slot lacks (#124 / S-16): longer than a
-/// range database reader takes to see a flush (its manifest poll is 1 s), and shorter than the holder's 2 s call, so a
-/// holder that still has the entries hears the gap and sends them rather than timing out and sending the same append.
-pub const GAP_WAIT: Duration = Duration::from_millis(1500);
+/// How long an append past this slot's log end waits for its first slot cell's range database to hold what the slot
+/// lacks (#124 / S-16): longer than a reader takes to see a flush (its manifest poll is 1 s), and short enough that
+/// other cells are tried within [`GAP_LOOKUP`]. A holder that still has the entries then hears the gap and sends them,
+/// rather than timing out and sending the same append.
+pub const GAP_WAIT: Duration = Duration::from_millis(1200);
+/// The whole S3 lookup of an append gap, under the holder's 2 s call. Past it the append answers `UNAVAILABLE`, which
+/// the holder retries: S3 confirmed nothing, so the holder must not take it for a gap and drop the slot.
+pub const GAP_LOOKUP: Duration = Duration::from_millis(1800);
 const COMPUTE: &str = "compute";
 const VOLUME: &str = bedrock_lib::datasets::capabilities::VOLUME;
 
@@ -401,9 +406,12 @@ impl pb::volume_server::Volume for Service {
             else {
                 return Ok(Response::new(outcome.answer));
             };
-            let meta = tokio::time::timeout(GAP_WAIT, cold.meta(&self.cell, pb_actor, end + 1))
-                .await
-                .unwrap_or_else(|_| Err(Status::unavailable("S3 did not answer in time")));
+            let lookup = cold.meta(&self.cell, pb_actor, end + 1, GAP_WAIT);
+            let Ok(meta) = tokio::time::timeout(GAP_LOOKUP, lookup).await else {
+                return Err(Status::unavailable(
+                    "S3 did not answer whether it holds what this slot lacks",
+                ));
+            };
             match meta {
                 Ok(meta) => {
                     let actor = self.actor(Some(pb_actor))?;
@@ -459,6 +467,21 @@ impl pb::volume_server::Volume for Service {
         let host = holder(request.get_ref().holder.as_ref())?.clone();
         check(&request, COMPUTE, Some(&host))?;
         self.metrics.heartbeats.inc();
+        // Claims the host no longer runs. One this node does not serve, or cannot write now, is passed over: the host
+        // does not resend it.
+        // ponytail: a claim ended while its range is sealed for a handoff stays leased on the new owner; carry it in
+        // the copy if that shows up.
+        for ended in request.into_inner().ended {
+            let Ok(actor) = self.actor(ended.actor.as_ref()) else {
+                continue;
+            };
+            let (store, holder) = (self.store.clone(), host.clone());
+            if let Err(error) =
+                blocking(move || store.end_lease(&actor, &holder, ended.epoch)).await?
+            {
+                tracing::debug!(error = %status(error), "ending a lease failed");
+            }
+        }
         let now = bedrock_lib::monotonic_now();
         let mut leases = self.leases.lock().unwrap_or_else(PoisonError::into_inner);
         // Hosts seen long ago no longer hold a lease here.

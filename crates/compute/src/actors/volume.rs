@@ -261,6 +261,9 @@ struct Node {
     users: usize,
     /// When the newest acknowledged heartbeat was sent.
     acked: Option<Instant>,
+    /// Claims this host stopped running, sent with each heartbeat until one is acknowledged. The node stays in the
+    /// heartbeat set while any are left.
+    ended: Vec<pb::Ended>,
 }
 
 impl Host {
@@ -292,36 +295,51 @@ impl Host {
 
     async fn beat(&self, slot: Slot) {
         let sent = bedrock_lib::monotonic_now();
+        let ended = self
+            .lock()
+            .get(&slot.address)
+            .map(|n| n.ended.clone())
+            .unwrap_or_default();
         let request = pb::HeartbeatRequest {
             holder: Some(self.holder.clone()),
+            ended: ended.clone(),
         };
         let beat = call(&self.peers, &slot, |mut c| async move {
             c.heartbeat(request).await
         });
-        if beat.await.is_ok()
-            && let Some(node) = self.lock().get_mut(&slot.address)
-        {
-            node.acked = node.acked.max(Some(sent));
+        if beat.await.is_ok() {
+            let mut nodes = self.lock();
+            if let Some(node) = nodes.get_mut(&slot.address) {
+                node.acked = node.acked.max(Some(sent));
+                node.ended.retain(|e| !ended.contains(e));
+                if node.users == 0 && node.ended.is_empty() {
+                    nodes.remove(&slot.address);
+                }
+            }
         }
     }
 
     /// Adds `slots` to the heartbeat set. The guard leaves it on drop, also when the caller is cancelled.
-    fn join(self: &Arc<Self>, slots: &[Slot; SLOTS]) -> Joined {
+    fn join(self: &Arc<Self>, slots: &[Slot; SLOTS], actor: &pb::Actor) -> Joined {
         let mut nodes = self.lock();
         for slot in slots {
-            nodes
-                .entry(slot.address.clone())
-                .or_insert_with(|| Node {
-                    slot: slot.clone(),
-                    users: 0,
-                    acked: None,
-                })
-                .users += 1;
+            Self::node(&mut nodes, slot).users += 1;
         }
         Joined {
             host: self.clone(),
             slots: slots.clone(),
+            actor: actor.clone(),
+            claimed: Vec::new(),
         }
+    }
+
+    fn node<'a>(nodes: &'a mut BTreeMap<String, Node>, slot: &Slot) -> &'a mut Node {
+        nodes.entry(slot.address.clone()).or_insert_with(|| Node {
+            slot: slot.clone(),
+            users: 0,
+            acked: None,
+            ended: Vec::new(),
+        })
     }
 
     /// Heartbeats `slots` once now.
@@ -338,7 +356,7 @@ impl Host {
         for slot in slots {
             if let Some(node) = nodes.get_mut(&slot.address) {
                 node.users -= 1;
-                if node.users == 0 {
+                if node.users == 0 && node.ended.is_empty() {
                     nodes.remove(&slot.address);
                 }
             }
@@ -503,14 +521,29 @@ impl State {
     }
 }
 
-/// A writer's place in its host's heartbeat set, left on drop.
+/// A writer's place in its host's heartbeat set, left on drop. Dropped, it also ends the lease of every claim it sent:
+/// whether the claim failed or its writer stopped, this host no longer runs the actor at it (`Live` in `volume.tla`).
+/// Only epochs this writer claimed are named, so a later claim of the same host keeps its lease.
 struct Joined {
     host: Arc<Host>,
     slots: [Slot; SLOTS],
+    actor: pb::Actor,
+    claimed: Vec<u64>,
 }
 
 impl Drop for Joined {
     fn drop(&mut self) {
+        let mut nodes = self.host.lock();
+        for slot in &self.slots {
+            let node = Host::node(&mut nodes, slot);
+            for &epoch in &self.claimed {
+                node.ended.push(pb::Ended {
+                    actor: Some(self.actor.clone()),
+                    epoch,
+                });
+            }
+        }
+        drop(nodes);
         self.host.leave(&self.slots);
     }
 }
@@ -538,13 +571,24 @@ impl Shared {
         self.changed.notify_waiters();
     }
 
-    /// Slot `i` takes no more appends from this writer; with fewer than two left, no entry can commit.
+    /// Slot `i` takes no more appends from this writer.
     fn lose(&self, i: usize) {
         let mut state = self.lock();
         state.lost[i] = true;
-        if state.lost.iter().filter(|lost| !**lost).count() < 2 {
-            self.fence(&mut state);
+        self.fence_without_quorum(&mut state);
+    }
+
+    /// Fences once fewer than two slots can count towards a commit: not lost, and voting as of their last answer. A
+    /// repaired slot votes again only once an entry of this epoch commits (`Replicate` in `volume.tla`), which takes two
+    /// voters, so with fewer no entry can commit again and only a new claim makes progress. Returns whether it fenced.
+    fn fence_without_quorum(&self, state: &mut State) -> bool {
+        let voters = (0..SLOTS)
+            .filter(|&i| state.voting[i] && !state.lost[i])
+            .count();
+        if voters < 2 {
+            self.fence(state);
         }
+        voters < 2
     }
 
     /// The slots still taking this writer's appends.
@@ -622,8 +666,12 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
                 shared.fence(&mut shared.lock());
                 return;
             }
-            // A corrupt slot is dropped until it repairs.
-            Err(status) if status.code() == Code::DataLoss => return shared.lose(i),
+            // A corrupt slot is dropped until it repairs, and so is a node that no longer serves the slot's range (a
+            // handoff moved it, or it is not ready yet): its heartbeats would otherwise keep a writer serving that can
+            // commit nothing there. A new claim reads where the range is now.
+            Err(status) if matches!(status.code(), Code::DataLoss | Code::FailedPrecondition) => {
+                return shared.lose(i);
+            }
             Err(_) => {
                 sleep(RETRY).await;
                 continue;
@@ -635,6 +683,9 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             Some(Refusal::None) => {
                 // The commit point the slot learned, which is below the one sent while it lacks entries up to it.
                 state.ack(i, through, slot.voting, slot.committed);
+                if shared.fence_without_quorum(&mut state) {
+                    return;
+                }
                 shared.changed.notify_waiters();
             }
             // The slot holds the actor's tombstone: it knows a `DELETE` committed, and takes nothing more. Any other
@@ -787,7 +838,7 @@ impl Writer {
         committed_at: u64,
     ) -> Result<Self, Error> {
         // Leaves the heartbeat set on every early return and on cancellation.
-        let joined = host.join(&slots);
+        let mut joined = host.join(&slots, &actor);
         host.beat_all(&slots).await;
         if host.live(&slots) < 2 {
             return Err(Error::Unavailable(
@@ -841,6 +892,7 @@ impl Writer {
                 sleep(RETRY).await;
                 continue;
             }
+            joined.claimed.push(epoch);
             let claims =
                 slots.iter().map(|slot| {
                     let (peers, slot) = (peers.clone(), slot.clone());

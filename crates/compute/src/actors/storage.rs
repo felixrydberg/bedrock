@@ -97,6 +97,11 @@ impl Storage {
         self.0.writer.scan(start, limit).await
     }
 
+    /// The claim epoch this storage writes at: a later claim of the actor has a higher one.
+    pub fn epoch(&self) -> u64 {
+        self.0.writer.epoch()
+    }
+
     /// The current acknowledged alarm, in Unix milliseconds.
     pub fn alarm_ms(&self) -> Option<u64> {
         self.0.writer.alarm_ms()

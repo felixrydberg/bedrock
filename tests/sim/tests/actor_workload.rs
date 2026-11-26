@@ -239,12 +239,19 @@ fn drift(node: &NodeHandle, rate: Option<f64>) -> f64 {
 /// What the instances of every host share with the harness, all in this process's memory.
 #[derive(Default)]
 struct Shared {
-    /// The last instance number handed out: unique across hosts and restarts.
+    /// Instances created so far.
     instances: AtomicU64,
-    /// Each instance's host.
-    hosts: Mutex<BTreeMap<u64, String>>,
+    /// Each instance's host, by actor ID and claim epoch, which is the instance's number.
+    hosts: Mutex<BTreeMap<(String, u64), String>>,
+    /// Heartbeats of volume nodes' runs that ended, which their counters no longer hold.
+    beats: AtomicU64,
     /// Alarms that fired, by actor ID and time.
     fired: Mutex<BTreeSet<(String, u64)>>,
+    /// The actor whose next increment stops at its append, for the holder kill.
+    armed: Mutex<Option<String>>,
+    /// The host of the increment that reached it.
+    appending: Mutex<Option<String>>,
+    reached: tokio::sync::Notify,
 }
 
 /// The counter actor: `incr` commits the counter plus one, `alarm` also sets an alarm [`ALARM_IN`] ahead, `get` reads the
@@ -308,6 +315,17 @@ impl Instance for Counter {
             b"incr" => {
                 self.increments += 1;
                 let next = current + 1;
+                let armed = {
+                    let mut armed = self.shared.armed.lock().unwrap();
+                    armed.take_if(|actor| *actor == self.actor).is_some()
+                };
+                if armed {
+                    let host = self.shared.hosts.lock().unwrap()
+                        [&(self.actor.clone(), self.instance)]
+                        .clone();
+                    *self.shared.appending.lock().unwrap() = Some(host);
+                    self.shared.reached.notify_one();
+                }
                 if !(self.bug == Some(Bug::Uncommitted) && self.increments.is_multiple_of(3)) {
                     self.storage.commit(Self::change(next)).await?;
                 }
@@ -362,8 +380,13 @@ fn compute(ip: &'static str, shared: Arc<Shared>, bug: Option<Bug>) -> NodeHandl
     spawn(&name.clone(), ip, move || {
         let (name, shared) = (name.clone(), shared.clone());
         let counter: Handler = Arc::new(move |actor, storage| {
-            let instance = shared.instances.fetch_add(1, Ordering::SeqCst) + 1;
-            shared.hosts.lock().unwrap().insert(instance, name.clone());
+            shared.instances.fetch_add(1, Ordering::SeqCst);
+            let instance = storage.epoch();
+            shared
+                .hosts
+                .lock()
+                .unwrap()
+                .insert((actor.id.clone(), instance), name.clone());
             Box::new(Counter {
                 actor: actor.id,
                 instance,
@@ -700,26 +723,28 @@ async fn faults(cluster: &mut Cluster, recorder: &Recorder, busy: &pb::Actor) ->
     Memory::shared().slow(Duration::ZERO);
     trace.push(format!("{:?} s3 back", recorder.now()));
 
-    // The holder of a busy actor dies, likely mid-append, and comes back.
+    // The holder of a busy actor dies once an increment reached its append, within the append's network round trip,
+    // and comes back.
     sleep(gap()).await;
-    let holder = {
-        let history = recorder.history.lock().unwrap();
-        let last = history
-            .calls
-            .iter()
-            .rev()
-            .find_map(|c| c.answer.filter(|_| c.actor == busy.id));
-        last.map(|a| cluster.shared.hosts.lock().unwrap()[&a.instance].clone())
-    };
-    if let Some(holder) = holder {
+    *cluster.shared.armed.lock().unwrap() = Some(busy.id.clone());
+    let kill = async {
+        tokio::time::timeout(Duration::from_secs(120), cluster.shared.reached.notified())
+            .await
+            .expect("no increment of the busy actor reached its append");
+        let holder = cluster.shared.appending.lock().unwrap().take().unwrap();
+        sleep(Duration::from_micros(thread_rng().gen_range(0..3_000))).await;
         handle.kill(cluster.computes[&holder].id());
-        trace.push(format!("{:?} killed {holder}", recorder.now()));
-        sleep(Duration::from_secs(10)).await;
-        handle.restart(cluster.computes[&holder].id());
-    }
+        trace.push(format!("{:?} killed {holder} mid-append", recorder.now()));
+        holder
+    };
+    let (_, holder) = tokio::join!(recorder.call(GATEWAY, busy, b"incr"), kill);
+    sleep(Duration::from_secs(10)).await;
+    handle.restart(cluster.computes[&holder].id());
 
     // A volume node is lost and comes back with its disk.
     sleep(gap()).await;
+    let ended = heartbeats(VOLUMES[0].1).await;
+    cluster.shared.beats.fetch_add(ended, Ordering::SeqCst);
     handle.kill(cluster.volumes[0].id());
     trace.push(format!("{:?} lost v1", recorder.now()));
     sleep(Duration::from_secs(15)).await;
@@ -728,6 +753,8 @@ async fn faults(cluster: &mut Cluster, recorder: &Recorder, busy: &pb::Actor) ->
 
     // Another loses its disk and repairs from its peers.
     sleep(gap()).await;
+    let ended = heartbeats(VOLUMES[1].1).await;
+    cluster.shared.beats.fetch_add(ended, Ordering::SeqCst);
     handle.kill(cluster.volumes[1].id());
     cluster.disks[1].fetch_add(1, Ordering::SeqCst);
     sleep(Duration::from_millis(100)).await;
@@ -824,6 +851,14 @@ async fn heartbeats(ip: &str) -> u64 {
         .sum()
 }
 
+async fn all_heartbeats() -> Vec<u64> {
+    let mut beats = Vec::new();
+    for (_, ip) in VOLUMES {
+        beats.push(heartbeats(ip).await);
+    }
+    beats
+}
+
 /// One run: the trace, or the first violation.
 async fn scenario(bug: Option<Bug>, faulted: bool) -> Result<Vec<String>, Violation> {
     let handle = Handle::current();
@@ -902,8 +937,7 @@ async fn scenario(bug: Option<Bug>, faulted: bool) -> Result<Vec<String>, Violat
         .name("client")
         .ip(CLIENT.parse().unwrap())
         .build();
-    let started = bedrock_lib::monotonic_now();
-    let outcome = client
+    client
         .spawn(async move {
             let key = topology_key("eu");
             let revision = until("topology write", Duration::from_secs(60), || {
@@ -928,6 +962,15 @@ async fn scenario(bug: Option<Bug>, faulted: bool) -> Result<Vec<String>, Violat
                 for driver in drivers {
                     driver.await.unwrap();
                 }
+                // Every actor recovers from the faults: an increment and a read go through, and the check holds them.
+                for target in &targets {
+                    for request in [&b"incr"[..], b"get"] {
+                        until(&format!("{} recovers its {:?}", &target.id[..8], String::from_utf8_lossy(request)), Duration::from_secs(120), || {
+                            recorder.call(GATEWAY, target, request)
+                        })
+                        .await;
+                    }
+                }
                 // Asleep again, so no lease holds up the deletions; then each deleted actor is called again.
                 sleep(IDLE + Duration::from_secs(3)).await;
                 for (i, target) in targets[ACTORS - DELETED..].iter().enumerate() {
@@ -945,7 +988,8 @@ async fn scenario(bug: Option<Bug>, faulted: bool) -> Result<Vec<String>, Violat
                             .find_map(|c| c.answer.filter(|_| c.actor == deleted.id));
                         last.map_or_else(
                             || "deleter".to_owned(),
-                            |a| cluster.shared.hosts.lock().unwrap()[&a.instance].clone(),
+                            |a| cluster.shared.hosts.lock().unwrap()[&(deleted.id.clone(), a.instance)]
+                                .clone(),
                         )
                     };
                     if let Err(refused) = delete(deleted, &holder).await {
@@ -976,10 +1020,19 @@ async fn scenario(bug: Option<Bug>, faulted: bool) -> Result<Vec<String>, Violat
             if faulted || bug == Some(Bug::SlowHolder) {
                 trace.push(cut_off(&cluster, &recorder, &actor("fence")).await);
             }
-            let mut beats = Vec::new();
-            for (_, ip) in VOLUMES {
-                beats.push(heartbeats(ip).await);
-            }
+            // Heartbeat volume, for `statefull/v2.md` §12 question 7: each node's counter plus what its killed runs took,
+            // over the run. Nothing holds an actor before the run starts.
+            let beats: Vec<u64> = all_heartbeats().await;
+            let total = beats.iter().sum::<u64>() + cluster.shared.beats.load(Ordering::SeqCst);
+            let over = recorder.now();
+            trace.insert(
+                2,
+                format!(
+                    "{total} heartbeats over {over:?}, {beats:?} by the volume nodes' last runs: {:.2}/s in all for {} Compute hosts",
+                    total as f64 / over.as_secs_f64(),
+                    COMPUTES.len()
+                ),
+            );
             let mut history = recorder.history.lock().unwrap().clone();
             history.fired = cluster.shared.fired.lock().unwrap().clone();
             let answered = history.calls.iter().filter(|c| c.answer.is_some()).count();
@@ -1006,22 +1059,10 @@ async fn scenario(bug: Option<Bug>, faulted: bool) -> Result<Vec<String>, Violat
                 }
                 return Err(violation);
             }
-            Ok((trace, beats))
+            Ok(trace)
         })
         .await
-        .unwrap();
-    let elapsed = started.elapsed();
-    let (mut trace, beats) = outcome?;
-    // Heartbeat volume, for `statefull/v2.md` §12 question 7: counts since each node's last start.
-    trace.insert(
-        2,
-        format!(
-            "heartbeats per volume node {beats:?} over {elapsed:?}: {:.2}/s in all for {} Compute hosts",
-            beats.iter().sum::<u64>() as f64 / elapsed.as_secs_f64(),
-            COMPUTES.len()
-        ),
-    );
-    Ok(trace)
+        .unwrap()
 }
 
 #[allow(clippy::disallowed_methods)] // A fresh test thread resets the simulator's seeded std map hashing.
@@ -1044,14 +1085,32 @@ fn run(seed: u64, bug: Option<Bug>, faulted: bool) -> Result<Vec<String>, Violat
 /// Seeds that still fail, with what they found and where the fix belongs. The check fails until this is empty.
 const OPEN: &[(u64, &str)] = &[];
 /// Seeds that found a bug, now fixed, with the focused test that holds the fix.
-const REGRESSIONS: &[(u64, &str)] = &[(
-    2,
-    "traced: a slot behind S3 waited out BEHIND_WAIT on an append gap, as long as the holder's call, so it never heard \r
-     its LogGap; with another slot repaired the actor never reached quorum again. Fixed by `serve::GAP_WAIT`; held by \r
-     crates/volume/tests/unit/cold.rs an_append_past_what_s3_holds_answers_its_gap_at_once",
-)];
+const REGRESSIONS: &[(u64, &str)] = &[
+    (
+        1,
+        "traced (2 and 3 as well, once every actor had to recover): the busy actor's writer kept one voting slot, one \
+         slot missing its claim and another repaired, so nothing committed, but it fenced only below two slots and held \
+         the actor while its lease lived. Fixed by fencing below two voters; held by crates/compute/tests/unit/volume.rs \
+         a_writer_left_with_one_voting_slot_stops_serving. Then the fenced writer's host kept heartbeating its slot for \
+         other actors, so its promise stayed leased and blocked every other claimant; fixed by ending the leases of \
+         claims a host stopped running; held by crates/volume/tests/unit/store.rs an_ended_claim_holds_no_lease",
+    ),
+    (
+        3,
+        "traced: after a handoff the writer kept appending to the old owner, which refused it as no owner of the range \
+         but still took its heartbeats, so the writer served without committing and held its other slot's lease. \
+         Fixed by dropping a slot that answers FAILED_PRECONDITION; held by this seed only",
+    ),
+    (
+        2,
+        "traced: a slot behind S3 waited out BEHIND_WAIT on an append gap, as long as the holder's call, so it never \
+         heard its LogGap; with another slot repaired the actor never reached quorum again. Fixed by `serve::GAP_WAIT` \
+         and `GAP_LOOKUP`; held by crates/volume/tests/unit/cold.rs \
+         an_append_past_what_s3_holds_answers_its_gap_at_once",
+    ),
+];
 /// Seeds run on every change.
-const SAMPLE: &[u64] = &[1, 3];
+const SAMPLE: &[u64] = &[4];
 
 fn seeds() -> Vec<u64> {
     match std::env::var("BEDROCK_ACTOR_WORKLOAD_SEED") {

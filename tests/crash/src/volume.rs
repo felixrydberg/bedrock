@@ -163,6 +163,36 @@ impl Holder {
         }
         ok
     }
+
+    /// Commits until `count` are acknowledged, reopening the actor when its writer stops serving; fails the run when
+    /// that takes longer than a minute. Unknown outcomes on the way stay in the history as such.
+    async fn progress(&mut self, writer: &mut Writer, value: &mut u64, count: usize) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let (mut acked, mut reopened) = (0, 0);
+        while acked < count {
+            assert!(
+                Instant::now() < deadline,
+                "{acked} of {count} commits acknowledged within a minute of a restart"
+            );
+            if !writer.serving() {
+                *writer = self.open().await;
+                *value = self.history.calls.last().unwrap().answer.unwrap().value;
+                reopened += 1;
+            }
+            if self.commit(writer, value).await {
+                acked += 1;
+            }
+        }
+        reopened
+    }
+}
+
+/// Releases `writer`, failing the run if the release does not return.
+async fn release(writer: Writer) {
+    tokio::time::timeout(Duration::from_secs(30), writer.release(0))
+        .await
+        .expect("the release did not return within 30 s")
+        .ok();
 }
 
 /// Whether three ready owners hold every `volume` range; otherwise what the relays answered. A new client each time: a
@@ -364,18 +394,16 @@ pub async fn run(options: Options) -> Result<VolumeOutcome, Violation> {
         )
         .await;
         kills += 1;
-        for _ in 0..BETWEEN {
-            holder.commit(&writer, &mut value).await;
-        }
+        reopened += holder.progress(&mut writer, &mut value, BETWEEN).await;
         if round % REOPEN == REOPEN - 1 {
-            let _ = writer.release(0).await;
+            release(writer).await;
             writer = holder.open().await;
             value = holder.history.calls.last().unwrap().answer.unwrap().value;
             reopened += 1;
         }
     }
-    let _ = writer.release(0).await;
-    holder.open().await.release(0).await.ok();
+    release(writer).await;
+    release(holder.open().await).await;
     holder.history.check()?;
     let calls = &holder.history.calls;
     Ok(VolumeOutcome {
