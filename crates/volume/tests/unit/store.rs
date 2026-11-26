@@ -182,6 +182,28 @@ fn an_ended_claim_holds_no_lease() {
         Refusal::None,
         "a's claim at 5 ended before it arrived"
     );
+
+    // A future ending neither hides nor replaces the current promise's ending, in either order, and stays for its claim.
+    store.end_lease(&actor, &b, 8).unwrap();
+    store.end_lease(&actor, &b, 6).unwrap();
+    let (answer, _) = store.claim(&actor, &a, 7, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None, "b's claim at 6 ended");
+    store.end_lease(&actor, &a, 7).unwrap();
+    store.end_lease(&actor, &a, 9).unwrap();
+    let (answer, _) = store.claim(&actor, &b, 8, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None, "a's claim at 7 ended");
+    let (answer, _) = store.claim(&actor, &a, 9, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::None,
+        "b's claim at 8 ended early"
+    );
+    let (answer, _) = store.claim(&actor, &b, 10, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::None,
+        "a's claim at 9 ended early"
+    );
 }
 
 /// What the slot answers now, for comparing whole answers.
@@ -1795,6 +1817,8 @@ fn an_import_starts_an_empty_slot_at_the_moved_point() {
         refused(&store.unimported(&actor()).unwrap().unwrap()),
         Refusal::NotImported
     );
+    // An ending of a claim still in flight leaves the slot importable (#124 / S-16).
+    store.end_lease(&actor(), &host("a"), 4).unwrap();
     let answer = store.import(&actor(), 3, 7, Some(99), 1).unwrap();
     assert_eq!(refused(&answer), Refusal::None);
     let s = slot(&answer);

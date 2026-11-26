@@ -109,7 +109,25 @@ pub struct Actor {
 
 /// Whether the promised holder said it stopped running the actor at this promise.
 fn lease_ended(claim: &pb::ClaimRecord) -> bool {
-    claim.holder.is_some() && claim.ended_epoch == claim.epoch && claim.ended_by == claim.holder
+    claim.holder.is_some()
+        && claim
+            .ended
+            .iter()
+            .any(|e| e.epoch == claim.epoch && e.holder == claim.holder)
+}
+
+/// Endings worth keeping under a promise at `epoch`: none below it, each once, lowest first.
+// ponytail: capped at 8 pending endings, the lowest kept; only claim calls still in flight add more.
+fn endings(ended: impl IntoIterator<Item = pb::Ending>, epoch: u64) -> Vec<pb::Ending> {
+    let mut kept: Vec<pb::Ending> = Vec::new();
+    for e in ended {
+        if e.epoch >= epoch && !kept.contains(&e) {
+            kept.push(e);
+        }
+    }
+    kept.sort_by_key(|e| e.epoch);
+    kept.truncate(8);
+    kept
 }
 
 /// A due alarm hint. The receiving holder validates it against its recovered, committed alarm before invoking.
@@ -907,13 +925,7 @@ impl Store {
             new.epoch = promise.epoch;
             new.holder = promise.holder.clone();
             new.released = promise.released && new.end == promise.end;
-            let ended = if copied.ended_epoch > here.ended_epoch {
-                &copied
-            } else {
-                here
-            };
-            new.ended_epoch = ended.ended_epoch;
-            new.ended_by = ended.ended_by.clone();
+            new.ended = endings(here.ended.iter().chain(&copied.ended).cloned(), new.epoch);
             new.reserved = here.reserved.max(copied.reserved);
             new.version = here.version.max(copied.version);
         }
@@ -1607,8 +1619,10 @@ impl Store {
             return Ok(answer(Refusal::None, &old, voting));
         }
         // A slot in a repaired span starts repaired; the import keeps that, and the slot votes once a claim commits.
+        // Endings of claims still in flight say nothing about the slot's state.
         let blank = pb::ClaimRecord {
             repaired: false,
+            ended: Vec::new(),
             ..old.clone()
         };
         if blank != pb::ClaimRecord::default() {
@@ -1699,13 +1713,20 @@ impl Store {
         let _lock = self.lock(actor);
         self.check_sealed(actor)?;
         let old = self.load(actor)?;
-        let other_holder = epoch == old.epoch && old.holder.as_ref() != Some(holder);
-        if epoch < old.epoch || other_holder || old.ended_epoch >= epoch || buried(&old).is_some() {
+        let ending = pb::Ending {
+            epoch,
+            holder: Some(holder.clone()),
+        };
+        let other_holder = epoch == old.epoch && old.holder != ending.holder;
+        if epoch < old.epoch
+            || other_holder
+            || old.ended.contains(&ending)
+            || buried(&old).is_some()
+        {
             return Ok(());
         }
         let new = pb::ClaimRecord {
-            ended_epoch: epoch,
-            ended_by: Some(holder.clone()),
+            ended: endings(old.ended.iter().cloned().chain([ending]), old.epoch),
             ..old.clone()
         };
         let mut batch = WriteBatch::default();

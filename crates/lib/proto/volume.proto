@@ -191,11 +191,11 @@ message ClaimRecord {
   LogEnd deleted = 17;
   // The `DELETE`'s `committed_at`, where the grace period starts.
   uint64 deleted_at_ms = 18;
-  // The newest claim a holder said it stopped running the actor at, possibly before that claim arrived here: while the
-  // promise is that claim, its lease is over.
-  uint64 ended_epoch = 19;
-  Holder ended_by = 20;
+  // Claims at or above the promise that their holder said it stopped running the actor at, some possibly before the
+  // claim arrived here: while the promise is one of them, its lease is over. Lowest epoch first.
+  repeated Ending ended = 19;
 }
+message Ending { uint64 epoch = 1; Holder holder = 2; }
 message OverlayRecord { uint64 seq = 1; optional bytes value = 2; }
 
 // An event for an actor (#116 / S-08, `statefull/v2.md` §6). A Compute host's Worker binding sends it to its cell
