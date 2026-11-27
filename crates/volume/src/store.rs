@@ -52,7 +52,8 @@ pub const MAX_UNFLUSHED_BYTES: u64 = 16 << 30;
 pub enum Error {
     Storage(StorageError),
     Invalid(String),
-    /// Too much is not yet flushed to S3; the holder retries later. Nothing was written.
+    /// Too much is not yet flushed to S3, or too many lease endings wait for their claims; the caller retries later.
+    /// Nothing was written.
     Backpressure,
     /// A multi-key read must be split before it can fit in one response.
     ReplyTooLarge,
@@ -105,6 +106,30 @@ pub struct Actor {
     hash: u64,
     prefix: Vec<u8>,
     kind: i32,
+}
+
+/// Whether the promised holder said it stopped running the actor at this promise.
+fn lease_ended(claim: &pb::ClaimRecord) -> bool {
+    claim.holder.is_some()
+        && claim
+            .ended
+            .iter()
+            .any(|e| e.epoch == claim.epoch && e.holder == claim.holder)
+}
+
+/// Endings of claims above the promise a slot stores; `end_lease` refuses more, and the host resends them.
+const PENDING_ENDINGS: usize = 8;
+
+/// Endings worth keeping under a promise at `epoch`: none below it, each once, lowest first.
+fn endings(ended: impl IntoIterator<Item = pb::Ending>, epoch: u64) -> Vec<pb::Ending> {
+    let mut kept: Vec<pb::Ending> = Vec::new();
+    for e in ended {
+        if e.epoch >= epoch && !kept.contains(&e) {
+            kept.push(e);
+        }
+    }
+    kept.sort_by_key(|e| e.epoch);
+    kept
 }
 
 /// A due alarm hint. The receiving holder validates it against its recovered, committed alarm before invoking.
@@ -902,6 +927,7 @@ impl Store {
             new.epoch = promise.epoch;
             new.holder = promise.holder.clone();
             new.released = promise.released && new.end == promise.end;
+            new.ended = endings(here.ended.iter().chain(&copied.ended).cloned(), new.epoch);
             new.reserved = here.reserved.max(copied.reserved);
             new.version = here.version.max(copied.version);
         }
@@ -1296,7 +1322,8 @@ impl Store {
                         ..wire
                     },
                     at_ms,
-                    released: claim.released,
+                    // An ended lease no longer holds up the alarm: no one runs the actor.
+                    released: claim.released || lease_ended(&claim),
                     holder: claim.holder,
                 });
             }
@@ -1594,8 +1621,10 @@ impl Store {
             return Ok(answer(Refusal::None, &old, voting));
         }
         // A slot in a repaired span starts repaired; the import keeps that, and the slot votes once a claim commits.
+        // Endings of claims still in flight say nothing about the slot's state.
         let blank = pb::ClaimRecord {
             repaired: false,
+            ended: Vec::new(),
             ..old.clone()
         };
         if blank != pb::ClaimRecord::default() {
@@ -1651,7 +1680,7 @@ impl Store {
         let other = old
             .holder
             .as_ref()
-            .filter(|h| *h != holder && !old.released);
+            .filter(|h| *h != holder && !old.released && !lease_ended(&old));
         let refused = if version < old.version {
             Refusal::StaleVersion
         } else if epoch <= old.epoch {
@@ -1676,6 +1705,43 @@ impl Store {
         self.save(&mut batch, actor, &old, &new)?;
         self.commit(batch)?;
         Ok((answer(refused, &new, voting), other.is_some()))
+    }
+
+    /// Ends the lease of the claim `holder` took at `epoch`: the holder no longer runs the actor there, so another may
+    /// claim it while the holder's host heartbeats for other actors. The ending is kept for a claim that has not arrived
+    /// yet, as a claim call can land after its writer gave up. `Ok` means it took effect or has none: a newer promise
+    /// or a tombstone stands.
+    pub fn end_lease(&self, actor: &Actor, holder: &pb::Holder, epoch: u64) -> Result<(), Error> {
+        let _lock = self.lock(actor);
+        self.check_sealed(actor)?;
+        let old = self.load(actor)?;
+        let ending = pb::Ending {
+            epoch,
+            holder: Some(holder.clone()),
+        };
+        let other_holder = epoch == old.epoch && old.holder != ending.holder;
+        if epoch < old.epoch
+            || other_holder
+            || old.ended.contains(&ending)
+            || buried(&old).is_some()
+        {
+            return Ok(());
+        }
+        let ended = endings(old.ended.iter().cloned().chain([ending]), old.epoch);
+        // The current promise's ending always fits; a full list refuses another future one rather than drop a stored one.
+        if epoch > old.epoch
+            && ended.iter().filter(|e| e.epoch > old.epoch).count() > PENDING_ENDINGS
+        {
+            return Err(Error::Backpressure);
+        }
+        let new = pb::ClaimRecord {
+            ended,
+            ..old.clone()
+        };
+        let mut batch = WriteBatch::default();
+        self.save(&mut batch, actor, &old, &new)?;
+        self.commit(batch)?;
+        Ok(())
     }
 
     /// Writes entries at the slot's promise (epoch and holder), once its log holds the holder's entry before them. An

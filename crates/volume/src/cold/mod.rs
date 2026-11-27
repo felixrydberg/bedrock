@@ -935,9 +935,15 @@ impl Cold {
         })
     }
 
-    /// Waits up to [`BEHIND_WAIT`] for `db` to hold the actor at `flushed` or later.
-    async fn caught_up(&self, db: &dyn Database, actor: &[u8], flushed: u64) -> Result<(), Status> {
-        let deadline = bedrock_lib::monotonic_now() + BEHIND_WAIT;
+    /// Waits up to `wait` for `db` to hold the actor at `flushed` or later.
+    async fn caught_up(
+        &self,
+        db: &dyn Database,
+        actor: &[u8],
+        flushed: u64,
+        wait: Duration,
+    ) -> Result<(), Status> {
+        let deadline = bedrock_lib::monotonic_now() + wait;
         loop {
             if seq_in(db, actor).await?.unwrap_or(0) >= flushed {
                 return Ok(());
@@ -952,7 +958,7 @@ impl Cold {
     }
 
     /// A database holding the actor at `flushed` or later, for a caller in `cell`, with its cell and name: its first slot
-    /// cell's, waited for up to [`BEHIND_WAIT`] while it holds an older point. After a first-slot move, until the
+    /// cell's, waited for up to `wait` while it holds an older point. After a first-slot move, until the
     /// actor's next flush copies it, that database lacks it: then another cell's that holds it is read instead. A cached
     /// catalog may name a database that a split or merge retired, so an older point is read again before it is waited
     /// for: only the database the catalog names now is polled, never the one it replaced.
@@ -962,6 +968,7 @@ impl Cold {
         actor: &pb::Actor,
         parsed: &Actor,
         flushed: u64,
+        wait: Duration,
     ) -> Result<(String, String, Arc<dyn Database>), Status> {
         let first = self.placement.first_cell(actor).await?;
         let opened = self.handle(cell, &first, parsed.hash()).await;
@@ -985,7 +992,7 @@ impl Cold {
                 // last flush yet.
                 if fresh == *name {
                     if self
-                        .caught_up(reopened.as_ref(), parsed.name(), flushed)
+                        .caught_up(reopened.as_ref(), parsed.name(), flushed, wait)
                         .await
                         .is_ok()
                     {
@@ -1087,7 +1094,9 @@ impl Cold {
         max_bytes: usize,
     ) -> Result<Vec<Option<Vec<u8>>>, Status> {
         let parsed = Actor::new(actor).map_err(status)?;
-        let (first, name, db) = self.holding(cell, actor, &parsed, flushed).await?;
+        let (first, name, db) = self
+            .holding(cell, actor, &parsed, flushed, BEHIND_WAIT)
+            .await?;
         let read = async {
             let mut values = Vec::with_capacity(keys.len());
             let mut bytes = 0;
@@ -1125,7 +1134,9 @@ impl Cold {
         limit: usize,
     ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, bool), Status> {
         let parsed = Actor::new(actor).map_err(status)?;
-        let (first, name, db) = self.holding(cell, actor, &parsed, flushed).await?;
+        let (first, name, db) = self
+            .holding(cell, actor, &parsed, flushed, BEHIND_WAIT)
+            .await?;
         let prefix = data_key(parsed.name(), b"");
         let read = async {
             let end = KeyRange::prefix(prefix.clone())
@@ -1151,10 +1162,16 @@ impl Cold {
     }
 
     /// The actor's [`Meta`] from a range database that holds it at `at_least` or later: where a slot left behind skips
-    /// to (S-06).
-    pub async fn meta(&self, cell: &str, actor: &pb::Actor, at_least: u64) -> Result<Meta, Status> {
+    /// to (S-06). `wait` bounds the wait for the first slot cell's reader, before other cells are tried.
+    pub async fn meta(
+        &self,
+        cell: &str,
+        actor: &pb::Actor,
+        at_least: u64,
+        wait: Duration,
+    ) -> Result<Meta, Status> {
         let parsed = Actor::new(actor).map_err(status)?;
-        let (first, name, db) = self.holding(cell, actor, &parsed, at_least).await?;
+        let (first, name, db) = self.holding(cell, actor, &parsed, at_least, wait).await?;
         let read = async {
             let bytes = db
                 .get(&meta_key(parsed.name()))

@@ -75,7 +75,9 @@ impl Storage {
 
     fn check(&self) -> Result<(), Error> {
         if self.0.fenced.load(Ordering::Relaxed) {
-            return Err(Error::Fenced);
+            return Err(Error::Fenced(
+                "a commit's caller was cancelled before its quorum answered".into(),
+            ));
         }
         Ok(())
     }
@@ -95,6 +97,11 @@ impl Storage {
     pub async fn scan(&self, start: Vec<u8>, limit: u32) -> Result<(Vec<pb::Value>, bool), Error> {
         self.check()?;
         self.0.writer.scan(start, limit).await
+    }
+
+    /// The claim epoch this storage writes at: a later claim of the actor has a higher one.
+    pub fn epoch(&self) -> u64 {
+        self.0.writer.epoch()
     }
 
     /// The current acknowledged alarm, in Unix milliseconds.

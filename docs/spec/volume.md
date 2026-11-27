@@ -22,7 +22,11 @@ after a disk wipe. S-03 (#111), S-04 (#112) and S-06 (#114) implement it.
   the same step when that fsync completes a quorum. It counts only an entry of its own epoch, which commits the
   entries before it (Raft's Figure 8 rule). The slot learns the commit point with the append.
 - **Lease.** Under the bounded-drift assumption a holder self-fences before any slot sees its lease expire, so a slot
-  sees a live lease exactly while its promised holder is between `Recover` and `Fence` or `Release`.
+  sees a live lease exactly while its promised holder is between `Recover` and `Fence` or `Release`. The code
+  approximates `Live` from above: a slot counts a promise as leased while its host heartbeats, until the host says
+  that claim ended (#124 / S-16). The host says so only once its writer stopped answering: it fenced, or its claim
+  failed. Two leftovers still over-approximate it: an ended claim not yet acknowledged, and the claims of a host that
+  restarted.
 - **Maintainer.** Two slots (`a`, `b`) can each believe they are the maintainer. `OpenMaint` is SlateDB writer fencing:
   the newest opener fences the other. `Flush` appends one atomic batch to S3, up to the announced commit point.
 - **Backpressure and truncation** (S-05, #113; config `volume-truncate` only, so the other configs keep their state

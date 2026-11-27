@@ -239,12 +239,12 @@ async fn cut_off(fingerprint: &Fingerprint, next: &mut usize) {
         let fenced = bedrock_lib::monotonic_now();
         let late = writer.commit(change("k", 2), None, 2).await;
         assert!(
-            matches!(late, Err(Error::Fenced)),
+            matches!(late, Err(Error::Fenced(_))),
             "a fenced writer commits nothing"
         );
         let read = writer.read(vec![b"k".to_vec()]).await;
         assert!(
-            matches!(read, Err(Error::Fenced)),
+            matches!(read, Err(Error::Fenced(_))),
             "a fenced writer reads nothing"
         );
         fenced

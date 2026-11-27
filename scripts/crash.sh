@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Runs the real-binary crash and fault checks (#25 / B-23 Layer 3) on Linux or WSL: the five release binaries, RocksDB
+# Runs the real-binary crash and fault checks (#25 / B-23 Layer 3) on Linux or WSL: the release binaries, RocksDB
 # and SeaweedFS as S3, killed and checked by tests/crash.
 #
 #   scripts/crash.sh run          One run of BEDROCK_CRASH_SECONDS (default 60) of faults, then convergence and checks.
 #   scripts/crash.sh sweep 10     Ten runs with consecutive seeds; lists the failures.
+#   scripts/crash.sh volume       Kills real bedrock-volume slots at every append delivery boundary (#124 / S-16).
 #
 # BEDROCK_CRASH_SEED picks the workload and faults; a run is not deterministic, so a failing seed may not repeat.
 # BEDROCK_CRASH_FAULTS=none runs without faults. Each run's configs, data, logs and faults.log stay in
@@ -16,7 +17,7 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/bedrock-crash-target-$(basena
 export BEDROCK_CRASH_BINS="$CARGO_TARGET_DIR/release"
 
 build() {
-    cargo build --release -p bedrock-api -p bedrock-relay -p bedrock-quicksilver -p bedrock-kv -p bedrock-cdn
+    cargo build --release -p bedrock-api -p bedrock-relay -p bedrock-quicksilver -p bedrock-kv -p bedrock-cdn -p bedrock-volume
     cargo test --release -p bedrock-crash --test crash --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))$/\1/p'
 }
 
@@ -38,6 +39,12 @@ run() {
 }
 
 case "${1:-}" in
+    volume)
+        test="$(build | tail -1)"
+        s3
+        "$test" --ignored --exact volume_slots_keep_every_acknowledged_commit_across_kills --nocapture 2>&1 |
+            grep -E '^CRASH |broke|Logs|Rerun|panicked'
+        ;;
     run)
         test="$(build | tail -1)"
         s3

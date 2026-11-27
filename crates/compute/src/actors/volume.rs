@@ -57,6 +57,8 @@ pub const MAX_ENTRY_BYTES: usize = bedrock_lib::kv::MAX_ENTRY_BYTES;
 /// Pages one SQLite read miss fetches, aligned (user decision 2026-11-15).
 pub const CHUNK_PAGES: u32 = 64;
 const CALL: Duration = Duration::from_secs(2);
+/// Ended claims one heartbeat carries, so it stays far below the message limit; the rest follow with later heartbeats.
+const ENDED_PER_BEAT: usize = 256;
 const RETRY: Duration = Duration::from_millis(100);
 /// Committed entries, and their encoded bytes, kept for a lagging slot. A slot further behind waits for S-06's repair.
 // The latest committed entry stays even when larger, so an idle slot can learn its commit point.
@@ -75,9 +77,9 @@ const VOLUME: &str = bedrock_lib::datasets::capabilities::VOLUME;
 pub enum Error {
     /// Another holder's lease is live on a slot; send the request there.
     Held(pb::Holder),
-    /// The writer stopped serving: its slots did not acknowledge heartbeats, a slot promised a newer epoch, or it
-    /// released. A commit that fails this way may still have committed.
-    Fenced,
+    /// The writer stopped serving, for the reason given: its slots did not acknowledge heartbeats, a slot promised a
+    /// newer epoch, too few slots still vote, or it released. A commit that fails this way may still have committed.
+    Fenced(String),
     /// A slot holds a newer topology version; read the topology again.
     StaleVersion,
     /// No quorum, or no slot caught up with the commit point, answered.
@@ -98,7 +100,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Held(h) => write!(f, "held by {} in {}", h.host, h.cell),
-            Self::Fenced => write!(f, "the writer stopped serving"),
+            Self::Fenced(why) => write!(f, "the writer stopped serving: {why}"),
             Self::StaleVersion => write!(f, "a slot holds a newer topology version"),
             Self::Unavailable(detail) => write!(f, "unavailable: {detail}"),
             Self::Rpc(status) => write!(f, "slot failed: {status}"),
@@ -261,6 +263,20 @@ struct Node {
     users: usize,
     /// When the newest acknowledged heartbeat was sent.
     acked: Option<Instant>,
+    /// Claims this host stopped running, sent with each heartbeat until one is acknowledged. The node stays in the
+    /// heartbeat set while any are left.
+    ended: Vec<pb::Ended>,
+}
+
+/// Drops the endings a slot `recorded`. The others it was `sent` go to the back, so endings the slot keeps refusing
+/// do not hold the front of every heartbeat; they are resent after the rest.
+fn requeue(queue: &mut Vec<pb::Ended>, sent: &[pb::Ended], recorded: &[pb::Ended]) {
+    let (refused, rest): (Vec<_>, Vec<_>) = std::mem::take(queue)
+        .into_iter()
+        .filter(|e| !recorded.contains(e))
+        .partition(|e| sent.contains(e));
+    *queue = rest;
+    queue.extend(refused);
 }
 
 impl Host {
@@ -292,36 +308,51 @@ impl Host {
 
     async fn beat(&self, slot: Slot) {
         let sent = bedrock_lib::monotonic_now();
+        let ended: Vec<pb::Ended> = self
+            .lock()
+            .get(&slot.address)
+            .map(|n| n.ended.iter().take(ENDED_PER_BEAT).cloned().collect())
+            .unwrap_or_default();
         let request = pb::HeartbeatRequest {
             holder: Some(self.holder.clone()),
+            ended: ended.clone(),
         };
         let beat = call(&self.peers, &slot, |mut c| async move {
             c.heartbeat(request).await
         });
-        if beat.await.is_ok()
-            && let Some(node) = self.lock().get_mut(&slot.address)
-        {
-            node.acked = node.acked.max(Some(sent));
+        if let Ok(reply) = beat.await {
+            let mut nodes = self.lock();
+            if let Some(node) = nodes.get_mut(&slot.address) {
+                node.acked = node.acked.max(Some(sent));
+                requeue(&mut node.ended, &ended, &reply.ended);
+                if node.users == 0 && node.ended.is_empty() {
+                    nodes.remove(&slot.address);
+                }
+            }
         }
     }
 
     /// Adds `slots` to the heartbeat set. The guard leaves it on drop, also when the caller is cancelled.
-    fn join(self: &Arc<Self>, slots: &[Slot; SLOTS]) -> Joined {
+    fn join(self: &Arc<Self>, slots: &[Slot; SLOTS], actor: &pb::Actor) -> Joined {
         let mut nodes = self.lock();
         for slot in slots {
-            nodes
-                .entry(slot.address.clone())
-                .or_insert_with(|| Node {
-                    slot: slot.clone(),
-                    users: 0,
-                    acked: None,
-                })
-                .users += 1;
+            Self::node(&mut nodes, slot).users += 1;
         }
         Joined {
             host: self.clone(),
             slots: slots.clone(),
+            actor: actor.clone(),
+            claimed: Vec::new(),
         }
+    }
+
+    fn node<'a>(nodes: &'a mut BTreeMap<String, Node>, slot: &Slot) -> &'a mut Node {
+        nodes.entry(slot.address.clone()).or_insert_with(|| Node {
+            slot: slot.clone(),
+            users: 0,
+            acked: None,
+            ended: Vec::new(),
+        })
     }
 
     /// Heartbeats `slots` once now.
@@ -338,7 +369,7 @@ impl Host {
         for slot in slots {
             if let Some(node) = nodes.get_mut(&slot.address) {
                 node.users -= 1;
-                if node.users == 0 {
+                if node.users == 0 && node.ended.is_empty() {
                     nodes.remove(&slot.address);
                 }
             }
@@ -395,6 +426,8 @@ struct State {
     /// Slots this writer stopped appending to (corrupt, behind what it keeps, or promised elsewhere); S-06 repairs them.
     lost: [bool; SLOTS],
     fenced: bool,
+    /// Why it fenced, for [`Error::Fenced`].
+    fenced_by: String,
 }
 
 enum Next {
@@ -403,6 +436,11 @@ enum Next {
 }
 
 impl State {
+    /// The error of a writer that stopped.
+    fn stopped(&self) -> Error {
+        Error::Fenced(self.fenced_by.clone())
+    }
+
     fn last(&self) -> u64 {
         self.base + self.log.len() as u64
     }
@@ -503,14 +541,29 @@ impl State {
     }
 }
 
-/// A writer's place in its host's heartbeat set, left on drop.
+/// A writer's place in its host's heartbeat set, left on drop. Dropped, it also ends the lease of every claim it sent:
+/// whether the claim failed or its writer stopped, this host no longer runs the actor at it (`Live` in `volume.tla`).
+/// Only epochs this writer claimed are named, so a later claim of the same host keeps its lease.
 struct Joined {
     host: Arc<Host>,
     slots: [Slot; SLOTS],
+    actor: pb::Actor,
+    claimed: Vec<u64>,
 }
 
 impl Drop for Joined {
     fn drop(&mut self) {
+        let mut nodes = self.host.lock();
+        for slot in &self.slots {
+            let node = Host::node(&mut nodes, slot);
+            for &epoch in &self.claimed {
+                node.ended.push(pb::Ended {
+                    actor: Some(self.actor.clone()),
+                    epoch,
+                });
+            }
+        }
+        drop(nodes);
         self.host.leave(&self.slots);
     }
 }
@@ -533,18 +586,37 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn fence(&self, state: &mut State) {
+    /// Stops the writer; the first reason given is the one [`Error::Fenced`] reports.
+    fn fence(&self, state: &mut State, why: impl Into<String>) {
+        if !state.fenced {
+            state.fenced_by = why.into();
+        }
         state.fenced = true;
         self.changed.notify_waiters();
     }
 
-    /// Slot `i` takes no more appends from this writer; with fewer than two left, no entry can commit.
-    fn lose(&self, i: usize) {
+    /// Slot `i` takes no more appends from this writer, because of `why`.
+    fn lose(&self, i: usize, why: impl std::fmt::Display) {
         let mut state = self.lock();
         state.lost[i] = true;
-        if state.lost.iter().filter(|lost| !**lost).count() < 2 {
-            self.fence(&mut state);
+        self.fence_without_quorum(&mut state, &format!("slot {i} dropped: {why}"));
+    }
+
+    /// Fences once fewer than two slots can count towards a commit: not lost, and voting as of their last answer. A
+    /// repaired slot votes again only once an entry of this epoch commits (`Replicate` in `volume.tla`), which takes two
+    /// voters, so with fewer no entry can commit again and only a new claim makes progress. Returns whether it fenced.
+    fn fence_without_quorum(&self, state: &mut State, after: &str) -> bool {
+        let voters = (0..SLOTS)
+            .filter(|&i| state.voting[i] && !state.lost[i])
+            .count();
+        if voters < 2 {
+            let why = format!(
+                "{after}; fewer than two voting slots left (voting {:?}, lost {:?})",
+                state.voting, state.lost
+            );
+            self.fence(state, why);
         }
+        voters < 2
     }
 
     /// The slots still taking this writer's appends.
@@ -619,11 +691,18 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
                         | Code::Unimplemented
                 ) =>
             {
-                shared.fence(&mut shared.lock());
+                shared.fence(
+                    &mut shared.lock(),
+                    format!("slot {i} refused an append: {status}"),
+                );
                 return;
             }
-            // A corrupt slot is dropped until it repairs.
-            Err(status) if status.code() == Code::DataLoss => return shared.lose(i),
+            // A corrupt slot is dropped until it repairs, and so is a node that no longer serves the slot's range (a
+            // handoff moved it, or it is not ready yet): its heartbeats would otherwise keep a writer serving that can
+            // commit nothing there. A new claim reads where the range is now.
+            Err(status) if matches!(status.code(), Code::DataLoss | Code::FailedPrecondition) => {
+                return shared.lose(i, status);
+            }
             Err(_) => {
                 sleep(RETRY).await;
                 continue;
@@ -635,6 +714,9 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             Some(Refusal::None) => {
                 // The commit point the slot learned, which is below the one sent while it lacks entries up to it.
                 state.ack(i, through, slot.voting, slot.committed);
+                if shared.fence_without_quorum(&mut state, &format!("slot {i} acknowledged")) {
+                    return;
+                }
                 shared.changed.notify_waiters();
             }
             // The slot holds the actor's tombstone: it knows a `DELETE` committed, and takes nothing more. Any other
@@ -642,7 +724,8 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             Some(Refusal::Deleted) => {
                 state.told[i] = u64::MAX;
                 if !shared.deleting {
-                    return shared.fence(&mut state);
+                    return shared
+                        .fence(&mut state, format!("slot {i} holds the actor's tombstone"));
                 }
                 shared.changed.notify_waiters();
                 return;
@@ -650,7 +733,12 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             Some(Refusal::LogGap) => {
                 if from <= state.base + 1 {
                     drop(state);
-                    return shared.lose(i);
+                    return shared.lose(
+                        i,
+                        format!(
+                            "it lacks entries before {from}, which this writer no longer keeps"
+                        ),
+                    );
                 }
                 let end = slot.end.unwrap_or_default().seq;
                 state.next[i] = (from - 1).min(end + 1);
@@ -659,10 +747,11 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             // dropped until it repairs.
             Some(refusal @ (Refusal::NotPromised | Refusal::StaleVersion)) => {
                 if refusal == Refusal::StaleVersion || slot.epoch > shared.epoch {
-                    return shared.fence(&mut state);
+                    let why = format!("slot {i} answered {refusal:?} at epoch {}", slot.epoch);
+                    return shared.fence(&mut state, why);
                 }
                 drop(state);
-                return shared.lose(i);
+                return shared.lose(i, "it lost this writer's promise");
             }
             _ => {
                 drop(state);
@@ -670,6 +759,10 @@ async fn replicate(shared: Arc<Shared>, i: usize) {
             }
         }
     }
+}
+
+fn late_heartbeats() -> String {
+    format!("fewer than two slots acknowledged a heartbeat sent within {FENCE:?}")
 }
 
 /// Fences the writer once its lease deadline passes without a heartbeat extending it.
@@ -682,7 +775,7 @@ async fn lease(shared: Arc<Shared>) {
                 sleep_until(deadline).await
             }
             _ => {
-                shared.fence(&mut shared.lock());
+                shared.fence(&mut shared.lock(), late_heartbeats());
                 return;
             }
         }
@@ -730,7 +823,9 @@ impl Writer {
         let told =
             writer.wait(|s| (s.told.iter().filter(|t| **t >= seq).count() >= 2).then_some(()));
         let told = tokio::time::timeout(FENCE, told).await;
-        writer.shared.fence(&mut writer.shared.lock());
+        writer
+            .shared
+            .fence(&mut writer.shared.lock(), "its MOVE committed");
         match told {
             Ok(result) => result?,
             Err(_) => {
@@ -764,7 +859,9 @@ impl Writer {
         let told =
             writer.wait(|s| (s.told.iter().filter(|t| **t >= seq).count() >= 2).then_some(()));
         let told = tokio::time::timeout(FENCE, told).await;
-        writer.shared.fence(&mut writer.shared.lock());
+        writer
+            .shared
+            .fence(&mut writer.shared.lock(), "its DELETE committed");
         match told {
             Ok(result) => result,
             Err(_) => Err(Error::Unavailable(
@@ -787,7 +884,7 @@ impl Writer {
         committed_at: u64,
     ) -> Result<Self, Error> {
         // Leaves the heartbeat set on every early return and on cancellation.
-        let joined = host.join(&slots);
+        let mut joined = host.join(&slots, &actor);
         host.beat_all(&slots).await;
         if host.live(&slots) < 2 {
             return Err(Error::Unavailable(
@@ -841,6 +938,7 @@ impl Writer {
                 sleep(RETRY).await;
                 continue;
             }
+            joined.claimed.push(epoch);
             let claims =
                 slots.iter().map(|slot| {
                     let (peers, slot) = (peers.clone(), slot.clone());
@@ -976,7 +1074,7 @@ impl Writer {
     pub fn serving(&self) -> bool {
         let mut state = self.shared.lock();
         if !state.fenced && self.shared.joined.host.live(&self.shared.usable(&state)) < 2 {
-            self.shared.fence(&mut state);
+            self.shared.fence(&mut state, late_heartbeats());
         }
         !state.fenced
     }
@@ -990,14 +1088,14 @@ impl Writer {
             {
                 let mut state = self.shared.lock();
                 if state.fenced {
-                    return Err(Error::Fenced);
+                    return Err(state.stopped());
                 }
                 if let Some(value) = ready(&mut state) {
                     return Ok(value);
                 }
             }
             if !self.serving() {
-                return Err(Error::Fenced);
+                return Err(self.shared.lock().stopped());
             }
             tokio::select! {
                 biased;
@@ -1023,7 +1121,7 @@ impl Writer {
         let seq = self
             .append(Kind::Release, Vec::new(), None, committed_at)
             .await?;
-        self.shared.fence(&mut self.shared.lock());
+        self.shared.fence(&mut self.shared.lock(), "it released");
         Ok(seq)
     }
 
@@ -1161,13 +1259,13 @@ impl Writer {
         for i in order {
             // A writer that stopped serving may be behind a newer holder.
             if !self.serving() {
-                return Err(Error::Fenced);
+                return Err(self.shared.lock().stopped());
             }
             match call(&shared.joined.host.peers, &shared.joined.slots[i], &f).await {
                 Ok(reply) => match answer(&reply).map(|a| (refused(a), slot_of(a).epoch)) {
                     Some((Some(Refusal::None), epoch)) if epoch == shared.epoch => {
                         if !self.serving() {
-                            return Err(Error::Fenced);
+                            return Err(self.shared.lock().stopped());
                         }
                         return Ok(reply);
                     }
@@ -1175,7 +1273,10 @@ impl Writer {
                         last = format!("slot {i} is promised to epoch {epoch}");
                     }
                     Some((Some(Refusal::Deleted), _)) => {
-                        shared.fence(&mut shared.lock());
+                        shared.fence(
+                            &mut shared.lock(),
+                            format!("slot {i} holds the actor's tombstone"),
+                        );
                         return Err(Error::Deleted);
                     }
                     refusal => last = format!("slot {i} refused: {refusal:?}"),
@@ -1205,6 +1306,7 @@ impl State {
             retained: 0,
             lost: [false; SLOTS],
             fenced: false,
+            fenced_by: String::new(),
         }
     }
 }

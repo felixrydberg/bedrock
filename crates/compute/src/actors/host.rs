@@ -508,7 +508,9 @@ impl Awake {
                             );
                             tokio::select! {
                                 biased;
-                                () = &mut stopped => Err(Error::Volume(volume::Error::Fenced)),
+                                () = &mut stopped => Err(Error::Volume(volume::Error::Fenced(
+                                    "the host stopped the actor during its alarm".into(),
+                                ))),
                                 result = instance.alarm(at) => result.map(|()| Vec::new()),
                             }
                         }
@@ -518,10 +520,14 @@ impl Awake {
                         }
                     }
                 }
-                _ => Err(Error::Volume(volume::Error::Fenced)),
+                _ => Err(Error::Volume(volume::Error::Fenced(
+                    "the instance no longer serves".into(),
+                ))),
             };
             match result {
-                Ok(_) if !self.serving() => Err(Error::Volume(volume::Error::Fenced)),
+                Ok(_) if !self.serving() => Err(Error::Volume(volume::Error::Fenced(
+                    "the writer stopped serving during the call".into(),
+                ))),
                 other => other,
             }
         };

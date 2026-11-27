@@ -144,6 +144,94 @@ fn claims_need_a_higher_epoch_a_current_version_and_no_other_live_lease() {
     assert!(expired);
 }
 
+/// #124 / S-16: a holder that stopped running the actor ends its lease, although its host still heartbeats; only its
+/// current claim's lease ends, and a new claim starts a lease again.
+#[test]
+fn an_ended_claim_holds_no_lease() {
+    let store = store();
+    let actor = actor();
+    let (a, b) = (host("a"), host("b"));
+    claimed(&store, &a, 2);
+    store.end_lease(&actor, &a, 1).unwrap();
+    store.end_lease(&actor, &b, 2).unwrap();
+    let (answer, _) = store.claim(&actor, &b, 3, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::LeaseLive,
+        "another epoch or holder ends nothing"
+    );
+    store.end_lease(&actor, &a, 2).unwrap();
+    let (answer, expired) = store.claim(&actor, &b, 3, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None);
+    assert!(!expired, "an ended lease did not expire");
+    let (answer, _) = store.claim(&actor, &a, 4, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::LeaseLive,
+        "b's new claim holds a lease"
+    );
+
+    // An ending can land before its claim: a's claim at 5 ends when it arrives, and an older ending changes nothing.
+    store.end_lease(&actor, &a, 5).unwrap();
+    store.end_lease(&actor, &a, 4).unwrap();
+    let (answer, _) = store.claim(&actor, &a, 5, 0, |_| false).unwrap();
+    assert_eq!(refused(&answer), Refusal::None);
+    let (answer, _) = store.claim(&actor, &b, 6, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::None,
+        "a's claim at 5 ended before it arrived"
+    );
+
+    // A future ending neither hides nor replaces the current promise's ending, in either order, and stays for its claim.
+    store.end_lease(&actor, &b, 8).unwrap();
+    store.end_lease(&actor, &b, 6).unwrap();
+    let (answer, _) = store.claim(&actor, &a, 7, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None, "b's claim at 6 ended");
+    store.end_lease(&actor, &a, 7).unwrap();
+    store.end_lease(&actor, &a, 9).unwrap();
+    let (answer, _) = store.claim(&actor, &b, 8, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None, "a's claim at 7 ended");
+    let (answer, _) = store.claim(&actor, &a, 9, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::None,
+        "b's claim at 8 ended early"
+    );
+    let (answer, _) = store.claim(&actor, &b, 10, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::None,
+        "a's claim at 9 ended early"
+    );
+}
+
+/// #124 / S-16: a slot never drops an ending it stored; a full list refuses another future one, so the heartbeat does
+/// not acknowledge it, while the current promise's ending still fits.
+#[test]
+fn a_full_list_of_pending_endings_refuses_more_but_keeps_the_stored_ones() {
+    let store = store();
+    let actor = actor();
+    let a = host("a");
+    claimed(&store, &a, 1);
+    for epoch in 2..10 {
+        store.end_lease(&actor, &host("b"), epoch).unwrap();
+    }
+    assert!(matches!(
+        store.end_lease(&actor, &host("b"), 10),
+        Err(Error::Backpressure)
+    ));
+    store.end_lease(&actor, &a, 1).unwrap();
+    let (answer, _) = store.claim(&actor, &host("b"), 9, 0, |_| true).unwrap();
+    assert_eq!(refused(&answer), Refusal::None, "a's claim at 1 ended");
+    let (answer, _) = store.claim(&actor, &a, 10, 0, |_| true).unwrap();
+    assert_eq!(
+        refused(&answer),
+        Refusal::None,
+        "b's stored ending at 9 holds"
+    );
+}
+
 /// What the slot answers now, for comparing whole answers.
 fn answer_of(store: &Store, holder: &pb::Holder, epoch: u64, version: u64) -> pb::Answer {
     let claim = store.load(&actor()).unwrap();
@@ -1755,6 +1843,8 @@ fn an_import_starts_an_empty_slot_at_the_moved_point() {
         refused(&store.unimported(&actor()).unwrap().unwrap()),
         Refusal::NotImported
     );
+    // An ending of a claim still in flight leaves the slot importable (#124 / S-16).
+    store.end_lease(&actor(), &host("a"), 4).unwrap();
     let answer = store.import(&actor(), 3, 7, Some(99), 1).unwrap();
     assert_eq!(refused(&answer), Refusal::None);
     let s = slot(&answer);

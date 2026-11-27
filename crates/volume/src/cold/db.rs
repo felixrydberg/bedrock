@@ -616,6 +616,8 @@ mod memory {
         /// The next commits fail; with `durable`, after they were applied.
         failing: u64,
         durable: bool,
+        /// How long each request waits before it is served, as a slow S3 would.
+        latency: std::time::Duration,
     }
 
     /// Clones share one bucket, like nodes sharing S3.
@@ -648,6 +650,19 @@ mod memory {
             let mut bucket = self.bucket();
             bucket.failing = count;
             bucket.durable = durable;
+        }
+
+        /// Makes every later request wait `latency` first (#124 / S-16).
+        pub fn slow(&self, latency: std::time::Duration) {
+            self.bucket().latency = latency;
+        }
+
+        /// Waits out the bucket's latency, holding no lock.
+        async fn wait(&self) {
+            let latency = self.bucket().latency;
+            if !latency.is_zero() {
+                tokio::time::sleep(latency).await;
+            }
         }
 
         /// The name of every database, in order.
@@ -697,6 +712,7 @@ mod memory {
     #[async_trait]
     impl Database for Handle {
         async fn get(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+            self.bucket.wait().await;
             let bucket = self.bucket.bucket();
             self.check(&bucket)?;
             Ok(bucket
@@ -706,6 +722,7 @@ mod memory {
         }
 
         async fn scan(&self, start: &[u8], end: &[u8], limit: usize) -> StorageResult<Vec<Entry>> {
+            self.bucket.wait().await;
             let bucket = self.bucket.bucket();
             self.check(&bucket)?;
             if start >= end {
@@ -731,6 +748,7 @@ mod memory {
     #[async_trait]
     impl Writer for Handle {
         async fn commit(&self, changes: Changes) -> StorageResult<()> {
+            self.bucket.wait().await;
             let mut bucket = self.bucket.bucket();
             self.check(&bucket)?;
             let failed = bucket.failing > 0;
@@ -771,6 +789,7 @@ mod memory {
     #[async_trait]
     impl Databases for Memory {
         async fn open(&self, name: &str) -> StorageResult<Arc<dyn Writer>> {
+            self.wait().await;
             let mut bucket = self.bucket();
             let db = bucket.databases.entry(name.to_owned()).or_default();
             db.epoch += 1;
@@ -782,6 +801,7 @@ mod memory {
         }
 
         async fn open_reader(&self, name: &str) -> StorageResult<Option<Arc<dyn Database>>> {
+            self.wait().await;
             if !self.bucket().databases.contains_key(name) {
                 return Ok(None);
             }
@@ -793,6 +813,7 @@ mod memory {
         }
 
         async fn catalog(&self, cell: &str) -> StorageResult<(Catalog, Option<String>)> {
+            self.wait().await;
             Ok(self
                 .bucket()
                 .catalogs

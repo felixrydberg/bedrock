@@ -129,8 +129,13 @@ message Slot {
 
 message Answer { Refusal refused = 1; Slot slot = 2; }
 
-message HeartbeatRequest { Holder holder = 1; }
-message HeartbeatReply {}
+// `ended`: claims this host stopped running the actor at, without a committed `RELEASE`, sent until acknowledged.
+message HeartbeatRequest { Holder holder = 1; repeated Ended ended = 2; }
+// A claim at `epoch` whose holder no longer runs the actor: its lease is over (`Live` in `docs/spec/volume.tla`).
+message Ended { Actor actor = 1; uint64 epoch = 2; }
+// `ended`: the endings this slot recorded, or has no use for (not its range, buried, or an older epoch); the host
+// resends the others.
+message HeartbeatReply { repeated Ended ended = 1; }
 
 message ReadRequest { Actor actor = 1; repeated bytes keys = 2; uint64 min_seq = 3; }
 // `value` is absent when the key is deleted or was never written.
@@ -186,7 +191,11 @@ message ClaimRecord {
   LogEnd deleted = 17;
   // The `DELETE`'s `committed_at`, where the grace period starts.
   uint64 deleted_at_ms = 18;
+  // Claims at or above the promise that their holder said it stopped running the actor at, some possibly before the
+  // claim arrived here: while the promise is one of them, its lease is over. Lowest epoch first.
+  repeated Ending ended = 19;
 }
+message Ending { uint64 epoch = 1; Holder holder = 2; }
 message OverlayRecord { uint64 seq = 1; optional bytes value = 2; }
 
 // An event for an actor (#116 / S-08, `statefull/v2.md` §6). A Compute host's Worker binding sends it to its cell

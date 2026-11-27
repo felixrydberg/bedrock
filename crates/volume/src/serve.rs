@@ -7,6 +7,7 @@
 //!   owner, and it seals the span before the first record goes out.
 //! - **Leases.** Each Compute host heartbeats once per second; an actor's lease is live while its holder's host was seen
 //!   within [`LEASE`]. A restarted node has seen no one yet, so for its first [`LEASE`] it treats every holder as live.
+//!   A heartbeat also names claims its host stopped running without a `RELEASE`; their leases end at once (#124 / S-16).
 //! - **Callers.** Over mutual TLS, holder calls must come from that holder's Compute host, and `Truncate` and `Repair`
 //!   from a volume node. A claimant recovers its log through `Log`, which only the holder the slot promised may read.
 //! - **Blocking.** Store calls wait on fsyncs and actor locks, so they run off the async workers.
@@ -34,6 +35,16 @@ use crate::store::{self, Actor, Store};
 
 /// How long a holder's host stays live after its last heartbeat (§5 Lease).
 pub const LEASE: Duration = Duration::from_secs(5);
+/// How long an append past this slot's log end waits for its first slot cell's range database to hold what the slot
+/// lacks (#124 / S-16): longer than a reader takes to see a flush (its manifest poll is 1 s), and short enough that
+/// other cells are tried within [`GAP_LOOKUP`]. A holder that still has the entries then hears the gap and sends them,
+/// rather than timing out and sending the same append.
+pub const GAP_WAIT: Duration = Duration::from_millis(1200);
+/// The whole S3 lookup of an append gap, under the holder's 2 s call. Past it the append answers `UNAVAILABLE`, which
+/// the holder retries: S3 confirmed nothing, so the holder must not take it for a gap and drop the slot.
+pub const GAP_LOOKUP: Duration = Duration::from_millis(1800);
+/// How long one heartbeat spends recording ended claims, well under the host's 2 s call; the rest wait for the next.
+pub const ENDING_BUDGET: Duration = Duration::from_millis(500);
 const COMPUTE: &str = "compute";
 const VOLUME: &str = bedrock_lib::datasets::capabilities::VOLUME;
 
@@ -55,6 +66,8 @@ struct Metrics {
     fsync: Latency,
     overlay: Family<KindLabel, Gauge>,
     expiries: Family<KindLabel, Counter>,
+    /// Holder heartbeats taken: one per second per Compute host with actors here (`statefull/v2.md` §12 question 7).
+    heartbeats: Counter,
 }
 
 impl Metrics {
@@ -65,6 +78,7 @@ impl Metrics {
             }),
             overlay: Family::default(),
             expiries: Family::default(),
+            heartbeats: Counter::default(),
         };
         admin.register_labelled(
             vec![("cell", cell.to_owned()), ("dc", dc.to_owned())],
@@ -83,6 +97,11 @@ impl Metrics {
                     "volume_lease_expiries",
                     "Claims that took an actor over from a holder whose lease had expired",
                     metrics.expiries.clone(),
+                );
+                registry.register(
+                    "volume_heartbeats",
+                    "Holder heartbeats this node took",
+                    metrics.heartbeats.clone(),
                 );
             },
         );
@@ -389,7 +408,13 @@ impl pb::volume_server::Volume for Service {
             else {
                 return Ok(Response::new(outcome.answer));
             };
-            match cold.meta(&self.cell, pb_actor, end + 1).await {
+            let lookup = cold.meta(&self.cell, pb_actor, end + 1, GAP_WAIT);
+            let Ok(meta) = tokio::time::timeout(GAP_LOOKUP, lookup).await else {
+                return Err(Status::unavailable(
+                    "S3 did not answer whether it holds what this slot lacks",
+                ));
+            };
+            match meta {
                 Ok(meta) => {
                     let actor = self.actor(Some(pb_actor))?;
                     let kind = actor.kind();
@@ -443,12 +468,39 @@ impl pb::volume_server::Volume for Service {
     ) -> Result<Response<pb::HeartbeatReply>, Status> {
         let host = holder(request.get_ref().holder.as_ref())?.clone();
         check(&request, COMPUTE, Some(&host))?;
+        self.metrics.heartbeats.inc();
         let now = bedrock_lib::monotonic_now();
-        let mut leases = self.leases.lock().unwrap_or_else(PoisonError::into_inner);
-        // Hosts seen long ago no longer hold a lease here.
-        leases.retain(|_, seen| now.duration_since(*seen) < LEASE);
-        leases.insert((host.cell, host.host), now);
-        Ok(Response::new(pb::HeartbeatReply {}))
+        {
+            let mut leases = self.leases.lock().unwrap_or_else(PoisonError::into_inner);
+            // Hosts seen long ago no longer hold a lease here.
+            leases.retain(|_, seen| now.duration_since(*seen) < LEASE);
+            leases.insert((host.cell.clone(), host.host.clone()), now);
+        }
+        // Claims the host no longer runs, recorded within ENDING_BUDGET so the heartbeat answers well inside the host's
+        // call. The reply names those recorded or of no use here (another node's range); the host resends the rest, so
+        // one that could not be written now (a sealed range, a storage error) is not lost.
+        // ponytail: an ending recorded while its range is sealed for a handoff stays on the old owner; carry it in the
+        // copy if that shows up.
+        let deadline = now + ENDING_BUDGET;
+        let mut recorded = Vec::new();
+        for ended in request.into_inner().ended {
+            let Ok(actor) = self.actor(ended.actor.as_ref()) else {
+                recorded.push(ended);
+                continue;
+            };
+            let (store, holder, epoch) = (self.store.clone(), host.clone(), ended.epoch);
+            let ending = blocking(move || store.end_lease(&actor, &holder, epoch));
+            // A write that misses the deadline goes unnamed; it may still land, and the host's resend is then a no-op.
+            let left = deadline.saturating_duration_since(bedrock_lib::monotonic_now());
+            let Ok(ended_lease) = tokio::time::timeout(left, ending).await else {
+                break;
+            };
+            match ended_lease? {
+                Ok(()) => recorded.push(ended),
+                Err(error) => tracing::debug!(error = %status(error), "ending a lease failed"),
+            }
+        }
+        Ok(Response::new(pb::HeartbeatReply { ended: recorded }))
     }
 
     async fn read(
