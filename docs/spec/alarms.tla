@@ -11,7 +11,7 @@ vars == <<clock, alarm, durable, holder, expired, wake, running, valid, lateOnly
 Times == {1, 2}
 Due(t) == t # 0 /\ clock >= t
 \* The slots' hint: their committed alarm, else the alarm in the tail past their commit point, which may have
-\* committed by quorum before the holder crashed. Delivery rejects a hint that is not the committed alarm.
+\* committed by quorum before the holder crashed. A hint that is not the committed alarm runs no handler.
 Hint == IF known # 0 \/ learned \/ Bug = "committed-only" THEN known ELSE alarm
 Eligible == holder = "released" \/ (holder = "crashed" /\ expired /\ Bug # "released-only")
 Init == /\ clock = 0 /\ alarm = 1 /\ durable = 1
@@ -45,12 +45,21 @@ Fallback == Scan(TRUE)
 \* Loss, failure or a lost success reply consumes only the volatile send. A scan retries.
 Lost == /\ wake # 0 /\ wake' = 0
         /\ UNCHANGED <<clock, alarm, durable, holder, expired, running, valid, lateOnly, known, learned>>
+\* Waking a crashed holder claims the actor, and the claim's recovery tells the slots the commit point.
+Recovered == IF holder = "crashed" THEN known' = alarm /\ learned' = TRUE ELSE UNCHANGED <<known, learned>>
 Deliver ==
     /\ wake # 0 /\ running = 0 /\ (holder # "crashed" \/ expired)
     /\ (Bug = "stale" \/ (wake = alarm /\ Due(alarm)))
     /\ running' = wake /\ holder' = "live" /\ expired' = FALSE /\ wake' = 0
     /\ valid' = (valid /\ (wake = alarm /\ Due(alarm)))
-    /\ UNCHANGED <<clock, alarm, durable, lateOnly, known, learned>>
+    /\ Recovered
+    /\ UNCHANGED <<clock, alarm, durable, lateOnly>>
+\* A hint the recovered alarm rejects still recovers a crashed holder, whose timer then owns the committed alarm.
+Recover ==
+    /\ wake # 0 /\ running = 0 /\ holder = "crashed" /\ expired
+    /\ Bug # "stale" /\ ~(wake = alarm /\ Due(alarm))
+    /\ holder' = "live" /\ expired' = FALSE /\ wake' = 0 /\ Recovered
+    /\ UNCHANGED <<clock, alarm, durable, running, valid, lateOnly>>
 Timer == /\ holder = "live" /\ running = 0 /\ Due(alarm) /\ running' = alarm
          /\ UNCHANGED <<clock, alarm, durable, holder, expired, wake, valid, lateOnly, known, learned>>
 \* Only an acknowledged handler commit clears or reschedules; a crash beforehand keeps it. A quorum acknowledges
@@ -58,7 +67,8 @@ Timer == /\ holder = "live" /\ running = 0 /\ Due(alarm) /\ running' = alarm
 Commit(t) == /\ holder = "live" /\ running # 0 /\ t \in {0, 2}
              /\ alarm' = t /\ durable' = t /\ running' = 0 /\ learned' = FALSE
              /\ UNCHANGED <<clock, holder, expired, wake, valid, lateOnly, known>>
-Next == Tick \/ Release \/ Crash \/ Expire \/ Acquire \/ Primary \/ Fallback \/ Lost \/ Deliver \/ Timer \/ Learn
+Next == Tick \/ Release \/ Crash \/ Expire \/ Acquire \/ Primary \/ Fallback \/ Lost \/ Deliver \/ Recover \/ Timer
+        \/ Learn
         \/ (\E t \in {0, 2} : Commit(t))
 Spec == Init /\ [][Next]_vars
 TypeOK == /\ clock \in 0..7 /\ alarm \in {0, 1, 2} /\ durable \in {0, 1, 2}

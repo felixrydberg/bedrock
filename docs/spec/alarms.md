@@ -18,8 +18,9 @@ append or heartbeat (`known`, `learned`), so a holder can commit an alarm and cr
 before any slot knows. The slots' hint is their committed alarm, or, when they know
 none, the alarm in the tail past their commit point (`Store::due_alarms`, PR #155).
 The model starts with alarm 1 either known or only in such a tail. A hint whose tail
-never committed is not modeled; delivery and Compute's recovery reject it like any
-stale hint.
+never committed is not modeled. Waking a crashed holder claims the actor, and its
+recovery tells the slots the commit point. A hint the recovered alarm rejects runs no
+handler but still recovers the holder (`Recover`), whose timer then owns the alarm.
 
 `CommitOnly`, `CurrentAlarmOnly`, `LateFallbackOnly` and `CrashRecoverable` have
 deliberate bugs `consume`, `stale`, `early-fallback` and `released-only`, registered
