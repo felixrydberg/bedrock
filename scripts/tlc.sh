@@ -28,6 +28,7 @@ alarms consume CommitOnly
 alarms stale CurrentAlarmOnly
 alarms early-fallback LateFallbackOnly
 alarms released-only CrashRecoverable
+alarms committed-only CrashRecoverable
 cell buffered DurableCommit
 cell uncommitted CommittedApply
 cell cas OrderedCAS
