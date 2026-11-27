@@ -9,6 +9,8 @@ rust-version = "1.92"
 
 [workspace.dependencies]
 async-trait = "0.1"
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 bedrock-lib = { path = "crates/lib" }
 figment = { version = "0.10.19", features = ["toml", "env"] }
 serde = { version = "1", features = ["derive"] }

@@ -14,7 +14,7 @@
 //! - **Sleep.** An actor with no event for [`IDLE`] appends `Release` and stops. Neither sleep nor wake touches S3.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -28,9 +28,10 @@ use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use tokio::time::{Instant, sleep};
 
+use super::sockets::{Context, Settings};
 use super::storage::Storage;
 use super::volume::{self, HEARTBEAT, Slot, Writer};
-use crate::runtime::{Error, ExecutionSpec, Executor, Instance};
+use crate::runtime::{Error, Event, ExecutionSpec, Executor, Instance};
 
 /// An actor with no event for this long sleeps.
 pub const IDLE: Duration = Duration::from_secs(10);
@@ -116,6 +117,7 @@ struct Inner {
     sandbox: Arc<dyn Executor>,
     actors: Mutex<BTreeMap<Key, Cell>>,
     metrics: Metrics,
+    sockets: Option<Arc<Settings>>,
 }
 
 impl ActorHost {
@@ -136,7 +138,24 @@ impl ActorHost {
             sandbox,
             actors: Mutex::default(),
             metrics: Metrics::new(admin, cell, dc),
+            sockets: None,
         }))
+    }
+
+    /// Enables Gateway callbacks for this host's event-scoped WebSocket effects.
+    pub fn with_sockets(
+        mut self,
+        admin: &Admin,
+        client: Arc<bedrock_lib::client::Client>,
+        limits: bedrock_lib::websockets::Limits,
+    ) -> Result<Self, tonic::Status> {
+        let settings = Settings::new(admin, client, limits)?;
+        Arc::get_mut(&mut self.0)
+            .ok_or_else(|| {
+                tonic::Status::failed_precondition("configure sockets before sharing the host")
+            })?
+            .sockets = Some(Arc::new(settings));
+        Ok(self)
     }
 
     /// The awake actor: the one already running here, or one claimed and woken now.
@@ -280,6 +299,9 @@ impl Inner {
             .get_or_create(&kind)
             .observe(started.elapsed().as_secs_f64());
         Ok(Arc::new(Awake {
+            actor: actor.clone(),
+            sockets: self.sockets.clone(),
+            socket_event: AtomicU64::new(0),
             kind: actor.kind,
             lateness: self.metrics.lateness.get_or_create(&kind).clone(),
             storage: Mutex::new(Some(storage)),
@@ -410,6 +432,9 @@ async fn alarms(host: Weak<Inner>, awake: Arc<Awake>) {
 
 /// An awake actor on this host.
 pub struct Awake {
+    actor: pb::Actor,
+    sockets: Option<Arc<Settings>>,
+    socket_event: AtomicU64,
     kind: i32,
     lateness: Histogram,
     /// `None` once stopped.
@@ -480,63 +505,106 @@ impl Awake {
         self.event(Event::Alarm(at_ms)).await.map(|_| ())
     }
 
-    async fn event(&self, event: Event) -> Result<Vec<u8>, Error> {
-        self.busy.fetch_add(1, Ordering::Relaxed);
-        let mut busy = Busy {
-            awake: self,
-            armed: false,
-        };
-        let result = {
-            let mut instance = self.instance.lock().await;
-            // Register before checking serving, so stop cannot miss an alarm entering its handler.
-            let stopped = self.stopped.notified();
-            tokio::pin!(stopped);
-            stopped.as_mut().enable();
-            let result = match instance.as_mut() {
-                Some(instance) if self.serving() => {
-                    // Only once the event runs: a caller cancelled while queued at the gate leaves the actor alone.
-                    match event {
-                        Event::Alarm(at)
-                            if at > super::storage::now_ms() || self.alarm_ms() != Some(at) =>
-                        {
-                            Ok(Vec::new())
-                        }
-                        Event::Alarm(at) => {
-                            busy.armed = true;
-                            self.lateness.observe(
-                                super::storage::now_ms().saturating_sub(at) as f64 / 1000.0,
-                            );
-                            tokio::select! {
-                                biased;
-                                () = &mut stopped => Err(Error::Volume(volume::Error::Fenced(
-                                    "the host stopped the actor during its alarm".into(),
-                                ))),
-                                result = instance.alarm(at) => result.map(|()| Vec::new()),
+    pub fn socket(
+        &self,
+        event: pb::SocketEvent,
+    ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, Error>> {
+        self.event(Event::Socket(Box::new(event)))
+    }
+
+    fn event(&self, event: Event) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, Error>> {
+        // Bound the future type exposed to simulated callers with nested task/time adapters.
+        Box::pin(async move {
+            self.busy.fetch_add(1, Ordering::Relaxed);
+            let mut busy = Busy {
+                awake: self,
+                armed: false,
+            };
+            let result = {
+                let mut instance = self.instance.lock().await;
+                // Register before checking serving, so stop cannot miss an alarm entering its handler.
+                let stopped = self.stopped.notified();
+                tokio::pin!(stopped);
+                stopped.as_mut().enable();
+                let result = match instance.as_mut() {
+                    Some(instance) if self.serving() => {
+                        // Only once the event runs: a caller cancelled while queued at the gate leaves the actor alone.
+                        match event {
+                            Event::Alarm(at)
+                                if at > super::storage::now_ms() || self.alarm_ms() != Some(at) =>
+                            {
+                                Ok(Vec::new())
+                            }
+                            event => {
+                                busy.armed = true;
+                                if let Event::Alarm(at) = &event {
+                                    self.lateness.observe(
+                                        super::storage::now_ms().saturating_sub(*at) as f64
+                                            / 1000.0,
+                                    );
+                                }
+                                // Ordinary requests drain across administrative stop, as before S-15.
+                                let cancellable = !matches!(event, Event::Request(_));
+                                let execute = async {
+                                    let storage = self.storage().ok_or_else(|| {
+                                        Error::Volume(volume::Error::Fenced(
+                                            "the instance no longer serves".into(),
+                                        ))
+                                    })?;
+                                    // The instance mutex serializes event numbers, including across storage awaits.
+                                    let number = self
+                                        .socket_event
+                                        .load(Ordering::Relaxed)
+                                        .checked_add(1)
+                                        .ok_or_else(|| {
+                                            Error::Handler("actor event number exhausted".into())
+                                        })?;
+                                    self.socket_event.store(number, Ordering::Relaxed);
+                                    let socket_event = matches!(event, Event::Socket(_));
+                                    let serving = || self.serving();
+                                    let mut context = Context::new(
+                                        &self.actor,
+                                        &storage,
+                                        self.sockets.as_deref(),
+                                        number,
+                                        &serving,
+                                    );
+                                    context.prepare(&event).await?;
+                                    let result = instance.event(event, &mut context).await;
+                                    context.finish(result, socket_event).await
+                                };
+                                if cancellable {
+                                    tokio::select! {
+                                        biased;
+                                        () = &mut stopped => Err(Error::Volume(volume::Error::Fenced(
+                                            "the host stopped the actor during its event".into(),
+                                        ))),
+                                        result = execute => result,
+                                    }
+                                } else {
+                                    execute.await
+                                }
                             }
                         }
-                        Event::Request(request) => {
-                            busy.armed = true;
-                            instance.invoke(request).await
-                        }
                     }
+                    _ => Err(Error::Volume(volume::Error::Fenced(
+                        "the instance no longer serves".into(),
+                    ))),
+                };
+                match result {
+                    Ok(_) if !self.serving() => Err(Error::Volume(volume::Error::Fenced(
+                        "the writer stopped serving during the call".into(),
+                    ))),
+                    other => other,
                 }
-                _ => Err(Error::Volume(volume::Error::Fenced(
-                    "the instance no longer serves".into(),
-                ))),
             };
-            match result {
-                Ok(_) if !self.serving() => Err(Error::Volume(volume::Error::Fenced(
-                    "the writer stopped serving during the call".into(),
-                ))),
-                other => other,
+            busy.armed = false;
+            drop(busy);
+            if matches!(result, Err(Error::Volume(_))) {
+                self.stop().await;
             }
-        };
-        busy.armed = false;
-        drop(busy);
-        if matches!(result, Err(Error::Volume(_))) {
-            self.stop().await;
-        }
-        result
+            result
+        })
     }
 
     /// Drops the instance and returns the storage, once no event runs.
@@ -556,11 +624,6 @@ impl Awake {
         drop(instance);
         storage
     }
-}
-
-enum Event {
-    Request(Vec<u8>),
-    Alarm(u64),
 }
 
 /// One event: on every exit it leaves the busy count and marks the actor used. An event dropped while armed (started

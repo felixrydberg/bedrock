@@ -1,4 +1,5 @@
 syntax = "proto3";
+import "replication.proto";
 
 // Actor storage on `bedrock-volume` (#111 / S-03, `statefull/v2.md` §5, `docs/spec/volume.tla`). A holder (a Compute
 // host) reserves an epoch at a quorum of the actor's three slots, claims with it and appends; each slot fsyncs before
@@ -211,8 +212,44 @@ message InvokeRequest {
   Actor actor = 1; bytes payload = 2; string host = 3;
   // An alarm Wake, distinct from an opaque request. Compute validates it under the input gate.
   optional uint64 alarm_ms = 4;
+  // Exactly one of a socket event, an alarm, or an opaque payload. The holder's normal event gate runs all three.
+  optional SocketEvent socket = 5;
 }
 // `holder` served the event, or with `redirect` holds the actor live elsewhere and `payload` is empty. A nonzero `code`
 // (a gRPC code, with `message`) is the host's failure: the event ran or may have, so it is an answer, never re-sent. Only
 // failures before a host took the event are gRPC errors, which Gateways may retry elsewhere.
 message InvokeReply { Holder holder = 1; bool redirect = 2; bytes payload = 3; int32 code = 4; string message = 5; }
+
+// S-15: the actor persists this reference; live transport and attachments stay at this Gateway.
+message SocketConnection { string id = 1; bedrock.replication.Member gateway = 2; }
+message SocketFrame { bytes data = 1; bool text = 2; }
+message SocketClose { uint32 code = 1; string reason = 2; }
+message SocketEvent {
+  enum Kind { OPEN = 0; MESSAGE = 1; CLOSE = 2; ERROR = 3; }
+  SocketConnection connection = 1;
+  Kind kind = 2;
+  SocketFrame frame = 3;
+  SocketClose close = 4;
+}
+message SocketEffect {
+  string id = 1;
+  oneof action { SocketFrame send = 2; bytes attachment = 3; SocketClose close = 4; }
+}
+enum SocketOutcome { ACCEPTED = 0; MISSING = 1; OVERLOADED = 2; UNAVAILABLE = 3; UNCERTAIN = 4; STALE = 5; }
+message SocketResult { string id = 1; SocketOutcome outcome = 2; string detail = 3; }
+message SocketReport { repeated SocketResult results = 1; }
+message SocketLookup { Actor actor = 1; repeated string ids = 2; }
+message SocketSnapshot { string id = 1; SocketOutcome outcome = 2; bytes attachment = 3; }
+message SocketSnapshots { repeated SocketSnapshot sockets = 1; }
+message SocketApply {
+  Actor actor = 1;
+  // Existing volume writer epoch, followed by a monotonically increasing event number in that awake instance.
+  // Gateways reject older/duplicate callbacks; there is no retry or durable delivery log.
+  uint64 epoch = 2;
+  uint64 event = 3;
+  repeated SocketEffect effects = 4;
+}
+service Sockets {
+  rpc Lookup(SocketLookup) returns (SocketSnapshots);
+  rpc Apply(SocketApply) returns (SocketReport);
+}

@@ -18,6 +18,7 @@ pub mod s3;
 pub mod sim;
 pub mod storage;
 pub mod transport;
+pub mod websockets;
 /// The `bedrock-volume` protocol (`proto/volume.proto`, #111 / S-03).
 pub mod volume {
     tonic::include_proto!("bedrock.volume");

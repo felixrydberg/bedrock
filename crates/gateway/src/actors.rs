@@ -18,6 +18,8 @@
 //!   rather than send the event again. The caller retries.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use bedrock_lib::actors::{self, ActorId, Kind, Regions, Topology};
@@ -229,12 +231,23 @@ impl Router {
 
     /// Routes an entering request to the actor's holder and returns its answer.
     pub async fn route(&self, actor: pb::Actor, payload: Vec<u8>) -> Result<Vec<u8>, Status> {
-        self.event(actor, payload, None).await
+        self.event(actor, payload, None, None).await
     }
 
     /// Routes an alarm Wake through the same location cache, redirects and Gateway tiers.
     pub async fn alarm(&self, actor: pb::Actor, at_ms: u64) -> Result<(), Status> {
-        self.event(actor, Vec::new(), Some(at_ms)).await.map(|_| ())
+        self.event(actor, Vec::new(), Some(at_ms), None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Routes socket inputs through the normal actor path, without replay after a handler outcome.
+    pub fn socket(
+        &self,
+        actor: pb::Actor,
+        socket: pb::SocketEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, Status>> + Send + '_>> {
+        Box::pin(self.event(actor, Vec::new(), None, Some(Box::new(socket))))
     }
 
     async fn event(
@@ -242,6 +255,7 @@ impl Router {
         actor: pb::Actor,
         payload: Vec<u8>,
         alarm_ms: Option<u64>,
+        socket: Option<Box<pb::SocketEvent>>,
     ) -> Result<Vec<u8>, Status> {
         let key = (actor.namespace.clone(), actor.id.clone());
         let mut place = self.cache().get(&key);
@@ -249,10 +263,10 @@ impl Router {
         loop {
             let result = match &place {
                 Some(place) => self
-                    .send(&actor, &payload, alarm_ms, place)
+                    .send(&actor, &payload, alarm_ms, socket.clone(), place)
                     .await
                     .map(|reply| (place.dc.clone(), reply)),
-                None => self.wake(&actor, &payload, alarm_ms).await,
+                None => self.wake(&actor, &payload, alarm_ms, socket.clone()).await,
             };
             let (dc, reply) = match result {
                 Ok(answer) => answer,
@@ -267,7 +281,13 @@ impl Router {
             let seen = Place { dc, holder };
             self.cache().insert(key.clone(), seen.clone());
             if reply.code != 0 {
-                return Err(Status::new(reply.code.into(), reply.message));
+                // A handler refusal is an outcome, even when its code resembles a pre-dispatch refusal.
+                let code = if socket.is_some() {
+                    Code::Unknown
+                } else {
+                    reply.code.into()
+                };
+                return Err(Status::new(code, reply.message));
             }
             if !reply.redirect {
                 return Ok(reply.payload);
@@ -293,6 +313,7 @@ impl Router {
         actor: &pb::Actor,
         payload: &[u8],
         alarm_ms: Option<u64>,
+        socket: Option<Box<pb::SocketEvent>>,
     ) -> Result<(String, pb::InvokeReply), Status> {
         // ponytail: one Quicksilver read in this cell per miss; cache the topology by revision if misses get hot.
         let code = region(&actor.id)?;
@@ -315,7 +336,10 @@ impl Router {
                     host: String::new(),
                 },
             };
-            match self.send(actor, payload, alarm_ms, &place).await {
+            match self
+                .send(actor, payload, alarm_ms, socket.clone(), &place)
+                .await
+            {
                 Ok(reply) => return Ok((dc, reply)),
                 Err(status) if status.code() == Code::FailedPrecondition => last = status,
                 Err(status) => return Err(status),
@@ -330,6 +354,7 @@ impl Router {
         actor: &pb::Actor,
         payload: &[u8],
         alarm_ms: Option<u64>,
+        socket: Option<Box<pb::SocketEvent>>,
         place: &Place,
     ) -> Result<pb::InvokeReply, Status> {
         let target = Location {
@@ -342,6 +367,7 @@ impl Router {
             payload: payload.to_vec(),
             host: place.holder.host.clone(),
             alarm_ms,
+            socket,
         };
         if target == self.home {
             return self.deliver(request).await;

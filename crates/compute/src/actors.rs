@@ -4,5 +4,6 @@
 
 pub mod host;
 pub mod serve;
+pub mod sockets;
 pub mod storage;
 pub mod volume;

@@ -24,6 +24,33 @@ rm -rf "$work" && mkdir -p "$work"
 # catches mistakes in the model itself. handoff's single point cannot split a range, so membership checks
 # DirectoryCoverage.
 BUGS='
+websockets accept-before-commit AcceptedRecorded
+websockets forget-roster RecoveredRoster
+websockets keep-attachment AttachmentLifetime
+websockets reuse-id IncarnationSafe
+websockets ungated OutputGated
+websockets old-effects OutputGated
+websockets unchecked-owner OwnerBound
+websockets timeout-prune UnknownRetained
+websockets retired-input RetiredInputRefused
+websockets replay-input NoReplay
+websockets replay-output NoReplay
+websockets stale-callback OutputOrdered
+websockets event-only EpochAdmission
+websockets overflow-all OverflowIsolated
+websockets unbounded QueueBound
+websockets slow-stalls HealthyNotStalled
+websockets-local accept-before-commit AcceptedRecorded
+websockets-local forget-roster RecoveredRoster
+websockets-local keep-attachment AttachmentLifetime
+websockets-local ungated OutputGated
+websockets-local old-effects OutputGated
+websockets-local unchecked-owner OwnerBound
+websockets-local timeout-prune UnknownRetained
+websockets-local retired-input RetiredInputRefused
+websockets-local replay-input NoReplay
+websockets-local replay-output NoReplay
+websockets-local slow-stalls HealthyNotStalled
 alarms consume CommitOnly
 alarms stale CurrentAlarmOnly
 alarms early-fallback LateFallbackOnly
@@ -243,7 +270,7 @@ bug() {
     fi
 }
 
-models="alarms relays cells follows merge materialized kv_actor kv_actor-local kv_actor-overwrite kv_actor-review kv_admission publisher membership service_isolation handoff handoff-ranges-restart handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
+models="websockets websockets-local alarms relays cells follows merge materialized kv_actor kv_actor-local kv_actor-overwrite kv_actor-review kv_admission publisher membership service_isolation handoff handoff-ranges-restart handoff-volume handoff-volume-faulty cell volume-base volume-handoff volume-wipe volume-topology volume-truncate volume-delete-wipe volume-delete-handoff volume-delete-truncate volume_cold-split volume_cold-move volume_dc volume_dc-small"
 case "${1:-}" in
     bugs) ;;
     "") for model in $models; do pass "$model"; done ;;

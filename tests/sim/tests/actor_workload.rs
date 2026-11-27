@@ -412,6 +412,7 @@ fn compute(ip: &'static str, shared: Arc<Shared>, bug: Option<Bug>) -> NodeHandl
                     &format!("/data/{}", compute_name(ip)),
                 ),
                 relays: addresses(&RELAYS),
+                sockets: Default::default(),
             },
             Arc::new(RustExecutor::new([(Kind::D1, counter)])),
         )
@@ -596,6 +597,7 @@ impl Recorder {
                 payload: request.to_vec(),
                 host: String::new(),
                 alarm_ms: None,
+                socket: None,
             });
             let reply = tokio::time::timeout(Duration::from_secs(10), invoke)
                 .await
@@ -916,6 +918,7 @@ async fn scenario(bug: Option<Bug>, faulted: bool) -> Result<Vec<String>, Violat
             relays: addresses(&RELAYS),
             internal_limit: bedrock_gateway::INTERNAL_LIMIT,
             actor_cache: bedrock_gateway::actors::CACHE,
+            sockets: Default::default(),
         })
     });
     let shared = Arc::new(Shared::default());

@@ -82,6 +82,7 @@ fn addresses(ips: &[&str]) -> Vec<String> {
 
 fn api() -> ApiConfig {
     ApiConfig {
+        bulk_max_bytes: bedrock_lib::node::DEFAULT_BULK_MAX_BYTES,
         node: node("api", API),
         write_listen: format!("{API}:7002").parse().unwrap(),
         write_token: TOKEN.into(),
@@ -733,6 +734,7 @@ async fn scenario() -> Vec<String> {
             relays: addresses(&RELAYS),
             internal_limit: bedrock_gateway::INTERNAL_LIMIT,
             actor_cache: bedrock_gateway::actors::CACHE,
+            sockets: Default::default(),
         })
     });
     let compute_nodes: Vec<_> = COMPUTES.into_iter().map(compute).collect();

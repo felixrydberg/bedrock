@@ -195,6 +195,7 @@ fn compute(ip: &'static str) -> NodeHandle {
             ComputeConfig {
                 node: node(&compute_name(ip), ip),
                 relays: addresses(&RELAYS),
+                sockets: Default::default(),
             },
             Arc::new(RustExecutor::new([(Kind::D1, counter)])),
         )
@@ -339,6 +340,7 @@ async fn scenario() -> Vec<String> {
             relays: addresses(&RELAYS),
             internal_limit: bedrock_gateway::INTERNAL_LIMIT,
             actor_cache: bedrock_gateway::actors::CACHE,
+            sockets: Default::default(),
         })
     });
     let hosts: BTreeMap<String, NodeHandle> = COMPUTES
@@ -471,6 +473,7 @@ async fn scenario() -> Vec<String> {
                             payload: b"incr".to_vec(),
                             host: String::new(),
                             alarm_ms: None,
+                            socket: None,
                         })
                         .await
                         .ok()

@@ -165,6 +165,7 @@ fn gateway(name: &str, ip: &str, cell: &str, relays: &[&str]) -> GatewayConfig {
         relays: addresses(relays),
         internal_limit: bedrock_gateway::INTERNAL_LIMIT,
         actor_cache: bedrock_gateway::actors::CACHE,
+        sockets: Default::default(),
     }
 }
 

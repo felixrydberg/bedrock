@@ -15,6 +15,7 @@
 
 pub mod actors;
 pub mod cells;
+pub mod sockets;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,6 +51,9 @@ pub struct GatewayConfig {
     /// Actor locations a cell Gateway caches.
     #[serde(default = "actor_cache")]
     pub actor_cache: usize,
+    /// Limits for live WebSocket transport and callbacks.
+    #[serde(default)]
+    pub sockets: bedrock_lib::websockets::Limits,
 }
 
 fn internal_limit() -> usize {
@@ -99,7 +103,8 @@ pub struct Gateway {
     limit: Semaphore,
     requests: Family<Labels, Counter>,
     /// A cell Gateway's actor routing.
-    router: Option<actors::Router>,
+    router: Option<Arc<actors::Router>>,
+    sockets: Option<Arc<sockets::Sockets>>,
 }
 
 impl Gateway {
@@ -121,13 +126,19 @@ impl Gateway {
             limit: Semaphore::new(limit),
             requests,
             router: None,
+            sockets: None,
         }
     }
 
     /// Routes actor requests that enter or reach this cell Gateway.
     pub fn with_actors(mut self, router: actors::Router) -> Self {
-        self.router = Some(router);
+        self.router = Some(Arc::new(router));
         self
+    }
+
+    /// Live socket owner, mountable on the future public listener.
+    pub fn sockets(&self) -> Option<Arc<sockets::Sockets>> {
+        self.sockets.clone()
     }
 
     fn count(&self, service: &str, outcome: &'static str) {
@@ -268,6 +279,12 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
         request: Request<bedrock_lib::volume::InvokeRequest>,
     ) -> Result<Response<bedrock_lib::volume::InvokeReply>, Status> {
         use bedrock_lib::volume::actors_client::ActorsClient;
+        let body = request.get_ref();
+        if (body.socket.is_some() && (body.alarm_ms.is_some() || !body.payload.is_empty()))
+            || (body.alarm_ms.is_some() && !body.payload.is_empty())
+        {
+            return Err(Status::invalid_argument("conflicting actor event fields"));
+        }
         let router = self.router.as_ref();
         if request.metadata().get(CELL_HEADER).is_some() {
             let dispatch = actors::Dispatch::default();
@@ -307,9 +324,13 @@ impl bedrock_lib::volume::actors_server::Actors for Gateway {
         let actor = request
             .actor
             .ok_or_else(|| Status::invalid_argument("missing actor"))?;
-        let result = match request.alarm_ms {
-            Some(at_ms) => router.alarm(actor, at_ms).await.map(|()| Vec::new()),
-            None => router.route(actor, request.payload).await,
+        let result = if let Some(socket) = request.socket {
+            router.socket(actor, *socket).await
+        } else {
+            match request.alarm_ms {
+                Some(at_ms) => router.alarm(actor, at_ms).await.map(|()| Vec::new()),
+                None => router.route(actor, request.payload).await,
+            }
         };
         self.count(COMPUTE, if result.is_ok() { "served" } else { "failed" });
         Ok(Response::new(bedrock_lib::volume::InvokeReply {
@@ -376,6 +397,10 @@ pub async fn run(config: GatewayConfig) -> Result<(), ConfigError> {
     if config.internal_limit == 0 {
         return Err(ConfigError("internal_limit must be positive".into()));
     }
+    config
+        .sockets
+        .validate()
+        .map_err(|e| ConfigError(e.to_string()))?;
     tracing::info!(node_id = %config.node.node_id, relays = ?config.relays, "starting bedrock-gateway");
     let admin = node::start_admin(&config.node).await?;
     let tls = bedrock_lib::transport::tls::start(&config.node, GATEWAY, &admin).await?;
@@ -439,15 +464,28 @@ pub async fn run(config: GatewayConfig) -> Result<(), ConfigError> {
         };
         let router = actors::Router::new(&admin, client, peers.clone(), home, config.actor_cache);
         gateway = gateway.with_actors(router);
+        gateway.sockets = Some(Arc::new(
+            sockets::Sockets::new(
+                member(&config.node),
+                gateway.router.as_ref().unwrap().clone(),
+                config.sockets.clone(),
+            )
+            .map_err(|e| ConfigError(e.to_string()))?,
+        ));
     }
     let gateway = Arc::new(gateway);
     let router = bedrock_lib::transport::server(tls.as_ref())
         .add_service(pb::reads_server::ReadsServer::from_arc(gateway.clone()))
         .add_service(
-            bedrock_lib::volume::actors_server::ActorsServer::from_arc(gateway)
+            bedrock_lib::volume::actors_server::ActorsServer::from_arc(gateway.clone())
                 .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
                 .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES),
         );
+    let router = router.add_optional_service(gateway.sockets().map(|sockets| {
+        bedrock_lib::volume::sockets_server::SocketsServer::from_arc(sockets)
+            .max_decoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(bedrock_lib::kv::MAX_MESSAGE_BYTES)
+    }));
     let mut server = bedrock_lib::transport::serve(router, config.node.listen, tls);
     let mut readiness = tokio::time::interval(Duration::from_millis(100));
     let result = loop {
