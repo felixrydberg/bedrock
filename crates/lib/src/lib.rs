@@ -2,6 +2,7 @@
 
 pub mod actors;
 pub mod admin;
+pub mod cdn;
 pub mod client;
 pub mod datasets;
 pub mod health;

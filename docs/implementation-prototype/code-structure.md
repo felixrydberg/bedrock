@@ -4,6 +4,7 @@ bedrock/crates/
 │   ├── membership        # shared half: the announced entry, the published namespace layout and the View
 │   ├── health
 │   ├── buckets
+│   ├── cdn               # cdn path rows, ref keys and the publish client, linked by bedrock-cdn and the deploy plane
 │   ├── placement         # directory types and the read side; the write side lives in relay
 │   ├── replication
 │   ├── relays
@@ -33,7 +34,7 @@ bedrock/crates/
 └── cdn/                  # bedrock-cdn: cdn dataset and artifact bytes
     ├── artifact_storage
     ├── artifact_transfer
-    ├── paths
+    ├── paths             # re-exports lib/cdn
     └── retention
 
 Each binary (`bedrock-api`, `bedrock-relay`, `bedrock-quicksilver`, `bedrock-kv`, `bedrock-cdn`) runs as its own process, depends on

@@ -739,7 +739,7 @@ fn commit_error(error: StorageError) -> CommitError {
 }
 
 /// One change's size inside a protobuf `Bulk` or `Event`, framing included.
-fn encoded_change_len(key: &[u8], value: Option<&[u8]>) -> usize {
+pub(crate) fn encoded_change_len(key: &[u8], value: Option<&[u8]>) -> usize {
     let field = |len: usize| 1 + prost::length_delimiter_len(len) + len;
     let change = field(key.len()) + value.map_or(0, |value| field(value.len()));
     field(change)

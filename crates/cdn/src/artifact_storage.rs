@@ -10,15 +10,13 @@
 //! Foyer and native S3 I/O ([`S3`]) are compiled out of simulation builds, like RocksDB; simulation supplies its own
 //! [`Origin`] and [`CacheStorage`].
 
-use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bedrock_lib::health::storage::{State, StorageHealth};
-use bedrock_lib::storage::{ErrorContext, StorageError, StorageResult};
+use bedrock_lib::storage::{StorageError, StorageResult};
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
 use tokio_stream::{Stream, StreamExt};
 
 #[cfg(not(madsim))]
@@ -27,38 +25,8 @@ mod foyer;
 #[cfg(not(madsim))]
 pub use self::foyer::Foyer;
 
-/// An artifact's name: the SHA-256 of its bytes.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Hash(pub [u8; 32]);
-
-impl Hash {
-    pub fn of(body: &[u8]) -> Self {
-        Hash(Sha256::digest(body).into())
-    }
-
-    /// Parses 64 lowercase hex digits, as [`Hash`] displays, S3 keys and inventories spell it.
-    pub fn parse(hex: &str) -> Option<Self> {
-        let digit = |c: u8| match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            _ => None,
-        };
-        if hex.len() != 64 {
-            return None;
-        }
-        let mut hash = [0; 32];
-        for (byte, pair) in hash.iter_mut().zip(hex.as_bytes().chunks(2)) {
-            *byte = digit(pair[0])? << 4 | digit(pair[1])?;
-        }
-        Some(Hash(hash))
-    }
-}
-
-impl fmt::Display for Hash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
-    }
-}
+use bedrock_lib::cdn::error_context;
+pub use bedrock_lib::cdn::{Hash, Origin};
 
 /// An artifact's bytes as a stream of chunks.
 pub type Body = Pin<Box<dyn Stream<Item = StorageResult<Bytes>> + Send>>;
@@ -95,18 +63,8 @@ pub trait CacheStorage: Send + Sync {
     fn usage(&self) -> StorageResult<u64>;
 }
 
-/// Where artifacts live for good: S3, or a model of it in simulation. It returns what it holds; [`Artifacts`] checks
-/// that the bytes match their name.
-#[async_trait]
-pub trait Origin: Send + Sync {
-    /// Stores `bytes` under `hash`; storing an artifact that exists succeeds.
-    async fn put(&self, hash: &Hash, bytes: Bytes) -> StorageResult<()>;
-    /// The bytes stored under `hash`, or `Ok(None)`.
-    async fn get(&self, hash: &Hash) -> StorageResult<Option<Bytes>>;
-}
-
 #[cfg(not(madsim))]
-pub use s3::S3;
+pub use bedrock_lib::cdn::S3;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use memory::Memory;
@@ -115,61 +73,9 @@ pub use memory::Memory;
 #[path = "../tests/support/memory.rs"]
 mod memory;
 
-#[cfg(not(madsim))]
-mod s3 {
-    use std::sync::Arc;
-
-    use async_trait::async_trait;
-    use bedrock_lib::s3::{get_checked, put_checked};
-    use bedrock_lib::storage::{StorageError, StorageResult};
-    use bytes::Bytes;
-    use object_store::{ObjectStore, PutMode};
-
-    use super::{Hash, Origin, context, path};
-
-    /// Artifacts in S3 under `artifacts/{sha256}`.
-    pub struct S3(pub Arc<dyn ObjectStore>);
-
-    #[async_trait]
-    impl Origin for S3 {
-        async fn put(&self, hash: &Hash, bytes: Bytes) -> StorageResult<()> {
-            let path = path(hash).into();
-            match put_checked(&*self.0, &path, bytes.into(), PutMode::Create).await {
-                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
-                // Backend errors can carry configured URLs, so only the classification is kept.
-                Err(_) => Err(StorageError::Unavailable(context(
-                    "object_store",
-                    hash,
-                    "artifact upload failed",
-                ))),
-            }
-        }
-
-        async fn get(&self, hash: &Hash) -> StorageResult<Option<Bytes>> {
-            // `get_checked` matches the body to its metadata.
-            let bytes = get_checked(&*self.0, &path(hash).into()).await?;
-            Ok(bytes.map(Bytes::from))
-        }
-    }
-}
-
 /// The health manager's source for the artifact cache.
 pub const DATASET: &str = bedrock_lib::datasets::capabilities::CDN;
 pub const LAYER: &str = "artifacts";
-
-fn path(hash: &Hash) -> String {
-    format!("artifacts/{hash}")
-}
-
-fn context(engine: &'static str, hash: &Hash, detail: &str) -> ErrorContext {
-    ErrorContext {
-        engine,
-        instance: DATASET.into(),
-        file: Some(path(hash)),
-        partition: None,
-        detail: detail.into(),
-    }
-}
 
 /// Artifacts in their [`Origin`] by SHA-256, read through a local cache.
 pub struct Artifacts {
@@ -214,7 +120,7 @@ impl Artifacts {
         };
         // Origin damage is not local damage.
         if Hash::of(&bytes) != *hash {
-            return Err(StorageError::Corruption(context(
+            return Err(StorageError::Corruption(error_context(
                 "origin",
                 hash,
                 "SHA-256 differs from the artifact's name",
@@ -255,7 +161,7 @@ impl Artifacts {
                     self.health.verified(DATASET, LAYER);
                     return Some(bytes);
                 }
-                Ok(_) => StorageError::Corruption(context(
+                Ok(_) => StorageError::Corruption(error_context(
                     "cache",
                     hash,
                     "cached artifact failed SHA-256 verification",
