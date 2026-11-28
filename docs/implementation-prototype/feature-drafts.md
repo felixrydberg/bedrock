@@ -170,8 +170,8 @@ Rules this implies:
 | **I — First CDN** (parallel with H; no dependency on KV drafts) |||||
 | [B-30](https://github.com/felixrydberg/bedrock/issues/78) | Artifact storage: S3 content addressing, `CacheStorage`, Foyer | CDN | `cdn/artifact_storage` | B-23 |
 | [B-31](https://github.com/felixrydberg/bedrock/issues/79) | Artifact transfer | CDN | `cdn/artifact_transfer` | B-30 |
-| [B-32](https://github.com/felixrydberg/bedrock/issues/80) | `cdn` path rows and ref keys (§4 decision 14) | CDN | `cdn/retention`, `cdn/paths` | B-23, B-30, B-09c |
-| [B-33](https://github.com/felixrydberg/bedrock/issues/81) | Publish client writing path rows and ref keys in bulk | CDN | `cdn/paths` | B-30, B-32 |
+| [B-32](https://github.com/felixrydberg/bedrock/issues/80) | `cdn` path rows and ref keys (§4 decision 14) | CDN | `cdn/retention`, `lib/cdn` | B-23, B-30, B-09c |
+| [B-33](https://github.com/felixrydberg/bedrock/issues/81) | Publish client writing path rows and ref keys in bulk | CDN | `lib/cdn` (B-50 links it) | B-30, B-32 |
 | [B-34](https://github.com/felixrydberg/bedrock/issues/82) | Regional L2 with two-replica artifact placement | CDN | `cdn/retention`, `cdn/artifact_storage` | B-31, B-32 |
 | [B-35](https://github.com/felixrydberg/bedrock/issues/83) | Artifact retrieval interface | CDN | `cdn/artifact_transfer` | B-33, B-34 |
 | [B-36](https://github.com/felixrydberg/bedrock/issues/84) | CDN end-to-end acceptance | CDN | `cdn` | B-30 … B-35 |
