@@ -53,6 +53,7 @@ impl Wake for Gateway {
             payload: Vec::new(),
             host: String::new(),
             alarm_ms: Some(at_ms),
+            socket: None,
         };
         let reply = self
             .0

@@ -11,6 +11,7 @@ test-support = []
 [dependencies]
 async-trait.workspace = true
 bedrock-lib.workspace = true
+futures-util.workspace = true
 prometheus-client.workspace = true
 prost.workspace = true
 rusqlite.workspace = true

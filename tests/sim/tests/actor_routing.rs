@@ -159,6 +159,7 @@ fn gateway(name: &str, ip: &str, cell: &str, relays: &[&str]) -> GatewayConfig {
         relays: addresses(relays),
         internal_limit: bedrock_gateway::INTERNAL_LIMIT,
         actor_cache: bedrock_gateway::actors::CACHE,
+        sockets: Default::default(),
     }
 }
 
@@ -683,6 +684,7 @@ async fn scenario() -> Vec<String> {
                             payload: b"incr".to_vec(),
                             host: String::new(),
                             alarm_ms: None,
+                            socket: None,
                         })
                         .await
                         .ok()?

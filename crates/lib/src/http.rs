@@ -61,7 +61,9 @@ pub async fn serve(listener: TcpListener, app: Router, tls: Option<Arc<Tls>>) {
                 let service = TowerToHyperService::new(app.clone());
                 let Some(tls) = tls.clone() else {
                     tokio::spawn(
-                        http1::Builder::new().serve_connection(TokioIo::new(stream), service),
+                        http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .with_upgrades(),
                     );
                     continue;
                 };
@@ -70,6 +72,7 @@ pub async fn serve(listener: TcpListener, app: Router, tls: Option<Arc<Tls>>) {
                         Ok(stream) => {
                             let _ = http1::Builder::new()
                                 .serve_connection(TokioIo::new(stream), service)
+                                .with_upgrades()
                                 .await;
                         }
                         Err(error) => tracing::debug!(%error, "http tls handshake rejected"),

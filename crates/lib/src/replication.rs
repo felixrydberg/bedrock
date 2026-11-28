@@ -11,6 +11,8 @@ pub mod writer;
 pub mod pb {
     tonic::include_proto!("bedrock.replication");
 }
+// The volume protocol imports the same generated Member, rather than a second routing-record type.
+pub use pb::Member;
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;

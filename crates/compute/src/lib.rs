@@ -37,6 +37,8 @@ pub struct ComputeConfig {
     pub node: NodeConfig,
     /// This cell's relays, tried in order.
     pub relays: Vec<String>,
+    #[serde(default)]
+    pub sockets: bedrock_lib::websockets::Limits,
 }
 
 impl AsRef<NodeConfig> for ComputeConfig {
@@ -146,7 +148,9 @@ pub async fn run(config: ComputeConfig, builtin: Arc<dyn Executor>) -> Result<()
         Arc::new(builtin::KvExecutor::new(&admin, directory.clone(), builtin)),
         // The sandbox executor is S-10; until then customer code is refused as unsupported.
         Arc::new(RustExecutor::new([])),
-    );
+    )
+    .with_sockets(&admin, client.clone(), config.sockets.clone())
+    .map_err(|e| ConfigError(e.to_string()))?;
     let (members, target) = membership::View::new(COMPUTE, cell);
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),

@@ -5,6 +5,8 @@ fn main() {
     // SAFETY: build scripts are single-threaded.
     unsafe { std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap()) };
     tonic_build::configure()
+        // Keep ordinary actor requests small when the optional socket event carries an owner route.
+        .boxed(".bedrock.volume.InvokeRequest.socket")
         .bytes([".bedrock.replication.Delivery.events"])
         // Ordered maps encode the same bytes on every run, which a replayed seed needs.
         .btree_map(["."])

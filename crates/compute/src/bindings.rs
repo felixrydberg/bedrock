@@ -31,6 +31,7 @@ pub async fn call(client: &Client, actor: pb::Actor, payload: Vec<u8>) -> Result
         payload,
         host: String::new(),
         alarm_ms: None,
+        socket: None,
     };
     let reply = client
         .call_member(member, |channel| async move {

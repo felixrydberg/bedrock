@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use bedrock_lib::actors::Kind;
 use bedrock_lib::volume as pb;
 
+use crate::actors::sockets::Context;
 use crate::actors::storage::Storage;
 use crate::actors::volume;
 
@@ -77,10 +78,21 @@ pub trait Executor: Send + Sync {
     async fn start(&self, spec: ExecutionSpec) -> Result<Box<dyn Instance>, Error>;
 }
 
-/// A started Worker or actor. The actor host calls [`Instance::invoke`] one event at a time (the input gate).
+/// A started Worker or actor. The actor host calls [`Instance::event`] one event at a time (the input gate).
 #[async_trait]
 pub trait Instance: Send {
     async fn invoke(&mut self, request: Vec<u8>) -> Result<Vec<u8>, Error>;
+
+    /// Every actor event shares the host's input/output gate. Effects are borrowed for this event only.
+    async fn event(&mut self, event: Event, _sockets: &mut Context<'_>) -> Result<Vec<u8>, Error> {
+        match event {
+            Event::Request(request) => self.invoke(request).await,
+            Event::Alarm(at) => self.alarm(at).await.map(|()| Vec::new()),
+            Event::Socket(_) => Err(Error::Unsupported(
+                "this instance has no WebSocket handler".into(),
+            )),
+        }
+    }
 
     /// A due alarm, dispatched by the actor host through the same input and output gates.
     /// The handler must commit its clear or reschedule together with its state changes.
@@ -89,6 +101,14 @@ pub trait Instance: Send {
             "this instance has no alarm handler".into(),
         ))
     }
+}
+
+/// Typed actor events; opaque application requests are never decoded as socket events.
+#[derive(Clone)]
+pub enum Event {
+    Request(Vec<u8>),
+    Alarm(u64),
+    Socket(Box<pb::SocketEvent>),
 }
 
 /// Builds a built-in kind's instance over the actor's storage.

@@ -112,10 +112,17 @@ impl pb::actors_server::Actors for Actors {
             caller.require(&[GATEWAY], Some(&self.holder.cell))?;
         }
         let request = request.into_inner();
+        if request.socket.is_some() && (request.alarm_ms.is_some() || !request.payload.is_empty())
+            || request.alarm_ms.is_some() && !request.payload.is_empty()
+        {
+            return Err(Status::invalid_argument("conflicting actor event fields"));
+        }
         let actor = request
             .actor
             .ok_or_else(|| Status::invalid_argument("missing actor"))?;
         if actor.kind == bedrock_lib::actors::Kind::Kv as i32
+            && request.socket.is_none()
+            && request.alarm_ms.is_none()
             && let Ok(kv) = bedrock_lib::kv::Request::decode(request.payload.as_slice())
             && matches!(
                 kv.operation,
@@ -148,7 +155,10 @@ impl pb::actors_server::Actors for Actors {
         let reply = match self.host.acquire(&actor).await {
             Ok(awake) => match match request.alarm_ms {
                 Some(at_ms) => awake.alarm(at_ms).await.map(|()| Vec::new()),
-                None => awake.invoke(request.payload).await,
+                None => match request.socket {
+                    Some(event) => awake.socket(*event).await,
+                    None => awake.invoke(request.payload).await,
+                },
             } {
                 Ok(payload) => pb::InvokeReply {
                     holder: Some(self.holder.clone()),
