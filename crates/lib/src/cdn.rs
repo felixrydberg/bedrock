@@ -27,6 +27,7 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::datasets::capabilities::CDN;
+use crate::replication::materialized::validate_scope;
 use crate::replication::writer::{CommitError, Write, Writer, encoded_change_len};
 use crate::replication::{Operation, pb};
 use crate::storage::{ErrorContext, StorageResult};
@@ -296,6 +297,8 @@ const API_TIMEOUT: Duration = Duration::from_secs(10);
 #[async_trait]
 impl Bulks for WriteApi {
     async fn commit(&self, namespace: &str, changes: Changes) -> Result<u64, Error> {
+        // Also keeps the namespace one URI path segment.
+        scope(namespace)?;
         let changes = changes
             .into_iter()
             .map(|(key, value)| pb::Change { key, value })
@@ -340,6 +343,10 @@ pub struct File {
 const ATTEMPTS: u32 = 4;
 
 /// Publishes and releases deployments in the `cdn` dataset.
+///
+/// Callers run at most one publish or release of a deployment at a time, and release a deployment only once no publish
+/// of it can still be running. Otherwise a publish's path rows can commit after a release deleted their ref keys, and
+/// the rows would point at artifacts nothing retains.
 pub struct Publisher {
     pub origin: Arc<dyn Origin>,
     pub bulks: Arc<dyn Bulks>,
@@ -356,6 +363,7 @@ impl Publisher {
         deployment_id: &str,
         files: &[File],
     ) -> Result<u64, Error> {
+        scope(namespace)?;
         let mut artifacts = BTreeMap::new();
         let mut paths = BTreeMap::new();
         for file in files {
@@ -404,6 +412,7 @@ impl Publisher {
         paths: &[String],
         artifacts: &[Hash],
     ) -> Result<u64, Error> {
+        scope(namespace)?;
         let paths = paths
             .iter()
             .map(|path| path_key(deployment_id, path))
@@ -425,6 +434,11 @@ impl Publisher {
         }
         Ok(revision)
     }
+}
+
+/// The writer's namespace check, run before anything is uploaded or sent.
+fn scope(namespace: &str) -> Result<(), Error> {
+    validate_scope(CDN, namespace).map_err(|e| Error::Invalid(e.to_string()))
 }
 
 /// Consecutive runs of `changes`, each of at most `max_bytes` as the writer counts them; at least one.

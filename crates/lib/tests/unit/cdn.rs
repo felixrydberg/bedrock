@@ -323,6 +323,10 @@ async fn a_publish_that_can_never_succeed_uploads_and_writes_nothing() {
     }
     let ambiguous = world.publisher().publish(NS, "a/b", &site()).await;
     assert!(matches!(ambiguous, Err(Error::Invalid(_))));
+    for namespace in ["", "other", "a/b"] {
+        let result = world.publisher().publish(namespace, "d1", &site()).await;
+        assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
+    }
     assert_eq!(world.store.puts.load(Ordering::SeqCst), 0);
     assert_eq!(world.writer.bootstrap(CDN, NS).await.unwrap().sequence, 0);
 }
@@ -331,20 +335,16 @@ async fn a_publish_that_can_never_succeed_uploads_and_writes_nothing() {
 #[tokio::test]
 async fn the_write_api_client_posts_one_bulk_and_maps_rejections() {
     use axum::routing::post;
-    let ok = |body: Bytes| async move {
+    // The first key picks the answer; every request goes to the one namespace the client accepts.
+    let answer = |body: Bytes| async move {
         let bulk = pb::Bulk::decode(body).unwrap();
-        (StatusCode::OK, bulk.changes.len().to_string())
+        match &bulk.changes[0].key[..] {
+            b"big" => (StatusCode::PAYLOAD_TOO_LARGE, String::new()),
+            b"busy" => (StatusCode::TOO_MANY_REQUESTS, String::new()),
+            _ => (StatusCode::OK, bulk.changes.len().to_string()),
+        }
     };
-    let app = axum::Router::new()
-        .route("/v1/cdn/ok", post(ok))
-        .route(
-            "/v1/cdn/big",
-            post(|| async { StatusCode::PAYLOAD_TOO_LARGE }),
-        )
-        .route(
-            "/v1/cdn/busy",
-            post(|| async { StatusCode::TOO_MANY_REQUESTS }),
-        );
+    let app = axum::Router::new().route("/v1/cdn/deployments", post(answer));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
     tokio::spawn(crate::http::serve(listener, app, None));
@@ -354,9 +354,15 @@ async fn the_write_api_client_posts_one_bulk_and_maps_rejections() {
         tls: None,
     };
     let changes: Changes = vec![(b"a".to_vec(), Some(Vec::new())), (b"b".to_vec(), None)];
-    assert_eq!(api.commit("ok", changes.clone()).await, Ok(2));
-    let big = api.commit("big", changes.clone()).await;
+    assert_eq!(api.commit(NS, changes.clone()).await, Ok(2));
+    let first = |key: &[u8]| vec![(key.to_vec(), None)];
+    let big = api.commit(NS, first(b"big")).await;
     assert!(matches!(big, Err(Error::Invalid(_))));
-    let busy = api.commit("busy", changes).await;
+    let busy = api.commit(NS, first(b"busy")).await;
     assert!(matches!(busy, Err(Error::Unavailable(_))));
+    // Refused before sending: a 404 from the stub would be Unavailable.
+    for namespace in ["", "deployments/x", "x?y", ".."] {
+        let result = api.commit(namespace, changes.clone()).await;
+        assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
+    }
 }
