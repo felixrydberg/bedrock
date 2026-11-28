@@ -1,9 +1,12 @@
 use super::*;
+use bedrock_lib::datasets::capabilities::VOLUME;
 use bedrock_lib::membership::Generations;
 use bedrock_lib::placement::State;
 use std::sync::Mutex;
 
 const GRACE: Duration = Duration::from_secs(15);
+const REPLICAS: usize = 3;
+const MAX_MOVING: usize = 16;
 
 fn relays() -> Vec<String> {
     ["a", "b", "c"].map(String::from).to_vec()
@@ -365,6 +368,7 @@ fn settle(service: &str, actual: &Members, directories: &mut Directories) -> usi
             &ready,
             &[],
             REPLICAS,
+            MAX_MOVING,
         );
         if changes.is_empty() {
             return pass;
@@ -423,6 +427,7 @@ fn placement_completes_handoffs_then_assigns_only_its_own_service() {
         &siblings::Ready::new(),
         &[],
         REPLICAS,
+        MAX_MOVING,
     );
     let Some(Change::Range {
         dataset, owners, ..
@@ -505,6 +510,7 @@ fn quicksilver_placement_ignores_auth_dataset_membership() {
         &siblings::Ready::new(),
         &[],
         REPLICAS,
+        MAX_MOVING,
     );
     let assigned = |dataset: &str| -> BTreeSet<String> {
         changes
@@ -539,7 +545,8 @@ fn quicksilver_placement_ignores_auth_dataset_membership() {
             0,
             &siblings::Ready::new(),
             &[],
-            REPLICAS
+            REPLICAS,
+            MAX_MOVING
         )
         .is_empty()
     );
@@ -598,7 +605,8 @@ fn handoff_readiness_is_scoped_to_the_service_dataset_and_range() {
             0,
             &ready,
             &[],
-            REPLICAS
+            REPLICAS,
+            MAX_MOVING
         ),
         vec![Change::Range {
             service: "quicksilver".into(),
@@ -654,6 +662,7 @@ fn a_leaving_owner_stays_while_the_only_ready_owner_is_unhealthy() {
         &siblings::Ready::new(),
         &[],
         REPLICAS,
+        MAX_MOVING,
     );
     assert!(!leaves(changes), "the only healthy copy was let go");
 
@@ -667,6 +676,7 @@ fn a_leaving_owner_stays_while_the_only_ready_owner_is_unhealthy() {
         &siblings::Ready::new(),
         &[],
         REPLICAS,
+        MAX_MOVING,
     );
     assert!(leaves(changes), "a healthy ready owner lets it go");
 }
@@ -745,6 +755,7 @@ fn a_cells_first_volume_owners_start_ready_and_later_ones_populate() {
         &siblings::Ready::new(),
         &[],
         1,
+        MAX_MOVING,
     );
     // No data exists anywhere yet, so there is nothing to copy (#114 / S-06).
     assert_eq!(states(&first), [State::Ready]);
@@ -759,6 +770,7 @@ fn a_cells_first_volume_owners_start_ready_and_later_ones_populate() {
         &siblings::Ready::new(),
         &[],
         1,
+        MAX_MOVING,
     );
     assert_eq!(states(&later), [State::Populating]);
 }
@@ -810,6 +822,7 @@ fn a_volume_owner_is_ready_only_for_its_current_assignment() {
             &ready,
             &[],
             1,
+            MAX_MOVING,
         )
     };
     // A copy made for an earlier assignment of the range does not count.
@@ -840,6 +853,7 @@ fn a_volume_owner_is_ready_only_for_its_current_assignment() {
         &siblings::Ready::new(),
         &[],
         1,
+        MAX_MOVING,
     );
     let Some(Change::Range {
         generations,
@@ -888,6 +902,7 @@ fn volume_ranges_merge_only_when_their_owners_generations_agree() {
             &siblings::Ready::new(),
             &[],
             1,
+            MAX_MOVING,
         )
         .into_iter()
         .filter(|c| matches!(c, Change::Merge { .. }))
@@ -976,7 +991,14 @@ fn completeness_counts_only_connected_healthy_holders_up_to_the_cells_size() {
         member("q5"),
         dropped,
     ]);
-    let coverage = completeness(&seen, &all, "quicksilver", "quicksilver", &directory);
+    let coverage = completeness(
+        &seen,
+        &all,
+        "quicksilver",
+        "quicksilver",
+        &directory,
+        REPLICAS,
+    );
     assert_eq!((coverage.complete, coverage.redundant), (SPACE / 4, 0));
 
     // Two `l2` members get two owners per range; an `l1`-only member gets none and is not expected to hold.
@@ -989,6 +1011,6 @@ fn completeness_counts_only_connected_healthy_holders_up_to_the_cells_size() {
         0,
         vec![owner("q1", State::Ready), owner("q4", State::Ready)],
     )]);
-    let coverage = completeness(&seen, &small, "quicksilver", "quicksilver", &two);
+    let coverage = completeness(&seen, &small, "quicksilver", "quicksilver", &two, REPLICAS);
     assert!(!coverage.degraded() && coverage.complete == SPACE);
 }

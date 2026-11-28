@@ -6,10 +6,14 @@ package bedrock.artifact;
 
 service ArtifactTransfer {
   // The artifact as a stream of chunks; `NOT_FOUND` when neither the node nor S3 has it. The serving node fetches a
-  // missing artifact from S3 itself, never from other peers.
+  // missing artifact from S3 itself, never from other peers. With `held_only`, it serves only a verified local copy and
+  // answers `NOT_FOUND` without reading S3: an availability check through real traffic (#82 / B-34).
   rpc Fetch(FetchRequest) returns (stream Chunk);
 }
 
 // `hash` is the artifact's 32-byte SHA-256.
-message FetchRequest { bytes hash = 1; }
+message FetchRequest {
+  bytes hash = 1;
+  bool held_only = 2;
+}
 message Chunk { bytes data = 1; }

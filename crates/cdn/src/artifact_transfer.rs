@@ -14,7 +14,10 @@
 //! - **Retries and timeouts.** Peers are tried in order, skipping those with an open breaker (B-13), then S3, whose
 //!   client retries on its own. Every call and every chunk is bounded by [`TIMEOUT`].
 //!
-//! Which peers hold an artifact (B-34), what to prewarm (B-45) and what to retain (B-32) are the caller's.
+//! - **Availability.** [`Transfer::held`] asks a holder for its verified local copy only, never S3 (#82 / B-34): a
+//!   holder that answers `None` lacks the bytes, and its caller reports that to `Sources::missing`.
+//!
+//! Which peers to name (`retention::sources`, B-34), what to prewarm and what to retain (B-32) are the caller's.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -88,15 +91,15 @@ impl Transfer {
             return self.fetch_s3(lane, hash).await;
         }
         // ponytail: a peer's request arriving meanwhile reads S3 itself rather than wait, since this fetch may be waiting
-        // on that peer, directly or through others. That costs one extra S3 read when a third node asks. The fix is
-        // placement, not waiting: B-34 should have one owner per range read S3 and the other name it, never back.
+        // on that peer, directly or through others. That costs one extra S3 read when a third node asks. Placement keeps
+        // holders from naming each other instead: each names only the owners ahead of it (`retention::sources`, B-34).
         let fetch = || async {
             // Checked inside the fetch: a request that just missed the previous one finds what it cached.
             if let Some(bytes) = self.artifacts.cached(hash).await {
                 return Ok(Some(bytes));
             }
             for peer in self.peers.health().route(sources) {
-                match self.fetch_peer(peer, hash).await {
+                match self.fetch_peer(peer, hash, false).await {
                     Ok(Some(bytes)) => {
                         self.artifacts.fill(hash, bytes.clone()).await;
                         return Ok(Some(bytes));
@@ -123,14 +126,26 @@ impl Transfer {
         coalesced(&self.from_s3, *hash, lane, fetch).await
     }
 
+    /// `peer`'s verified copy of the artifact, or `None` when it holds none; it never reads S3 for this. Nothing is
+    /// cached here.
+    pub async fn held(&self, peer: &str, hash: &Hash) -> Result<Option<Bytes>, Status> {
+        self.fetch_peer(peer, hash, true).await
+    }
+
     /// The artifact streamed from `peer` and verified, or `None` when the peer could not find it.
-    async fn fetch_peer(&self, peer: &str, hash: &Hash) -> Result<Option<Bytes>, Status> {
+    async fn fetch_peer(
+        &self,
+        peer: &str,
+        hash: &Hash,
+        held_only: bool,
+    ) -> Result<Option<Bytes>, Status> {
         let channel = self
             .peers
             .channel(peer, Class::Bulk)
             .map_err(|e| Status::unavailable(e.to_string()))?;
         let request = pb::FetchRequest {
             hash: Bytes::copy_from_slice(&hash.0),
+            held_only,
         };
         let mut client = ArtifactTransferClient::new(channel);
         let call = client.fetch(request);
@@ -195,7 +210,12 @@ impl pb::artifact_transfer_server::ArtifactTransfer for Transfer {
         let hash = <[u8; 32]>::try_from(&request.get_ref().hash[..])
             .map(Hash)
             .map_err(|_| Status::invalid_argument("hash must be 32 bytes"))?;
-        match self.get(&lane, &hash, &[]).await {
+        let got = if request.get_ref().held_only {
+            Ok(self.artifacts.cached(&hash).await)
+        } else {
+            self.get(&lane, &hash, &[]).await
+        };
+        match got {
             // The stream is polled only as the bulk connection's flow control allows.
             Ok(Some(bytes)) => {
                 let chunks = (0..bytes.len()).step_by(CHUNK).map(move |at| {

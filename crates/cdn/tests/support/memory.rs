@@ -12,7 +12,18 @@ use super::{Body, CacheStorage, Hash, Origin, body, collect};
 #[derive(Default)]
 pub struct Memory(pub Mutex<BTreeMap<Hash, Bytes>>);
 
+#[cfg(madsim)]
+thread_local! {
+    static SHARED: std::sync::Arc<Memory> = std::sync::Arc::default();
+}
+
 impl Memory {
+    /// The bucket every node of this simulation shares, as they would share S3. Each seed runs on a fresh thread.
+    #[cfg(madsim)]
+    pub fn shared() -> std::sync::Arc<Self> {
+        SHARED.with(Clone::clone)
+    }
+
     /// Holding `artifacts`, each under its SHA-256.
     pub fn with(artifacts: &[&Bytes]) -> Self {
         let artifacts = artifacts.iter().map(|a| (Hash::of(a), (*a).clone()));

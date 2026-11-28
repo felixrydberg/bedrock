@@ -27,6 +27,11 @@ cell = "eu-1a"
 bootstrap = false
 grace_ms = 20000
 
+# Owners per range and ranges in handoff at once, per service (B-34). Defaults: 2 owners for `cdn`, 3 for the rest, and
+# 16 moving. For `volume`, use ceil(3 / cells in the DC).
+# [membership.replicas]
+# volume = 3
+
 # Identical on every voter; values are certificate URI node IDs, not host names.
 [membership.voter_ids]
 "relay-eu-1a-1:7300" = "relay-eu-1a-1"

@@ -196,7 +196,8 @@ fn relay(ip: &str) -> RelayConfig {
                 .collect(),
             bootstrap: true,
             grace_ms: 20_000,
-            volume_replicas: 3,
+            replicas: Default::default(),
+            max_moving: Default::default(),
         }),
         write_token: Some(TOKEN.into()),
     }

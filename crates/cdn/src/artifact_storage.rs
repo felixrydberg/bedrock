@@ -108,10 +108,11 @@ pub trait Origin: Send + Sync {
 #[cfg(not(madsim))]
 pub use s3::S3;
 
-#[cfg(any(test, feature = "test-support"))]
+// Simulation builds use it as their S3 and cache (B-23a).
+#[cfg(any(test, feature = "test-support", madsim))]
 pub use memory::Memory;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "test-support", madsim))]
 #[path = "../tests/support/memory.rs"]
 mod memory;
 
@@ -197,6 +198,17 @@ impl Artifacts {
         let hash = Hash::of(&body);
         self.origin.put(&hash, body).await?;
         Ok(hash)
+    }
+
+    /// The artifacts cached on this node: its local availability, apart from which ranges it owns (#82 / B-34). Each was
+    /// verified when cached and is verified again when read.
+    pub fn inventory(&self) -> StorageResult<std::collections::BTreeSet<Hash>> {
+        Ok(self
+            .cache
+            .inventory()?
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .collect())
     }
 
     /// The verified artifact, or `Ok(None)` when the origin has no artifact by that hash.

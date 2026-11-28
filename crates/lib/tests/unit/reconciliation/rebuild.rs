@@ -2,6 +2,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
+use crate::admin::Admin;
 use crate::storage::WriteBatch;
 
 const SOURCE: (&str, &str) = ("auth", "engine");

@@ -26,3 +26,42 @@ fn cdn_drains_nodes_through_its_ranges_and_refuses_one_namespace() {
         Err(Error::Unsupported { .. })
     ));
 }
+
+/// The artifact store's settings sit beside the service's (#82 / B-34); outside simulation `[s3]` is required.
+#[test]
+// figment's test error is large; it is only a test failure.
+#[allow(clippy::result_large_err)]
+fn cdn_config_takes_s3_and_the_cache_size() {
+    figment::Jail::expect_with(|jail| {
+        jail.create_file(
+            "bedrock.toml",
+            r#"
+            node_id = "cdn-1"
+            listen = "0.0.0.0:7200"
+            admin_listen = "0.0.0.0:7201"
+            data_dir = "data"
+            roles = ["l2"]
+            datasets = ["cdn"]
+            relays = ["relay-1:7300"]
+            api = "api:7002"
+            s3_endpoint = "http://s3"
+            cache_mb = 64
+            [location]
+            region = "eu"
+            dc = "arn1"
+            cell = "eu-1a"
+            [s3]
+            endpoint = "http://s3"
+            bucket = "bedrock"
+            "#,
+        )?;
+        jail.set_env("BEDROCK_S3__ACCESS_KEY_ID", "local");
+        jail.set_env("BEDROCK_S3__SECRET_ACCESS_KEY", "private-s3-key");
+        let config: CdnConfig = node::load().map_err(|e| e.0)?;
+        assert_eq!(config.cache_mb, 64);
+        assert_eq!(config.s3.as_ref().unwrap().bucket, "bedrock");
+        assert!(!format!("{config:?}").contains("private-s3-key"));
+        assert_eq!(CdnConfig::from(config.service).cache_mb, 10 * 1024);
+        Ok(())
+    });
+}

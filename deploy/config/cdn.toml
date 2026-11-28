@@ -9,6 +9,14 @@ datasets = ["cdn"]
 relays = ["relay-eu-1a-1:7300", "relay-eu-1a-2:7300", "relay-eu-1a-3:7300"]
 api = "api.core:7002"
 s3_endpoint = "https://s3.example.internal"
+# The local artifact cache on disk, in MiB.
+cache_mb = 10240
+
+# Artifacts live under `artifacts/{sha256}` (B-30); the bucket is shared with the API.
+# Credentials come from BEDROCK_S3__ACCESS_KEY_ID and BEDROCK_S3__SECRET_ACCESS_KEY.
+[s3]
+endpoint = "https://s3.example.internal"
+bucket = "bedrock"
 
 [location]
 region = "eu"

@@ -476,10 +476,10 @@ impl Cluster {
                     self.write_address(),
                     self.options.s3,
                 );
-                if node.kind == Kind::Volume {
+                if matches!(node.kind, Kind::Volume | Kind::Cdn) {
                     top += "cache_mb = 16\n";
                 }
-                if matches!(node.kind, Kind::Kv | Kind::Volume) {
+                if matches!(node.kind, Kind::Kv | Kind::Volume | Kind::Cdn) {
                     tables += &format!(
                         "[s3]\nendpoint = {:?}\nbucket = {:?}\naccess_key_id = \"local\"\nsecret_access_key = \"local\"\n",
                         format!("http://127.0.0.1:{}", self.s3.port),
@@ -1229,7 +1229,7 @@ async fn unconverged(run: &Run) -> Option<Violation> {
         }
         for (range, owners) in &placed {
             let settled = owners.iter().all(|(_, state)| *state == OwnerState::Ready);
-            if !settled || owners.len() != hosts.min(3) {
+            if !settled || owners.len() != hosts.min(bedrock_lib::node::default_replicas(dataset)) {
                 let detail = format!("{dataset} range {range:x?} has owners {owners:?}");
                 return waiting("RedundancyRestored", detail);
             }

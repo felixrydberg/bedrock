@@ -9,6 +9,7 @@ async-trait.workspace = true
 bedrock-lib.workspace = true
 bytes = "1"
 prost.workspace = true
+serde.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-stream = "0.1"
@@ -31,6 +32,7 @@ tonic-build = { package = "madsim-tonic-build", version = "0.6" }
 test-support = []
 
 [dev-dependencies]
+figment = { workspace = true, features = ["test"] }
 tempfile.workspace = true
 tokio-stream = { version = "0.1", features = ["net"] }
 

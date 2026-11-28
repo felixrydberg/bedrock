@@ -5,10 +5,21 @@ pub mod artifact_transfer;
 pub mod paths;
 pub mod retention;
 
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
+
 use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, ReplicationPolicy};
+use bedrock_lib::health::protection;
 use bedrock_lib::health::storage::StorageHealth;
 use bedrock_lib::membership;
-use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
+use bedrock_lib::node::{self, Budget, ConfigError, NodeConfig, ServiceConfig};
+use bedrock_lib::reconciliation::{self, Reconciler};
+use bedrock_lib::s3::S3Config;
+use serde::Deserialize;
+
+use crate::artifact_storage::{Artifacts, CacheStorage, Origin};
+use crate::artifact_transfer::{ArtifactTransferServer, Transfer};
 
 pub const DATASETS: &[Dataset] = &[Dataset {
     name: datasets::capabilities::CDN,
@@ -29,10 +40,95 @@ pub const DATASETS: &[Dataset] = &[Dataset {
     },
 }];
 
+#[derive(Clone, Deserialize)]
+pub struct CdnConfig {
+    #[serde(flatten)]
+    pub service: ServiceConfig,
+    /// The bucket artifacts live in, under `artifacts/{sha256}`. Required outside simulation.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+    /// The local artifact cache on disk, in MiB, in `data_dir/cdn-artifacts`.
+    #[serde(default = "default_cache_mb")]
+    pub cache_mb: u64,
+}
+
+fn default_cache_mb() -> u64 {
+    10 * 1024
+}
+
+impl From<ServiceConfig> for CdnConfig {
+    fn from(service: ServiceConfig) -> Self {
+        CdnConfig {
+            service,
+            s3: None,
+            cache_mb: default_cache_mb(),
+        }
+    }
+}
+
+impl AsRef<NodeConfig> for CdnConfig {
+    fn as_ref(&self) -> &NodeConfig {
+        &self.service.node
+    }
+}
+
+impl fmt::Debug for CdnConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CdnConfig")
+            .field("service", &self.service)
+            .field("s3", &self.s3)
+            .field("cache_mb", &self.cache_mb)
+            .finish()
+    }
+}
+
+/// How often the holders' prewarming and repair pass runs (#82 / B-34).
+const PREWARM: Duration = Duration::from_secs(1);
+/// The artifact cache's memory tier, in MiB.
+// ponytail: fixed; make it a setting when a deployment needs another size.
+#[cfg(not(madsim))]
+const CACHE_MEMORY_MB: u64 = 256;
+
+/// Artifacts in the configured bucket through the Foyer cache, or in the shared in-memory model in simulation builds.
+async fn artifacts(
+    node: &NodeConfig,
+    s3: Option<&S3Config>,
+    cache_mb: u64,
+    health: Arc<StorageHealth>,
+) -> Result<Artifacts, ConfigError> {
+    #[cfg(not(madsim))]
+    let (origin, cache): (Arc<dyn Origin>, Arc<dyn CacheStorage>) = {
+        let s3 = s3.ok_or_else(|| ConfigError("bedrock-cdn needs [s3] for artifacts".into()))?;
+        let store = bedrock_lib::s3::object_store(s3).map_err(|e| ConfigError(e.to_string()))?;
+        let cache = artifact_storage::Foyer::open(
+            &node.data_dir.join("cdn-artifacts"),
+            CACHE_MEMORY_MB,
+            cache_mb,
+        )
+        .await
+        .map_err(|e| ConfigError(format!("opening the artifact cache: {e}")))?;
+        (Arc::new(artifact_storage::S3(store)), Arc::new(cache))
+    };
+    #[cfg(madsim)]
+    let (origin, cache): (Arc<dyn Origin>, Arc<dyn CacheStorage>) = {
+        let _ = (node, s3, cache_mb);
+        (
+            artifact_storage::Memory::shared(),
+            Arc::new(artifact_storage::Memory::default()),
+        )
+    };
+    Ok(Artifacts::new(origin, cache, health))
+}
+
 /// Runs the node until Ctrl-C or SIGTERM. `main` and the simulation both start here.
 /// If the enabled CDN engine cannot open or is unhealthy at startup, its ranges are not followed and the node stays
 /// unready until restart; one that damage stopped opening starts empty and quarantined instead, and rebuilds. Configuration, admin startup, registry and relay session initialization errors are returned.
-pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
+pub async fn run(config: impl Into<CdnConfig>) -> Result<(), ConfigError> {
+    let CdnConfig {
+        service: config,
+        s3,
+        cache_mb,
+    } = config.into();
     config.validate()?;
     tracing::info!(node_id = %config.node.node_id, datasets = ?config.datasets, "starting bedrock-cdn");
     let admin = node::start_admin(&config.node).await?;
@@ -70,10 +166,11 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     // recovery matters.
     let skipped = ranged.len() != datasets.iter().count();
     let (members, target) = membership::View::new("cdn", &config.node.location.cell);
-    let peers = std::sync::Arc::new(
-        bedrock_lib::transport::Peers::new(&admin)
-            .with_tls(bedrock_lib::transport::tls::start(&config.node, "cdn", &admin).await?),
-    );
+    let members = Arc::new(members);
+    let tls = bedrock_lib::transport::tls::start(&config.node, "cdn", &admin).await?;
+    let peers = Arc::new(bedrock_lib::transport::Peers::new(&admin).with_tls(tls.clone()));
+    let artifacts =
+        Arc::new(artifacts(&config.node, s3.as_ref(), cache_mb, storage.clone()).await?);
     let session = bedrock_lib::relays::client::Session::join(
         peers.clone(),
         config.relays.clone(),
@@ -82,8 +179,9 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
         ranged,
     )
     .map_err(|e| ConfigError(e.to_string()))?;
+    let metrics = reconciliation::Metrics::new(&admin);
     let rebuilding = bedrock_lib::reconciliation::rebuild::start(
-        &admin,
+        &metrics,
         &storage,
         &session,
         "engine",
@@ -99,11 +197,56 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
             })
             .collect(),
     );
-    let mut readiness = tokio::time::interval(std::time::Duration::from_millis(100));
+    // Peers fetch artifacts on the bulk class; holders prewarm and repair what their ranges retain (#82 / B-34).
+    let transfer = Arc::new(Transfer::new(
+        artifacts.clone(),
+        peers.clone(),
+        &protection::Metrics::new(&admin),
+    ));
+    let prewarming = datasets
+        .get(datasets::capabilities::CDN)
+        .and_then(|instance| instance.engine.clone().ok())
+        .map(|engine| {
+            let view = members.clone();
+            let prewarm = retention::Prewarm {
+                engine,
+                placement: Box::new(move || {
+                    let members = view.members().map_err(|e| e.to_string())?;
+                    let directory = view
+                        .directory(datasets::capabilities::CDN)
+                        .map_err(|e| e.to_string())?;
+                    Ok((members, directory))
+                }),
+                me: config.node.node_id.clone(),
+                lane: format!("{}/warm", config.node.location.cell),
+                artifacts: artifacts.clone(),
+                transfer: transfer.clone(),
+            };
+            let settings = reconciliation::Config {
+                burst: 64,
+                refill: Duration::from_millis(10),
+                // Above B-31's whole-transfer deadline, so a slow peer falls back to S3 within one repair.
+                repair_timeout: artifact_transfer::DEADLINE * 2,
+                base_backoff: Duration::from_secs(1),
+                max_backoff: Duration::from_secs(60),
+                seed: bedrock_lib::placement::hash_of("prewarm", &config.node.node_id, b""),
+            };
+            tokio::spawn(
+                Reconciler::new("prewarm", Arc::new(prewarm), settings, &metrics).run(PREWARM),
+            )
+        });
+    let router = bedrock_lib::transport::server(tls.as_ref())
+        .add_service(ArtifactTransferServer::from_arc(transfer));
+    let mut serving = bedrock_lib::transport::serve(router, config.node.listen, tls);
+    let mut readiness = tokio::time::interval(Duration::from_millis(100));
     let mut shutdown = std::pin::pin!(node::shutdown_signal());
     loop {
         tokio::select! {biased;
             ()=&mut shutdown=>break,
+            served=&mut serving=>{
+                served.map_err(|e| ConfigError(format!("listen {}: {e}", config.node.listen)))?;
+                break;
+            },
             _=readiness.tick()=>{
                 // Quarantined datasets are routed around (B-14); they do not hold back the others.
                 let unhealthy = storage.unhealthy();
@@ -118,7 +261,11 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     admin.set_ready(false);
     rebuilding.abort();
     scrubbing.abort();
+    if let Some(prewarming) = prewarming {
+        prewarming.abort();
+    }
     session.drain().await;
+    serving.close().await;
     tracing::info!("shutting down");
     Ok(())
 }

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bedrock_lib::admin::Admin;
-use bedrock_lib::datasets::capabilities::{VOLUME, full_replica, pushed, ranged_datasets};
+use bedrock_lib::datasets::capabilities::{full_replica, pushed, ranged_datasets};
 use bedrock_lib::membership::{
     DATASET, Directories, Generations, Published, Publisher, RANGE, SERVICES, encode_generations,
     key, namespace,
@@ -39,10 +39,6 @@ pub mod control;
 const TIMEOUT: Duration = Duration::from_secs(5);
 /// Re-plans at least this often, which is what expires grace periods.
 const RECONCILE: Duration = Duration::from_secs(1);
-// ponytail: fixed until B-34 makes them per-service settings read at relay startup (CDN artifacts want 2 replicas).
-// `volume` has its own setting, `volume_replicas`.
-const REPLICAS: usize = 3;
-const MAX_MOVING: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 // ponytail: a pass plans a handful of changes, so boxing `Set` would save nothing measurable.
@@ -210,7 +206,7 @@ fn retain_readable(
 /// to a cell relay (this one or a synced sibling), still carries the dataset and its storage for it is healthy, so a
 /// killed node is degraded at once, not after the grace period; members behind an unreachable sibling count as gone
 /// until they reconnect. Each member is judged by one observation, local first as in [`plan`]. Redundancy wants as many
-/// holders as placement can give each range: [`REPLICAS`], or fewer when fewer published members are `ready` `l2`
+/// holders as placement can give each range: `replicas`, or fewer when fewer published members are `ready` `l2`
 /// members carrying the dataset. Unlike placement, an unhealthy member still counts there: it keeps its ranges, so the
 /// cell stays degraded until it recovers.
 pub fn completeness(
@@ -219,6 +215,7 @@ pub fn completeness(
     service: &str,
     dataset: &str,
     directory: &Directory,
+    replicas: usize,
 ) -> coverage::Coverage {
     let carries = |m: &pb::Member| m.datasets.iter().any(|d| d == dataset);
     let mut observed: BTreeMap<&str, &pb::Member> = BTreeMap::new();
@@ -249,7 +246,7 @@ pub fn completeness(
                 && carries(m)
         })
         .count();
-    coverage::coverage(directory, REPLICAS.min(placeable), |node| {
+    coverage::coverage(directory, replicas.min(placeable), |node| {
         holders.contains(node)
     })
 }
@@ -284,6 +281,7 @@ pub fn place(
     ready: &siblings::Ready,
     drains: &[Drain],
     replicas: usize,
+    max_moving: usize,
 ) -> Vec<Change> {
     let mut changes = Vec::new();
     for dataset in ranged_datasets(service) {
@@ -328,7 +326,7 @@ pub fn place(
         if entries.is_empty() {
             // A drain's members are `draining`, and its rate bounds the handoffs (#68 / B-21b).
             let drained = drain::apply(&members, drains, dataset);
-            let moving = drain::moving(drains, MAX_MOVING);
+            let moving = drain::moving(drains, max_moving);
             entries = placement::assign(directory, &drained, &unhealthy, replicas, moving);
             // A cell's first owners of a dataset no relay streams (`volume`) have nothing anywhere to copy, so they start
             // `ready` (#114 / S-06). Every later owner copies and reports.
@@ -451,7 +449,8 @@ pub struct Cell {
     relays: Vec<String>,
     cell: String,
     grace: Duration,
-    volume_replicas: usize,
+    /// Per-service placement settings (#82 / B-34).
+    settings: MembershipSettings,
     control: Arc<control::Control>,
     drain_hooks: BTreeMap<String, Vec<Arc<dyn drain::Hook>>>,
     report: Report,
@@ -501,7 +500,7 @@ impl Cell {
             relays,
             cell,
             grace: Duration::from_millis(settings.grace_ms),
-            volume_replicas: settings.volume_replicas,
+            settings: settings.clone(),
             control,
             drain_hooks,
         };
@@ -623,11 +622,8 @@ impl Cell {
                         snapshot.revision,
                         &ready,
                         drains,
-                        if *service == VOLUME {
-                            self.volume_replicas
-                        } else {
-                            REPLICAS
-                        },
+                        self.settings.replicas(service),
+                        self.settings.max_moving(service),
                     ));
                 }
             }
@@ -709,7 +705,14 @@ impl Cell {
                 let directory = published.directories.get(dataset).unwrap_or(&empty);
                 self.report.set(
                     dataset,
-                    completeness(seen, actual, service, dataset, directory),
+                    completeness(
+                        seen,
+                        actual,
+                        service,
+                        dataset,
+                        directory,
+                        self.settings.replicas(service),
+                    ),
                 );
             }
         }

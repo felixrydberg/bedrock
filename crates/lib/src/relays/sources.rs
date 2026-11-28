@@ -23,11 +23,14 @@ pub const RECHECK: Duration = Duration::from_secs(1);
 
 /// `(node, dataset, namespace, range start)` → applied revision the holder reported, and when.
 type Behind = BTreeMap<(String, String, String, u64), (u64, Instant)>;
+/// `(node, dataset, hash)` → when the holder said it lacks the item at `hash`.
+type Missing = BTreeMap<(String, String, u64), Instant>;
 
-/// Holders that recently turned down a read for being behind.
+/// Holders that recently turned down a read for being behind, or for lacking what was asked.
 #[derive(Default)]
 pub struct Sources {
     behind: Mutex<Behind>,
+    missing: Mutex<Missing>,
 }
 
 impl Sources {
@@ -56,10 +59,19 @@ impl Sources {
         );
     }
 
+    /// `node` owns the range holding `hash` but does not have its item locally: a CDN holder without the artifact's
+    /// bytes, which tracks them apart from its ranges (#82 / B-34). Other hashes in the range are unaffected.
+    pub fn missing(&self, node: &str, dataset: &str, hash: u64) {
+        let now = crate::monotonic_now();
+        let mut missing = self.missing.lock().unwrap();
+        missing.retain(|_, at| now.duration_since(*at) < RECHECK);
+        missing.insert((node.into(), dataset.into(), hash), now);
+    }
+
     /// Holders of `hash` in a ranged service (`quicksilver`, `cdn`), best first: `ready` owners before `leaving` or
     /// draining ones, then those in the caller's failure `domain`. Never `populating` owners, owners that are no longer
-    /// members, owners whose `dataset` storage is unhealthy, or holders that reported being behind `min_revision` within
-    /// [`RECHECK`]. Open breakers are skipped
+    /// members, owners whose `dataset` storage is unhealthy, or holders that reported being behind `min_revision` or
+    /// [`Sources::missing`] `hash` within [`RECHECK`]. Open breakers are skipped
     /// unless every candidate's is open ([`Health::route`] fails open). Keys hash with
     /// [`crate::placement::hash_of`]; CDN artifacts use their content hash and minimum revision 0.
     #[allow(clippy::too_many_arguments)]
@@ -76,6 +88,7 @@ impl Sources {
     ) -> Vec<&'a pb::Member> {
         let now = crate::monotonic_now();
         let behind = self.behind.lock().unwrap();
+        let missing = self.missing.lock().unwrap();
         let range = placement::start_of(directory, hash);
         let mut candidates: Vec<(&State, &pb::Member)> = placement::owners(directory, hash)
             .iter()
@@ -91,13 +104,18 @@ impl Sources {
                     *applied >= min_revision || now.duration_since(*at) >= RECHECK
                 })
             })
+            .filter(|o| {
+                missing
+                    .get(&(o.node.clone(), dataset.to_owned(), hash))
+                    .is_none_or(|at| now.duration_since(*at) >= RECHECK)
+            })
             .filter_map(|o| Some((&o.state, members.get(&o.node)?)))
             .filter(|(_, m)| {
                 crate::membership::quarantined(m, dataset)
                     .is_none_or(|quarantined| !hits(&quarantined, (hash, hash.wrapping_add(1))))
             })
             .collect();
-        drop(behind);
+        drop((behind, missing));
         // Stable, so equal candidates keep directory order.
         candidates.sort_by_key(|(state, m)| {
             (

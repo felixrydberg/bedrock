@@ -91,6 +91,7 @@ async fn transfer(server: &str) {
         let mut client = ArtifactTransferClient::new(peers.channel(server, Class::Bulk).unwrap());
         let request = FetchRequest {
             hash: Bytes::copy_from_slice(&hash.0),
+            held_only: false,
         };
         let call = client.fetch(request);
         let response = peers.call(server, Class::Bulk, TIMEOUT, call).await;

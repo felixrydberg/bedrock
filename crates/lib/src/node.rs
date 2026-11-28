@@ -179,14 +179,38 @@ pub struct MembershipSettings {
     /// How long a disconnected node stays a member; it may reconnect to any cell relay meanwhile.
     #[serde(default = "default_grace_ms")]
     pub grace_ms: u64,
-    /// Owners of each `volume` range: `ceil(3 / cells in the DC)`, so an actor's three slots land on three nodes
-    /// (#111 / S-03). The default suits a DC with one cell.
-    #[serde(default = "default_volume_replicas")]
-    pub volume_replicas: usize,
+    /// Owners of each range, per service, overriding [`MembershipSettings::replicas`]'s defaults (#82 / B-34). For
+    /// `volume`, `ceil(3 / cells in the DC)`, so an actor's three slots land on three nodes (#111 / S-03).
+    #[serde(default)]
+    pub replicas: BTreeMap<String, usize>,
+    /// Ranges of a service in handoff at once, per service, overriding 16.
+    #[serde(default)]
+    pub max_moving: BTreeMap<String, usize>,
 }
 
-fn default_volume_replicas() -> usize {
-    3
+/// Owners of each of `service`'s ranges unless configured: 2 for `cdn` (two verified artifact holders, `cdn.md` §3),
+/// otherwise 3, which suits a `volume` DC with one cell.
+pub fn default_replicas(service: &str) -> usize {
+    if service == crate::datasets::capabilities::CDN {
+        2
+    } else {
+        3
+    }
+}
+
+impl MembershipSettings {
+    /// Owners of each of `service`'s ranges: [`default_replicas`] unless configured.
+    pub fn replicas(&self, service: &str) -> usize {
+        self.replicas
+            .get(service)
+            .copied()
+            .unwrap_or_else(|| default_replicas(service))
+    }
+
+    /// Ranges of `service` in handoff at once.
+    pub fn max_moving(&self, service: &str) -> usize {
+        self.max_moving.get(service).copied().unwrap_or(16)
+    }
 }
 
 /// Longer than a silent relay's detection ([`crate::relays::IDLE`]) minus its progress interval, so failover fits.
@@ -224,11 +248,16 @@ impl RelayConfig {
             if self.tier != Tier::Cell {
                 return Err(ConfigError("membership requires a cell-tier relay".into()));
             }
-            // Placement would plan no owners and hand every volume range away.
-            if membership.volume_replicas == 0 {
-                return Err(ConfigError(
-                    "membership.volume_replicas must be at least 1".into(),
-                ));
+            // Placement would plan no owners and hand every range away, or move none.
+            if let Some((service, _)) = membership
+                .replicas
+                .iter()
+                .chain(&membership.max_moving)
+                .find(|(_, n)| **n == 0)
+            {
+                return Err(ConfigError(format!(
+                    "membership.replicas and membership.max_moving for {service} must be at least 1"
+                )));
             }
             let advertised = self.node.advertised();
             // Siblings elect the publisher by address, so it must be the one they dial.
