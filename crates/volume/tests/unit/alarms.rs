@@ -79,8 +79,10 @@ fn setup(first: bool, count: usize) -> (Scanner, Arc<Recorder>, Directory) {
     )
 }
 
+// ponytail: a fixed count, since madsim's seeded scheduler can need more than 10 yields to finish a spawned wake.
+// Parked tasks cost nothing, so 1000 is cheap; replace it with a wait on the scanner going idle if it ever falls short.
 async fn settle() {
-    for _ in 0..10 {
+    for _ in 0..1000 {
         tokio::task::yield_now().await;
     }
 }

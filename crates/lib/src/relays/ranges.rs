@@ -30,7 +30,8 @@ pub fn within(inner: Range, outer: Range) -> bool {
     inner.0 >= outer.0 && end(inner) <= end(outer)
 }
 
-pub(crate) fn overlaps(a: Range, b: Range) -> bool {
+/// Whether two half-open ranges share a hash; neither range is validated.
+pub fn overlaps(a: Range, b: Range) -> bool {
     u128::from(a.0) < end(b) && u128::from(b.0) < end(a)
 }
 

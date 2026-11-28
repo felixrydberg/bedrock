@@ -40,8 +40,8 @@ disconnection aborts recovery. No readiness follows a partial or corrupt transfe
   dataset. Events keep their namespace and per-namespace revision. Coverage is per namespace: a delivery notes how
   far each namespace it touches is covered, so namespaces without writes add nothing. The subscriber keeps one
   covered revision per namespace and resumes with that table. Each ranged dataset has a fixed namespace set in code
-  (`placement::namespaces`): `quicksilver` has `infrastructure`, `auth` has `keys` and `cdn` has `pages` and
-  `workers`. Auth is not currently placed by Quicksilver; its namespace remains available to the generic writer and
+  (`placement::namespaces`): `quicksilver` has `infrastructure`, `auth` has `keys` and `cdn` has `deployments`
+  (decision 17). Auth is not currently placed by Quicksilver; its namespace remains available to the generic writer and
   relay contracts for future Gateway work. The writer rejects any other namespace of these datasets. This is the
   model's constant `Namespaces`.
 - **Pushed ranges.** A relay pushes each leaf subscriber its full owned range set per dataset, tagged with the
@@ -126,6 +126,9 @@ upper tiers need only a few relays. Provisioning is static configuration here.
 No node configures subscriptions. `bedrock-quicksilver` and `bedrock-cdn` follow the ranges the
 relays push of each dataset they carry (`cdn` for the CDN, whose `ref/{sha256}/…` keys are placed
 by content hash, `feature-drafts.md` §4 decision 14); `Session::join` maps those datasets to their engines.
+Which hash a key gets is not part of the protocol: writers, relays and holders all call
+`placement::hash_of`, so they agree on every key's range whatever rule it applies, and `relays.tla`
+keeps keys and hashes abstract. A new placement rule therefore needs no model change (#80 / B-32).
 Every node also follows its own membership namespace whole. Customer
 `kv` opens/reads do not create interests. Leaf sessions also carry [cell membership](membership.md)
 (#15 / B-12). The leaf client stores a whole namespace under its namespace-NUL prefix and a
@@ -388,9 +391,8 @@ java -XX:+UseParallelGC -cp ../../scripts/tla2tools.jar tlc2.TLC -workers 1 -met
 The focused suites cover selector changes, filtered coverage, corruption, restart,
 eviction, storage failure/rebuild, subscription cancellation, two-tier forwarding,
 pruned-cursor bootstrap, and GC protection. A range follow through a writer, a top
-relay and a cell relay receives only its hashes in every namespace, picks up a
-namespace created after it followed, and resumes after a restart
-(`range_follow_streams_every_namespace_and_only_its_hashes_through_two_tiers`).
+relay and a cell relay receives only its hashes and resumes after a restart
+(`range_follow_streams_only_its_hashes_through_two_tiers_and_resumes`).
 `tests/sim/tests/relays.rs` runs seeds
 1, 2 and 42 twice and compares committed application traces through idle partitions,
 node kills, all-open routing and a KV-only process-task abort on a relay machine.

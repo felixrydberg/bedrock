@@ -22,7 +22,7 @@ fn cdn_drains_nodes_through_its_ranges_and_refuses_one_namespace() {
     let node = Scope::Node("cdn-1".into());
     assert_eq!(hooks[0].drain(&node, None), Ok(Outcome::NothingToMove));
     assert!(matches!(
-        hooks[0].drain(&node, Some("pages")),
+        hooks[0].drain(&node, Some("deployments")),
         Err(Error::Unsupported { .. })
     ));
 }

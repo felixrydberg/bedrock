@@ -252,9 +252,9 @@ async fn frame(stream: &mut tonic::Streaming<pb::RelayFrame>) -> pb::relay_frame
         .unwrap()
 }
 
-fn follow(namespace: &str, from: u64) -> pb::RelayRequest {
+fn follow((dataset, namespace): (&str, &str), from: u64) -> pb::RelayRequest {
     request(pb::relay_request::Kind::Follow(pb::Follow {
-        dataset: "cdn".into(),
+        dataset: dataset.into(),
         namespace: namespace.into(),
         from,
         span: None,
@@ -264,22 +264,30 @@ fn follow(namespace: &str, from: u64) -> pb::RelayRequest {
 }
 
 #[tokio::test]
-async fn namespace_unfollow_preserves_the_other_namespace_on_the_same_session() {
+async fn unfollowing_one_stream_preserves_the_other_on_the_same_session() {
+    const UNFOLLOWED: (&str, &str) = ("auth", "keys");
+    const KEPT: (&str, &str) = ("cdn", "deployments");
     let writer = writer().await;
     let server = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17201).await;
-    for namespace in ["pages", "workers"] {
-        commit(&writer, "cdn", namespace, Operation::Set(b"first".to_vec())).await;
+    for (dataset, namespace) in [UNFOLLOWED, KEPT] {
+        commit(
+            &writer,
+            dataset,
+            namespace,
+            Operation::Set(b"first".to_vec()),
+        )
+        .await;
     }
     let (tx, mut stream) = raw(&server.address, 0).await;
-    for namespace in ["pages", "workers"] {
-        tx.send(follow(namespace, 1)).await.unwrap();
+    for stream in [UNFOLLOWED, KEPT] {
+        tx.send(follow(stream, 1)).await.unwrap();
     }
     let mut seen = std::collections::BTreeSet::new();
     while seen.len() < 2 {
         if let pb::relay_frame::Kind::Delivery(delivery) = frame(&mut stream).await {
-            seen.insert(delivery.namespace.clone());
+            seen.insert(delivery.dataset.clone());
             tx.send(request(pb::relay_request::Kind::Ack(pb::Ack {
-                dataset: "cdn".into(),
+                dataset: delivery.dataset,
                 namespace: delivery.namespace,
                 applied: delivery.through,
                 span: None,
@@ -289,39 +297,41 @@ async fn namespace_unfollow_preserves_the_other_namespace_on_the_same_session() 
         }
     }
     tx.send(request(pb::relay_request::Kind::Unfollow(pb::Unfollow {
-        dataset: "cdn".into(),
-        namespace: "pages".into(),
+        dataset: UNFOLLOWED.0.into(),
+        namespace: UNFOLLOWED.1.into(),
         span: None,
     })))
     .await
     .unwrap();
     // This later follow's range is a protocol barrier: the earlier unfollow was processed.
-    tx.send(follow("workers", 2)).await.unwrap();
+    tx.send(follow(KEPT, 2)).await.unwrap();
     loop {
         if let pb::relay_frame::Kind::Range(range) = frame(&mut stream).await
-            && range.namespace == "workers"
+            && (range.dataset.as_str(), range.namespace.as_str()) == KEPT
         {
             break;
         }
     }
+    let (dataset, namespace) = UNFOLLOWED;
     commit(
         &writer,
-        "cdn",
-        "pages",
+        dataset,
+        namespace,
         Operation::Set(b"unfollowed".to_vec()),
     )
     .await;
+    let (dataset, namespace) = KEPT;
     commit(
         &writer,
-        "cdn",
-        "workers",
+        dataset,
+        namespace,
         Operation::Set(b"still followed".to_vec()),
     )
     .await;
     loop {
         if let pb::relay_frame::Kind::Delivery(delivery) = frame(&mut stream).await {
-            assert_ne!(delivery.namespace, "pages");
-            if delivery.namespace == "workers" && delivery.through == 2 {
+            assert_ne!(delivery.dataset, UNFOLLOWED.0);
+            if delivery.dataset == KEPT.0 && delivery.through == 2 {
                 break;
             }
         }
@@ -863,16 +873,12 @@ async fn until(what: &str, done: impl Fn() -> bool) {
 }
 
 #[tokio::test]
-async fn range_follow_streams_every_namespace_and_only_its_hashes_through_two_tiers() {
+async fn range_follow_streams_only_its_hashes_through_two_tiers_and_resumes() {
     use bedrock_lib::placement::hash_of;
     use bedrock_lib::storage::{KeyRange, l2_key};
     const HALF: u64 = 1 << 63;
     let writer = writer().await;
     let keys: Vec<Vec<u8>> = (0u8..16).map(|i| vec![b'k', i]).collect();
-    // `workers` has no writes yet when the range is first followed.
-    for key in &keys {
-        put(&writer, "pages", key, Operation::Set(b"pages".to_vec())).await;
-    }
     let source = serve(Hub::writer("writer".into(), writer.clone(), peers()), 17501).await;
     let top = relay("top", 3, &source.address);
     let top_task = top.start();
@@ -890,42 +896,53 @@ async fn range_follow_streams_every_namespace_and_only_its_hashes_through_two_ti
         prefix: Vec::new(),
         span: Some((0, HALF)),
     };
-    let stored = |namespace: &str, key: &[u8]| {
+    let stored = |key: &[u8]| {
         local
-            .get(&l2_key(hash_of("cdn", namespace, key), namespace, key))
+            .get(&l2_key(
+                hash_of("cdn", "deployments", key),
+                "deployments",
+                key,
+            ))
             .unwrap()
     };
-    let inside = |namespace: &str, key: &[u8]| hash_of("cdn", namespace, key) < HALF;
-    let session = Session::start(peers(), vec![cell.address.clone()], vec![target()]).unwrap();
-    let complete = |namespace: &'static str, value: &'static [u8]| {
+    let inside = |key: &[u8]| hash_of("cdn", "deployments", key) < HALF;
+    let complete = |value: &'static [u8]| {
         let keys = keys.clone();
         let stored = &stored;
         move || {
             keys.iter()
-                .filter(|key| inside(namespace, key))
-                .all(|key| stored(namespace, key).as_deref() == Some(value))
+                .filter(|key| inside(key))
+                .all(|key| stored(key).as_deref() == Some(value))
         }
     };
-    until("namespace pages", complete("pages", b"pages")).await;
-    assert!(keys.iter().filter(|key| inside("pages", key)).count() > 0);
-    // Nothing outside the range arrives, in any namespace.
+    // The namespace has no writes yet when the range is first followed.
+    let session = Session::start(peers(), vec![cell.address.clone()], vec![target()]).unwrap();
+    for key in &keys {
+        put(&writer, "deployments", key, Operation::Set(b"one".to_vec())).await;
+    }
+    until("first writes", complete(b"one")).await;
+    assert!(keys.iter().filter(|key| inside(key)).count() > 0);
+    // Nothing outside the range arrives.
     for entry in local.scan(&KeyRange::prefix(*b"l2/")).unwrap() {
         let (key, _) = entry.unwrap();
         let hash = u64::from_be_bytes(key[3..11].try_into().unwrap());
         assert!(hash < HALF, "key outside the followed range");
     }
-    // A fixed namespace first written after the follow streams too.
-    for key in &keys {
-        put(&writer, "workers", key, Operation::Set(b"workers".to_vec())).await;
-    }
-    until("namespace workers", complete("workers", b"workers")).await;
     drop(session);
-    for key in &keys {
-        put(&writer, "pages", key, Operation::Delete).await;
+    // Writes while the subscriber is away arrive when it resumes.
+    for (i, key) in keys.iter().enumerate() {
+        let operation = match i % 2 {
+            0 => Operation::Delete,
+            _ => Operation::Set(b"two".to_vec()),
+        };
+        put(&writer, "deployments", key, operation).await;
     }
     let resumed = Session::start(peers(), vec![cell.address.clone()], vec![target()]).unwrap();
-    until("deletes after restart", || {
-        keys.iter().all(|key| stored("pages", key).is_none()) && complete("workers", b"workers")()
+    until("writes after restart", || {
+        keys.iter()
+            .enumerate()
+            .filter(|(_, key)| inside(key))
+            .all(|(i, key)| stored(key).as_deref() == (i % 2 == 1).then_some(b"two".as_slice()))
     })
     .await;
     drop(resumed);
@@ -949,7 +966,8 @@ async fn a_bulk_across_two_ranges_reaches_each_range_with_exactly_its_own_keys()
     let cell = serve(cell, 17513).await;
     let halves = [(0, HALF), (HALF, 0)];
     let engines = halves.map(|_| Arc::new(MemoryEngine::new("local")));
-    let inside = |half: usize, key: &[u8]| (hash_of("cdn", "pages", key) < HALF) == (half == 0);
+    let inside =
+        |half: usize, key: &[u8]| (hash_of("cdn", "deployments", key) < HALF) == (half == 0);
     let sessions: Vec<_> = (0..2)
         .map(|half| {
             let target = Target {
@@ -966,13 +984,17 @@ async fn a_bulk_across_two_ranges_reaches_each_range_with_exactly_its_own_keys()
         .collect();
     let stored = |half: usize, key: &[u8]| {
         engines[half]
-            .get(&l2_key(hash_of("cdn", "pages", key), "pages", key))
+            .get(&l2_key(
+                hash_of("cdn", "deployments", key),
+                "deployments",
+                key,
+            ))
             .unwrap()
     };
     let keys: Vec<Vec<u8>> = (0u8..16).map(|i| vec![b'k', i]).collect();
     assert!((0..2).all(|half| keys.iter().any(|key| inside(half, key))));
     let bulk = |changes| async {
-        put(&writer, "pages", b"", Operation::Bulk(changes)).await;
+        put(&writer, "deployments", b"", Operation::Bulk(changes)).await;
     };
     // One bulk spanning both ranges, then one that deletes half its keys and changes the rest.
     bulk(
@@ -998,7 +1020,13 @@ async fn a_bulk_across_two_ranges_reaches_each_range_with_exactly_its_own_keys()
     )
     .await;
     let last = keys.iter().find(|key| inside(1, key)).unwrap().clone();
-    put(&writer, "pages", &last, Operation::Set(b"four".to_vec())).await;
+    put(
+        &writer,
+        "deployments",
+        &last,
+        Operation::Set(b"four".to_vec()),
+    )
+    .await;
     let expected = |half: usize, i: usize, key: &[u8]| -> Option<&'static [u8]> {
         if !inside(half, key) {
             None

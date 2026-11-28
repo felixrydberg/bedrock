@@ -124,6 +124,7 @@ impl Reconcile for Rebuild {
                 .get(dataset, layer)
                 .map(|r| r.ranges)
                 .unwrap_or_default();
+
             if ranges.is_empty()
                 && let Some(found) = restore.narrow().await?
                 && self.health.narrow(dataset, layer, found.clone())
@@ -197,6 +198,7 @@ impl Restore for Reinitialise {
 
     async fn restore(&self, ranges: &[Range]) -> StorageResult<()> {
         let _busy = self.busy.lock().await;
+
         if ranges.is_empty() {
             let empty = MemoryEngine::new("empty");
             self.engine.restore(&*empty.snapshot()?)?;
@@ -238,7 +240,7 @@ fn verify(
     engine: &dyn StorageEngine,
     widen: &dyn Fn(&[Range]) -> StorageResult<Vec<Range>>,
 ) -> StorageResult<Option<Vec<Range>>> {
-    let Ok(mut ranges) = storage::listed(engine) else {
+    let Ok(mut ranges) = engine.snapshot().and_then(|s| storage::listed(s.as_ref())) else {
         return Ok(None);
     };
     let mut discarded = Vec::new();

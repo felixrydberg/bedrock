@@ -2,8 +2,8 @@
 
 pub mod artifact_storage;
 pub mod artifact_transfer;
-mod manifests {}
-mod retention {}
+pub mod paths;
+pub mod retention;
 
 use bedrock_lib::datasets::{self, CachePolicy, Dataset, Policy, Registry, ReplicationPolicy};
 use bedrock_lib::health::storage::StorageHealth;
@@ -12,8 +12,8 @@ use bedrock_lib::node::{self, Budget, ConfigError, ServiceConfig};
 
 pub const DATASETS: &[Dataset] = &[Dataset {
     name: datasets::capabilities::CDN,
-    // Global retention namespaces (`workers`, `pages`; B-32). A range's L2 owners never evict its records; idle artifact
-    // bytes are evicted through `CacheStorage` (B-44).
+    // Path rows and ref keys (#80 / B-32) in the global `deployments` retention namespace (decision 17). A range's L2
+    // owners never evict its records; idle artifact bytes are evicted through `CacheStorage` (B-44).
     defaults: Policy {
         replication: ReplicationPolicy::Global,
         cache: CachePolicy {

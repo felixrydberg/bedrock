@@ -93,7 +93,7 @@ impl Relay {
 
     /// What its replay log advertises for each stream the leaf follows.
     fn ranges(&self) -> Vec<Vec<(u64, u64)>> {
-        [("auth", "keys"), ("cdn", "pages")]
+        [("auth", "keys"), ("cdn", "deployments")]
             .map(|(dataset, namespace)| self.replay.ranges(dataset, namespace))
             .to_vec()
     }
@@ -118,7 +118,7 @@ async fn until(what: &str, within: Duration, done: impl Fn() -> bool) {
 fn inside(revision: u64) -> Vec<u8> {
     (0u64..)
         .map(|i| format!("{revision}-{i}").into_bytes())
-        .find(|key| hash_of("cdn", "pages", key) < HALF)
+        .find(|key| hash_of("cdn", "deployments", key) < HALF)
         .unwrap()
 }
 
@@ -127,7 +127,7 @@ async fn commit(writer: &Arc<Writer>, first: u64, last: u64) {
     for revision in first..=last {
         for (dataset, namespace, key) in [
             ("auth", "keys", b"key".to_vec()),
-            ("cdn", "pages", inside(revision)),
+            ("cdn", "deployments", inside(revision)),
         ] {
             let write = Write {
                 dataset: dataset.into(),
@@ -148,7 +148,7 @@ async fn caught_up(session: &Session, engine: &MemoryEngine, revision: u64) {
         .await
         .unwrap_or_else(|_| panic!("revision {revision} stalled: {:?}", session.error()));
     let key = inside(revision);
-    let stored = l2_key(hash_of("cdn", "pages", &key), "pages", &key);
+    let stored = l2_key(hash_of("cdn", "deployments", &key), "deployments", &key);
     until("the range's latest key", DEADLINE, || {
         engine.get(&stored).unwrap().is_some()
     })

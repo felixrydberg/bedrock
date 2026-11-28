@@ -1308,7 +1308,10 @@ impl Store {
                 continue;
             }
             // An uncommitted tail may still commit an alarm, and the claim's own `alarm_ms` is that tail, so the hint
-            // would not come back on the commit: keep it until the tail commits or is truncated.
+            // would not come back on the commit: keep it until the tail commits or is truncated. A holder can commit
+            // that tail by quorum and crash before this slot learns it, so with no committed alarm the tail's is the
+            // hint; the caller sends it only once the lease lapsed, and the next claim's recovery decides.
+            let alarm = alarm.or(claim.alarm_ms.filter(|_| end(&claim).seq > claim.committed));
             if alarm.is_none() || indexed.contains(&prefix) {
                 continue;
             }

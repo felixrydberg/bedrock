@@ -994,7 +994,7 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
     set(&|i| i.confirming = false);
     assert_eq!(hub.ready(), expected);
 
-    // Every fixed namespace counts, even one no write has reached the relay for yet.
+    // A fixed namespace counts even when no write has reached the relay for it yet.
     hub.push_ranges(&me, ranges("cdn", 3));
     hub.ranges_acked(1, ack("cdn", 3));
     let follow = |namespace: &str| {
@@ -1010,9 +1010,8 @@ async fn a_member_is_ready_for_a_range_only_after_acknowledging_its_push_and_cat
                 interest(0),
             );
     };
-    follow("pages");
-    assert_eq!(hub.ready(), expected, "`workers` is not followed yet");
-    follow("workers");
+    assert_eq!(hub.ready(), expected, "`deployments` is not followed yet");
+    follow("deployments");
     let mut both = expected.clone();
     both.insert((me, "cdn".to_string()), vec![(whole.0, whole.1, 0)]);
     assert_eq!(hub.ready(), both);
@@ -1270,12 +1269,12 @@ async fn a_refused_push_is_pushed_again_on_the_next_pass() {
 #[test]
 fn a_stream_started_past_this_relays_history_moves_its_head_to_the_cursor() {
     let hub = hub();
-    let key = ("cdn".to_owned(), "workers".to_owned());
+    let key = ("cdn".to_owned(), "deployments".to_owned());
     hub.observe_head(&key, 124);
     assert_eq!(hub.resume_from(&key, 127), 127);
     assert_eq!(hub.source_head(&key), Some(126));
 
-    let fresh = ("cdn".to_owned(), "pages".to_owned());
+    let fresh = ("quicksilver".to_owned(), "infrastructure".to_owned());
     assert_eq!(hub.resume_from(&fresh, 1), 1);
     assert_eq!(
         hub.source_head(&fresh),

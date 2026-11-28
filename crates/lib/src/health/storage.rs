@@ -163,7 +163,10 @@ impl StorageHealth {
             Ok(Some(marker)) => {
                 // A narrowed record whose ranges cannot be read means the whole instance.
                 let ranges = (marker == NARROWED)
-                    .then(|| listed(monitored.inner.as_ref()).ok())
+                    .then(|| {
+                        let snapshot = monitored.inner.snapshot().ok()?;
+                        listed(snapshot.as_ref()).ok()
+                    })
                     .flatten()
                     .unwrap_or_default();
                 let mut report = monitored.source.report.lock().unwrap();
@@ -418,9 +421,10 @@ pub fn list(engine: &dyn StorageEngine, ranges: &[Range], narrowed: bool) -> Sto
     engine.write(mark)
 }
 
-/// The ranges `engine`'s quarantine record lists; an error if a listing cannot be read as a range.
-pub fn listed(engine: &dyn StorageEngine) -> StorageResult<Vec<Range>> {
-    let names = engine.snapshot()?.revisions_in(&[prefixed(LISTED)])?;
+/// The ranges `snapshot`'s quarantine record lists; an error if a listing cannot be read as a range. Their data may
+/// already be discarded while their subscriptions' progress remains, so they are no copy until the record is released.
+pub fn listed(snapshot: &dyn Snapshot) -> StorageResult<Vec<Range>> {
+    let names = snapshot.revisions_in(&[prefixed(LISTED)])?;
     names
         .keys()
         .map(|name| {
