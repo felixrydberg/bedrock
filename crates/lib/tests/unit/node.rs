@@ -176,17 +176,22 @@ fn relay_membership_is_cell_local_and_requires_a_valid_voter_location() {
     wrong_identity.node.node_id = "another-relay".into();
     assert!(wrong_identity.validate().unwrap_err().0.contains("node_id"));
     assert_eq!(config.membership.as_ref().unwrap().grace_ms, 20_000);
-    assert_eq!(config.membership.as_ref().unwrap().volume_replicas, 3);
+    // Per-service placement settings (#82 / B-34): CDN artifacts want two holders, the rest three.
+    let settings = config.membership.as_ref().unwrap();
+    assert_eq!(
+        (settings.replicas("cdn"), settings.replicas("volume")),
+        (2, 3)
+    );
+    assert_eq!(settings.max_moving("cdn"), 16);
     // No owners per volume range would hand every range away (#111 / S-03).
     let mut no_owners = config.clone();
-    no_owners.membership.as_mut().unwrap().volume_replicas = 0;
-    assert!(
-        no_owners
-            .validate()
-            .unwrap_err()
-            .0
-            .contains("volume_replicas")
-    );
+    no_owners
+        .membership
+        .as_mut()
+        .unwrap()
+        .replicas
+        .insert("volume".into(), 0);
+    assert!(no_owners.validate().unwrap_err().0.contains("volume"));
     assert!(!format!("{config:?}").contains("private-writer-token"));
     // A relay is never its own sibling.
     assert!(
@@ -254,4 +259,43 @@ fn data_centers_are_named_by_iata_code() {
     ] {
         assert!(!valid_dc(dc), "{dc}");
     }
+}
+
+/// Per-service placement settings come from `[membership]` and from the environment (#82 / B-34).
+#[test]
+fn relay_placement_settings_come_from_the_file_and_the_environment() {
+    Jail::expect_with(|jail| {
+        jail.create_file(
+            "bedrock.toml",
+            r#"
+            node_id = "relay-1"
+            listen = "0.0.0.0:7300"
+            admin_listen = "0.0.0.0:7301"
+            data_dir = "data"
+            tier = "cell"
+            upstreams = ["api:7000"]
+            [location]
+            region = "eu"
+            dc = "arn1"
+            cell = "eu-1a"
+            [membership.voter_ids]
+            "relay-1:7300" = "relay-1"
+            [membership.replicas]
+            cdn = 3
+            [membership.max_moving]
+            cdn = 4
+            "#,
+        )?;
+        jail.set_env("BEDROCK_MEMBERSHIP__REPLICAS__VOLUME", "1");
+        let config: RelayConfig = load().map_err(|e| e.0)?;
+        let settings = config.membership.unwrap();
+        assert_eq!(settings.replicas("cdn"), 3);
+        assert_eq!(settings.replicas("volume"), 1);
+        assert_eq!(settings.replicas("quicksilver"), 3);
+        assert_eq!(
+            (settings.max_moving("cdn"), settings.max_moving("volume")),
+            (4, 16)
+        );
+        Ok(())
+    });
 }

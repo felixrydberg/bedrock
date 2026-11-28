@@ -115,6 +115,10 @@ services:
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   kv-eu-2:
     <<: *kv
@@ -150,6 +154,10 @@ services:
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   kv-eu-3:
     <<: *kv
@@ -185,6 +193,10 @@ services:
       BEDROCK_RELAYS: "[relay-eu-1:7300, relay-eu-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   relay-us-1:
     <<: *relay
@@ -246,6 +258,10 @@ services:
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   kv-us-2:
     <<: *kv
@@ -281,6 +297,10 @@ services:
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   kv-us-3:
     <<: *kv
@@ -316,6 +336,10 @@ services:
       BEDROCK_RELAYS: "[relay-us-1:7300, relay-us-2:7300]"
       BEDROCK_API: api:7002
       BEDROCK_S3_ENDPOINT: http://s3:8333
+      BEDROCK_S3__ENDPOINT: http://s3:8333
+      BEDROCK_S3__BUCKET: bedrock
+      BEDROCK_S3__ACCESS_KEY_ID: local
+      BEDROCK_S3__SECRET_ACCESS_KEY: local
 
   quicksilver-eu-1:
     <<: *quicksilver

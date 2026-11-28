@@ -74,7 +74,8 @@ all membership changes until it returns.
   share the namespace's one revision order.
 - **Assignment.** Only the membership publisher writes, and only once membership has nothing left to write, so it
   plans from applied membership. Each pass runs `placement::assign` (#18 / B-15) per dataset, over the members whose
-  `datasets` include it, with 3 replicas and at most 16 ranges moving, and applies the handoff steps below. It then
+  `datasets` include it, with the service's owners per range and ranges moving at once (the relay's `[membership]` `replicas` and `max_moving`
+  per service; by default 2 owners for `cdn` (B-34), 3 for the rest, and 16 moving), and applies the handoff steps below. It then
   waits for its subscription to apply the writes, as for membership. Every write carries the revision its plan was read
   at (checked during ordered Raft application), plus its internal leadership term, so a publisher planning from a stale
   view or superseded leadership cannot overwrite newer state. A failed write abandons

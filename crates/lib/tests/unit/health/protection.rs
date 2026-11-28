@@ -498,7 +498,8 @@ async fn a_range_move_warming_a_new_owner_stays_bounded_and_shares_fetches_with_
     assert!(source.peak("cell-a") <= S3_FETCHES.per_cell);
 }
 
-/// Replica repair as B-34 will run it: desired artifacts against the local cache, fetching through the read path.
+/// Replica repair as `bedrock_cdn::retention::Prewarm` runs it: desired artifacts against the local cache, fetching
+/// through the read path.
 struct Warm {
     artifacts: Vec<String>,
     cache: Arc<Cache>,

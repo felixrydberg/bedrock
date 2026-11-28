@@ -1377,7 +1377,7 @@ async fn quarantined_dataset_rebuilds_from_a_verified_bootstrap_while_the_other_
     );
     raw["auth"].put(b"a/ghost", b"leftover").unwrap();
     let rebuilding = bedrock_lib::reconciliation::rebuild::start(
-        &admin,
+        &bedrock_lib::reconciliation::Metrics::new(&admin),
         &health,
         &session,
         "engine",

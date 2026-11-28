@@ -259,3 +259,22 @@ async fn kv_readers_fail_over_to_the_next_ranked() {
     }
     assert_eq!(ids(&readers(members.values(), &health, hash)), ranked[3..]);
 }
+
+/// A CDN holder that answered a held-only fetch without the artifact is skipped for that artifact only, until
+/// [`RECHECK`] passes (#82 / B-34).
+#[cfg_attr(not(madsim), tokio::test(start_paused = true))]
+#[cfg_attr(madsim, tokio::test)]
+async fn a_holder_missing_an_artifact_is_skipped_for_that_artifact_until_rechecked() {
+    let health = Health::new(&Admin::new());
+    let members = members(&[("a", ""), ("b", "")]);
+    let dir = directory(vec![owner("a", State::Ready), owner("b", State::Ready)]);
+    let sources = Sources::default();
+    let select = |hash| ids(&sources.select(&members, &dir, &health, "", "cdn", "", hash, 0));
+    sources.missing("a", "cdn", H);
+    assert_eq!(select(H), ["b"]);
+    assert_eq!(select(H + 1), ["a", "b"], "other artifacts in the range");
+    sources.missing("b", "quicksilver", H);
+    assert_eq!(select(H), ["b"], "other datasets");
+    tokio::time::sleep(RECHECK).await;
+    assert_eq!(select(H), ["a", "b"]);
+}

@@ -83,7 +83,7 @@ pub async fn run(config: ServiceConfig) -> Result<(), ConfigError> {
     )
     .map_err(|e| ConfigError(e.to_string()))?;
     let rebuilding = bedrock_lib::reconciliation::rebuild::start(
-        &admin,
+        &bedrock_lib::reconciliation::Metrics::new(&admin),
         &storage,
         &session,
         "engine",

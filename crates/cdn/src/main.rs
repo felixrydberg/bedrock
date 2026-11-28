@@ -3,5 +3,5 @@
 #[tokio::main]
 async fn main() -> Result<(), bedrock_lib::node::ConfigError> {
     bedrock_lib::node::init_tracing();
-    bedrock_cdn::run(bedrock_lib::node::load()?).await
+    bedrock_cdn::run(bedrock_lib::node::load::<bedrock_cdn::CdnConfig>()?).await
 }

@@ -84,6 +84,7 @@ async fn peer_fetch(addr: String, hash: Hash) -> Bytes {
         .connect_lazy();
     let request = pb::FetchRequest {
         hash: Bytes::copy_from_slice(&hash.0),
+        held_only: false,
     };
     let mut stream = ArtifactTransferClient::new(channel)
         .fetch(request)

@@ -24,7 +24,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{Config, Metrics, Reconcile, Reconciler};
-use crate::admin::Admin;
 use crate::health::storage::{self, State, StorageHealth};
 use crate::relays::client::{Rebuilder, Session};
 use crate::relays::ranges::Range;
@@ -298,9 +297,9 @@ fn hashes(range: &KeyRange) -> Option<Range> {
 
 /// Rebuilds a binary's quarantined dataset engines in the background: each of `engines` (its
 /// [`StorageHealth::wrap_replication`] handle, wrapped as `layer`) is reinitialised and re-bootstrapped through `session`.
-/// `seed` seeds retry jitter (B-23a).
+/// `seed` seeds retry jitter (B-23a). `metrics` are the process's one set, shared with its other reconcilers.
 pub fn start(
-    admin: &Admin,
+    metrics: &Metrics,
     health: &Arc<StorageHealth>,
     session: &Session,
     layer: &'static str,
@@ -330,7 +329,7 @@ pub fn start(
         "rebuild",
         Arc::new(Rebuild::new(health.clone(), sources)),
         config,
-        &Metrics::new(admin),
+        metrics,
     );
     tokio::spawn(reconciler.run(INTERVAL))
 }

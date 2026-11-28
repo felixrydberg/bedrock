@@ -82,3 +82,55 @@ fn any_namespace_retains_and_neighbours_at_the_same_position_do_not() {
     assert!(!retained(&engine, &neighbour).unwrap());
     assert!(!retained(&engine, &sha(0, 1)).unwrap());
 }
+
+#[test]
+fn holders_name_only_the_owners_ahead_of_them_so_no_two_name_each_other() {
+    use bedrock_lib::placement::{Owner, State};
+    use bedrock_lib::replication::pb::Member;
+
+    let artifact = sha(5, 1);
+    let owner = |node: &str, state| Owner {
+        node: node.into(),
+        state,
+    };
+    // A handoff in progress: two ready owners and a populating one.
+    let directory = Directory::from([
+        (0, vec![owner("x", State::Ready)]),
+        (
+            4,
+            vec![
+                owner("a", State::Ready),
+                owner("b", State::Ready),
+                owner("c", State::Populating),
+            ],
+        ),
+    ]);
+    let members: BTreeMap<String, Member> = ["a", "b", "c", "x"]
+        .map(|node| {
+            let member = Member {
+                node_id: node.into(),
+                address: format!("{node}:1"),
+                ..Member::default()
+            };
+            (node.to_owned(), member)
+        })
+        .into();
+    let of = |me| sources(&directory, &members, me, &artifact);
+    assert_eq!(of("a"), Some(vec![]), "the first owner reads S3");
+    assert_eq!(of("b"), Some(vec!["a:1".to_owned()]));
+    assert_eq!(of("c"), Some(vec!["a:1".to_owned(), "b:1".to_owned()]));
+    assert_eq!(of("x"), None, "not an owner of this range: no prewarming");
+    // An owner the view no longer lists is skipped.
+    let mut gone = members.clone();
+    gone.remove("a");
+    assert_eq!(sources(&directory, &gone, "b", &artifact), Some(vec![]));
+}
+
+#[test]
+fn ref_keys_parse_back_to_their_artifact() {
+    let artifact = sha(9, 3);
+    assert_eq!(ref_hash(&ref_key(&artifact, "d1").unwrap()), Some(artifact));
+    assert_eq!(ref_hash(&path_key("d1", "/a").unwrap()), None);
+    assert_eq!(ref_hash(format!("ref/{artifact}").as_bytes()), None);
+    assert_eq!(ref_hash(b"ref/zz"), None);
+}

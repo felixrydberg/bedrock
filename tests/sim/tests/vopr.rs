@@ -179,7 +179,7 @@ const STALE_API: &str = "10.0.5.2";
 /// The relays above the cell, between it and the API.
 const REGION_RELAYS: [&str; 2] = ["10.0.5.61", "10.0.5.62"];
 const RELAYS: [&str; 3] = ["10.0.5.11", "10.0.5.12", "10.0.5.13"];
-/// One more of each than replicas, as a real cell has: nodes then differ in what they own, and ranges split and move.
+/// More of each than replicas (3 for Quicksilver, 2 for the CDN), as a real cell has: nodes then differ in what they own, and ranges split and move.
 const QUICKSILVERS: [&str; 4] = ["10.0.5.21", "10.0.5.22", "10.0.5.23", "10.0.5.24"];
 const CDNS: [&str; 4] = ["10.0.5.31", "10.0.5.32", "10.0.5.33", "10.0.5.34"];
 const KVS: [&str; 2] = ["10.0.5.41", "10.0.5.42"];
@@ -808,7 +808,8 @@ fn relay(name: &str, ip: &str, replay_max_bytes: Option<u64>) -> RelayConfig {
                 .collect(),
             bootstrap: true,
             grace_ms: GRACE.as_millis() as u64,
-            volume_replicas: 3,
+            replicas: Default::default(),
+            max_moving: Default::default(),
         }),
         write_token: Some(TOKEN.into()),
     }
@@ -1607,7 +1608,7 @@ fn unconverged(run: &Run, processes: &[Process]) -> Option<Violation> {
         }
         for (range, owners) in &placed {
             let settled = owners.iter().all(|(_, s)| *s == OwnerState::Ready);
-            if !settled || owners.len() != hosts.min(3) {
+            if !settled || owners.len() != hosts.min(bedrock_lib::node::default_replicas(dataset)) {
                 let detail = format!("{dataset} range {range:x?} has owners {owners:?}");
                 return waiting("RedundancyRestored", detail);
             }

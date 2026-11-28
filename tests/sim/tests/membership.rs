@@ -141,7 +141,8 @@ fn relay(name: &str, ip: &str, cell: &str, relays: &[&str]) -> RelayConfig {
                 .collect(),
             bootstrap: true,
             grace_ms: GRACE.as_millis() as u64,
-            volume_replicas: 3,
+            replicas: Default::default(),
+            max_moving: Default::default(),
         }),
         write_token: Some(TOKEN.into()),
     }
@@ -205,11 +206,11 @@ impl Leaf {
     }
 }
 
-/// Every range has three ready owners from `members`, or all of them when there are fewer.
+/// Every `cdn` range has two ready owners from `members` (#82 / B-34), or all of them when there are fewer.
 fn placed(directory: &Directory, members: &[&str]) -> bool {
     directory.contains_key(&0)
         && directory.values().all(|owners| {
-            owners.len() == members.len().min(3)
+            owners.len() == members.len().min(2)
                 && owners
                     .iter()
                     .all(|o| o.state == State::Ready && members.contains(&o.node.as_str()))
